@@ -3,9 +3,9 @@
 /**
  * version-sync.mjs
  *
- * Synchronizes version in package.json from a git tag or explicit argument.
- * Updates packages/plugin, packages/pi-plugin, packages/cli, and
- * packages/dsh-plugin to the same version. All release together on each tag.
+ * Synchronizes package.json and Cargo.toml versions from a git tag or explicit argument.
+ * The plugin packages (including the local dsh-plugin port) and all four
+ * Rust workspace crates share each release version.
  *
  * Usage:
  *   node scripts/version-sync.mjs 0.1.0           # set version to 0.1.0
@@ -26,6 +26,8 @@ const PACKAGES = [
     join(repoRoot, "packages", "cli"),
     join(repoRoot, "packages", "dsh-plugin"),
 ];
+const CARGO_CRATES = ["mc-core", "mc-store", "mc-module", "mc-tokenizer"];
+const CARGO_LOCK_PATH = join(repoRoot, "Cargo.lock");
 
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[\w.]+)?(?:\+[\w.]+)?$/;
 
@@ -97,6 +99,68 @@ for (const pkgDir of PACKAGES) {
             writeFileSync(pkgPath, `${JSON.stringify(pkg, null, indent)}\n`, "utf-8");
         }
     }
+}
+
+for (const crate of CARGO_CRATES) {
+    const manifestPath = join(repoRoot, "crates", crate, "Cargo.toml");
+    const content = readFileSync(manifestPath, "utf-8");
+    const updated = setCargoManifestVersion(content, version, manifestPath);
+    reportChange(`crates/${crate}/Cargo.toml`, content, updated);
+}
+
+const cargoLock = readFileSync(CARGO_LOCK_PATH, "utf-8");
+const updatedCargoLock = setCargoLockVersions(cargoLock, version, CARGO_CRATES);
+reportChange("Cargo.lock", cargoLock, updatedCargoLock);
+
+function reportChange(label, before, after) {
+    if (before === after) {
+        console.log(`${label}: (already at target version)`);
+        return;
+    }
+    console.log(`${label}: workspace crate versions → ${version}`);
+    if (!dryRun) {
+        writeFileSync(join(repoRoot, label), after, "utf-8");
+    }
+}
+
+function setCargoManifestVersion(content, targetVersion, path) {
+    const packageStart = content.search(/^\[package\][ \t]*\r?$/m);
+    if (packageStart < 0) {
+        throw new Error(`${path} has no [package] section`);
+    }
+    const packageBodyStart = content.indexOf("\n", packageStart) + 1;
+    const remaining = content.slice(packageBodyStart);
+    const nextSection = remaining.search(/^\[[^\]\r\n]+\][ \t]*\r?$/m);
+    const packageBodyEnd = nextSection < 0 ? content.length : packageBodyStart + nextSection;
+    const packageBody = content.slice(packageBodyStart, packageBodyEnd);
+    const versionLine = /^([ \t]*version[ \t]*=[ \t]*")[^"]+("[^\r\n]*)$/m;
+    const matches = packageBody.match(versionLine);
+    if (!matches) {
+        throw new Error(`${path} has no version in its [package] section`);
+    }
+    const updatedBody = packageBody.replace(versionLine, `$1${targetVersion}$2`);
+    return content.slice(0, packageBodyStart) + updatedBody + content.slice(packageBodyEnd);
+}
+
+function setCargoLockVersions(content, targetVersion, crateNames) {
+    const blocks = content.split(/(?=^\[\[package\]\][ \t]*\r?$)/m);
+    const found = new Map(crateNames.map((name) => [name, 0]));
+    const updated = blocks.map((block) => {
+        const nameMatch = block.match(/^name = "([^"]+)"[ \t]*\r?$/m);
+        if (!nameMatch || !found.has(nameMatch[1])) return block;
+        const name = nameMatch[1];
+        found.set(name, found.get(name) + 1);
+        const versionLine = /^([ \t]*version[ \t]*=[ \t]*")[^"]+("[^\r\n]*)$/m;
+        if (!versionLine.test(block)) {
+            throw new Error(`Cargo.lock package ${name} has no version`);
+        }
+        return block.replace(versionLine, `$1${targetVersion}$2`);
+    });
+    const missing = [...found].filter(([, count]) => count !== 1).map(([name, count]) => `${name} (${count} entries)`);
+    if (missing.length > 0) {
+        throw new Error(`Cargo.lock must contain each workspace crate exactly once: ${missing.join(", ")}`);
+    }
+    return updated.join("");
 }
 
 /** Detect whether the JSON file is indented with tabs or N-space indent. */

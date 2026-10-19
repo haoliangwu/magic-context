@@ -1,3 +1,4 @@
+import { sessionLog } from "@magic-context/core/shared/logger";
 import { isRecord } from "@magic-context/core/shared/record-type-guard";
 
 import { isPiSystemEntry } from "./system-entry-pi";
@@ -116,6 +117,124 @@ export function rewriteNativeToolInput(
 	const items = envelope.items.slice();
 	items[match.index] = { ...match.item, [field]: nextValue };
 	envelope.message.providerPayload = { ...envelope.payload, items };
+}
+
+function textIdentity(
+	part: unknown,
+): { id: string; phase: unknown } | undefined {
+	if (
+		!isRecord(part) ||
+		part.type !== "text" ||
+		typeof part.textSignature !== "string"
+	)
+		return undefined;
+	try {
+		const signature: unknown = JSON.parse(part.textSignature);
+		if (
+			isRecord(signature) &&
+			signature.v === 1 &&
+			typeof signature.id === "string" &&
+			signature.id.length > 0 &&
+			(signature.phase === undefined ||
+				signature.phase === "commentary" ||
+				signature.phase === "final_answer")
+		) {
+			return { id: signature.id, phase: signature.phase };
+		}
+	} catch {}
+	return undefined;
+}
+
+/** Mirror prepared text edits without converting or discarding opaque native history. */
+export function rewriteNativeAssistantTexts(
+	message: unknown,
+	previous: unknown,
+	sessionId?: string,
+): void {
+	const envelope = getNativeEnvelope(message);
+	if (
+		envelope?.message.role !== "assistant" ||
+		!isRecord(previous) ||
+		!Array.isArray(previous.content) ||
+		!Array.isArray(envelope.message.content)
+	)
+		return;
+	const content = envelope.message.content;
+	for (let index = 0; index < content.length; index++) {
+		const part = content[index];
+		const before = previous.content[index];
+		if (
+			!isRecord(part) ||
+			part.type !== "text" ||
+			typeof part.text !== "string" ||
+			!isRecord(before) ||
+			before.type !== "text" ||
+			typeof before.text !== "string"
+		)
+			continue;
+		// The Responses dispatch check accepts cached text without the leading
+		// "§N§ " label added by tagging. Keep those native bytes cache-stable when
+		// the label is the only difference, rather than introducing a wire edit.
+		if (
+			part.text.replace(/^§\d+§ /u, "") === before.text.replace(/^§\d+§ /u, "")
+		)
+			continue;
+		const identity = textIdentity(part);
+		const sameIdentity = (value: unknown) => {
+			const other = textIdentity(value);
+			return (
+				identity !== undefined &&
+				other?.id === identity.id &&
+				other.phase === identity.phase
+			);
+		};
+		const matches = envelope.items.flatMap((item, itemIndex) =>
+			isRecord(item) &&
+			item.type === "message" &&
+			item.role === "assistant" &&
+			identity !== undefined &&
+			item.id === identity.id &&
+			item.phase === identity.phase
+				? [{ item, itemIndex }]
+				: [],
+		);
+		const match = matches[0];
+		const outputs =
+			match && Array.isArray(match.item.content)
+				? match.item.content.flatMap((output, outputIndex) =>
+						isRecord(output) &&
+						output.type === "output_text" &&
+						typeof output.text === "string"
+							? [{ output, outputIndex }]
+							: [],
+					)
+				: [];
+		if (
+			!identity ||
+			content.filter(sameIdentity).length !== 1 ||
+			previous.content.filter(sameIdentity).length !== 1 ||
+			matches.length !== 1 ||
+			outputs.length !== 1
+		) {
+			if (sessionId)
+				sessionLog(
+					sessionId,
+					`native assistant text replay skipped: missing or ambiguous id/phase match at part ${index} (items=${matches.length}, outputs=${outputs.length}); retaining native history for dispatch validation`,
+				);
+			continue;
+		}
+		const { output, outputIndex } = outputs[0];
+		if (output.text === part.text) continue;
+		const nextContent = (match.item.content as unknown[]).slice();
+		nextContent[outputIndex] = { ...output, text: part.text };
+		// Copy only the path to the selected text. Reasoning, IDs, signatures and
+		// native-only fields retain their bytes and relative order.
+		const items = envelope.items.slice();
+		items[match.itemIndex] = { ...match.item, content: nextContent };
+		envelope.items = items;
+		envelope.payload = { ...envelope.payload, items };
+		envelope.message.providerPayload = envelope.payload;
+	}
 }
 
 function hasRedactedThinkingContent(message: Record<string, unknown>): boolean {

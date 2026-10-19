@@ -149,7 +149,7 @@ export function childCreateInput(
         // The agent's own allowlist again, as session rules: the host evaluates
         // these after the agent's rules (which end with the user's global ones),
         // so here the allowlist is the last word on what the child may call.
-        permissions: hiddenChildPermissions(agent),
+        permissions: hiddenChildPermissions(agent, model.providerID),
     };
 }
 

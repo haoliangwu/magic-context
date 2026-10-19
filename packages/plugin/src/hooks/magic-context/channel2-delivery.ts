@@ -51,9 +51,9 @@ import {
     buildChannel2Reminder,
     type Channel1State,
     type Channel2PredicateBaseline,
+    currentReclaimableToolOutputCount,
     evaluateChannel2,
     formatChannel2Evaluation,
-    reclaimableToolOutputCount,
     type ToolReclaimHint,
 } from "./ctx-reduce-nudge";
 import { assistantAwaitingTools } from "./read-session-db";
@@ -250,7 +250,7 @@ export async function maybeDeliverChannel2(
             deps.directiveText ??
             buildChannel2Reminder(
                 effectiveU,
-                reclaimableToolOutputCount(deps.baseline?.baselineParts ?? []),
+                currentReclaimableToolOutputCount(deps.baseline),
                 deps.oldestReclaimableToolTags,
             );
         const sent = await deliverSyntheticUserMessage(sessionId, {

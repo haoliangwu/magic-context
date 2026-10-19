@@ -18,14 +18,20 @@ import { type ManagedRecompContext, runManagedRecomp } from "./recomp-orchestrat
 // (`client.session.get`) and never passed the historian the hidden-completion
 // executor that host provides, so every run failed with MC-R01.
 
-function executorCoveringRequestedRange(): HiddenCompletionExecutor & { opened: string[] } {
+function executorCoveringRequestedRange(): HiddenCompletionExecutor & {
+    opened: string[];
+    maxOutputCaps: Array<number | undefined>;
+} {
     const opened: string[] = [];
+    const maxOutputCaps: Array<number | undefined> = [];
     let prompt = "";
     return {
         opened,
+        maxOutputCaps,
         capabilities: { tools: false, harness: "opencode" },
         open: async (run) => {
             opened.push(run.kind);
+            maxOutputCaps.push(run.maxOutputTokens);
             return { id: `child-${opened.length}`, childSessionId: `child-${opened.length}` };
         },
         attempt: async (_handle, request) => {
@@ -45,7 +51,11 @@ function executorCoveringRequestedRange(): HiddenCompletionExecutor & { opened: 
     };
 }
 
-function context(db: Database, executor: HiddenCompletionExecutor): ManagedRecompContext {
+function context(
+    db: Database,
+    executor: HiddenCompletionExecutor,
+    historianMaxOutputTokens?: number,
+): ManagedRecompContext {
     return {
         client: undefined as never,
         hiddenCompletionExecutor: executor,
@@ -54,6 +64,7 @@ function context(db: Database, executor: HiddenCompletionExecutor): ManagedRecom
         directory: "/tmp/project",
         historianChunkTokens: 10_000,
         historianTimeoutMs: 1_000,
+        historianMaxOutputTokens,
         memoryEnabled: false,
         autoPromote: false,
         fallbackModels: [],
@@ -102,7 +113,24 @@ describe("runManagedRecomp without an OpenCode 1 client", () => {
             expect(message).toContain("## Magic Recomp — Complete");
             expect(message).not.toContain("MC-R01");
             expect(executor.opened.length).toBeGreaterThan(0);
+            expect(executor.maxOutputCaps.every((cap) => cap === undefined)).toBe(true);
             expect(getCompartments(db, sessionId).at(-1)?.content).toContain("Rebuilt");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("passes the configured historian output cap to the hidden executor", async () => {
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-recomp-v2-output-cap";
+        const executor = executorCoveringRequestedRange();
+        try {
+            await withMessages(sessionId, 6, () =>
+                runManagedRecomp(context(db, executor, 65_536), sessionId),
+            );
+            expect(executor.maxOutputCaps.length).toBeGreaterThan(0);
+            expect(executor.maxOutputCaps.every((cap) => cap === 65_536)).toBe(true);
         } finally {
             closeQuietly(db);
         }

@@ -53,6 +53,7 @@ export interface RegisterCtxStatusDeps {
 	configParseFailures?: ConfigParseFailure[];
 	hasDeprecatedProtectedTags?: boolean;
 	compactionEnabled?: boolean;
+	smartNotesEnabled?: boolean;
 }
 
 export type CtxStatusRuntimeDeps = Omit<

@@ -19,7 +19,9 @@ export function scheduleAfterBootQuiet(
     task: () => void,
     additionalDelayMs = 0,
 ): ReturnType<typeof setTimeout> {
-    const timer = setTimeout(task, bootQuietRemainingMs() + Math.max(0, additionalDelayMs));
+    const timer = inRootAsyncContext(() =>
+        setTimeout(task, bootQuietRemainingMs() + Math.max(0, additionalDelayMs)),
+    );
     (timer as { unref?: () => void }).unref?.();
     return timer;
 }
@@ -28,3 +30,5 @@ export function scheduleAfterBootQuiet(
 export function setBootQuietPeriodForTests(startAtMs: number | null): void {
     bootQuietUntilMs = startAtMs === null ? 0 : startAtMs + BOOT_QUIET_MS;
 }
+
+import { inRootAsyncContext } from "../shared/sqlite";

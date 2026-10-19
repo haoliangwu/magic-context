@@ -28,7 +28,7 @@
  *
  * Runs in the TypeScript transform by default and in the Rust transform with
  * MC_E2E_MODE=rust. Set SYSTEM_ORDER_EVIDENCE to a directory to dump the
- * per-request table used by docs/reports/system-prompt-change-detection-order.md.
+ * per-request table for comparing fold decisions and provider-visible prefixes.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";

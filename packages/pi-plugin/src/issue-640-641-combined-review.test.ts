@@ -49,12 +49,16 @@ test("combined review: a completed managed receipt survives delayed provider ret
 	h.invoke("agent_start", {});
 	await h.invoke("context", { messages: [userMessage("managed", 1)] });
 	expect(h.budget.completed).toBe(true);
-	h.invoke("before_provider_request", { payload: { messages: [] } });
+	h.invoke("before_provider_request", {
+		payload: { messages: [userMessage("managed", 1)] },
+	});
 	expect(h.aborts).toBe(0);
 	// Provider backoff does not restart context preparation. Its completed result
 	// remains managed even when the next payload attempt is more than 25s later.
 	h.budget.elapsed = () => 26_000;
-	h.invoke("before_provider_request", { payload: { messages: [] } });
+	h.invoke("before_provider_request", {
+		payload: { messages: [userMessage("managed", 1)] },
+	});
 	expect(h.refusals).toEqual([]);
 	expect(h.aborts).toBe(0);
 });

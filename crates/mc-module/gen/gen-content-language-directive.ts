@@ -1,3 +1,4 @@
+import "./quiet-live-log";
 /**
  * Generate the Rust content-language resolver and its TypeScript differential fixture.
  *

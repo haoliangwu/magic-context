@@ -104,6 +104,7 @@ export function postprocessReplaySnapshot(
         ...replay,
         staleReduceStrippedIds: new Set(replay.staleReduceStrippedIds),
         processedImageStrippedIds: new Set(replay.processedImageStrippedIds),
+        processedImageMarkers: new Map(replay.processedImageMarkers),
         strippedPlaceholderIds: new Set(replay.strippedPlaceholderIds),
         hiddenSeamPlaceholderIds: new Set(replay.hiddenSeamPlaceholderIds),
         mergedReasoningStrippedIds: new Set(replay.mergedReasoningStrippedIds),

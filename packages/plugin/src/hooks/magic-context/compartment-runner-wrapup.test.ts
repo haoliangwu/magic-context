@@ -715,6 +715,7 @@ describe("runCompartmentAgent wrapup controls", () => {
                     ...rawTypes,
                     9_899,
                     sessionId,
+                    sessionId,
                     ...rawTypes,
                     9_949,
                     Number.MAX_SAFE_INTEGER,

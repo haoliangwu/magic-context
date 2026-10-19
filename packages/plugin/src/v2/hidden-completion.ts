@@ -11,11 +11,13 @@ import type {
 import { HiddenCompletionRefusal } from "../hooks/magic-context/compartment-runner-types";
 import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
 import { recordHiddenVariantWarning } from "../shared/hidden-variant-warnings";
+import { needsBlockedRead } from "../shared/hidden-zen-read";
 import { log } from "../shared/logger";
 import type { PromptArgs } from "../shared/model-suggestion-retry";
 import { parseProviderModel, toModelEntry } from "../shared/resolve-fallbacks";
 import { runTokenLog } from "../shared/run-token-log";
 import type { Database } from "../shared/sqlite";
+import { subagentTemperature } from "../shared/subagent-temperature";
 import { createNativeHiddenChildren } from "./hidden-child-native";
 import {
     assistantOutcome,
@@ -59,6 +61,13 @@ export interface V2HiddenCompletionOptions {
     log?: (message: string) => void;
     /** Return the host catalog when available; catalog failures leave the request unchanged. */
     modelCatalog?: () => Promise<unknown>;
+    /**
+     * The user's `historian.temperature`, applied to historian, editor and recomp passes.
+     * OpenCode 1 carries it on the historian agent config; OpenCode 2 has no agent-level
+     * sampling, so it is authored onto each historian request here. Dreamer tasks never
+     * receive it.
+     */
+    historianTemperature?: () => number | undefined;
 }
 
 interface RunState {
@@ -546,6 +555,45 @@ export async function createV2HiddenCompletionExecutor(
             }
 
             const requested = await validateVariant(requestModel(request, run.child.model));
+            if (run.identity.kind !== "dreamer-task" && request.body.temperature === undefined) {
+                const configured = options.historianTemperature?.();
+                if (typeof configured === "number" && Number.isFinite(configured))
+                    request = { ...request, body: { ...request.body, temperature: configured } };
+            }
+            if (typeof request.body.temperature === "number") {
+                let metadata: unknown;
+                try {
+                    const listed = await options.modelCatalog?.();
+                    const rows = Array.isArray(listed)
+                        ? listed
+                        : (listed as { data?: unknown[] } | undefined)?.data;
+                    metadata = rows?.find(
+                        (row) =>
+                            row?.providerID === requested.providerID &&
+                            (row?.id === requested.modelID || row?.modelID === requested.modelID),
+                    );
+                } catch {
+                    // A failed catalog lookup is not evidence of sampling support.
+                }
+                const temperature = subagentTemperature(
+                    modelKey(requested),
+                    metadata,
+                    request.body.temperature,
+                    (message) => note(message),
+                );
+                const body = { ...request.body };
+                if (temperature === undefined) delete body.temperature;
+                else body.temperature = temperature;
+                request = { ...request, body };
+            }
+            // Session permissions determine which genuine definitions the host can
+            // offer. Cross-provider retries must not retain the previous surface.
+            if (
+                needsBlockedRead(run.identity.agent, run.child.model.providerID) !==
+                needsBlockedRead(run.identity.agent, requested.providerID)
+            ) {
+                retire(run, "hidden-run-tool-surface-changed");
+            }
             if (run.retired) {
                 // Fallback retries share the original handle. A terminal provider failure has
                 // already retired its child, so give the retry a fresh carrier instead of
@@ -583,54 +631,59 @@ export async function createV2HiddenCompletionExecutor(
                 budgetReject = reject;
             });
             if (budget) {
-                budgetPoll = setInterval(() => {
-                    try {
-                        const fresh = withReader(
-                            options.openReader,
-                            (reader) =>
-                                reader.assistantSince?.(run.child.id, usageSeq) ??
-                                (() => {
-                                    const latest = reader.latestAssistant(run.child.id);
-                                    return latest ? [latest] : [];
-                                })(),
-                        );
-                        for (const row of fresh) {
-                            if (row.seq <= usageSeq) continue;
-                            usageSeq = row.seq;
-                            const tokens = row.data.tokens;
-                            const decision = budget.charge(
-                                Math.max(0, tokens?.input ?? 0),
-                                Math.max(0, tokens?.cache?.read ?? 0),
-                                Math.max(0, tokens?.cache?.write ?? 0),
-                                row.data.finish === "stop" &&
-                                    !(row.data.content ?? []).some(
-                                        (part) => part.type === "tool-call",
-                                    ),
-                                false,
+                budgetPoll = inRootAsyncContext(() =>
+                    setInterval(() => {
+                        try {
+                            const fresh = withReader(
+                                options.openReader,
+                                (reader) =>
+                                    reader.assistantSince?.(run.child.id, usageSeq) ??
+                                    (() => {
+                                        const latest = reader.latestAssistant(run.child.id);
+                                        return latest ? [latest] : [];
+                                    })(),
                             );
-                            const onBudgetUpdate = run.identity.metadata?.onBudgetUpdate;
-                            if (typeof onBudgetUpdate === "function")
-                                onBudgetUpdate({ ...budget.snapshot(), sessionId: run.child.id });
-                            if (decision !== "continue") {
-                                if (budgetPoll) clearInterval(budgetPoll);
-                                // This host exposes context shaping but no pre-tool execution
-                                // hook for hidden children. Stop at the soft threshold instead
-                                // of allowing another investigation call to execute.
-                                attempt.budgetExceeded = new DreamTokenBudgetExceeded(
-                                    run.child.id,
-                                    budget.snapshot().spent,
+                            for (const row of fresh) {
+                                if (row.seq <= usageSeq) continue;
+                                usageSeq = row.seq;
+                                const tokens = row.data.tokens;
+                                const decision = budget.charge(
+                                    Math.max(0, tokens?.input ?? 0),
+                                    Math.max(0, tokens?.cache?.read ?? 0),
+                                    Math.max(0, tokens?.cache?.write ?? 0),
+                                    row.data.finish === "stop" &&
+                                        !(row.data.content ?? []).some(
+                                            (part) => part.type === "tool-call",
+                                        ),
+                                    false,
                                 );
-                                void interruptAndRetire(run, "token-budget").finally(() =>
-                                    budgetReject(attempt.budgetExceeded as Error),
-                                );
-                                return;
+                                const onBudgetUpdate = run.identity.metadata?.onBudgetUpdate;
+                                if (typeof onBudgetUpdate === "function")
+                                    onBudgetUpdate({
+                                        ...budget.snapshot(),
+                                        sessionId: run.child.id,
+                                    });
+                                if (decision !== "continue") {
+                                    if (budgetPoll) clearInterval(budgetPoll);
+                                    // This host exposes context shaping but no pre-tool execution
+                                    // hook for hidden children. Stop at the soft threshold instead
+                                    // of allowing another investigation call to execute.
+                                    attempt.budgetExceeded = new DreamTokenBudgetExceeded(
+                                        run.child.id,
+                                        budget.snapshot().spent,
+                                    );
+                                    void interruptAndRetire(run, "token-budget").finally(() =>
+                                        budgetReject(attempt.budgetExceeded as Error),
+                                    );
+                                    return;
+                                }
                             }
+                        } catch (error) {
+                            if (budgetPoll) clearInterval(budgetPoll);
+                            budgetReject(error instanceof Error ? error : new Error(String(error)));
                         }
-                    } catch (error) {
-                        if (budgetPoll) clearInterval(budgetPoll);
-                        budgetReject(error instanceof Error ? error : new Error(String(error)));
-                    }
-                }, POLL_INTERVAL_MS);
+                    }, POLL_INTERVAL_MS),
+                );
             }
             let abortReject!: (error: Error) => void;
             const aborted = new Promise<never>((_resolve, reject) => {
@@ -700,8 +753,28 @@ export async function createV2HiddenCompletionExecutor(
                 const tokens = row.data.tokens;
                 const tokenNumber = (value: unknown): number | undefined =>
                     typeof value === "number" && Number.isFinite(value) ? value : undefined;
-                const reportedInput = tokenNumber(tokens?.input);
-                const reportedOutput = tokenNumber(tokens?.output);
+                // A refused tool still consumes a model step. Count every assistant
+                // row in this attempt, excluding earlier runs on a reused carrier.
+                const steps = withReader(
+                    options.openReader,
+                    (reader) => reader.assistantSince?.(run.child.id, baseline) ?? [row],
+                ).filter((step) => step.seq > baseline && step.seq <= row.seq);
+                const reportedUsage = steps.some(
+                    (step) =>
+                        tokenNumber(step.data.tokens?.input) !== undefined ||
+                        tokenNumber(step.data.tokens?.output) !== undefined,
+                );
+                const usage = steps.reduce(
+                    (total, step) => ({
+                        input: total.input + (tokenNumber(step.data.tokens?.input) ?? 0),
+                        output: total.output + (tokenNumber(step.data.tokens?.output) ?? 0),
+                        cacheRead:
+                            total.cacheRead + (tokenNumber(step.data.tokens?.cache?.read) ?? 0),
+                        cacheWrite:
+                            total.cacheWrite + (tokenNumber(step.data.tokens?.cache?.write) ?? 0),
+                    }),
+                    { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                );
                 // A host promise may resolve at the same instant as cancellation.
                 // Never publish a completion after the child has been retired.
                 if (request.signal?.aborted || run.retired || Date.now() >= deadline) {
@@ -722,15 +795,7 @@ export async function createV2HiddenCompletionExecutor(
                     // If either side is numeric, retain the provider's partial usage
                     // and floor omitted components to zero. With no numeric usage,
                     // use the local meter so budget accounting remains finite.
-                    usage:
-                        reportedInput !== undefined || reportedOutput !== undefined
-                            ? {
-                                  input: reportedInput ?? 0,
-                                  output: reportedOutput ?? 0,
-                                  cacheRead: tokenNumber(tokens?.cache?.read) ?? 0,
-                                  cacheWrite: tokenNumber(tokens?.cache?.write) ?? 0,
-                              }
-                            : meter(system, promptText(request), text ?? ""),
+                    usage: reportedUsage ? usage : meter(system, promptText(request), text ?? ""),
                     lengthCapped: ["length", "max_tokens"].includes(row.data.finish ?? ""),
                     providerId: row.data.model?.providerID ?? requested.providerID,
                     modelId: row.data.model?.id ?? requested.modelID,
@@ -810,3 +875,5 @@ export async function createV2HiddenCompletionExecutor(
         },
     };
 }
+
+import { inRootAsyncContext } from "../shared/sqlite";

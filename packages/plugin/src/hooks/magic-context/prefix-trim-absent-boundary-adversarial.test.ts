@@ -7,10 +7,9 @@ import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
  *
  * The protected cache rule under test: a defer pass (not cache-busting) must
  * serve bytes whose prefix is byte-identical to what the last served pass sent.
- * A missing boundary never cuts, so every pass serves the whole window, the same
- * bytes as before the absent-boundary classification existed; the shapes below
- * (host rows deleted or inserted, a revert, a restart, OpenCode's compaction
- * reorder) are the ones an ordinal-based cut got wrong.
+ * A boundary absent only from the live array can cut by persisted relative
+ * order. Deleting or inserting earlier rows must not shift that cut; a revert
+ * that deletes the boundary or a reordered host window must still fail closed.
  */
 
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
@@ -230,17 +229,17 @@ describe("absent-boundary prefix trim: append-only defer passes keep the priced 
         expectAppendOnlyDefer(priced, defer);
     });
 
-    it("boundary sorts inside the window, row missing: priced A, append, defer B", () => {
+    it("boundary row absent only from the live window: priced A, append, defer B", () => {
         createOpenCodeStore(range(1, 30).map((index) => regularRow(index)));
         const db = contextDb();
         const boundary = idOf(12);
         const window = (to: number) => liveWindow(range(5, to).filter((index) => index !== 12));
         const priced = window(30);
-        expect(servePass(db, priced, boundary, true).prefixTrimStatus).toBe("refused");
-        expect(ids(priced)).toEqual([undefined, ...ids(window(30))]);
+        expect(servePass(db, priced, boundary, true).prefixTrimStatus).toBe("applied");
+        expect(ids(priced)).toEqual([undefined, ...ids(liveWindow(range(13, 30)))]);
         insertRows([regularRow(31)]);
         const defer = window(31);
-        expect(servePass(db, defer, boundary, false).prefixTrimStatus).toBe("refused");
+        expect(servePass(db, defer, boundary, false).prefixTrimStatus).toBe("applied");
         expectAppendOnlyDefer(priced, defer);
     });
 
@@ -287,16 +286,16 @@ describe("absent-boundary prefix trim: append-only defer passes keep the priced 
         expectAppendOnlyDefer(priced, defer);
     });
 
-    it("degraded before any bust: defer A, append, defer B", () => {
+    it("reanchors before any bust: defer A, append, defer B", () => {
         createOpenCodeStore(range(1, 30).map((index) => regularRow(index)));
         const db = contextDb();
         const boundary = idOf(12);
         const window = (to: number) => liveWindow(range(5, to).filter((index) => index !== 12));
         const first = window(30);
-        expect(servePass(db, first, boundary, false).prefixTrimStatus).toBe("refused");
+        expect(servePass(db, first, boundary, false).prefixTrimStatus).toBe("applied");
         insertRows([regularRow(31)]);
         const second = window(31);
-        expect(servePass(db, second, boundary, false).prefixTrimStatus).toBe("refused");
+        expect(servePass(db, second, boundary, false).prefixTrimStatus).toBe("applied");
         expectAppendOnlyDefer(first, second);
     });
 });
@@ -337,8 +336,8 @@ describe("absent-boundary prefix trim: the log does not imply the host window st
 });
 
 describe("absent-boundary prefix trim: host changes between a priced and a defer pass", () => {
-    // With no cut there is nothing for a change to host rows, a revert or a
-    // restart to move: each defer pass serves the priced bytes.
+    // Relative order survives edits before the seam, unlike absolute ordinals.
+    // A process restart must not change the resulting request prefix either.
     it("a host row deleted before the boundary does not change the defer bytes", () => {
         createOpenCodeStore(range(1, 30).map((index) => regularRow(index)));
         const db = contextDb();
@@ -346,7 +345,7 @@ describe("absent-boundary prefix trim: host changes between a priced and a defer
         const window = () => liveWindow(range(5, 30).filter((index) => index !== 12));
         const priced = window();
         servePass(db, priced, boundary, true);
-        expect(ids(priced)).toEqual([undefined, ...ids(window())]);
+        expect(ids(priced)).toEqual([undefined, ...ids(liveWindow(range(13, 30)))]);
 
         deleteRows([idOf(3)]);
         const defer = window();
@@ -404,7 +403,7 @@ describe("absent-boundary prefix trim: host changes between a priced and a defer
         const boundary = idOf(12);
         const window = () => liveWindow(range(5, 30).filter((index) => index !== 12));
         const priced = window();
-        expect(servePass(db, priced, boundary, true).prefixTrimStatus).toBe("refused");
+        expect(servePass(db, priced, boundary, true).prefixTrimStatus).toBe("applied");
 
         resetPrefixTrimFallbackState(SESSION_ID);
         const defer = window();
@@ -505,7 +504,7 @@ describe("absent-boundary prefix trim: source-order branch", () => {
         };
     }
 
-    it("keeps master's refusal: the whole window on defer and busting passes", () => {
+    it("reanchors the immutable source seam identically on defer and busting passes", () => {
         createOpenCodeStore(range(1, 30).map((index) => regularRow(index)));
         const db = contextDb();
         const boundary = idOf(12);
@@ -514,20 +513,20 @@ describe("absent-boundary prefix trim: source-order branch", () => {
         const deferFirst = window(30);
         const deferFirstOrder = sourceOrderFor(deferFirst);
         expect(servePass(db, deferFirst, boundary, false, deferFirstOrder).prefixTrimStatus).toBe(
-            "refused",
+            "applied",
         );
-        expect(ids(deferFirst)).toEqual([undefined, ...ids(window(30))]);
+        expect(ids(deferFirst)).toEqual([undefined, ...ids(liveWindow(range(13, 30)))]);
 
         const priced = window(30);
         expect(servePass(db, priced, boundary, true, sourceOrderFor(priced)).prefixTrimStatus).toBe(
-            "refused",
+            "applied",
         );
-        expect(ids(priced)).toEqual([undefined, ...ids(window(30))]);
+        expect(ids(priced)).toEqual([undefined, ...ids(liveWindow(range(13, 30)))]);
 
         insertRows([regularRow(31)]);
         const defer = window(31);
         expect(servePass(db, defer, boundary, false, sourceOrderFor(defer)).prefixTrimStatus).toBe(
-            "refused",
+            "applied",
         );
         expectAppendOnlyDefer(priced, defer);
     });
@@ -575,22 +574,21 @@ describe.skipIf(!(costRows > 0))("absent-boundary prefix trim: per-pass cost", (
             });
         }
 
-        // Degraded shape: the boundary sorts inside the window but its row is
-        // missing. No cut; the first pass places the boundary, later passes
-        // reuse that verdict.
+        // The boundary still exists in the store but is omitted from the live
+        // window. Every pass places the same seam using persisted order.
         const insideIndex = costRows - 50;
         const insideBoundary = idOf(insideIndex);
         const degradedWindow = () => liveWindow(tail.filter((index) => index !== insideIndex));
         time("degraded busting pass", () => {
             expect(servePass(db, degradedWindow(), insideBoundary, true).prefixTrimStatus).toBe(
-                "refused",
+                "applied",
             );
         });
         for (let pass = 0; pass < 3; pass += 1) {
             time(`degraded defer pass ${pass}`, () => {
                 expect(
                     servePass(db, degradedWindow(), insideBoundary, false).prefixTrimStatus,
-                ).toBe("refused");
+                ).toBe("applied");
             });
         }
 

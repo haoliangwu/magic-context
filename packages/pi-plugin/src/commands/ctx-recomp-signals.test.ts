@@ -75,7 +75,11 @@ describe("/ctx-recomp post-completion signal contract", () => {
 	});
 
 	test("captures session data before detached work and threads its abort signal", () => {
-		expect(codeOnly).toContain("const snapshot = readPiSessionSnapshot(ctx)");
+		// The snapshot is numbered in the session's stored coordinate space
+		// (pi-ordinal-alignment.ts), so the read takes an offset source.
+		expect(codeOnly).toMatch(
+			/const snapshot = readPiSessionSnapshot\(\s*ctx,\s*piRawOrdinalOffsetSource\(currentDeps\.db, sessionId\),?\s*\)/,
+		);
 		expect(codeOnly).toContain("readMessages: () => snapshot.rawMessages");
 		expect(codeOnly).toContain("branchEntries: snapshot.branchEntries");
 		expect(codeOnly).toContain("work: async (signal)");

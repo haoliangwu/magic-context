@@ -6,6 +6,7 @@ import { MagicContextConfigSchema } from "../../config/schema/magic-context";
 import { closeDatabase, openDatabase } from "../../features/magic-context/storage-db";
 import { updateSessionMeta } from "../../features/magic-context/storage-meta";
 import { resetCtxReduceRegisteredGloballyForTest } from "../../hooks/magic-context/ctx-reduce-availability";
+import { saveLkgSlotToDb } from "../../hooks/magic-context/lkg-persist";
 import { captureLkgSlot } from "../../hooks/magic-context/lkg-replay";
 import { lkgReplayFits } from "../../hooks/magic-context/lkg-replay-fit";
 import { getSlot, resetLkgSlotsForTest } from "../../hooks/magic-context/lkg-slot";
@@ -59,6 +60,12 @@ test("v2 outer admission serves validated LKG before writer backoff", async () =
                 modelKey: "openai/gpt-4.1",
                 providerKey: "openai",
             });
+            if (
+                !saveLkgSlotToDb(db, "ses-v2-lkg-order", getSlot("ses-v2-lkg-order")!, undefined, {
+                    rebuild: true,
+                })
+            )
+                throw new Error("Fixture LKG did not commit");
         },
         { getRustReplayParticipant: () => null, disposeRust: () => {} },
     );

@@ -19,6 +19,10 @@ type KnownSlot = {
  * a negative cache cannot quietly become permanent.
  */
 const KNOWN_SLOTS: Record<string, KnownSlot> = {
+    "packages/plugin/src/features/magic-context/compaction-marker-candidates.ts:exitRegistered": {
+        classification: "PUBLICATION",
+        reason: "Records that the process-exit handler stopping marker candidate workers is installed; it stores no candidate, absence or failure verdict.",
+    },
     "packages/pi-plugin/src/index.ts:databaseExitHookRegistered": {
         classification: "PUBLICATION",
         reason: "Correct: records that the one process-exit handler closing the shared database is installed, so /reload doesn't register a second one; it holds no failure or absence verdict.",
@@ -52,6 +56,10 @@ const KNOWN_SLOTS: Record<string, KnownSlot> = {
     "packages/plugin/src/features/magic-context/memory/embedding-openai.ts:failureTimes": {
         classification: "VERDICT",
         reason: "Correct: circuit state expires and a half-open probe re-evaluates the endpoint.",
+    },
+    "packages/plugin/src/hooks/magic-context/raw-ordinal-warmup.ts:exitHookRegistered": {
+        classification: "PUBLICATION",
+        reason: "Correct: records that the one process-exit handler stopping canonical-ordinal warm-up workers is installed; it holds no failure or absence verdict.",
     },
     "packages/plugin/src/features/magic-context/memory/project-identity.ts:homeProjectPermission": {
         classification: "VERDICT",
@@ -191,7 +199,8 @@ function sourceFiles(directory: string): string[] {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
         const path = join(directory, entry.name);
         if (entry.isDirectory()) {
-            files.push(...sourceFiles(path));
+            // Package fixture harnesses are excluded from production compilation.
+            if (entry.name !== "__tests__") files.push(...sourceFiles(path));
         } else if (entry.isFile() && path.endsWith(".ts") && !path.endsWith(".test.ts")) {
             files.push(path);
         }

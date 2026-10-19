@@ -1,4 +1,4 @@
-import { lstat, readlink, realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ProviderError } from "./errors";
@@ -121,18 +121,17 @@ async function canonicalPath(path: string, allowMissing: boolean): Promise<strin
         const suffix: string[] = [];
         let candidate = path;
         while (true) {
+            let symbolicLink = false;
             try {
-                const metadata = await lstat(candidate);
-                if (metadata.isSymbolicLink()) {
-                    const target = await readlink(candidate);
-                    const resolvedTarget = resolve(dirname(candidate), target);
-                    return canonicalPath(join(resolvedTarget, ...suffix), true);
-                }
+                symbolicLink = (await lstat(candidate)).isSymbolicLink();
             } catch (candidateError) {
                 if (!isMissingError(candidateError)) {
                     throw fsError(path, candidateError);
                 }
             }
+            // lstat distinguishes an absent entry from a link to an absent target.
+            // Reject the link: appending its name to a real ancestor would leave it unresolved.
+            if (symbolicLink) throw fsError(path, error);
 
             const parent = dirname(candidate);
             if (parent === candidate) {

@@ -1,12 +1,64 @@
 import { describe, expect, it } from "bun:test";
+import { spawnSync } from "node:child_process";
 import {
     Database,
+    detectSqliteRuntime,
     getSqliteMemoryStats,
     loadSqliteModule,
     SqliteRuntimeUnavailableError,
 } from "./sqlite";
 
 describe("SQLite runtime selector", () => {
+    it("suppresses only the node:sqlite experimental warning in a real Node process", () => {
+        // Node 24.21 no longer emits this warning, so inject it during loading
+        // to keep the suppression assertion load-bearing on newer runtimes.
+        const selectorUrl = new URL("./sqlite.ts", import.meta.url).href;
+        const script = `
+            import { loadSqliteModule } from ${JSON.stringify(selectorUrl)};
+            const originalEmitWarning = process.emitWarning;
+            let listenerSawX = false;
+            process.on("warning", (warning) => {
+                if (warning.message === "x") listenerSawX = true;
+            });
+            await loadSqliteModule("Node.js", async (specifier) => {
+                if (specifier !== "node:sqlite") throw new Error("unexpected backend: " + specifier);
+                process.emitWarning("SQLite is an experimental feature and might change at any time", "ExperimentalWarning");
+                process.emitWarning("x", "ExperimentalWarning");
+                return {};
+            });
+            if (process.emitWarning !== originalEmitWarning) throw new Error("emitWarning was not restored");
+            process.emitWarning("after", "ExperimentalWarning");
+            await new Promise((resolve) => setImmediate(resolve));
+            if (!listenerSawX) throw new Error("the original warning listener was not called");
+        `;
+        const child = spawnSync("node", ["--trace-warnings", "--input-type=module", "-e", script], {
+            encoding: "utf8",
+            windowsHide: true,
+        });
+
+        expect(child.error).toBeUndefined();
+        expect(child.status).toBe(0);
+        expect(child.stderr).not.toContain("SQLite is an experimental feature");
+        expect(child.stderr).toContain("ExperimentalWarning: x");
+        expect(child.stderr).toContain("ExperimentalWarning: after");
+        expect(child.stderr).toMatch(/ExperimentalWarning: x[\s\S]*?\n\s+at /);
+    });
+
+    it("leaves Bun and OpenCode warning emission untouched", async () => {
+        expect(detectSqliteRuntime()).toBe("Bun");
+        const originalEmitWarning = process.emitWarning;
+        let requestedSpecifier = "";
+
+        await loadSqliteModule("Bun", async (specifier) => {
+            requestedSpecifier = specifier;
+            expect(process.emitWarning).toBe(originalEmitWarning);
+            return {};
+        });
+
+        expect(requestedSpecifier).toBe("bun:sqlite");
+        expect(process.emitWarning).toBe(originalEmitWarning);
+    });
+
     it("reports live connection PRAGMAs and removes closed handles", () => {
         const before = getSqliteMemoryStats().connectionCount;
         const db = new Database(":memory:");

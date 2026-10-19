@@ -26,6 +26,7 @@ export interface RunDueCompiledSmartNoteChecksArgs {
     leaseHeld?: () => boolean;
     signal?: AbortSignal;
     retinaHandoff?: boolean;
+    smartNotesEnabled?: boolean;
     githubToken?: string | null;
 }
 
@@ -53,7 +54,7 @@ const MAX_FAILURES_BEFORE_REAUTHOR = 3;
 export async function runDueCompiledSmartNoteChecks(
     args: RunDueCompiledSmartNoteChecksArgs,
 ): Promise<RunDueCompiledSmartNoteChecksResult> {
-    if ((await wakePlaneStatus()) === "present") {
+    if (args.smartNotesEnabled === false || (await wakePlaneStatus()) === "present") {
         return { ran: 0, surfaced: 0, failed: 0, networkFailed: 0 };
     }
 

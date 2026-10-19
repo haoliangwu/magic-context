@@ -56,7 +56,15 @@ const TOOL_OWNER_CACHE_KEY_SEP = "\x00";
 type InertWhitespaceTag = ReturnType<typeof getInertWhitespaceAssistantTags>[number];
 const inertWhitespaceCache = new WeakMap<
     ContextDatabase,
-    Map<string, { tagsVersion: number; ownersKey: string; tags: InertWhitespaceTag[] }>
+    Map<
+        string,
+        {
+            tagsVersion: number;
+            identityRevision: string | null | undefined;
+            ownersKey: string;
+            tags: InertWhitespaceTag[];
+        }
+    >
 >();
 
 function getCachedInertWhitespaceAssistantTags(
@@ -70,6 +78,7 @@ function getCachedInertWhitespaceAssistantTags(
     );
     const ownersKey = JSON.stringify(messageIds);
     const tagsVersion = tagger.getLoadedTagsVersion?.(sessionId, db);
+    const identityRevision = tagger.getLoadedTagIdentityRevision?.(sessionId, db);
     if (tagsVersion === undefined)
         return getInertWhitespaceAssistantTags(db, sessionId, messageIds);
 
@@ -79,10 +88,15 @@ function getCachedInertWhitespaceAssistantTags(
         inertWhitespaceCache.set(db, bySession);
     }
     const cached = bySession.get(sessionId);
-    if (cached?.tagsVersion === tagsVersion && cached.ownersKey === ownersKey) return cached.tags;
+    if (
+        cached?.tagsVersion === tagsVersion &&
+        cached.identityRevision === identityRevision &&
+        cached.ownersKey === ownersKey
+    )
+        return cached.tags;
 
     const tags = getInertWhitespaceAssistantTags(db, sessionId, messageIds);
-    bySession.set(sessionId, { tagsVersion, ownersKey, tags });
+    bySession.set(sessionId, { tagsVersion, identityRevision, ownersKey, tags });
     return tags;
 }
 
@@ -237,6 +251,7 @@ export type MessageInfo = {
     id?: string;
     role?: string;
     sessionID?: string;
+    time?: { created?: number; completed?: number };
     summary?: boolean;
     /** Marks one of the two m[0]/m[1] messages prepended by compartment injection. */
     syntheticHead?: boolean;
@@ -268,6 +283,14 @@ export type TagTarget = {
     thinkingDropProtected?: boolean;
     /** A rewrite here would invalidate a later protected signed block. */
     thinkingRewriteProtected?: boolean;
+    /**
+     * Pi only: the number a duplicate tag identity was just folded into. This
+     * pass keeps the bytes already served for it, so drops are withheld like
+     * `thinkingDropProtected`, but unlike that flag it does not keep a pending
+     * flush signal alive: the flush is consumed on this pass and the queued
+     * drop waits for the next pass that busts for its own reason.
+     */
+    identityRepairProtected?: boolean;
     /** Non-mutating count of current and replacement token-bearing fields for a planned drop. */
     measureReclaim?: (skeleton: boolean) => {
         beforeTools: number;
@@ -320,6 +343,8 @@ export type TagTarget = {
     /** Non-mutating: would drop()/truncate() actually reclaim bytes? Tool
      * targets only; absent on message/file targets. */
     canDrop?: () => boolean;
+    /** Prepare durable host removal authorization; false defers the new drop without changing bytes. */
+    prepareDrop?: () => boolean;
     /** A full arc removal would strand or merge native reasoning, so keep a paired skeleton. */
     requiresToolArcSkeleton?: boolean;
     /** Non-mutating read of the tool invocation's input object (e.g. to read
@@ -476,6 +501,14 @@ export interface TagMessagesOptions {
      * remove its emptied rows from the served array as well.
      */
     servedMessages?: MessageLike[];
+    /**
+     * Applied to assistant text that a pass restores from its saved source copy.
+     * OpenCode 2 cannot strip copied `§N§` notation before the host stores a reply,
+     * so its adapter strips it from the request copy instead; a source copy saved
+     * before that strip existed still holds the copies and would put them back.
+     * Unset on every other host, where restored text is served as saved.
+     */
+    normalizeRestoredAssistantText?: (text: string) => string;
     /** @internal diagnostic hook used by cache-stability/perf tests. */
     onToolOwnerFallbackLookup?: (lookup: ToolOwnerFallbackLookup) => void;
 }
@@ -905,7 +938,10 @@ export function tagMessages(
                 // than what the resolver expected.
                 const persistedSource = sourceContents.get(tagId);
                 if (persistedSource !== undefined) {
-                    textPart.text = persistedSource;
+                    textPart.text =
+                        options.normalizeRestoredAssistantText && message.info.role === "assistant"
+                            ? options.normalizeRestoredAssistantText(persistedSource)
+                            : persistedSource;
                 } else {
                     const sourceContent = stripTagPrefix(textPart.text);
                     if (sourceContent.trim().length > 0) {

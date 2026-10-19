@@ -5,8 +5,6 @@ import {
 import {
 	applyProvenInputFloor,
 	deriveWindowGeometry,
-	getWindowOverlay,
-	resolveWindowOverlayFacts,
 	type WindowGeometryResult,
 } from "@magic-context/core/shared/window-geometry";
 
@@ -77,11 +75,6 @@ export function resolvePiWindowGeometry(
 		{
 			providerLimit:
 				observedWindow === undefined ? undefined : { context: observedWindow },
-			overlay: resolveWindowOverlayFacts(
-				providerID,
-				modelID,
-				getWindowOverlay(),
-			),
 			contextCap: isSaneLimit(args.detectedContextLimit)
 				? args.detectedContextLimit
 				: undefined,

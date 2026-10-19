@@ -31,7 +31,6 @@ that the missing v1 mechanism exists on that host.
 | tagging | pass | pass | pass | pass |
 | thinking-block safety | pass | declared-divergence | declared-divergence | declared-divergence |
 | todo synthesis | pass | declared-divergence | pass | pass |
-| window overlay reload | pass | pass | pass | pass |
 | Pi cross-harness | declared-divergence | declared-divergence | pass | declared-divergence |
 | Pi Rust degradation arc 1 | declared-divergence | declared-divergence | pass | declared-divergence |
 | Pi Rust degradation arc 4 | declared-divergence | declared-divergence | pass | declared-divergence |
@@ -46,7 +45,6 @@ that the missing v1 mechanism exists on that host.
 - Conflict disable: the equivalent GA safety property is no competing summarizer; the real compaction hook is answered locally and the next provider request retains its checkpoint.
 - Todo synthesis: GA has no native todo writer; the OC2 branch verifies the real tool inventory and empty durable todo state. A real-host tool-registration mutant makes this assertion fail.
 - Dropped-input guard: select GA's `shell` tool instead of v1 `bash`; the unchanged refusal and recovery-message assertions pass on the real host.
-- Window overlay reload: include the OC2 model key in the fixture and preserve mock usage across restart; exact initial and reloaded percentages pass.
 - Compaction off: retain memory/tool registration, pass the shared compaction-off mode, and bypass v1-only synthetic marker deletion for GA-owned checkpoints.
 - Memory injection: register the shared ctx_* implementations with the GA tool editor using JSON Schema; a real ctx_memory write is now present in a fresh session's first request.
 - Historian success: Anthropic transport allows the shared historian mock matcher to return the publication payload; real-host publication now passes.
@@ -59,30 +57,23 @@ that the missing v1 mechanism exists on that host.
 
 ## Reproduction summary
 
-- OpenCode 1 manifest lane: 54 passed, 0 failed. The separately excluded overlay
-  reload scenario also passed. All 52 pre-fold test names remained present; the
+- OpenCode 1 manifest lane: 54 passed, 0 failed. All 52 pre-fold test names remained present; the
   two new canonical `drops` and `tagging` scenarios account for the increase.
-- Pi manifest lane: 41 passed, 0 failed after corrections (21 files). The focused
-  overlay scenario also passes. The two Pi-only Rust degradation files were not
+- Pi manifest lane: 41 passed, 0 failed after corrections (21 files). The two Pi-only Rust degradation files were not
   rerun in this adjudication; their prior record was 6 passing tests.
 - OMP baseline reproduced: 19 passed, 21 failed, one setup error across 20 files.
-  Final manifest lane: 36 passed, 0 failed, 0 errors across 18 files; the focused
-  overlay adds one passing test. Removing two declared-divergence files removes
+  Final manifest lane: 36 passed, 0 failed, 0 errors across 18 files. Removing two declared-divergence files removes
   four tests (including their non-failing companions), not just the two red tests.
   Corrected configuration and fixtures pass the independent historian, memory,
   todo and overflow assertions. Two whole-system scenarios are now declared
   host-imposed divergences; later long-session OMP phases are not claimed tested.
-- Window overlay: Pi and OMP now persist `21.784593935169045` for the 100K
-  overlay and `13.174536256323776` after a 160K rewrite plus reload. The stale
-  value before reload remains asserted. OpenCode 2 now passes the same exact assertions.
 - Pi manifest lane: 41 passed, 0 failed. The two Pi-only Rust degradation files
-  passed 6 tests. The excluded overlay scenario reproduces the product bug below.
+  passed 6 tests.
 - OpenCode 2 manifest lane: **34 passed, 0 failed across 20 selected scenarios**
   (187 assertions). The original baseline was 12 passed / 29 failed. The lower
   test count reflects replacement of the unavailable native-todo cases with one
   explicit live-host divergence test, and removal of failure-only teardown errors;
-  it is not 41 original tests silently made green. The excluded overlay scenario
-  separately passes its three exact-pressure assertions. The dedicated real-GA
+  it is not 41 original tests silently made green. The dedicated real-GA
   `tests/opencode2/` regression lane is **48 passed, 0 failed** (494 assertions).
 - Shared cleanup seam safety: v1 TS pure-replay differential is byte-identical on
   all four defer passes against `5efbe9b78b031156e44c00082fff385e48c46e46`;
@@ -93,8 +84,6 @@ Commands:
 ```sh
 MC_E2E_MODE=ts MC_E2E_HOST=<host> NODE_ENV='' bun test --timeout 600000 \
   $(bun scripts/validate-mode-manifest.ts --mode ts --harness <host>)
-MC_E2E_MODE=ts MC_E2E_HOST=<host> NODE_ENV='' bun test --timeout 600000 \
-  tests/window-overlay-reload.test.ts
 MC_E2E_MODE=rust MC_E2E_HOST=pi NODE_ENV='' bun test --timeout 600000 \
   tests/pi-rust-degradation-arc-1.test.ts tests/pi-rust-degradation-arc-4.test.ts
 ```
@@ -116,7 +105,6 @@ MC_E2E_MODE=rust MC_E2E_HOST=pi NODE_ENV='' bun test --timeout 600000 \
 | short-context overflow | HARNESS GAP: distinct 20KB records avoid OMP's loop rejection and actually drive pressure to 93.6%. |
 | slow historian | HARNESS GAP: corrected configuration sends slow historian requests to the local mock provider. |
 | todo synthesis | HARNESS GAP: direct tool exposure plus `_todowrite` recognition preserves exact synthetic IDs, payloads and replay bytes. |
-| window overlay reload | PRODUCT BUG: configured host windows were mislabeled observed; OMP additionally needed a mock overlay cell and restart/resume reload. |
 
 Detailed source citations and carrier differences are in
 [`packages/pi-plugin/PARITY.md`](../pi-plugin/PARITY.md#35-omp-provider-attestation-prevents-whole-system-byte-parity).

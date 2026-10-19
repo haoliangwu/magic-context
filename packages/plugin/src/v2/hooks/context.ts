@@ -1,5 +1,6 @@
 import { loadPluginConfigDetailed } from "../../config";
-import { isCompactionEnabled } from "../../config/agent-disable";
+import { isCompactionEnabled, isSmartNoteSurfaceAvailable } from "../../config/agent-disable";
+import { logConfigDependencyNotesOnce } from "../../config/dependency-notes";
 import { withLiveDreamerOutputCap } from "../../config/live-child-output-cap";
 import {
     dreamerRunConfig,
@@ -7,9 +8,11 @@ import {
     pluginConfigReader,
 } from "../../config/live-run-config";
 import { getProtectedTokensTierOverrides } from "../../config/project-security";
-import { createSubcCheckoutClaimGate } from "../../features/magic-context/checkout-claim";
 import { summarizeManualDream } from "../../features/magic-context/dreamer/manual-summary";
-import { userMemoryCollectionEnabled } from "../../features/magic-context/dreamer/task-config";
+import {
+    userObservationCollectionEnabled,
+    userObservationsRequested,
+} from "../../features/magic-context/dreamer/task-config";
 import { formatUnsupportedDreamTasks } from "../../features/magic-context/dreamer/task-registry";
 import {
     type FailClosedReason,
@@ -41,6 +44,7 @@ import {
     getCurrentToolSetHash,
     recordToolDefinition,
 } from "../../features/magic-context/tool-definition-tokens";
+import { stageOpenCodeV2TransformDecision } from "../../features/magic-context/transform-decision-log";
 import {
     type HiddenCompletionExecutor,
     HiddenCompletionRefusal,
@@ -57,6 +61,7 @@ import {
     createDroppedInputGuard,
     recordToolParameters,
 } from "../../hooks/magic-context/dropped-input-guard";
+import { clearEmbedSessionState } from "../../hooks/magic-context/embed-session-state";
 import { EmergencyFailClosedError } from "../../hooks/magic-context/emergency-fail-closed";
 import { resolveContextLimit, resolveModelKey } from "../../hooks/magic-context/event-resolvers";
 import { estimateFinalWireInputTokens } from "../../hooks/magic-context/final-wire-token-estimate";
@@ -72,29 +77,32 @@ import { materializeM0 } from "../../hooks/magic-context/inject-compartments";
 import { armLatestThinkingRecoveryFromError } from "../../hooks/magic-context/latest-thinking-recovery";
 import {
     beginV2LkgRequest,
+    clearLkgMeasuredRequest,
     lkgProviderInputTotal,
     noteLkgProviderResponse,
 } from "../../hooks/magic-context/lkg-measured-request";
 import { lkgReplayLimit, measureLkgReplay } from "../../hooks/magic-context/lkg-replay-fit";
 import { getSlot } from "../../hooks/magic-context/lkg-slot";
 import { createModuleToolBackends } from "../../hooks/magic-context/module-tool-backends";
-import { getDefaultSubcConnectionFile } from "../../hooks/magic-context/module-transport";
 import { resolveOpenCodeProtectedTailBoundary } from "../../hooks/magic-context/protected-tail-boundary";
 import { setBoundedRawMessageProvider } from "../../hooks/magic-context/read-session-chunk";
 import {
     estimateTokens,
     preloadTokenizer,
 } from "../../hooks/magic-context/read-session-formatting";
+import { createM0RenderOptions } from "../../hooks/magic-context/render-options";
 import { servedModuleM0Text } from "../../hooks/magic-context/rust-served-m0";
 import {
     STORAGE_BUSY_MESSAGE,
     StorageBusyRefusalError,
 } from "../../hooks/magic-context/storage-busy-refusal";
+import { retirePendingSystemPromptDelivery } from "../../hooks/magic-context/system-prompt-delivery";
 import { createSystemPromptHashHandler } from "../../hooks/magic-context/system-prompt-hash";
 import { createTransform, type TransformDeps } from "../../hooks/magic-context/transform";
 import { UnmanagedOverWindowError } from "../../hooks/magic-context/unmanaged-over-window";
 import { UnresolvedHistoryBoundaryError } from "../../hooks/magic-context/unresolved-history-boundary";
 import { scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
+import { createDreamTimerModuleClient } from "../../plugin/dream-timer-module-client";
 import {
     createMessagesTransformHandler,
     tryMessagesTransformLkgReplay,
@@ -129,6 +137,8 @@ import {
     withSqliteTransformPass,
 } from "../../shared/sqlite";
 import { renderUserFacingFailure, userFacingFailureCode } from "../../shared/user-facing-codes";
+import { CTX_NOTE_DESCRIPTION, withoutSmartNoteText } from "../../tools/ctx-note/constants";
+import { CTX_NOTE_LIGHT_DESCRIPTION } from "../../tools/light-descriptions";
 import { applyJsonSchemaParameterDescriptions } from "../../tools/parameter-descriptions";
 import { createV2RustCompactionMarkerStrategy, trimToRecordedBoundary } from "../fold/boundary";
 import { hostMediaAsset, hostUsesMediaAssets, rememberHostMedia } from "../fold/host-media";
@@ -140,7 +150,7 @@ import {
     NativeFoldReplay,
     nativeRowID,
 } from "../fold/native-replay";
-import { FoldOwner, foldDigest } from "../fold/owner";
+import { FoldOwner } from "../fold/owner";
 import { HostFoldPolicy } from "../fold/policy";
 import { restoreRow } from "../fold/restore";
 import { seedV2ForkFromParent, sessionHasMagicContextState } from "../fork-inheritance";
@@ -156,18 +166,18 @@ import {
     syntheticCandidates,
 } from "./channel2";
 import { registerV2Commands } from "./commands";
+import { stripCopiedTagNotation } from "./copied-tag-notation";
 import { DeletedSessionTombstones } from "./deleted-session-tombstones";
 import { resolveManualDreamTask, runManualDreamNow } from "./dream-manual";
 import { registerV2DreamScheduleTimer } from "./dream-timer";
 import { startDreamTrigger } from "./dream-trigger";
-import { V2GenerateReplay } from "./generate";
+import { generateReplayAnchor, V2GenerateReplay } from "./generate";
 import { HiddenChildHook, hiddenToolCallRefusal, registerHiddenChildAgents } from "./hidden-child";
 import { hiddenTerminalError } from "./hidden-terminal-error";
 import { V2LkgSystemReplay } from "./lkg-system";
 import { modelLimitCacheWarm, warmModelLimitCacheFromCatalog } from "./model-limit-cache";
 import { adaptPayload, HEAD_IDS } from "./payload";
 import { interruptBeforeProvider, V2ContextRefusal } from "./refusal";
-
 import { RestoredRowCache } from "./restore-rows";
 import { createV2RpcLiveSessionState } from "./rpc-live-state";
 import { createV2RustRefusalRecovery, resolveV2RustModeModuleClient } from "./rust-mode";
@@ -189,7 +199,10 @@ import {
     resolveV2BoundaryUserMessage,
     servedBoundaryRow,
 } from "./store";
+import { bindV2SystemPromptResponse } from "./system-prompt-response";
 import { registerTools } from "./tools";
+import { bindV2TransformDecision } from "./transform-decision-binding";
+import { createV2AutoEmbedSession, createV2TransformFeatureDeps } from "./transform-features";
 import type { SessionContext, V2Context, V2Message } from "./types";
 import { persistV2UsageReading } from "./usage-persist";
 import { resolveUsageReading } from "./usage-reading";
@@ -303,6 +316,7 @@ export function createHostSeams(
         TransformDeps,
         | "hostRawMessages"
         | "hostMessageReconciliationSource"
+        | "hostPrepareRawOrdinals"
         | "hostProtectedTailBoundary"
         | "hostModelFallback"
         | "getModelKey"
@@ -313,6 +327,10 @@ export function createHostSeams(
     return {
         hostRawMessages: readAllForConversion,
         hostMessageReconciliationSource: reconciliationSource,
+        // The OpenCode 2 reader already knows each message's position in the
+        // session. The default warm-up indexes OpenCode 1's SQLite database,
+        // which is a different store and cannot prepare this reader's messages.
+        hostPrepareRawOrdinals: async () => true,
         hostProtectedTailBoundary: (args) =>
             resolveOpenCodeProtectedTailBoundary({
                 ...args,
@@ -465,6 +483,7 @@ export function applyV2PromptSurfaceTools(
     draft: SessionContext,
     runtime: PromptSurfaceRuntime,
     config: PromptSurfaceConfig | undefined,
+    smartNotesEnabled = true,
 ): void {
     if (!draft.tools) return;
     const modelKey = `${draft.model.providerID}/${draft.model.id}`;
@@ -472,8 +491,20 @@ export function applyV2PromptSurfaceTools(
     for (const id of ACTIVE_TOOL_IDS) {
         const tool = draft.tools[id];
         if (!tool) continue;
-        tool.description = registration.descriptionFor(id, tool.description);
-        applyJsonSchemaParameterDescriptions(id, tool.input, registration.preset);
+        tool.description =
+            id === "ctx_note" && !smartNotesEnabled
+                ? withoutSmartNoteText(
+                      registration.preset === "light"
+                          ? CTX_NOTE_LIGHT_DESCRIPTION
+                          : CTX_NOTE_DESCRIPTION,
+                  )
+                : registration.descriptionFor(id, tool.description);
+        applyJsonSchemaParameterDescriptions(
+            id,
+            tool.input,
+            registration.preset,
+            smartNotesEnabled,
+        );
     }
 }
 
@@ -543,9 +574,21 @@ export async function applyV2SystemPrompt(
         })),
     );
     const system = { system: draft.system.map((part) => String(part.text ?? "")) };
+    bindSystemDateOutput(system.system, () => {
+        draft.system.splice(
+            0,
+            draft.system.length,
+            ...system.system.map((text, index) => ({
+                ...draft.system[index],
+                type: "text",
+                text,
+            })),
+        );
+    });
     await systemPrompt.handler(
         {
             sessionID: draft.sessionID,
+            dateRefreshRequest: draft,
             model: { providerID: draft.model.providerID, modelID: draft.model.id },
         },
         system,
@@ -599,10 +642,6 @@ export async function registerContext(context: V2Context) {
         return;
     }
     const liveConfigReader = pluginConfigReader(directory, config);
-    const checkoutClaim = createSubcCheckoutClaimGate(
-        "opencode",
-        () => config.subc?.connection_file ?? getDefaultSubcConnectionFile(),
-    );
     const compactionOff = !isCompactionEnabled(config);
     const conflicts = detectConflicts(directory, {
         compactionEnabled: !compactionOff,
@@ -638,6 +677,9 @@ export async function registerContext(context: V2Context) {
         directory,
         warn: (message) => log(`[magic-context] config warning: ${message}`),
     });
+    // Settings that are on but inert because another section turns off what
+    // they rely on (for example smart notes with the dreamer disabled).
+    logConfigDependencyNotesOnce(config, log);
     // Tools are registered only when this first open succeeds: registering them
     // later would change the tool list mid-session, so they need a restart. A
     // refused open is retried on later turns through the gate, and the first
@@ -821,6 +863,7 @@ export async function registerContext(context: V2Context) {
                 keepSubagents: config.keep_subagents === true,
                 ensureAgent: () => (hiddenAgentsReady ??= context.agent.reload()),
                 modelCatalog: () => Promise.resolve(context.model.list()),
+                historianTemperature: () => config.historian?.temperature,
                 openReader: openStoreReader,
             },
         );
@@ -847,6 +890,7 @@ export async function registerContext(context: V2Context) {
         );
         const trigger = startDreamTrigger(context, {
             config: dreamerAtBoot,
+            smartNotesEnabled: config.smart_notes.enabled,
             sample: () => {
                 const current = dreamerRunConfig(config, liveConfigReader.poll().effective);
                 return { config: current.dreamer ?? dreamerAtBoot, mural: current.mural };
@@ -857,23 +901,12 @@ export async function registerContext(context: V2Context) {
             projectMemoryEnabled: config.memory.enabled,
             language: config.language,
             mural: config.mural,
+            memoryInjectionBudgetTokens: config.memory.injection_budget_tokens,
+            retinaHandoff: config.smart_notes.retina_handoff,
+            transformMode: config.transform_mode,
+            moduleClient: createDreamTimerModuleClient(rustModeModuleClient),
         });
-        // The trigger runs due tasks after a session turn; the schedule timer runs
-        // them on their cron schedule when nobody is chatting.
-        const timer = registerV2DreamScheduleTimer({
-            directory,
-            projectIdentity,
-            config,
-            dreamer: dreamerAtBoot,
-            liveConfig: () => liveConfigReader.poll().effective,
-            executor: cappedExecutor,
-            openReader: openStoreReader,
-        });
-        return {
-            async dispose() {
-                await Promise.all([trigger.dispose(), timer.dispose()]);
-            },
-        };
+        return trigger;
     };
     // Both stay undefined after a refused start until recoverHiddenWork wires them.
     let hiddenCompletionExecutor: HiddenCompletionExecutor | undefined =
@@ -889,6 +922,31 @@ export async function registerContext(context: V2Context) {
     // start they hold this stand-in, which reaches the executor recoverHiddenWork
     // wires later.
     const lateHiddenExecutor = createLateHiddenExecutor(() => hiddenCompletionExecutor);
+    // Maintenance owns one process-wide timer, regardless of dreamer.disable.
+    // The shared timer samples the git indexing switch separately from dream tasks.
+    let maintenanceTimer: ReturnType<typeof registerV2DreamScheduleTimer> | undefined;
+    const startMaintenance = () => {
+        const timerProjectIdentity = resolveProjectIdentityForSession(
+            directory,
+            config.allow_home_project,
+        );
+        if (!timerProjectIdentity || maintenanceTimer) return;
+        maintenanceTimer = registerV2DreamScheduleTimer({
+            directory,
+            projectIdentity: timerProjectIdentity,
+            config,
+            dreamer: dreamerAtBoot,
+            liveConfig: () => liveConfigReader.poll().effective,
+            executor: withLiveDreamerOutputCap(
+                lateHiddenExecutor,
+                config,
+                () => liveConfigReader.poll().effective,
+            ),
+            openReader: openStoreReader,
+            rustModeModuleClient,
+        });
+    };
+    if (db && isDatabasePersisted(db)) startMaintenance();
     let hiddenWorkRecovery: Promise<boolean> | undefined;
     /**
      * Wire the historian's executor and the dreamer on the first successful open
@@ -900,6 +958,7 @@ export async function registerContext(context: V2Context) {
             ? Promise.resolve(false)
             : (hiddenWorkRecovery ??= (async () => {
                   try {
+                      startMaintenance();
                       hiddenCompletionExecutor ??= await createHiddenExecutor(database);
                       dreamTrigger ??= startDreamer(hiddenCompletionExecutor);
                       return true;
@@ -923,7 +982,8 @@ export async function registerContext(context: V2Context) {
             twoPass: fresh.historian?.two_pass === true,
             expandTools: fresh.historian?.expand_tools,
             autoPromote: fresh.memory?.auto_promote ?? true,
-            userMemoriesEnabled: userMemoryCollectionEnabled(fresh.dreamer),
+            userMemoriesEnabled: userObservationCollectionEnabled(fresh.dreamer),
+            userObservationsRequested: userObservationsRequested(fresh.dreamer),
             commitClusterTrigger: fresh.commit_cluster_trigger,
             chunkTokens: deriveHistorianChunkTokens(
                 resolveHistorianContextLimit(models.primary?.model),
@@ -936,8 +996,10 @@ export async function registerContext(context: V2Context) {
     const agents = new Map<string, string>();
     const sessionDirectories = new Map<string, string>();
     const historyRefreshSessions = new Set<string>();
+    registerSystemDateRefresh(historyRefreshSessions);
     const pendingMaterializationSessions = new Set<string>();
     const lastHeuristicsTurnId = new Map<string, string>();
+    const commitSeenLastPass = new Map<string, boolean>();
     const restoredRows = new RestoredRowCache();
     const rawProviders = new Map<string, () => void>();
     let passDuties: ReturnType<typeof createChatMessageHook> | undefined;
@@ -1088,6 +1150,7 @@ export async function registerContext(context: V2Context) {
     const latestLkgResponseIds = new BoundedSessionMap<string | undefined>(1000);
     const recordUsage = async (
         draft: Pick<SessionContext, "sessionID" | "model">,
+        passStarting = false,
     ): Promise<boolean> => {
         let unsafe = false;
         try {
@@ -1100,6 +1163,23 @@ export async function registerContext(context: V2Context) {
             try {
                 const latest = reader.latestAssistant(draft.sessionID);
                 latestLkgResponseIds.set(draft.sessionID, latest?.id);
+                try {
+                    bindV2SystemPromptResponse(draft.sessionID, reader);
+                } catch (error) {
+                    sessionLog(
+                        draft.sessionID,
+                        "v2 response ownership unavailable; keeping system identity pending",
+                        error,
+                    );
+                }
+                // The previous pass's busting or system-change decision belongs to
+                // the reply its request produced. Best-effort; never refuses a turn.
+                bindV2TransformDecision({
+                    db,
+                    sessionId: draft.sessionID,
+                    reader,
+                    passStarting,
+                });
                 if (latest)
                     noteLkgProviderResponse({
                         sessionId: draft.sessionID,
@@ -1243,7 +1323,9 @@ export async function registerContext(context: V2Context) {
                     continue;
                 }
                 if (event.type === "session.deleted") {
+                    clearLkgMeasuredRequest(sessionID);
                     deletedSessions.add(sessionID);
+                    transform?.clearSessionLogState(sessionID);
                     if (db) {
                         markSessionCleanupPending(db, sessionID);
                         clearSession(db, sessionID);
@@ -1257,8 +1339,10 @@ export async function registerContext(context: V2Context) {
                     variants.delete(sessionID);
                     agents.delete(sessionID);
                     channel1.delete(sessionID);
+                    commitSeenLastPass.delete(sessionID);
+                    clearEmbedSessionState(sessionID);
                     historyRefreshSessions.delete(sessionID);
-                    pendingMaterializationSessions.delete(sessionID);
+                    clearPendingMaterialization(pendingMaterializationSessions, sessionID);
                     lastHeuristicsTurnId.delete(sessionID);
                     restoredRows.forget(sessionID);
                     await nativeFoldReplay?.forget(sessionID);
@@ -1292,19 +1376,36 @@ export async function registerContext(context: V2Context) {
     const materialize = (draft: SessionContext) => {
         db = storage.require();
         const state = getOrCreateSessionMeta(db, draft.sessionID);
+        const modelKey = `${draft.model.providerID}/${draft.model.id}`;
+        const contextLimit =
+            resolveContextLimit(draft.model.providerID, draft.model.id, {
+                db,
+                sessionID: draft.sessionID,
+            }) ||
+            draft.model.limit?.context ||
+            (state.lastObservedModelKey === modelKey ? state.lastUsageContextLimit : undefined);
         return materializeM0({
+            ...createM0RenderOptions(
+                {
+                    ...createV2TransformFeatureDeps(config, compactionOff, directory),
+                    ...createV2ThresholdDeps(config),
+                },
+                usage.get(draft.sessionID)?.usage ?? { percentage: 0, inputTokens: 0 },
+                modelKey,
+                contextLimit,
+                resolveProjectIdentityForSession(directory, config.allow_home_project),
+            ),
             db,
             sessionId: draft.sessionID,
             state,
-            projectPath:
-                resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
             projectDirectory: directory,
-            memoryEnabled:
-                config.memory.enabled &&
-                !!resolveProjectIdentityForSession(directory, config.allow_home_project),
-            memoryInjectionBudgetTokens: config.memory.injection_budget_tokens,
             hardSignals: {
-                systemHash: foldDigest(JSON.stringify(draft.system)),
+                // Reuse the systemPromptHash saved by the system hook after it has
+                // resolved guidance, presets and the date. Hashing the raw compaction
+                // draft instead would make the next unchanged context pass rebuild the
+                // cached head. Compaction can run before the system hook, so an
+                // unknown identity stays empty for that hook to initialize.
+                systemHash: state.systemPromptHash ?? "",
                 toolSetHash: getCurrentToolSetHash(
                     draft.model.providerID,
                     draft.model.id,
@@ -1339,6 +1440,9 @@ export async function registerContext(context: V2Context) {
         if (nativeFoldReplay) rememberHostMedia(draft.messages);
         const reader = openStoreReader();
         try {
+            // Compaction may precede the first context callback. Wait for the pending
+            // database open instead of refusing while its asynchronous probe is running.
+            await storage.probe();
             const watermark = reader.latestSequenceForIds(
                 draft.sessionID,
                 draft.messages.flatMap((message) => (message.id ? [message.id] : [])),
@@ -1431,28 +1535,10 @@ export async function registerContext(context: V2Context) {
         // A deletion that races an in-flight pass must not let that pass rebuild
         // the state just cleared by the one deletion event.
         if (deletedSessions.has(draft.sessionID)) return;
-        // Before anything below writes for this session: refuse the turn when
-        // another machine holds the session's agent. This holds in compaction-off
-        // mode too; passing the draft through would keep working on an agent this
-        // machine does not hold.
-        const claimRefusal = await checkoutClaim.refusal(draft.sessionID, directory);
-        if (claimRefusal) {
-            pushNotification(
-                "toast",
-                { message: claimRefusal.message, variant: "error" },
-                draft.sessionID,
-            );
-            await refuseBeforeProvider(
-                context.session,
-                draft.sessionID,
-                "checkout-claim-held-elsewhere",
-                claimRefusal,
-            );
-            throw new V2ContextRefusal(claimRefusal.message, { cause: claimRefusal });
-        }
         const systemAtEntry = structuredClone(draft.system);
         const slotAtEntry = getSlot(draft.sessionID);
         const restoreLkgSystem = () => {
+            retirePendingSystemPromptDelivery(draft.sessionID);
             if (
                 !lkgSystems.restore(
                     draft.sessionID,
@@ -1496,7 +1582,14 @@ export async function registerContext(context: V2Context) {
         // grows host state without bound and a light-preset session's shortened
         // descriptions become the baseline every later request (any session,
         // any model) starts from. Registration happens once, in tools.ts.
-        applyV2PromptSurfaceTools(draft, promptSurfaceRuntime, config.prompt_surface);
+        applyV2PromptSurfaceTools(
+            draft,
+            promptSurfaceRuntime,
+            config.prompt_surface,
+            // A disabled dreamer cannot evaluate smart notes, so ctx_note loses
+            // its smart-note text exactly as with smart_notes.enabled=false.
+            isSmartNoteSurfaceAvailable(config),
+        );
         const admissionDb = db ?? storage.current();
         const replayFits: NonNullable<
             Parameters<typeof tryMessagesTransformLkgReplay>[0]["replayFits"]
@@ -1578,7 +1671,7 @@ export async function registerContext(context: V2Context) {
             // left to the transform below: its force band and emergency path are what
             // reduce an over-limit session, and refusing ahead of them would refuse
             // the same stored reading again on every later turn.
-            if ((await recordUsage(draft)) && !compactionOff) {
+            if ((await recordUsage(draft, true)) && !compactionOff) {
                 const storageReason = storage.current() ? null : storage.reason();
                 if (storageReason) {
                     noticeStorageRefusal(draft.sessionID, storageReason);
@@ -1634,6 +1727,7 @@ export async function registerContext(context: V2Context) {
             systemPrompt ??= createSystemPromptHashHandler({
                 db,
                 dreamerEnabled: config.dreamer !== undefined && !config.dreamer.disable,
+                smartNotesEnabled: config.smart_notes.enabled,
                 memoryEnabled:
                     config.memory.enabled &&
                     !!resolveProjectIdentityForSession(directory, config.allow_home_project),
@@ -1647,6 +1741,27 @@ export async function registerContext(context: V2Context) {
                 injectionEnabled: config.system_prompt_injection.enabled,
                 injectionSkipSignatures: config.system_prompt_injection.skip_signatures,
             });
+            let responseAfterSequence: number | undefined;
+            try {
+                const responseReader = openStoreReader();
+                try {
+                    responseAfterSequence = responseReader.latestSequence(draft.sessionID);
+                } finally {
+                    responseReader.close();
+                }
+            } catch (error) {
+                sessionLog(
+                    draft.sessionID,
+                    "v2 response boundary unavailable; no system delivery acknowledgement",
+                    error,
+                );
+            }
+            beginV2LkgRequest(
+                draft.sessionID,
+                `${draft.model.providerID}/${draft.model.id}`,
+                latestLkgResponseIds.get(draft.sessionID),
+                responseAfterSequence,
+            );
             await applyV2SystemPrompt(systemPrompt, draft);
             await preloadTokenizer();
             passDuties ??= createChatMessageHook({
@@ -1671,6 +1786,7 @@ export async function registerContext(context: V2Context) {
             // registered until plugin disposal, rather than falling back to the v1 store.
             prepareHistorySession(draft.sessionID);
             transform ??= createTransform({
+                ...createV2TransformFeatureDeps(config, compactionOff, directory),
                 cacheTtlConfig: config.cache_ttl,
                 cacheTtlConfigured: config.cacheTtlConfigured,
                 sampleCacheTtlConfig: () => liveConfigReader.poll().effective,
@@ -1683,6 +1799,10 @@ export async function registerContext(context: V2Context) {
                 // conversation differently from the v1 tables a converted store
                 // still carries.
                 storeGeneration: "v2",
+                // The host stores copied `§N§` notation unchanged (no hook runs before
+                // it writes a finished reply), so assistant text restored from a saved
+                // source copy gets the same strip `adaptPayload` gives the live text.
+                normalizeRestoredAssistantText: stripCopiedTagNotation,
                 // GA owns its native checkpoints; this adapter never writes the v1
                 // synthetic marker rows that the shared off-transition deletes.
                 hostCleanupCompactionMarkers: () => ({
@@ -1707,17 +1827,30 @@ export async function registerContext(context: V2Context) {
                 historyRefreshSessions,
                 pendingMaterializationSessions,
                 lastHeuristicsTurnId,
+                commitSeenLastPass,
                 variantBySession: variants,
                 keepReasoningTokens: config.keep_reasoning_tokens,
                 directory,
                 sessionDirectoryBySession: sessionDirectories,
-                projectPath: directory,
+                projectPath: resolveProjectIdentityForSession(directory, config.allow_home_project),
+                getHistorianChunkTokens: () => sampleHistorian().chunkTokens,
+                getFallbackModelId: (sessionID) => {
+                    const model = liveModels.get(sessionID);
+                    return model ? `${model.providerID}/${model.modelID}` : undefined;
+                },
+                maybeAutoEmbedSession: createV2AutoEmbedSession({
+                    db,
+                    resolveDirectory: (sessionID) => sessionDirectories.get(sessionID) ?? directory,
+                    allowHomeProject: config.allow_home_project,
+                    recompProgressBySession: new Map(),
+                }),
                 hiddenCompletionExecutor,
                 historianRunnable:
                     !compactionOff &&
                     hiddenCompletionExecutor !== undefined &&
                     config.historian?.disable !== true,
                 historianModel: historianModels.primary,
+                historianContextLimit: sampleHistorian().contextLimit,
                 fallbackModels: historianModels.fallbacks,
                 resolveHistorianRun: sampleHistorian,
                 historianTimeoutMs: config.historian_timeout_ms,
@@ -1766,14 +1899,10 @@ export async function registerContext(context: V2Context) {
                 promptSurface: config.prompt_surface,
                 promptSurfaceRuntime,
                 onRustEngineReconnectRefusal: (refusal) => rustRefusalRecovery?.arm(refusal),
-                memoryConfig: {
-                    enabled: config.memory.enabled,
-                    injectionBudgetTokens: config.memory.injection_budget_tokens,
-                    autoPromote: config.memory.auto_promote,
-                },
                 ...createHostSeams(context, readAllForConversion, pagedRead, liveModels),
             });
             const admitted = new Set<string>();
+            let messageTimes: ReturnType<V2StoreReader["messageTimes"]> | undefined;
             const reader = openStoreReader();
             let checkpoint: SessionContext["messages"][number] | undefined;
             let submitted: string | undefined;
@@ -1806,7 +1935,11 @@ export async function registerContext(context: V2Context) {
                     boundaryRepair?.kind === "baseline-reset"
                 ) {
                     historyRefreshSessions.add(draft.sessionID);
-                    pendingMaterializationSessions.add(draft.sessionID);
+                    requestPendingMaterialization(
+                        pendingMaterializationSessions,
+                        draft.sessionID,
+                        "boundary_repair",
+                    );
                 }
                 const incoming = cut && draft.messages.find((message) => message.id === cut.id);
                 postFold = cut !== undefined;
@@ -1844,7 +1977,11 @@ export async function registerContext(context: V2Context) {
                     // cleanup) are flagged to apply in that same pass rather than
                     // causing a second cache rebuild later.
                     historyRefreshSessions.add(draft.sessionID);
-                    pendingMaterializationSessions.add(draft.sessionID);
+                    requestPendingMaterialization(
+                        pendingMaterializationSessions,
+                        draft.sessionID,
+                        "host_history_change",
+                    );
                 }
                 if (cut && incoming && nativeRestored) {
                     const present = new Set(
@@ -1869,7 +2006,11 @@ export async function registerContext(context: V2Context) {
                         onHard: (reason) => {
                             sessionLog(draft.sessionID, `HARD reason=${reason}`);
                             materialize(draft);
-                            pendingMaterializationSessions.add(draft.sessionID);
+                            requestPendingMaterialization(
+                                pendingMaterializationSessions,
+                                draft.sessionID,
+                                "host_compaction",
+                            );
                         },
                     });
                     checkpoint = structuredClone(identity.rendered ?? incoming);
@@ -1951,6 +2092,11 @@ export async function registerContext(context: V2Context) {
                         ...draft.messages.filter((message) => message !== incoming),
                     );
                 }
+                if (config.temporal_awareness === true)
+                    messageTimes = reader.messageTimes(
+                        draft.sessionID,
+                        draft.messages.flatMap((message) => (message.id ? [message.id] : [])),
+                    );
             } finally {
                 reader.close();
             }
@@ -1975,12 +2121,8 @@ export async function registerContext(context: V2Context) {
                     nativeFoldReplay.invalidate(draft.sessionID, true);
                 }
             }
-            const mapped = adaptPayload(draft, admitted);
-            beginV2LkgRequest(
-                draft.sessionID,
-                `${draft.model.providerID}/${draft.model.id}`,
-                latestLkgResponseIds.get(draft.sessionID),
-            );
+            const mapped = adaptPayload(draft, admitted, messageTimes);
+            bindSystemDateRequestIdentity(mapped, draft);
             await createMessagesTransformHandler({
                 magicContext: { "experimental.chat.messages.transform": transform },
                 compactionOff,
@@ -1994,6 +2136,13 @@ export async function registerContext(context: V2Context) {
                 >[1],
             );
             mapped.commit();
+            // Keep the transform decision this pass staged (if any) together with
+            // the store sequence captured before the request; the next pass binds it
+            // to the reply written after that sequence.
+            stageOpenCodeV2TransformDecision({
+                sessionId: draft.sessionID,
+                responseAfterSequence,
+            });
             if (db) {
                 await deliverPendingChannel2(
                     context,
@@ -2155,24 +2304,14 @@ export async function registerContext(context: V2Context) {
     };
     await context.session.hook("context", (draft) =>
         withSqliteTransformPass(async () => {
-            const anchor = draft.messages.at(-1)?.id;
+            const anchor = generateReplayAnchor(draft.messages);
             await runManagedContext(draft);
             // The shared last-good-request slot is saved before m[0] is replaced
             // by a host checkpoint message. Save the final message array here
             // so side questions reuse the exact history handed back to the host.
-            if (
-                !compactionOff &&
-                draft.messages.some(
-                    (message) =>
-                        message.id === HEAD_IDS[0] ||
-                        message.content.some(
-                            (part) =>
-                                typeof part.text === "string" &&
-                                part.text.includes("<session-history>"),
-                        ),
-                )
-            )
-                generateReplay.capture(draft, anchor);
+            if (!compactionOff) generateReplay.capture(draft, anchor);
+            else
+                sessionLog(draft.sessionID, "generate replay capture skipped: compaction-disabled");
         }),
     );
     await context.session.hook("generate", async (draft) => {
@@ -2214,6 +2353,13 @@ export async function registerContext(context: V2Context) {
             : lateHiddenExecutor,
         compactionMarkerStrategy: v2CompactionMarkerStrategy,
         prepareHistorySession,
+        readSessionDirectory: async (sessionID) => {
+            try {
+                return (await context.session.get({ sessionID })).location?.directory ?? null;
+            } catch {
+                return null;
+            }
+        },
         storageDir,
     });
     // The v2 TUI reaches manual dreaming through RPC because this host has no
@@ -2256,6 +2402,8 @@ export async function registerContext(context: V2Context) {
         void runManualDreamNow({
             db: runDb,
             dreamer: manualDreamer,
+            smartNotesEnabled: config.smart_notes.enabled,
+            memoryEnabled: config.memory.enabled,
             projectIdentity:
                 resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
             directory,
@@ -2322,12 +2470,14 @@ export async function registerContext(context: V2Context) {
     });
     // Start the RPC server asynchronously after plugin construction returns so
     // Bun.serve and its discovery-file write do not consume the host's deadline.
-    setTimeout(() => {
-        if (rpcStopped) return;
-        void rpcServer
-            .start()
-            .catch((error) => log("[magic-context] v2 RPC server failed to start", error));
-    }, 0);
+    inRootAsyncContext(() =>
+        setTimeout(() => {
+            if (rpcStopped) return;
+            void rpcServer
+                .start()
+                .catch((error) => log("[magic-context] v2 RPC server failed to start", error));
+        }, 0),
+    );
     return {
         async dispose() {
             rpcStopped = true;
@@ -2338,6 +2488,7 @@ export async function registerContext(context: V2Context) {
             await usageDone;
             deletedSessions.clear();
             await dreamTrigger?.dispose();
+            await maintenanceTimer?.dispose();
             for (const release of rawProviders.values()) release();
             rawProviders.clear();
             restoredRows.clear();
@@ -2346,3 +2497,14 @@ export async function registerContext(context: V2Context) {
         },
     };
 }
+
+import {
+    clearPendingMaterialization,
+    requestPendingMaterialization,
+} from "../../hooks/magic-context/pending-materialization";
+import {
+    bindSystemDateOutput,
+    bindSystemDateRequestIdentity,
+    registerSystemDateRefresh,
+} from "../../hooks/magic-context/system-date-refresh";
+import { inRootAsyncContext } from "../../shared/sqlite";

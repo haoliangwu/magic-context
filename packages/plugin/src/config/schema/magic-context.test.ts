@@ -38,7 +38,7 @@ describe("MagicContextConfigSchema", () => {
                 fail_closed_blocking: true,
                 transform_mode: "ts",
                 storage: { enforce_private_permissions: true },
-                smart_notes: { retina_handoff: false },
+                smart_notes: { enabled: true, retina_handoff: false },
                 cache_ttl: "5m",
                 prompt_surface: { default: "full" },
                 execute_threshold_percentage: 65,
@@ -144,7 +144,7 @@ describe("MagicContextConfigSchema", () => {
                     overlay: false,
                 },
                 smart_drops: false,
-                smart_notes: { retina_handoff: false },
+                smart_notes: { enabled: true, retina_handoff: false },
                 shadow_embedding: {
                     enabled: false,
                 },

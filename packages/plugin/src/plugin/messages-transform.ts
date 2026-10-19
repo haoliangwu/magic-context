@@ -1,4 +1,3 @@
-import type { CheckoutClaimGate } from "../features/magic-context/checkout-claim";
 import {
     type FailClosedController,
     isFailClosedBlockingError,
@@ -15,16 +14,27 @@ import {
 import { updateSessionMeta } from "../features/magic-context/storage-meta-session";
 import { DegradedPassRefusalError } from "../hooks/magic-context/degraded-pass-refusal";
 import { EmergencyFailClosedError } from "../hooks/magic-context/emergency-fail-closed";
+import { markLkgRecoveryDirty } from "../hooks/magic-context/lkg-recovery-fence";
+import {
+    hasProcessLocalLkgProof,
+    lkgDirtyRevision,
+    lkgRecoveryEntryUnproven,
+    lkgRecoveryReplayUnproven,
+    noteLkgRecoveryPrefix,
+    rememberLkgDirtyRevision,
+} from "../hooks/magic-context/lkg-recovery-prefix";
 import { replayLkg, resolveLkgModelKeys } from "../hooks/magic-context/lkg-replay";
 import { lkgReplayFits, lkgReplayLimit } from "../hooks/magic-context/lkg-replay-fit";
 import { dropSlot, getSlot, noteEntry } from "../hooks/magic-context/lkg-slot";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
+import { replayCommittedDrops } from "../hooks/magic-context/replay-committed-drops";
 import {
     noteExternalLkgReplay,
     type RustLkgReplayParticipant,
     resolveRustLkgReplayParticipant,
 } from "../hooks/magic-context/rust-lkg-freeze-registry";
 import { StorageBusyRefusalError } from "../hooks/magic-context/storage-busy-refusal";
+import { retirePendingSystemPromptDelivery } from "../hooks/magic-context/system-prompt-delivery";
 import type { MessageLike } from "../hooks/magic-context/transform-operations";
 import { replayRustModeBindingMismatchStrips } from "../hooks/magic-context/transform-postprocess-phase";
 import { UnmanagedOverWindowError } from "../hooks/magic-context/unmanaged-over-window";
@@ -244,6 +254,11 @@ export function tryMessagesTransformLkgReplay(args: {
         dropSlot(sessionId, "lkg_invalidated_reshape");
         sessionLog(sessionId, "lkg_invalidated_reshape");
     } else if (sessionId && entry) {
+        if (
+            !args.rust &&
+            lkgRecoveryEntryUnproven(sessionId, entry, output.messages as MessageLike[])
+        )
+            return false;
         let replayBlocked = false;
         try {
             const db = openDatabase();
@@ -271,7 +286,6 @@ export function tryMessagesTransformLkgReplay(args: {
                 sessionLog(sessionId, "lkg_emergency_armed");
             } else {
                 const inputMessages = output.messages as MessageLike[];
-                const inputCount = inputMessages.length;
                 const keys = resolveLkgModelKeys(inputMessages);
                 const replay = replayLkg({
                     sessionId,
@@ -289,6 +303,16 @@ export function tryMessagesTransformLkgReplay(args: {
                                   resolvedProviderID: keys.providerKey ?? undefined,
                               }),
                 });
+                if (replay.ok && !rust && lkgRecoveryReplayUnproven(sessionId)) {
+                    sessionLog(sessionId, "lkg_restart_rebuild_required");
+                    return false;
+                }
+                // A failed batch may already have committed earlier drops. The
+                // fallback must serve that subset before a later defer replays it.
+                if (replay.ok && !rust && !replayCommittedDrops(db, sessionId, replay.messages)) {
+                    sessionLog(sessionId, "lkg_reasoning_prefix_changed");
+                    return false;
+                }
                 // TypeScript mode has no Rust result to check, but replaying
                 // the saved request for a known model still has to pass the
                 // same fit check as Rust mode: measured size of the saved
@@ -330,15 +354,34 @@ export function tryMessagesTransformLkgReplay(args: {
                     replayBlocked = true;
                     sessionLog(sessionId, "lkg_replay_does_not_fit");
                 } else if (replay.ok) {
+                    const recoverySlot = getSlot(sessionId);
+                    if (!recoverySlot) return false;
+                    const revision = markLkgRecoveryDirty({
+                        sessionId,
+                        slot: recoverySlot,
+                        processLocalProof: hasProcessLocalLkgProof(sessionId),
+                        ownDirtyRevision: lkgDirtyRevision(sessionId),
+                    });
+                    rememberLkgDirtyRevision(sessionId, revision);
+                    if (
+                        !rust &&
+                        !noteLkgRecoveryPrefix({
+                            sessionId,
+                            entry,
+                            messages: replay.messages,
+                            ...keys,
+                        })
+                    )
+                        return false;
+                    retirePendingSystemPromptDelivery(sessionId);
                     args.onLkgReplay?.();
+                    // Record raw-part visibility before installing bytes that a later
+                    // healthy Rust pass must preserve, even if the module has already tagged them.
+                    noteExternalLkgReplay(rust, sessionId, inputMessages, replay.messages);
                     replaceMessagesInPlace(
                         output,
                         replay.messages as unknown as MessageWithParts[],
                     );
-                    // The provider has now cached the replayed bytes. Tell a Rust
-                    // adapter, so its next successful pass keeps serving them instead
-                    // of switching to module output, which would bust that cache.
-                    noteExternalLkgReplay(rust, sessionId, inputCount);
                     sessionLog(sessionId, "lkg_replay_served");
                     return true;
                 } else {
@@ -423,18 +466,6 @@ export function createMessagesTransformHandler(args: {
      * registry picks the adapter (the one that most recently ran the session).
      */
     rustReplayParticipant?: () => RustLkgReplayParticipant | null | undefined;
-    /**
-     * The checkout claim check, run before anything in the pass can write. A
-     * session whose agent another machine holds is refused here, in every mode
-     * (compaction-off included): passing it through would let this machine keep
-     * working on an agent it does not hold.
-     */
-    checkoutClaim?: {
-        gate: Pick<CheckoutClaimGate, "refusal">;
-        projectRoot: string;
-        /** Tells the user before the refusal is thrown (the host shows a thrown error tersely). */
-        onRefusal?: (sessionId: string, message: string) => Promise<void>;
-    };
 }): (input: Record<string, never>, output: MessagesTransformOutput) => Promise<MessageWithParts[]> {
     const resolveRust = (sessionId: string): RustLkgReplayParticipant | undefined =>
         args.rustReplayParticipant
@@ -447,24 +478,6 @@ export function createMessagesTransformHandler(args: {
             typeof sessionId === "string" &&
             sessionId.length > 0 &&
             args.internalChildSessions?.has(sessionId) === true;
-        // Magic Context's own child sessions belong to no agent; every other
-        // session is checked once per cache period before the pass writes.
-        if (args.checkoutClaim && sessionId && !isInternalChild) {
-            const refusal = await args.checkoutClaim.gate.refusal(
-                sessionId,
-                args.checkoutClaim.projectRoot,
-            );
-            if (refusal) {
-                if (args.checkoutClaim.onRefusal) {
-                    try {
-                        await args.checkoutClaim.onRefusal(sessionId, refusal.message);
-                    } catch (noticeError) {
-                        log("[magic-context] checkout-claim host refusal failed:", noticeError);
-                    }
-                }
-                throw refusal;
-            }
-        }
         // Snapshot only the array, never nested messages: compaction-off gates
         // every stage that writes retained message internals, and its additive
         // path only prepends new synthetic message objects. A shallow snapshot

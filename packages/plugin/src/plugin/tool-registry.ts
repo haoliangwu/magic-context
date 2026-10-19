@@ -1,6 +1,10 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { MagicContextPluginConfig } from "../config";
-import { isCompactionEnabled, isDreamerRunnable } from "../config/agent-disable";
+import {
+    isCompactionEnabled,
+    isDreamerRunnable,
+    isSmartNoteSurfaceAvailable,
+} from "../config/agent-disable";
 import { resolveProjectIdentityForSession } from "../features/magic-context/memory/project-identity";
 import { getProtectionWindowForSession } from "../features/magic-context/protection-window";
 import {
@@ -23,8 +27,10 @@ import {
     createCtxMemoryTools,
 } from "../tools/ctx-memory";
 import { createCtxNoteTools } from "../tools/ctx-note";
+import { withoutSmartNoteText } from "../tools/ctx-note/constants";
 import { createCtxReduceTools } from "../tools/ctx-reduce";
 import { createCtxSearchTools } from "../tools/ctx-search";
+import { CTX_NOTE_LIGHT_DESCRIPTION } from "../tools/light-descriptions";
 import { parameterDescriptionsFor } from "../tools/parameter-descriptions";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./embedding-bootstrap";
 import { normalizeToolArgSchemas } from "./normalize-tool-arg-schemas";
@@ -157,11 +163,13 @@ export function createToolRegistry(args: {
         ...createCtxNoteTools({
             db,
             dreamerEnabled: isDreamerRunnable(pluginConfig),
+            smartNotesEnabled: pluginConfig.smart_notes?.enabled,
             resolveProjectPath,
             rustToolBackends,
         }),
         ...createCtxSearchTools({
             db,
+            rerankConnectionFile: pluginConfig.subc?.connection_file,
             resolveProjectPath,
             ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
         }),
@@ -202,9 +210,17 @@ export function createToolRegistry(args: {
     const registration = promptSurfaceRuntime.resolveRegistration(
         args.registrationPromptSurface ?? pluginConfig.prompt_surface,
     );
+    // Smart notes need both smart_notes.enabled and a runnable dreamer, which
+    // evaluates their conditions; without either, ctx_note is surfaced without
+    // its surface_condition argument and smart-note text.
+    const smartNotesAvailable = isSmartNoteSurfaceAvailable(pluginConfig);
     const surfacedTools = Object.fromEntries(
         Object.entries(allTools).map(([toolId, definition]) => {
-            const parameterDescriptions = parameterDescriptionsFor(toolId, registration.preset);
+            const parameterDescriptions = parameterDescriptionsFor(
+                toolId,
+                registration.preset,
+                smartNotesAvailable,
+            );
             const argsWithPresetDescriptions = parameterDescriptions
                 ? Object.fromEntries(
                       Object.entries(definition.args).map(([name, schema]) => [
@@ -224,7 +240,14 @@ export function createToolRegistry(args: {
                 {
                     ...definition,
                     args: argsWithPresetDescriptions,
-                    description: registration.descriptionFor(toolId, definition.description ?? ""),
+                    description:
+                        toolId === "ctx_note" && !smartNotesAvailable
+                            ? withoutSmartNoteText(
+                                  registration.preset === "light"
+                                      ? CTX_NOTE_LIGHT_DESCRIPTION
+                                      : (definition.description ?? ""),
+                              )
+                            : registration.descriptionFor(toolId, definition.description ?? ""),
                 },
             ];
         }),

@@ -13,14 +13,11 @@ import {
 } from "../../src/opencode2-runner/spawn";
 
 /**
- * `/ctx-flush` on OpenCode 2 runs through the TUI keymap command, which calls
- * the `flush` RPC handler. What it has to produce is not a toast: the next
- * request must be a PRICED pass that applies the queued work, instead of the
- * deferred pass an ordinary turn takes.
- *
- * The plugin names that decision per pass in its own log, so the turns before
- * the flush are the control — they must carry some other reason — and the turn
- * after it must carry the explicit-flush one.
+ * The server-registered `/ctx-flush` command uses the `flush` RPC handler. This
+ * test calls that handler and checks the effect on the next user request: an
+ * ordinary turn leaves queued work deferred, while a flush makes the next turn
+ * apply it. The plugin log records the decision, so the two control turns must
+ * lack an explicit-flush reason and the turn after the command must have one.
  */
 const HEURISTICS_DECISION = "heuristics WILL";
 const EXPLICIT_FLUSH = "heuristics WILL RUN — reason=explicit_flush";

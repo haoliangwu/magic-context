@@ -23,7 +23,7 @@ import {
 	userMessage,
 } from "./test-utils.test";
 
-// Explicit transactions and autocommit writes share a 250 ms synchronous
+// Explicit transactions and autocommit writes share a 2000 ms synchronous
 // acquisition budget for later writes in the turn. The first session-meta write
 // also has the shared 16.5 s yielding budget, after trying a valid LKG.
 // Pi's 5000 ms connection setting must be restored after every bounded attempt.

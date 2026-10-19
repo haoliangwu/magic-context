@@ -142,6 +142,6 @@ describe("v2 context hook never registers a persistent tool transform", () => {
         expect(source.slice(hookStart)).toContain("await runManagedContext(draft)");
         const hookBody = source.slice(bodyStart);
         expect(hookBody).not.toContain("context.tool.transform(");
-        expect(hookBody).toContain("applyV2PromptSurfaceTools(draft");
+        expect(hookBody).toMatch(/applyV2PromptSurfaceTools\(\s*draft/);
     });
 });

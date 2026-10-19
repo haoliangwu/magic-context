@@ -20,6 +20,7 @@ import {
     addMergedReasoningStrippedIds,
     clearEmergencyRecovery,
     getOverflowState,
+    getThinkingBindingRecoveryTarget,
     recordDetectedContextLimit,
     recordOverflowDetected,
     resetEmergencyRecoveryRegistryForTest,
@@ -34,10 +35,14 @@ import { createMessagesTransformHandler } from "../../plugin/messages-transform"
 import * as logger from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import forceFixture from "./__fixtures__/rust-signed-thinking-reset/force.json";
+import idleFixture from "./__fixtures__/rust-signed-thinking-reset/idle.json";
+import rewriteFixture from "./__fixtures__/rust-signed-thinking-reset/rewrite.json";
 import { DegradedPassRefusalError } from "./degraded-pass-refusal";
-import { EmergencyFailClosedError } from "./emergency-fail-closed";
+import { EmergencyFailClosedError, SIGNED_TURN_OVER_LIMIT } from "./emergency-fail-closed";
 import { resolveTrustedContextLimit } from "./event-resolvers";
 import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
+import { armLatestThinkingRecovery } from "./latest-thinking-recovery";
 import { createDbLkgPersistence } from "./lkg-persist";
 import { getInMemorySlot, registerLkgPersistence, resetLkgSlotsForTest } from "./lkg-slot";
 import { setRawMessageProvider } from "./read-session-chunk";
@@ -169,12 +174,15 @@ function frozenSession(label: string, options: { compactionOff?: boolean } = {})
     let pass = 0;
     const script: Step[] = [];
     let moduleOutput: (input: MessageLike[]) => unknown[] = (input) => structuredClone(input);
+    let responseExtras: Record<string, unknown> = {};
     let lastInput: MessageLike[] = [];
     let statusFails = false;
     const moduleClient: RustModeModuleClient = {
-        call: async ({ method }) => {
+        call: async ({ method, body }) => {
             if (method === "session.status" && statusFails) throw new Error("no answer");
             if (method !== "transform") return { ok: true };
+            // Page uploads are not separate scheduler decisions; only the final page applies.
+            if (body?.transform_page_complete === false) return { ok: true };
             pass += 1;
             const step = script.shift() ?? "SOFT+";
             if (step === "throw") throw new Error("daemon unavailable");
@@ -185,6 +193,7 @@ function frozenSession(label: string, options: { compactionOff?: boolean } = {})
                 served_from: "transform",
                 row_version: pass,
                 native_messages: moduleOutput(lastInput),
+                ...responseExtras,
             };
         },
     };
@@ -210,11 +219,13 @@ function frozenSession(label: string, options: { compactionOff?: boolean } = {})
         ...(options.compactionOff ? { compactionOff: true } : {}),
     };
     let estimatorOverride: typeof estimateFinalWireInputTokens | undefined;
+    let resetFenceHook: ((sessionId: string) => void) | undefined;
     const makeAdapter = () =>
         createRustModeTransform(deps, {
             moduleClient,
             modulePageMaxBytes: 512 * 1024,
             scheduleLkgCapture: (capture) => capture(),
+            afterSignedThinkingResetFenceForTests: (id) => resetFenceHook?.(id),
             rawFallbackEstimatorForTests: (args) =>
                 (estimatorOverride ?? estimateFinalWireInputTokens)(args),
         });
@@ -327,6 +338,14 @@ function frozenSession(label: string, options: { compactionOff?: boolean } = {})
         },
         setModuleOutput: (value: (input: MessageLike[]) => unknown[]) => {
             moduleOutput = value;
+        },
+        /** Extra fields (such as `signed_thinking_reset`) added to every later module response. */
+        setResponseExtras: (value: Record<string, unknown>) => {
+            responseExtras = value;
+        },
+        /** Crash seam: runs after a reset's strip fence, before the old LKG slot is dropped. */
+        setResetFenceHook: (value: ((sessionId: string) => void) | undefined) => {
+            resetFenceHook = value;
         },
         /** Arm emergency recovery without provider proof, so no LKG replay is admitted. */
         armEmergency: () =>
@@ -705,12 +724,9 @@ describe("a restart resumes a freeze the durable slot proves", () => {
         expect(s.frozenFields().lkgRepresentationFrozen).toBe(false);
     });
 
-    it("restart right after an uncaptured failure replay adopts module output (gap closed by the v95 marker)", async () => {
-        // A replay served after a failure is not captured, so the durable slot does
-        // not hold the raw tail it served and nothing inside the slot proves the
-        // freeze. Nothing else durable records the freeze either (the planned fix is a
-        // frozen marker column on the slot row, added by schema migration v95), so the
-        // restarted adapter adopts module output. This pins that known gap until then.
+    it("restart right after an uncaptured failure replay preserves its raw tail", async () => {
+        // The slot predates the raw tail, but the separate served-part evidence
+        // survives restart and keeps the module's later tags hidden.
         const s = frozenSession("restart-after-failure");
         const sid = s.sessionId;
         s.setModuleOutput(tagAllUsers);
@@ -725,11 +741,11 @@ describe("a restart resumes a freeze the durable slot proves", () => {
 
         s.restart();
         const served = await s.run([...conversation], "SOFT+");
-        expect(textOf(served, "m2")).toBe("§3§ turn 2");
+        expect(textOf(served, "m2")).toBe("turn 2");
         expect(s.frozenFields().lkgRepresentationFrozen).toBe(false);
     });
 
-    it("a restart right after an uncaptured failure replay strips the thinking produced against its raw tail", async () => {
+    it("a restart right after an uncaptured failure replay keeps thinking bound to its unchanged raw tail", async () => {
         const s = frozenSession("restart-after-failure-thinking");
         const sid = s.sessionId;
         s.setModuleOutput(tagAllUsers);
@@ -747,11 +763,9 @@ describe("a restart resumes a freeze the durable slot proves", () => {
 
         s.restart();
         const served = await s.run([...conversation], "SOFT+");
-        // The module retags m2, changing the prefix a2's thinking was produced
-        // against, so a2's thinking must not be sent behind it.
-        expect(textOf(served, "m2")).toBe("§3§ turn 2");
-        expect(hasReasoningOn(served, "a2")).toBe(false);
-        // The strip is persisted, so the next pass serves the same bytes.
+        expect(textOf(served, "m2")).toBe("turn 2");
+        expect(hasReasoningOn(served, "a2")).toBe(true);
+        // The same raw representation is retained on the next healthy pass.
         conversation.push(assistant(sid, "a3"), user(sid, "m4", "turn 4"));
         const next = await s.run([...conversation], "SOFT+");
         expect(sha(next.slice(0, served.length))).toBe(sha(served));
@@ -915,15 +929,20 @@ describe("a healthy frozen pass is admitted like any other replay", () => {
         // The freeze can still end: a module bust (what /ctx-flush requests) whose
         // output fits is served, and thinking the freeze served raw is stripped.
         s.setModuleOutput((input) =>
-            tagAllUsers(input).map((message) =>
-                (message as MessageLike).info.id === "m-huge"
-                    ? {
-                          ...(message as MessageLike),
-                          parts: [{ type: "text", text: "[compacted]" }],
-                      }
-                    : message,
-            ),
+            tagAllUsers(input).map((message) => {
+                const native = message as MessageLike;
+                return {
+                    ...native,
+                    parts:
+                        native.info.id === "m-huge"
+                            ? [{ type: "text", text: "[compacted]" }]
+                            : native.parts.filter(
+                                  (part) => (part as { type?: string }).type !== "reasoning",
+                              ),
+                };
+            }),
         );
+        s.setResponseExtras({ signed_thinking_reset: true });
         const served = await s.run([...conversation], "HARD");
         expect(s.frozenFields().lkgRepresentationFrozen).toBe(false);
         expect(JSON.stringify(served)).toContain("[compacted]");
@@ -1044,5 +1063,247 @@ describe("the replay registry follows the adapter's lifetime", () => {
         // No other adapter has run the session, so with several adapters alive in
         // this test process the wrapper attributes it to none of them.
         if (before - 1 !== 1) expect(resolveRustLkgReplayParticipant(sid)).toBeUndefined();
+    });
+});
+
+// Real Rust engine output replayed through this adapter. The fixtures are the
+// `R2_HOST_FIXTURE` lines printed by the mc-module test
+// `review_r2_native_engine_exports_force_and_idle_for_host_strip`: a session with an older
+// signed turn and an open signed tool loop (a4..a6 signed, a7 unsigned), before and after
+// a force-band pass, an idle-expired pass, and a pass whose m0/m1 head was rebuilt. A signed thinking block is valid only while every byte before it is unchanged.
+// Force and idle passes keep the head, so every block through the last kept reasoning must
+// stay; a rewritten head invalidates all of them, so none may be served, in the healthy,
+// reactive-recovery and previously frozen host states alike.
+type HostFixture = {
+    input: MessageLike[];
+    before: { native_messages: MessageLike[] };
+    pressured: {
+        native_messages: MessageLike[];
+        prefix_bust_permitted: boolean;
+        signed_thinking_reset?: boolean;
+    };
+};
+const signedThinkingFixtures = {
+    force: forceFixture as unknown as HostFixture,
+    idle: idleFixture as unknown as HostFixture,
+    rewrite: rewriteFixture as unknown as HostFixture,
+};
+
+function reasoningIds(messages: MessageLike[]): string[] {
+    return messages
+        .filter((message) =>
+            message.parts.some((part) => (part as { type?: unknown }).type === "reasoning"),
+        )
+        .map((message) => String(message.info.id));
+}
+
+/** The served messages through the last reasoning part of message `a6`, the fixture's
+ * newest signed step: everything a kept signature is bound to. */
+function prefixThroughKeptThinking(messages: MessageLike[]): string {
+    const end = messages.findIndex((message) => message.info.id === "a6");
+    expect(end).toBeGreaterThanOrEqual(0);
+    const copy = structuredClone(messages.slice(0, end + 1));
+    const kept = copy.at(-1) as MessageLike;
+    const last = kept.parts.findLastIndex(
+        (part) => (part as { type?: unknown }).type === "reasoning",
+    );
+    expect(last).toBeGreaterThanOrEqual(0);
+    kept.parts = kept.parts.slice(0, last + 1);
+    return JSON.stringify(copy);
+}
+
+/**
+ * Serve the fixture's baseline, put the host in `mode` (healthy; reactive, with a provider
+ * rejection armed; or frozen, after a module failure), then serve the pressured pass. When
+ * given, `override` replaces the module's pressured native output and extra response fields.
+ */
+async function runSignedThinkingFixture(
+    label: string,
+    fixture: HostFixture,
+    mode: "healthy" | "reactive" | "frozen",
+    step: string,
+    override?: { output: MessageLike[]; extras: Record<string, unknown> },
+) {
+    const s = frozenSession(label);
+    const remap = (messages: MessageLike[]) =>
+        structuredClone(messages).map((message) => {
+            message.info.sessionID = s.sessionId;
+            return message;
+        });
+    const input = remap(fixture.input);
+    s.setModuleOutput(() => remap(fixture.before.native_messages));
+    const before = (await s.run(input, "SOFT+")) as MessageLike[];
+    if (mode === "reactive") armLatestThinkingRecovery(s.db, s.sessionId);
+    if (mode === "frozen") await s.run(input, "throw");
+    s.setUsage(step === "HARD" ? 66 : 86, step === "HARD" ? 132_000 : 172_000);
+    const pressuredOutput = override?.output ?? fixture.pressured.native_messages;
+    s.setModuleOutput(() => remap(pressuredOutput));
+    s.setResponseExtras(
+        override?.extras ??
+            (fixture.pressured.signed_thinking_reset ? { signed_thinking_reset: true } : {}),
+    );
+    const after = (await s.run(input, step)) as MessageLike[];
+    s.setResponseExtras({});
+    return { s, input, before, after };
+}
+
+describe("Rust host thinking strips with real engine output", () => {
+    for (const kind of ["force", "idle"] as const) {
+        for (const mode of ["healthy", "reactive", "frozen"] as const) {
+            it(`keeps every block through the kept thinking on ${kind} (${mode})`, async () => {
+                const fixture = signedThinkingFixtures[kind];
+                expect(fixture.pressured.prefix_bust_permitted).toBe(true);
+                expect(fixture.pressured.signed_thinking_reset ?? false).toBe(false);
+                const { before, after } = await runSignedThinkingFixture(
+                    `signed-${kind}-${mode}`,
+                    fixture,
+                    mode,
+                    "SOFT",
+                );
+                expect(prefixThroughKeptThinking(after)).toBe(prefixThroughKeptThinking(before));
+            });
+        }
+    }
+    for (const mode of ["healthy", "reactive", "frozen"] as const) {
+        it(`a rewritten head serves no signed thinking, now or on the next pass (${mode})`, async () => {
+            const fixture = signedThinkingFixtures.rewrite;
+            expect(fixture.pressured.prefix_bust_permitted).toBe(true);
+            expect(fixture.pressured.signed_thinking_reset).toBe(true);
+            const { s, input, after } = await runSignedThinkingFixture(
+                `signed-rewrite-${mode}`,
+                fixture,
+                mode,
+                "HARD",
+            );
+            expect(reasoningIds(after)).toEqual([]);
+            // The module replays its persisted strip on the next pass; the host must not
+            // restore the turn's original signed thinking either.
+            const next = (await s.run(input, "SOFT+")) as MessageLike[];
+            expect(reasoningIds(next)).toEqual([]);
+        });
+    }
+    // The reported `signed_thinking_reset`, not the module's own output, drives the host:
+    // given output that still carries signed thinking, the host strips every block of it.
+    for (const mode of ["healthy", "reactive"] as const) {
+        it(`a reported reset strips thinking the module output still carries (${mode})`, async () => {
+            const fixture = signedThinkingFixtures.rewrite;
+            const withThinking = signedThinkingFixtures.force.pressured.native_messages;
+            expect(reasoningIds(withThinking).length).toBeGreaterThan(0);
+            const { after } = await runSignedThinkingFixture(
+                `signed-reset-decision-${mode}`,
+                fixture,
+                mode,
+                "HARD",
+                { output: withThinking, extras: { signed_thinking_reset: true } },
+            );
+            expect(reasoningIds(after)).toEqual([]);
+        });
+    }
+});
+
+describe("a signed-thinking reset survives a crash and never ships over the window", () => {
+    // The module commits the reset before it answers, but the host's LKG snapshot and
+    // reactive recovery are separate state. The host records a strip fence for every
+    // thinking-bearing assistant of the input before it touches either. LKG admission applies
+    // that fence: a snapshot taken before the reset still carries the fenced thinking, so it
+    // no longer matches what a replay would serve and is not admitted. A crash after the
+    // fence therefore never resurrects the removed thinking; the turn is refused until the
+    // module answers, which then serves its persisted reset.
+    it("a crash after the reset fence, before the old snapshot is dropped, never replays the removed thinking", async () => {
+        const fixture = signedThinkingFixtures.rewrite;
+        const s = frozenSession("signed-reset-crash");
+        const remap = (messages: MessageLike[]) =>
+            structuredClone(messages).map((message) => {
+                message.info.sessionID = s.sessionId;
+                return message;
+            });
+        const input = remap(fixture.input);
+        s.setModuleOutput(() => remap(fixture.before.native_messages));
+        const before = (await s.run(input, "SOFT+")) as MessageLike[];
+        expect(reasoningIds(before).length).toBeGreaterThan(0);
+
+        // The reset pass: real engine output, already stripped by the module.
+        s.setUsage(66, 132_000);
+        s.setModuleOutput(() => remap(fixture.pressured.native_messages));
+        s.setResponseExtras({ signed_thinking_reset: true });
+        s.setResetFenceHook(() => {
+            throw new Error("simulated crash after the reset fence");
+        });
+        // The interrupted pass falls back to the pre-reset snapshot, which the fence refuses.
+        await expect(s.run(input, "HARD")).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        s.setResetFenceHook(undefined);
+        s.setResponseExtras({});
+
+        // A new process whose module cannot answer finds only that snapshot: still refused,
+        // never served with the thinking the module removed.
+        s.restart();
+        await expect(s.run(input, "throw")).rejects.toBeInstanceOf(EmergencyFailClosedError);
+
+        // Once the module answers again it replays its persisted reset.
+        s.setModuleOutput(() => remap(fixture.pressured.native_messages));
+        const healthy = (await s.run(input, "SOFT+")) as MessageLike[];
+        expect(reasoningIds(healthy)).toEqual([]);
+        expect(healthy.map((message) => message.info.id)).toEqual(
+            remap(fixture.pressured.native_messages).map((message) => message.info.id),
+        );
+    });
+
+    // Reactive recovery is ended only once the stripped replacement is captured: a crash
+    // before that leaves it armed, and the fence alone keeps the old thinking out.
+    it("a crash after the reset fence leaves reactive recovery armed until a captured replacement", async () => {
+        const fixture = signedThinkingFixtures.rewrite;
+        const s = frozenSession("signed-reset-crash-reactive");
+        const remap = (messages: MessageLike[]) =>
+            structuredClone(messages).map((message) => {
+                message.info.sessionID = s.sessionId;
+                return message;
+            });
+        const input = remap(fixture.input);
+        s.setModuleOutput(() => remap(fixture.before.native_messages));
+        await s.run(input, "SOFT+");
+        armLatestThinkingRecovery(s.db, s.sessionId);
+        s.setUsage(66, 132_000);
+        s.setModuleOutput(() => remap(fixture.pressured.native_messages));
+        s.setResponseExtras({ signed_thinking_reset: true });
+        s.setResetFenceHook(() => {
+            throw new Error("simulated crash after the reset fence");
+        });
+        await expect(s.run(input, "HARD")).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        expect(getThinkingBindingRecoveryTarget(s.db, s.sessionId) ?? "").toStartWith(
+            "latest_thinking_original",
+        );
+        // The completed reset pass captures its replacement, then ends the recovery.
+        s.setResetFenceHook(undefined);
+        const served = (await s.run(input, "HARD")) as MessageLike[];
+        expect(reasoningIds(served)).toEqual([]);
+        expect(getThinkingBindingRecoveryTarget(s.db, s.sessionId) ?? "").toBe("");
+    });
+
+    it("a reset whose whole request is still over the window is refused, not sent", async () => {
+        const fixture = signedThinkingFixtures.rewrite;
+        const s = frozenSession("signed-reset-over-window");
+        const remap = (messages: MessageLike[]) =>
+            structuredClone(messages).map((message) => {
+                message.info.sessionID = s.sessionId;
+                return message;
+            });
+        const input = remap(fixture.input);
+        s.setModuleOutput(() => remap(fixture.before.native_messages));
+        await s.run(input, "SOFT+");
+        // The module's output on the reset pass still carries a prompt far over the 200k
+        // limit (about 1 MB of real words), so the host's final-wire estimate proves the whole
+        // request over the window even though no signed thinking is left to strip.
+        const huge = "lorem ipsum dolor sit amet ".repeat(40_000);
+        s.setModuleOutput(() =>
+            remap(fixture.pressured.native_messages).map((message) =>
+                message.info.id === "u3"
+                    ? { ...message, parts: [{ type: "text", text: huge }] }
+                    : message,
+            ),
+        );
+        s.setResponseExtras({ signed_thinking_reset: true });
+        const refused = s.run(input, "HARD");
+        await expect(refused).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        await expect(refused).rejects.toThrow(SIGNED_TURN_OVER_LIMIT);
     });
 });

@@ -37,11 +37,13 @@ describe("detectConflicts", () => {
             OPENCODE_CONFIG_DIR: process.env.OPENCODE_CONFIG_DIR,
             XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
             OPENCODE_DISABLE_AUTOCOMPACT: process.env.OPENCODE_DISABLE_AUTOCOMPACT,
+            OPENCODE_DISABLE_PROJECT_CONFIG: process.env.OPENCODE_DISABLE_PROJECT_CONFIG,
             HOME: process.env.HOME,
         };
         process.env.OPENCODE_CONFIG_DIR = userConfigDir;
         process.env.HOME = homeDir;
         delete process.env.XDG_CONFIG_HOME;
+        delete process.env.OPENCODE_DISABLE_PROJECT_CONFIG;
         // Disable auto-compaction default during tests so we isolate plugin
         // detection from compaction detection.
         process.env.OPENCODE_DISABLE_AUTOCOMPACT = "1";
@@ -732,6 +734,60 @@ describe("detectConflicts", () => {
             });
             expect(result.nativeCompaction.auto).toBe(false);
             expect(result.conflicts.compactionAuto).toBe(false);
+        });
+
+        it("v1 boot fallback ignores project compaction when project config is disabled", async () => {
+            writeCompaction(globalDir, "opencode.json", { auto: false, prune: false });
+            writeCompaction(projectDir, "opencode.json", { auto: true, prune: true });
+            writeCompaction(join(projectDir, ".opencode"), "opencode.jsonc", {
+                auto: true,
+                prune: true,
+            });
+            const resolvedCompaction = await resolveCompactionForBoot(
+                {
+                    config: { get: () => new Promise<never>(() => {}) },
+                },
+                20,
+            );
+            expect(resolvedCompaction).toBeNull();
+
+            for (const value of ["true", "1", "TRUE"]) {
+                process.env.OPENCODE_DISABLE_PROJECT_CONFIG = value;
+                const result = detectConflicts(projectDir, {
+                    compactionEnabled: true,
+                    hostGeneration: "v1",
+                    resolvedCompaction,
+                });
+                expect(result.nativeCompaction).toEqual({ auto: false, prune: false });
+                expect(result.hasConflict).toBe(false);
+            }
+        });
+
+        it("v1 still reads project compaction when the project-disable flag is false", () => {
+            writeCompaction(globalDir, "opencode.json", { auto: false });
+            writeCompaction(projectDir, "opencode.jsonc", { auto: true });
+            for (const value of ["false", "0", ""]) {
+                process.env.OPENCODE_DISABLE_PROJECT_CONFIG = value;
+                const result = detectConflicts(projectDir, { compactionEnabled: true });
+                expect(result.nativeCompaction.auto).toBe(true);
+                expect(result.conflicts.compactionAuto).toBe(true);
+            }
+        });
+
+        it("v1 project-disable flag preserves explicit and user compaction layers", () => {
+            process.env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
+            writeCompaction(globalDir, "opencode.json", { auto: false });
+            const explicit = join(root, "explicit-opencode.json");
+            writeFileSync(explicit, JSON.stringify({ compaction: { auto: true } }));
+            process.env.OPENCODE_CONFIG = explicit;
+            expect(detectConflicts(projectDir).conflicts.compactionAuto).toBe(true);
+
+            delete process.env.OPENCODE_CONFIG;
+            writeCompaction(join(homeDir, ".opencode"), "opencode.json", { auto: true });
+            expect(detectConflicts(projectDir).conflicts.compactionAuto).toBe(true);
+
+            writeCompaction(launcherDir, "opencode.json", { auto: false });
+            expect(detectConflicts(projectDir).conflicts.compactionAuto).toBe(false);
         });
 
         it("v2 ranks the project .opencode overlay above global supplementary config", () => {

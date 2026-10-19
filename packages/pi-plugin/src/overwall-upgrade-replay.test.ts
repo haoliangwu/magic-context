@@ -1,151 +1,16 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-	copySessionStateForClone,
-	getTagsBySession,
-	updateSessionMeta,
-	updateTagDropMode,
-	updateTagStatus,
-} from "@magic-context/core/features/magic-context/storage";
+import { copySessionStateForClone } from "@magic-context/core/features/magic-context/storage";
 import { getNativeToolInputs } from "@magic-context/core/features/magic-context/storage-native-replay";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
-import {
-	clearContextHandlerSession,
-	registerPiContextHandler,
-} from "./context-handler";
-import {
-	assistantMessage,
-	createFakePi,
-	createTestDb,
-	fakeContext,
-	toolResultMessage,
-	userMessage,
-} from "./test-utils.test";
+import { clearContextHandlerSession } from "./context-handler";
+import { calls, fixture } from "./overwall-upgrade-replay.fixture";
+import { observePiPublicationForTest } from "./publication-observer-fixture.test";
 
 const dir = new URL("./__fixtures__/", import.meta.url);
-function fixture(
-	native: boolean,
-	count = 200,
-	db = createTestDb(),
-	session = `review-${native}`,
-	remap = false,
-) {
-	const fake = createFakePi();
-	const model = {
-		id: "native-upgrade-codex",
-		api: "openai-codex-responses",
-		provider: "openai-codex",
-		contextWindow: 100000,
-		compat: {
-			requiresReasoningContentForAllAssistantTurns: false,
-			requiresReasoningContentForToolCalls: false,
-		},
-	};
-	const source = [
-		userMessage("first", 1),
-		...Array.from({ length: count }, (_, i) => [
-			assistantMessage("", 2 + i * 2, {
-				api: model.api,
-				provider: model.provider,
-				model: model.id,
-				content: [
-					{
-						type: "toolCall",
-						id: `call-${i}|fc-${i}`,
-						name: "read",
-						arguments: { path: `original-${i}` },
-					},
-				],
-				...(native
-					? {
-							providerPayload: {
-								type: "openaiResponsesHistory",
-								items: [
-									{
-										type: "function_call",
-										id: `fc-${i}`,
-										call_id: `call-${i}`,
-										name: "read",
-										arguments: JSON.stringify({ path: `original-${i}` }),
-									},
-								],
-							},
-						}
-					: {}),
-			}),
-			toolResultMessage(`call-${i}|fc-${i}`, `output-${i}`, 3 + i * 2),
-		]).flat(),
-		userMessage("continue", 1000),
-	];
-	const ids = source.map((_, i) => `${remap ? "clone-" : ""}entry-${i}`);
-	const restart = () => {
-		clearContextHandlerSession(session);
-		registerPiContextHandler(fake.pi as never, {
-			db,
-			heuristics: { clearReasoningAge: 100 },
-			scheduler: { executeThresholdPercentage: 80 },
-		});
-	};
-	restart();
-	const pass = async (percent: number) => {
-		updateSessionMeta(db, session, {
-			lastResponseTime: Date.now(),
-			cacheTtl: "59m",
-		});
-		const messages = structuredClone(source);
-		const handler = fake.handlers.get("context") as unknown as (
-			input: { messages: unknown[] },
-			ctx: unknown,
-		) => Promise<{ messages: unknown[] }>;
-		const out = await handler(
-			{ messages },
-			{
-				...fakeContext(session, process.cwd(), ids, messages),
-				model,
-				getContextUsage: () => ({
-					percent,
-					tokens: percent * 1000,
-					contextWindow: 100000,
-				}),
-			},
-		);
-		return out.messages;
-	};
-	const seed = async () => {
-		await pass(0);
-		for (const t of getTagsBySession(db, session))
-			if (t.type === "tool") {
-				updateTagStatus(db, session, t.tagNumber, "dropped");
-				updateTagDropMode(db, session, t.tagNumber, "full");
-			}
-	};
-	return {
-		db,
-		session,
-		source,
-		ids,
-		pass,
-		seed,
-		restart,
-		close: () => {
-			clearContextHandlerSession(session);
-			db.close();
-		},
-	};
-}
-type TranscriptMessage = {
-	role: string;
-	content?: Array<{ type: string }>;
-};
-const calls = (m: TranscriptMessage[]) =>
-	m.flatMap((x) =>
-		x.role === "assistant"
-			? (x.content ?? []).filter((p) => p.type === "toolCall")
-			: [],
-	).length;
 for (const native of [false, true])
 	test(`Q1 200 legacy full ${native ? "native" : "plain"} first defer equals base bytes`, async () => {
 		const f = fixture(native);
@@ -223,6 +88,7 @@ test("Q3 cloned native markers survive remapped entry ids", async () => {
 
 test("Q2 malformed document after mint retains pairs on restart defer", async () => {
 	const f = fixture(true, 10);
+	const publication = observePiPublicationForTest(f.session);
 	try {
 		await f.seed();
 		expect(calls(await f.pass(90))).toBe(0);
@@ -232,10 +98,20 @@ test("Q2 malformed document after mint retains pairs on restart defer", async ()
 			)
 			.run("{", f.session);
 		f.restart();
+		publication.reset();
 		const deferred = await f.pass(0);
 		expect(calls(deferred)).toBe(10);
 		expect(JSON.stringify(await f.pass(0))).toBe(JSON.stringify(deferred));
+		publication.expect("skipped", "envelope_unreadable", 2);
+		expect(
+			f.db
+				.prepare(
+					"SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?",
+				)
+				.get(f.session),
+		).toEqual({ trailing_blank_decisions: "{" });
 	} finally {
+		publication.restore();
 		f.close();
 	}
 });
@@ -301,53 +177,21 @@ for (const native of [false, true]) {
 	});
 }
 
-// The parent runs this case in fresh Bun processes over the same file-backed database.
-const childMode = process.env.MC_OVERWALL_RESTART_MODE;
-(childMode ? test : test.skip)("removal marker child", async () => {
-	const root = process.env.MC_OVERWALL_RESTART_DIR;
-	if (!root) throw new Error("missing isolated restart directory");
-	const native = process.env.MC_OVERWALL_RESTART_NATIVE === "true";
-	const f = fixture(
-		native,
-		10,
-		createTestDb(join(root, "context.db")),
-		"process-restart",
-	);
-	try {
-		if (childMode === "mint") await f.seed();
-		const messages = await f.pass(childMode === "mint" ? 90 : 0);
-		const markers = [...getNativeToolInputs(f.db, f.session)];
-		expect(calls(messages)).toBe(0);
-		expect(markers).toHaveLength(10);
-		expect(
-			markers.every(
-				([, value]) => value === '{"__magic_context_remove_tool_arc__":true}',
-			),
-		).toBe(true);
-		writeFileSync(
-			join(root, `${childMode}.json`),
-			JSON.stringify({ messages, markers }),
-		);
-	} finally {
-		f.close();
-	}
-});
+// Both phases use fresh processes; replay starts only after mint has closed its database.
 
 for (const native of [false, true]) {
-	test(`removal markers survive a separate-process restart (native=${native})`, () => {
+	test(`removal markers survive a separate-process restart (native=${native})`, async () => {
 		const root = createTestTempDirFromPath(
 			join(tmpdir(), "mc-overwall-restart-"),
 		);
 		try {
 			for (const mode of ["mint", "replay"]) {
-				const child = Bun.spawnSync({
+				const child = Bun.spawn({
 					windowsHide: true,
 					cmd: [
 						process.execPath,
-						"test",
-						import.meta.path,
-						"-t",
-						"^removal marker child$",
+						new URL("./overwall-restart-child.fixture.ts", import.meta.url)
+							.pathname,
 					],
 					cwd: process.cwd(),
 					env: {
@@ -356,11 +200,57 @@ for (const native of [false, true]) {
 						MC_OVERWALL_RESTART_DIR: root,
 						MC_OVERWALL_RESTART_NATIVE: String(native),
 					},
+					stdin: "pipe",
 					stdout: "pipe",
 					stderr: "pipe",
 					timeout: 30000,
 				});
-				expect(child.exitCode, new TextDecoder().decode(child.stderr)).toBe(0);
+				const ready = Promise.withResolvers<void>();
+				const stderr = new Response(child.stderr).text();
+				let output = "";
+				const decoder = new TextDecoder();
+				const read = child.stdout.pipeTo(
+					new WritableStream({
+						write(chunk) {
+							output += decoder.decode(chunk, { stream: true });
+							if (output.split("\n").includes(`READY ${mode}`)) ready.resolve();
+						},
+					}),
+				);
+				try {
+					await Promise.race([
+						ready.promise,
+						child.exited.then(async (code) => {
+							throw new Error(
+								`${mode} child exited before READY (${code}): ${await stderr}`,
+							);
+						}),
+					]);
+					child.stdin.write("GO\n");
+					child.stdin.end();
+					const code = await child.exited;
+					await read;
+					expect(code, `${mode} child: ${await stderr}`).toBe(0);
+					expect(
+						output.split("\n"),
+						`${mode} child did not complete`,
+					).toContain(`DONE ${mode}`);
+					const result = JSON.parse(
+						readFileSync(join(root, `${mode}.json`), "utf8"),
+					);
+					expect(calls(result.messages)).toBe(0);
+					expect(result.markers).toHaveLength(10);
+					expect(
+						result.markers.every(
+							([, value]: [string, string]) =>
+								value === '{"__magic_context_remove_tool_arc__":true}',
+						),
+					).toBe(true);
+				} finally {
+					if (child.exitCode === null) child.kill();
+					await child.exited;
+					await read;
+				}
 			}
 			expect(readFileSync(join(root, "replay.json"), "utf8")).toBe(
 				readFileSync(join(root, "mint.json"), "utf8"),

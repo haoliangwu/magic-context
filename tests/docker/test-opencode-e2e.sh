@@ -3,10 +3,10 @@
 # Magic Context — OpenCode E2E test runner (runs inside Docker).
 #
 # Two scenarios:
-#   SETUP_SMOKE    — fresh-install path via `doctor --force`
+#   SETUP_SMOKE    — doctor recognizes an unregistered, fresh host
 #   SESSION_SMOKE  — single-turn `opencode run` against aimock
 #
-# Both assertions check the shared SQLite DB at
+# The session assertions check the shared SQLite DB at
 #   ~/.local/share/cortexkit/magic-context/context.db
 # rather than scraping logs, so failures are unambiguous.
 # ----------------------------------------------------------------------
@@ -61,12 +61,10 @@ fi
 cd /test/project
 
 # ----------------------------------------------------------------------
-# Phase 1: SETUP_SMOKE — non-interactive setup via `doctor --force`.
-# Doctor's --force mode repairs an existing OpenCode install: it adds
-# the plugin entry, fixes compaction conflicts, ensures tui.json. It
-# does NOT create opencode.json from scratch (that's the setup wizard's
-# job). To simulate the "user just installed OpenCode + ran doctor"
-# path, we seed an empty opencode.json first.
+# Phase 1: SETUP_SMOKE — doctor on an unregistered OpenCode install.
+# Installing the npm package does not register it with the host. Doctor
+# reports this optional install as informational, even with --force;
+# setup owns registration. The session phase registers the local plugin.
 # ----------------------------------------------------------------------
 section "Phase 1: SETUP_SMOKE — doctor --force on a fresh OpenCode install"
 
@@ -96,8 +94,14 @@ check "doctor --force completed without hard failures" \
 check "OpenCode config still exists at ~/.config/opencode/opencode.json" \
     "test -f $HOME/.config/opencode/opencode.json"
 
-check "Plugin entry registered in OpenCode config" \
-    "grep -qE '@cortexkit/opencode-magic-context' $HOME/.config/opencode/opencode.json"
+check "Doctor reports the unregistered host as informational" \
+    "echo \"\$DOCTOR_OUT\" | grep -qE 'Magic Context is not installed there \(run setup to add it\)'"
+
+check "Doctor does not register a plugin on an optional host" \
+    "! grep -qE '@cortexkit/opencode-magic-context' $HOME/.config/opencode/opencode.json"
+
+check "Missing first-session database is informational" \
+    "echo \"\$DOCTOR_OUT\" | grep -q 'OpenCode session database not yet created' && ! echo \"\$DOCTOR_OUT\" | grep -q 'FAIL OpenCode session database'"
 
 # Magic Context creates its DB lazily on first plugin load, so it
 # may not exist yet after just `doctor`. The session smoke phase

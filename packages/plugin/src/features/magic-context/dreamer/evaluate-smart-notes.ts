@@ -58,6 +58,7 @@ export interface EvaluateSmartNotesArgs {
     fallbackModels?: readonly ModelInput[];
     /** When true, authoring-compiled provider conditions are owned by retina. */
     retinaHandoff?: boolean;
+    smartNotesEnabled?: boolean;
     onLeaseLost?: (phase: string, error?: unknown) => void;
 }
 
@@ -105,9 +106,11 @@ function createPromptAbortSignal(
 export async function evaluateSmartNotes(
     args: EvaluateSmartNotesArgs,
 ): Promise<EvaluateSmartNotesResult> {
-    if ((await wakePlaneStatus()) === "present") {
+    if (args.smartNotesEnabled === false || (await wakePlaneStatus()) === "present") {
         const pending = getPendingSmartNotes(args.db, args.projectIdentity).length;
-        log("[dreamer] evaluate-smart-notes: skipped (wake plane active)");
+        log(
+            `[dreamer] evaluate-smart-notes: skipped (${args.smartNotesEnabled === false ? "smart notes disabled" : "wake plane active"})`,
+        );
         return { surfaced: 0, pending, ran: false };
     }
 

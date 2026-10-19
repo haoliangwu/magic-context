@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { instructionB, instructionC } from "./bootstrap";
-const base = process.argv[2] ?? "docs/reports/issue-582-self-tag";
+const base = process.argv[2] ?? ".cortexkit/internal-docs/investigations/reports/issue-582-self-tag";
 const read = (path: string) => JSON.parse(readFileSync(path, "utf8"));
 const summaries = ["live-c", "supplement-c", "live-d", "supplement-d", "controls-c"].map(phase => read(`${base}-${phase}-summary.json`));
 for (const summary of summaries) {

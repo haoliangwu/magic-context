@@ -51,8 +51,10 @@ import {
 	getOrCreateSessionMeta,
 	getProjectState,
 	persistCachedM0,
+	queueAutoSearchHintDecisionRetirement,
 	readProjectDocsCanonical,
 } from "@magic-context/core/features/magic-context/storage";
+import { readSessionMeta } from "@magic-context/core/features/magic-context/storage-meta-session";
 import {
 	getActiveUserMemories,
 	type UserMemory,
@@ -93,7 +95,10 @@ import {
 	trimWorkspaceMemoriesToBudgetV2,
 	type WorkspaceRenderContext,
 } from "@magic-context/core/hooks/magic-context/inject-compartments";
-
+import {
+	hasRawMessageProvider,
+	readRawSessionMessages,
+} from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { renderUserProfileContent } from "@magic-context/core/hooks/magic-context/user-profile-render";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
@@ -178,6 +183,7 @@ function trimPiMessagesToBoundary(
 	trimMutableEntryIds = false,
 	sessionId?: string,
 	preserveBoundary = false,
+	retireDecisions?: (messageIds: ReadonlySet<string>) => void,
 ): number {
 	// Pi tool calls and results occupy separate entries. If only part of the
 	// boundary message was summarized, keep the prefix: removing an earlier call
@@ -195,6 +201,30 @@ function trimPiMessagesToBoundary(
 		if (msg && resolveStableId(msg, i, entryIds) === effectiveCutoffId) {
 			cutoffIndex = i;
 			break;
+		}
+	}
+	if (cutoffIndex < 0 && sessionId && hasRawMessageProvider(sessionId)) {
+		// The active branch can still place a boundary omitted from event.messages.
+		// Never infer that position from the shortened live-array indices.
+		try {
+			const branch = readRawSessionMessages(sessionId);
+			const positions = new Map(
+				branch.map((message, index) => [message.id, index]),
+			);
+			const boundaryPosition = positions.get(cutoffMessageId);
+			if (boundaryPosition === undefined) return 0;
+			let previous = -1;
+			for (const [index, message] of piMessages.entries()) {
+				if (isPiSystemEntry(message)) continue;
+				const id = resolveStableId(message, index, entryIds);
+				const position =
+					positions.get(id) ?? positions.get(`${SYNTH_USER_ID_PREFIX}${id}`);
+				if (position === undefined || position <= previous) return 0;
+				previous = position;
+				if (position <= boundaryPosition) cutoffIndex = index;
+			}
+		} catch {
+			return 0;
 		}
 	}
 	if (cutoffIndex < 0) return 0;
@@ -277,6 +307,14 @@ function trimPiMessagesToBoundary(
 		}
 	}
 
+	const retiredIds = new Set<string>();
+	if (retireDecisions) {
+		for (const index of remove) {
+			if (index > cutoffIndex) continue;
+			const id = resolveStableId(piMessages[index], index, entryIds);
+			if (id) retiredIds.add(id);
+		}
+	}
 	const kept = piMessages.filter((_, index) => !remove.has(index));
 	const removed = piMessages.length - kept.length;
 	piMessages.splice(0, piMessages.length, ...kept);
@@ -284,6 +322,11 @@ function trimPiMessagesToBoundary(
 		const keptIds = entryIds.filter((_, index) => !remove.has(index));
 		entryIds.splice(0, entryIds.length, ...keptIds);
 	}
+	// These IDs belong to the summarized prefix just removed, not to missing branch
+	// entries or tool-pair cleanup beyond the boundary. Saved search hints (or no-hint
+	// omissions) can go: restoring raw history before this summary boundary requires
+	// a full rebuild of the cached request prefix, so a new hint adds no extra cache miss.
+	retireDecisions?.(retiredIds);
 	return removed;
 }
 
@@ -700,6 +743,7 @@ function resolveMuralForM0Pi(
 	db: ContextDatabase,
 	modelKey: string,
 	budgetTokens: number,
+	mode: "persist" | "read-only" = "persist",
 ): MuralWireOptions | undefined {
 	if (state.memoryEnabled === false) return undefined;
 	if (state.mural) return state.mural;
@@ -710,6 +754,7 @@ function resolveMuralForM0Pi(
 		modelKey,
 		true,
 		budgetTokens,
+		mode,
 	);
 }
 
@@ -868,6 +913,7 @@ export function trimPiMessagesToCachedBoundary(
 		compartments.some(
 			(c) => c.endMessageId === boundary && c.endBlockIndex != null,
 		),
+		(ids) => queueAutoSearchHintDecisionRetirement(db, sessionId, ids),
 	);
 }
 
@@ -1590,7 +1636,7 @@ function renderFreshM0PiNonPersisted(
 } {
 	const docs = readProjectDocsForPiM0(state);
 	const cachedMaterializedAt =
-		getOrCreateSessionMeta(db, state.sessionId).cachedM0MaterializedAt ?? 0;
+		readSessionMeta(db, state.sessionId).cachedM0MaterializedAt ?? 0;
 	const frozen = readFrozenM0InputsPi(state, db, docs, cachedMaterializedAt);
 	// CACHE STABILITY: materializedAt feeds the m[1] expiry cutoff. It must be
 	// stable across consecutive fallback passes, so reuse the last persisted value
@@ -1602,13 +1648,15 @@ function renderFreshM0PiNonPersisted(
 	);
 	const memoryBudget =
 		state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
-	// Fresh fallback is a last-resort HARD-equivalent render: resolve mural once
-	// so the non-persisted pair still carries the image when the feature is on.
+	// Render the same mural image a full history rebuild would, so the bytes match
+	// what the next saved rebuild serves, but without saving it: this fallback runs
+	// only because another process holds the database write lock.
 	const mural = resolveMuralForM0Pi(
 		state,
 		db,
 		frozen.markers.modelKey,
 		memoryBudget,
+		"read-only",
 	);
 	rememberPiMural(state.sessionId, mural);
 	let dpm = 1;
@@ -2278,8 +2326,7 @@ export function createPiM0M1PassSnapshot(args: {
 			? [...args.compartments]
 			: getCompartments(args.db, args.sessionId);
 	return {
-		sessionMeta:
-			args.sessionMeta ?? getOrCreateSessionMeta(args.db, args.sessionId),
+		sessionMeta: args.sessionMeta ?? readSessionMeta(args.db, args.sessionId),
 		compartments,
 		projectDocs: args.projectDocs,
 		cachedRow: readCachedPiM0M1Row(args.db, args.sessionId),
@@ -2386,6 +2433,9 @@ function adoptCachedPiProjectIdentity(
 	db: ContextDatabase,
 	state: PiM0M1State,
 ): void {
+	// A fully cached prefix outside a project must not acquire a writer just to
+	// replace its NULL identity with another NULL identity during defer replay.
+	if (state.projectIdentity == null) return;
 	db.prepare(
 		"UPDATE session_meta SET cached_m0_project_identity = ? WHERE session_id = ? AND cached_m0_project_identity IS NULL",
 	).run(state.projectIdentity, state.sessionId);
@@ -2638,6 +2688,7 @@ function prependM0M1Messages(
 // Cached bytes and their boundary come from one row. Replaying them must not
 // depend on live marker validation or fresh rendering succeeding.
 function replayCompletePiPrefix(
+	db: ContextDatabase,
 	state: PiM0M1State,
 	row: CachedPiM0M1Row,
 	compartments: PiCompartment[],
@@ -2667,6 +2718,8 @@ function replayCompletePiPrefix(
 				compartments.some(
 					(c) => c.endMessageId === trimBoundaryId && c.endBlockIndex != null,
 				),
+				(ids) =>
+					queueAutoSearchHintDecisionRetirement(db, state.sessionId, ids),
 			)
 		: 0;
 	const head: PiAgentMessage[] = [];
@@ -2711,7 +2764,7 @@ export function prepareCachedM0M1PiReplay(
 		freezePrefixForPass: true,
 		preparedPrefix: undefined,
 	};
-	replayCompletePiPrefix(snapshot, cached, [], [], undefined, "cache_hit");
+	replayCompletePiPrefix(db, snapshot, cached, [], [], undefined, "cache_hit");
 	return snapshot.preparedPrefix;
 }
 
@@ -2733,6 +2786,8 @@ export function injectM0M1Pi(
 					false,
 					state.sessionId,
 					isPartialCompartmentEnd(db, state.sessionId, prepared.trimBoundaryId),
+					(ids) =>
+						queueAutoSearchHintDecisionRetirement(db, state.sessionId, ids),
 				)
 			: 0;
 		const head = structuredClone(prepared.messages);
@@ -2805,6 +2860,7 @@ export function injectM0M1Pi(
 				: snapshot.cachedRow;
 			if (cached?.cached_m0_bytes && cached.cached_m1_bytes) {
 				return replayCompletePiPrefix(
+					db,
 					state,
 					cached,
 					currentCompartments,
@@ -2850,6 +2906,7 @@ export function injectM0M1Pi(
 					: snapshot.cachedRow;
 				if (cached?.cached_m0_bytes && cached.cached_m1_bytes) {
 					return replayCompletePiPrefix(
+						db,
 						state,
 						cached,
 						currentCompartments,
@@ -3043,6 +3100,8 @@ export function injectM0M1Pi(
 				false,
 				state.sessionId,
 				isPartialCompartmentEnd(db, state.sessionId, trimBoundaryId),
+				(ids) =>
+					queueAutoSearchHintDecisionRetirement(db, state.sessionId, ids),
 			)
 		: 0;
 	const muralWire = m0.includes("<memory-mural>")

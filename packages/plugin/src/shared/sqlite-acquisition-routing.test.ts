@@ -118,7 +118,7 @@ test("exhausted routed acquisition never enters the callback or multiplies privi
         db.close();
         rmSync(dir, { recursive: true, force: true });
     }
-});
+}, 30_000);
 
 for (const mode of ["run", "get", "all", "exec"] as const) {
     test(`foreground ${mode} autocommit waits share one turn budget and restore production timeout`, () => {
@@ -147,7 +147,8 @@ for (const mode of ["run", "get", "all", "exec"] as const) {
                 }
                 expect(() => db.exec("BEGIN IMMEDIATE")).toThrow("acquisition remained busy");
             });
-            expect(performance.now() - started).toBeLessThan(650);
+            expect(performance.now() - started).toBeGreaterThanOrEqual(1900);
+            expect(performance.now() - started).toBeLessThan(2600);
             expect(db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
             expect(db.prepare("SELECT * FROM result").all()).toEqual([]);
             blocker.exec("ROLLBACK");
@@ -159,5 +160,5 @@ for (const mode of ["run", "get", "all", "exec"] as const) {
             db.close();
             rmSync(dir, { recursive: true, force: true });
         }
-    });
+    }, 30_000);
 }

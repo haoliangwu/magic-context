@@ -43,6 +43,11 @@ export function toolDescriptionManifest(): Record<string, { full: string; light:
     }
     visit(file);
     if (!expression) throw new Error(`No tool description for ${id}`);
+    // Preview the default smart-note description. Disabled smart notes use built-in plain-note text, not overrides.
+    if (id === "ctx_note" && ts.isConditionalExpression(expression)) {
+      const branch = [expression.whenTrue, expression.whenFalse].find((node) => node.getText() === "CTX_NOTE_DESCRIPTION");
+      if (branch) expression = branch;
+    }
     const full = ts.isIdentifier(expression) ? constants(resolve(plugin, `tools/${folder}/constants.ts`))[expression.text] : literal(expression);
     const short = light[`${id.toUpperCase()}_LIGHT_DESCRIPTION`];
     if (!full || !short) throw new Error(`Missing full/light tool definition for ${id}`);

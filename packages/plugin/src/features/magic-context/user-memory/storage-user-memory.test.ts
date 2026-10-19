@@ -9,6 +9,7 @@ import {
     insertUserMemory,
     insertUserMemoryCandidates,
     pruneExpiredUserMemoryCandidates,
+    restoreUserMemory,
     USER_MEMORY_CANDIDATE_TTL_MS,
 } from "./storage-user-memory";
 
@@ -59,6 +60,48 @@ describe("user-memory provenance", () => {
 
         expect(getActiveUserMemories(db)[0].sourceCandidateIds).toEqual([41]);
         expect(getActiveUserMemories(db)[0].sourceProvenance).toBeNull();
+        db.close();
+    });
+});
+
+describe("user-memory restore", () => {
+    it("returns a dismissed memory to the active set", () => {
+        const db = freshDb();
+        db.prepare(
+            `INSERT INTO user_memories
+                (content, status, promoted_at, source_candidate_ids, created_at, updated_at)
+             VALUES (?, 'dismissed', ?, ?, ?, ?)`,
+        ).run("Prefers concise explanations", 1, "[]", 1, 1);
+        expect(getActiveUserMemories(db)).toHaveLength(0);
+
+        const [row] = db.prepare("SELECT id FROM user_memories").all() as Array<{ id: number }>;
+        restoreUserMemory(db, row.id);
+
+        const active = getActiveUserMemories(db);
+        expect(active).toHaveLength(1);
+        expect(active[0].content).toBe("Prefers concise explanations");
+        db.close();
+    });
+
+    it("leaves an already-active memory untouched", () => {
+        const db = freshDb();
+        db.prepare(
+            `INSERT INTO user_memories
+                (content, status, promoted_at, source_candidate_ids, created_at, updated_at)
+             VALUES (?, 'active', ?, ?, ?, ?)`,
+        ).run("Prefers concise explanations", 1, "[]", 1, 1);
+        const [row] = db.prepare("SELECT id FROM user_memories").all() as Array<{ id: number }>;
+
+        restoreUserMemory(db, row.id);
+
+        // No transition, no write: updated_at must stay at the seeded value so
+        // a caller that bumps on the caller side does not invalidate for a
+        // no-op (mirrors the Rust status predicate).
+        const [after] = db
+            .prepare("SELECT updated_at FROM user_memories WHERE id = ?")
+            .all(row.id) as Array<{ updated_at: number }>;
+        expect(after.updated_at).toBe(1);
+        expect(getActiveUserMemories(db)).toHaveLength(1);
         db.close();
     });
 });

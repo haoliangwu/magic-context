@@ -472,6 +472,7 @@ export function createMagicContextCommandHandler(deps: {
     db: Database;
     /** Boot-resolved mode; command paths must not re-read configuration. */
     compactionOff?: boolean;
+    smartNotesEnabled?: boolean;
     executeThresholdPercentage?: number | { default: number; [modelKey: string]: number };
     executeThresholdTokens?: { default?: number; [modelKey: string]: number | undefined };
     historyBudgetPercentage?: number;
@@ -517,6 +518,8 @@ export function createMagicContextCommandHandler(deps: {
     sampleToastDurationMs?: () => number | undefined;
     transformMode?: ResolvedTransformMode;
     rustModeModuleClient?: RustModeModuleClient;
+    /** Rust mode: the historian settings resolved from the current config, sent with /ctx-wrapup. */
+    resolveRustWrapupHistorianFields?: () => Record<string, unknown>;
     projectRoot?: string;
     dreamer?: {
         config: DreamerConfig;
@@ -760,16 +763,28 @@ export function createMagicContextCommandHandler(deps: {
                                       backlog: readDreamTaskBacklogsSafely(
                                           deps.db,
                                           deps.dreamer.projectPath,
-                                          CANONICAL_DREAM_TASKS,
+                                          CANONICAL_DREAM_TASKS.filter(
+                                              (task) =>
+                                                  deps.smartNotesEnabled !== false ||
+                                                  task !== "evaluate-smart-notes",
+                                          ),
                                       ),
                                       progress: deps.getDreamerProgress?.() ?? null,
                                       skipped: readSkippedDreamTasksSafely(
                                           deps.db,
                                           deps.dreamer.projectPath,
+                                      ).filter(
+                                          (task) =>
+                                              deps.smartNotesEnabled !== false ||
+                                              task !== "evaluate-smart-notes",
                                       ),
                                       failures: readFailingDreamTasksSafely(
                                           deps.db,
                                           deps.dreamer.projectPath,
+                                      ).filter(
+                                          (state) =>
+                                              deps.smartNotesEnabled !== false ||
+                                              state.task !== "evaluate-smart-notes",
                                       ),
                                   }
                                 : undefined,
@@ -826,9 +841,22 @@ export function createMagicContextCommandHandler(deps: {
                                 session_id: sessionId,
                                 keep,
                                 command_id: rustCommandId("wrapup"),
+                                ...deps.resolveRustWrapupHistorianFields?.(),
                             },
                             MAX_WRAPUP_REQUEST_BUDGET_MS,
                         );
+                        if (
+                            value.disposition !== "completed" &&
+                            value.disposition !== "nothing_to_compact"
+                        ) {
+                            // The user sees one generic line for every retryable reason
+                            // (a transform still applying, a historian failure backoff, a
+                            // spent budget); the log keeps which one it was.
+                            sessionLog(
+                                sessionId,
+                                `ctx-wrapup not completed disposition=${String(value.disposition)} reason=${String(value.reason ?? "none")} summary=${JSON.stringify(value.summary ?? "")}`,
+                            );
+                        }
                         result = formatRustOperationMessage("wrapup", value);
                     } catch (error) {
                         sessionLog(

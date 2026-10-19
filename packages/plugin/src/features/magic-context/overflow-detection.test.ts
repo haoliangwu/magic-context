@@ -162,7 +162,7 @@ describe("overflow-detection / detectThinkingBindingMismatch", () => {
     });
 
     // Captured on 2026-09-26; the body was byte-identical for Claude Fable 5.1
-    // and Claude Opus 5.5 (docs/reports/anthropic-thinking-binding.md section 2).
+    // and Claude Opus 5.5.
     // It carries no message id of any kind, only lowered wire-array paths.
     const LIVE_BINDING_400_BODY = {
         type: "error",

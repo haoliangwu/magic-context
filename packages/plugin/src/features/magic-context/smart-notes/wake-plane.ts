@@ -34,10 +34,12 @@ async function probeWakePlaneCatalog(): Promise<readonly CatalogEntry[]> {
         throw new Error("subc connection is not configured");
     }
 
-    const client = await SubcClient.connect({
-        connectionFile: file,
-        handshakeTimeoutMs: WAKE_PLANE_HANDSHAKE_TIMEOUT_MS,
-    });
+    const client = await inRootAsyncContext(() =>
+        SubcClient.connect({
+            connectionFile: file,
+            handshakeTimeoutMs: WAKE_PLANE_HANDSHAKE_TIMEOUT_MS,
+        }),
+    );
     try {
         return await client.catalogList();
     } finally {
@@ -100,3 +102,5 @@ export const __wakePlaneTest = {
     },
     ttlMs: WAKE_PLANE_STATUS_TTL_MS,
 };
+
+import { inRootAsyncContext } from "../../../shared/sqlite";

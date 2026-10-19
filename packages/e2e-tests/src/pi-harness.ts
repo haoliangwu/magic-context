@@ -10,10 +10,12 @@ import {
   MockProvider,
   type MockResponse,
 } from "./mock-provider/server";
+import { piModelRefToCanonical } from "../../plugin/src/shared/harness-provider-map";
 import { prepareContextDatabase } from "./prepare-context-db";
 import {
   createPiIsolatedEnv,
   type PiIsolatedEnv,
+  type PiMockModel,
   type PiRunnerHost,
   type PiRunResult,
 } from "./pi-runner/spawn";
@@ -33,12 +35,17 @@ export interface PiTestHarnessOptions {
   modelContextLimit?: number;
   mockDefault?: MockResponse;
   extensionsBeforeMagicContext?: string[];
+  extensionsAfterMagicContext?: string[];
   /** Share the cortexkit DB with another harness. */
   sharedDataDir?: string;
   /** Optional working directory override before the persistent Pi process starts. */
   workdir?: string;
   /** Start Pi in its (throwaway) HOME directory instead of a project folder. */
   workdirIsHome?: boolean;
+  /** Pin the historian to this mock-backed provider/model (plain Pi only). */
+  historianModel?: PiMockModel;
+  /** models.dev catalogue copied into the throwaway host cache. */
+  modelsCatalog?: string;
 }
 
 const DEFAULT_MOCK_RESPONSE: MockResponse = {
@@ -199,6 +206,8 @@ export class PiTestHarness implements PiHostHarness {
   private readonly expectMagicContext: boolean;
   private contextDbCached: Database | null = null;
   private turns: PiRunResult[] = [];
+  /** The historian's pinned model when it differs from the session model. */
+  private historianModel?: PiMockModel;
 
   private constructor(
     host: PiRunnerHost,
@@ -240,6 +249,9 @@ export class PiTestHarness implements PiHostHarness {
       piSettingsExtra: options.piSettingsExtra,
       modelContextLimit: options.modelContextLimit,
       extensionsBeforeMagicContext: options.extensionsBeforeMagicContext,
+      extensionsAfterMagicContext: options.extensionsAfterMagicContext,
+      historianModel: options.historianModel,
+      modelsCatalog: options.modelsCatalog,
     });
 
     try {
@@ -249,7 +261,9 @@ export class PiTestHarness implements PiHostHarness {
       throw error;
     }
 
-    return new PiTestHarness(host, mock, rpc, options.magicContextConfig?.enabled !== false);
+    const harness = new PiTestHarness(host, mock, rpc, options.magicContextConfig?.enabled !== false);
+    harness.historianModel = options.historianModel;
+    return harness;
   }
 
   get serverUrl(): null {
@@ -765,8 +779,15 @@ export class PiTestHarness implements PiHostHarness {
 
   assertHistorianRequestsUseMock(): void {
     if (this.expectMagicContext && this.hasContextDb()) {
-      const model = this.host === "omp" ? "mock/mock-model" : "anthropic/claude-haiku-4-5";
-      assertHistorianMockRouting(this.contextDb(), this.harnessId, model);
+      const pinned = this.historianModel;
+      const model = pinned
+        ? `${pinned.provider}/${pinned.id}`
+        : this.host === "omp" ? "mock/mock-model" : "anthropic/claude-haiku-4-5";
+      // The invocation ledger records a Pi provider alias such as google-antigravity under
+      // its shared-config spelling (google), so either spelling counts as the pinned model.
+      assertHistorianMockRouting(this.contextDb(), this.harnessId, model, [
+        piModelRefToCanonical(model),
+      ]);
     }
   }
 

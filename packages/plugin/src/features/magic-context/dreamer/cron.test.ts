@@ -1,7 +1,14 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { isValidCron, matchesCron, nextDueAtMs, nextOccurrence, parseCron } from "./cron";
+import {
+    __setCronCandidateVisitCounterForTests,
+    isValidCron,
+    matchesCron,
+    nextDueAtMs,
+    nextOccurrence,
+    parseCron,
+} from "./cron";
 
 function parsed(expr: string) {
     const r = parseCron(expr);
@@ -151,12 +158,18 @@ describe("nextOccurrence", () => {
     });
     it("answers an impossible day-of-month at once instead of scanning years of minutes", () => {
         const c = parsed("0 0 30,31 2 *");
-        const startedAt = performance.now();
-        for (let run = 0; run < 10; run++) {
-            expect(nextOccurrence(c, local(2026, 1, 1, 0, 0))).toBeNull();
+        let candidateVisits = 0;
+        __setCronCandidateVisitCounterForTests(() => candidateVisits++);
+        try {
+            for (let run = 0; run < 10; run++) {
+                expect(
+                    nextOccurrence(c, local(2026, 1, 1, 0, 0), undefined, 2 * 60_000),
+                ).toBeNull();
+            }
+        } finally {
+            __setCronCandidateVisitCounterForTests();
         }
-        // A full four-year minute scan takes tens of milliseconds per call.
-        expect(performance.now() - startedAt).toBeLessThan(20);
+        expect(candidateVisits).toBe(0);
     });
     it("excludeCivilMinute skips a matching candidate (DST double-fire guard)", () => {
         const c = parsed("30 1 * * *"); // 01:30 daily

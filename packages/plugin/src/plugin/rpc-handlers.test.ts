@@ -3,9 +3,11 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { rmSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { loadPluginConfigDetailed } from "../config";
+import { pluginConfigReader } from "../config/live-run-config";
 import { MagicContextConfigSchema } from "../config/schema/magic-context";
 import { replaceAllCompartmentState } from "../features/magic-context/compartment-storage";
 import { insertMemory } from "../features/magic-context/memory";
@@ -27,18 +29,22 @@ import {
     resetEpochFloorRegistryForTest,
     resolveEpochFloorForPass,
 } from "../features/magic-context/storage-meta-persisted";
+import type { HiddenCompletionExecutor } from "../hooks/magic-context/compartment-runner-types";
 import { createLiveSessionState } from "../hooks/magic-context/live-session-state";
+import { setRawMessageProvider } from "../hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
 import type { RustModeModuleClient } from "../hooks/magic-context/rust-mode-transform";
+import { _resetHarnessForTesting, setHarness } from "../shared/harness";
 import * as logger from "../shared/logger";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../shared/models-dev-cache";
 import { pluginPackageVersion } from "../shared/plugin-package-version";
-import type { MagicContextRpcServer } from "../shared/rpc-server";
+import { MagicContextRpcServer } from "../shared/rpc-server";
 import { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
 import { buildStatusViewFor } from "../shared/status-view";
 import { checkStatusDetailPayload } from "../shared/status-view-check";
 import { createTestTempDirFromPath } from "../shared/test-temp-dir";
+import { registerV2Commands } from "../v2/hooks/commands";
 import {
     buildCompartmentCount,
     buildDebugMemoryUsage,
@@ -81,6 +87,203 @@ function registeredRpcMethods(
     return handlers;
 }
 
+function createLiveHistorianConfig(targetMaxTokens: number | undefined) {
+    const root = createTestTempDirFromPath(join(tmpdir(), "mc-rpc-historian-cap-"));
+    const previousHome = process.env.HOME;
+    const previousConfigHome = process.env.XDG_CONFIG_HOME;
+    process.env.HOME = root;
+    process.env.XDG_CONFIG_HOME = join(root, "config");
+    const directory = join(root, "project");
+    const userConfigDirectory = join(root, "config", "cortexkit");
+    mkdirSync(directory, { recursive: true });
+    mkdirSync(userConfigDirectory, { recursive: true });
+    const configPath = join(userConfigDirectory, "magic-context.jsonc");
+    const writeConfig = (maxTokens: number | undefined): void => {
+        writeFileSync(
+            configPath,
+            JSON.stringify({
+                historian: {
+                    ...(maxTokens === undefined ? {} : { maxTokens }),
+                    opencode: { model: "test/rpc-historian" },
+                },
+            }),
+        );
+    };
+    writeConfig(4096);
+    const bootConfig = loadPluginConfigDetailed(directory, false).config;
+    const reader = pluginConfigReader(directory, bootConfig);
+    writeConfig(targetMaxTokens);
+    const effective = reader.poll().effective;
+    expect(effective.historian?.maxTokens).toBe(targetMaxTokens);
+
+    return {
+        root,
+        directory,
+        bootConfig,
+        restoreEnvironment() {
+            if (previousHome === undefined) delete process.env.HOME;
+            else process.env.HOME = previousHome;
+            if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+            else process.env.XDG_CONFIG_HOME = previousConfigHome;
+        },
+    };
+}
+
+function terminalAwareLiveSessionState(sessionId: string) {
+    const liveSessionState = createLiveSessionState();
+    let resolveTerminal!: () => void;
+    const terminal = new Promise<void>((resolve) => {
+        resolveTerminal = resolve;
+    });
+    const progress = liveSessionState.recompProgressBySession;
+    liveSessionState.recompProgressBySession = new Proxy(progress, {
+        get(target, property) {
+            if (property === "set") {
+                return (id: string, value: { phase?: string }) => {
+                    const result = target.set(id, value as never);
+                    if (
+                        id === sessionId &&
+                        (value.phase === "done" ||
+                            value.phase === "failed" ||
+                            value.phase === "skipped")
+                    ) {
+                        resolveTerminal();
+                    }
+                    return result;
+                };
+            }
+            const value = Reflect.get(target, property, target) as unknown;
+            return typeof value === "function" ? value.bind(target) : value;
+        },
+    }) as typeof progress;
+    return { liveSessionState, terminal };
+}
+
+function outputCapExecutor(caps: Array<number | undefined>): HiddenCompletionExecutor {
+    let promptJson = "";
+    let childNumber = 0;
+    return {
+        capabilities: { tools: false, harness: "opencode" },
+        open: async (run) => {
+            caps.push(run.maxOutputTokens);
+            childNumber += 1;
+            return {
+                id: `rpc-cap-child-${childNumber}`,
+                childSessionId: `rpc-cap-child-${childNumber}`,
+            };
+        },
+        attempt: async (_handle, request) => {
+            promptJson = JSON.stringify(request);
+        },
+        collect: async () => {
+            const range = promptJson.match(/Messages (\d+)-(\d+):/);
+            if (!range) throw new Error("historian prompt did not include a message range");
+            return {
+                text: `<output><compartment start="${range[1]}" end="${range[2]}" title="Rebuilt"><p1>Rebuilt ${range[1]}-${range[2]}.</p1></compartment></output>`,
+                reasoning: null,
+                lengthCapped: false,
+                usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            };
+        },
+        close: async () => {},
+    };
+}
+
+async function exerciseManagedOutputCap(args: {
+    surface: "tui-rpc" | "opencode2-command";
+    method: "recomp" | "wrapup";
+    maxTokens: number | undefined;
+}): Promise<void> {
+    const liveConfig = createLiveHistorianConfig(args.maxTokens);
+    const db = createTestDb();
+    const sessionId = `rpc-cap-${args.surface}-${args.method}-${String(args.maxTokens ?? "unset")}`;
+    const rawMessages = Array.from({ length: 8 }, (_, index) => ({
+        ordinal: index + 1,
+        id: `message-${index + 1}`,
+        role: "user",
+        parts: [{ type: "text", text: `message ${index + 1} alpha beta gamma delta` }],
+    }));
+    const unregisterProvider = setRawMessageProvider(sessionId, {
+        readMessages: () => rawMessages,
+        getMessageCount: () => rawMessages.length,
+    });
+    const { liveSessionState, terminal } = terminalAwareLiveSessionState(sessionId);
+    const caps: Array<number | undefined> = [];
+    const rpc = new MagicContextRpcServer(join(liveConfig.root, "storage"), liveConfig.directory);
+    try {
+        setHarness(args.surface === "opencode2-command" ? "opencode2" : "opencode");
+        registerRpcHandlers(rpc, {
+            directory: liveConfig.directory,
+            config: liveConfig.bootConfig,
+            client: undefined,
+            hiddenCompletionExecutor: outputCapExecutor(caps),
+            liveSessionState,
+            getDatabase: () => db,
+        });
+
+        if (args.surface === "tui-rpc") {
+            await rpc.dispatch(
+                args.method,
+                args.method === "recomp" ? { sessionId } : { sessionId, messagesToKeep: 2 },
+            );
+        } else {
+            const registered: Array<{
+                name: string;
+                execute: (input: {
+                    sessionID: string;
+                    prompt: { text: string };
+                    delivery: "steer";
+                }) => Promise<void>;
+            }> = [];
+            const commandDomain = {
+                async transform(callback: (editor: { add: (definition: never) => void }) => void) {
+                    callback({ add: (definition) => registered.push(definition as never) });
+                    return {};
+                },
+                async reload() {},
+            };
+            await registerV2Commands({
+                command: commandDomain as never,
+                rpc,
+                directory: liveConfig.directory,
+                compactionEnabled: true,
+            });
+            const command = registered.find((entry) => entry.name === `ctx-${args.method}`);
+            if (!command) throw new Error(`OpenCode 2 did not register ctx-${args.method}`);
+            await command.execute({
+                sessionID: sessionId,
+                prompt: { text: args.method === "recomp" ? "" : "/ctx-wrapup 2" },
+                delivery: "steer",
+            });
+        }
+
+        await terminal;
+        expect(caps.length, `${args.surface} ${args.method}`).toBeGreaterThan(0);
+        expect(
+            caps.every((cap) => cap === args.maxTokens),
+            `${args.surface} ${args.method}`,
+        ).toBe(true);
+    } finally {
+        unregisterProvider();
+        closeQuietly(db);
+        _resetHarnessForTesting();
+        liveConfig.restoreEnvironment();
+        rmSync(liveConfig.root, { recursive: true, force: true });
+    }
+}
+
+describe("manual historian cap reaches the OpenCode historian executor", () => {
+    for (const surface of ["tui-rpc", "opencode2-command"] as const) {
+        for (const method of ["recomp", "wrapup"] as const) {
+            for (const maxTokens of [65_536, undefined]) {
+                test(`${surface} ${method} passes ${maxTokens ?? "unset"} from live config`, async () => {
+                    await exerciseManagedOutputCap({ surface, method, maxTokens });
+                });
+            }
+        }
+    }
+});
+
 afterEach(() => {
     resetSidebarSnapshotCache();
     clearModelsDevCache();
@@ -108,6 +311,42 @@ describe("home project sidebar", () => {
 });
 
 describe("session-owner", () => {
+    test("moved-session recomp and recovery use fresh host ownership before opening local state", async () => {
+        const root = createTestTempDirFromPath(join(tmpdir(), "moved-history-owner-"));
+        const handlers = new Map<string, TestRpcHandler>();
+        const liveSessionState = createLiveSessionState();
+        liveSessionState.sessionDirectoryBySession.set("moved", "/old");
+        try {
+            registerRpcHandlers(
+                {
+                    handle: (method: string, handler: TestRpcHandler) =>
+                        handlers.set(method, handler),
+                } as unknown as MagicContextRpcServer,
+                {
+                    directory: "/old",
+                    config: MagicContextConfigSchema.parse({}),
+                    client: undefined,
+                    liveSessionState,
+                    storageDir: root,
+                    readSessionDirectory: async () => "/new",
+                    getDatabase: () => {
+                        throw new Error("old instance must not open history state");
+                    },
+                },
+            );
+            expect(await handlers.get("session-owner")!({ sessionId: "moved" })).toEqual({
+                owner: false,
+            });
+            for (const method of ["recomp", "wrapup"]) {
+                const reply = await handlers.get(method)!({ sessionId: "moved" });
+                expect(reply.ok).toBe(false);
+                expect(reply.error).toContain("current project directory (/new)");
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     function ownerHandler(directory: string, sessionDirectories: Record<string, string>) {
         const handlers = new Map<string, TestRpcHandler>();
         const rpcServer = {
@@ -329,6 +568,22 @@ describe("sidebar snapshot RPC failures", () => {
     test("paused sidebar logs once per directory and reason without stacks", () => {
         const directory = createTestTempDirFromPath(join(tmpdir(), "sidebar-paused-"));
         execFileSync("git", ["init", "-q", directory], { windowsHide: true });
+        // A repository with commits: one with none is recognized from its files and gets its
+        // directory identity without asking git, so a failing git could not pause it.
+        execFileSync(
+            "git",
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "first",
+            ],
+            { cwd: directory, windowsHide: true },
+        );
         const db = createTestDb();
         const logged = spyOn(logger, "log").mockImplementation(() => {});
         try {
@@ -385,6 +640,68 @@ describe("sidebar snapshot RPC failures", () => {
         expect(buildSidebarSnapshotRpcResponse(busyDb, "ses_busy", process.cwd())).toEqual({
             error: "sidebar snapshot unavailable",
         });
+    });
+});
+
+describe("buildStatusDetail — per-model execute threshold", () => {
+    test.each([
+        {
+            name: "persisted model",
+            persisted: "test/model-a",
+            explicit: undefined,
+            threshold: 50,
+            tokens: 250_000,
+        },
+        {
+            name: "explicit model takes precedence",
+            persisted: "test/model-a",
+            explicit: "test/model-b",
+            threshold: 20,
+            tokens: 100_000,
+        },
+        {
+            name: "unknown model keeps the default",
+            persisted: null,
+            explicit: undefined,
+            threshold: 65,
+            tokens: undefined,
+        },
+    ])("$name", ({ persisted, explicit, threshold, tokens }) => {
+        const db = createTestDb();
+        try {
+            const sessionId = "ses-status-threshold";
+            db.prepare(
+                "INSERT INTO session_meta (session_id, last_observed_model_key) VALUES (?, ?)",
+            ).run(sessionId, persisted);
+            const detail = buildStatusDetail(
+                db,
+                sessionId,
+                process.cwd(),
+                explicit,
+                {
+                    execute_threshold_tokens: {
+                        "test/model-a": 250_000,
+                        "test/model-b": 100_000,
+                    },
+                },
+                undefined,
+                undefined,
+                {
+                    usage: {
+                        current_total_input_tokens: 100_000,
+                        context_limit_tokens: 500_000,
+                    },
+                },
+            );
+
+            expect(detail.executeThreshold).toBe(threshold);
+            expect(detail.executeThresholdTokens).toBe(tokens);
+            expect(detail.executeThresholdMode).toBe(
+                tokens === undefined ? "percentage" : "tokens",
+            );
+        } finally {
+            closeQuietly(db);
+        }
     });
 });
 

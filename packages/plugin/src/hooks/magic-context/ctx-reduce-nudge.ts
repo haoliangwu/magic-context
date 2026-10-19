@@ -1,10 +1,13 @@
 import { estimateTokens } from "./read-session-formatting";
 import { byteSize } from "./tag-content-primitives";
+import { countReclaimableToolOutputs } from "./tail-hygiene-output-count";
 import {
     stripChannel1ReminderSpans,
     type TailHygieneBaseline,
     type TailHygienePartMeasurement,
 } from "./tail-hygiene-walk";
+
+export { currentReclaimableToolOutputCount } from "./tail-hygiene-output-count";
 
 export type Channel1Level = "gentle" | "firm" | "urgent";
 
@@ -431,7 +434,7 @@ function formatOldestReclaimableHint(hint?: readonly ToolReclaimHint[]): string 
 }
 
 export function reclaimableToolOutputCount(parts: readonly TailHygienePartMeasurement[]): number {
-    return parts.filter((part) => part.kind === "toolOutput" && part.uTokens > 0).length;
+    return countReclaimableToolOutputs(parts);
 }
 
 function formatReclaimableOutputSummary(count: number, tokens: number): string {

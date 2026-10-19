@@ -11,7 +11,7 @@ import { LIGHT_PARAMETER_DESCRIPTIONS } from "../src/tools/parameter-description
 const ARTIFACT_DIR = resolve(
     import.meta.dir,
     "../../..",
-    "docs/specs/prompt-surface/light-validation",
+    ".cortexkit/internal-docs/research/prompt-surface/light-validation",
 );
 const MODEL = {
     label: "Gemma 4 31B",

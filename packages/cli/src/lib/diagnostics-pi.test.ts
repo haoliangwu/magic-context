@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import { projectPathToPiDirSlug } from "../commands/migrate";
-import { collectDiagnostics, sanitizeValue } from "./diagnostics-pi";
+import { collectDiagnostics, renderDiagnosticsMarkdown, sanitizeValue } from "./diagnostics-pi";
 
 setDefaultTimeout(15_000);
 
@@ -81,8 +81,9 @@ describe("collectDiagnostics Pi path resolution", () => {
     it("reports the explicit shared storage directory and its source", async () => {
         const root = makeTempRoot();
         const cwd = join(root, "workspace");
-        const storageDir = join(root, "shared-magic-context");
-        process.env.HOME = join(root, "home");
+        const home = join(root, "home");
+        const storageDir = join(home, "shared-magic-context");
+        process.env.HOME = home;
         process.env.XDG_DATA_HOME = join(root, "private-data");
         process.env.XDG_CACHE_HOME = join(root, "cache");
         process.env.XDG_CONFIG_HOME = join(root, "config");
@@ -95,6 +96,11 @@ describe("collectDiagnostics Pi path resolution", () => {
 
         expect(report.storageDir.path).toBe(storageDir);
         expect(report.storageDir.source).toBe("environment override");
+        const markdown = renderDiagnosticsMarkdown(report);
+        expect(markdown).toContain(
+            "Magic Context storage is at ~/shared-magic-context, outside the folder Engram backs up (~/.local/share/cortexkit/magic-context). It is not included in CortexKit backups.",
+        );
+        expect(markdown).not.toContain(storageDir);
     });
 
     it("reads recent sessions from PI_CODING_AGENT_DIR instead of HOME/.pi/agent", async () => {

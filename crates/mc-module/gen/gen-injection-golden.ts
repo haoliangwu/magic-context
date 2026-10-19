@@ -1,3 +1,4 @@
+import "./quiet-live-log";
 /**
  * Generate the differential synthetic-todowrite injection golden for the Rust
  * mc-module port.

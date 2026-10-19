@@ -240,6 +240,49 @@ export function makeWholeMessageSentinel(
 }
 
 /**
+ * True when neutralizing this whole message must leave it with no parts at all
+ * instead of a sentinel part.
+ *
+ * OpenCode 2 hands host system updates (instruction changes, other plugins'
+ * reminders) to the transform as `system` rows; OpenCode 1 and Pi never do.
+ * OpenCode 2's Anthropic adapter drops empty text in user and assistant
+ * messages, but sends a `system` row as an in-conversation system message
+ * (Claude models with native system updates: Opus 4.8 and every Claude 5)
+ * with its text blocks as they are, and Anthropic rejects an empty text block
+ * with HTTP 400 `text content blocks must be non-empty`. On older Claude
+ * models the host instead appends the row to the user turn as a
+ * `<system-update>` text block; with the row removed, that block goes too.
+ *
+ * A message left with no parts is omitted when the payload goes back to the
+ * host (`adaptPayload().commit()` in v2/hooks/payload.ts), the same rule the
+ * Rust module applies to a rendered message with no content. Other providers
+ * keep the `[dropped]` row: it is valid there and already served.
+ */
+export function wholeMessageNeutralizationRemoves(
+    message: { info: { role?: unknown } },
+    providerID?: string,
+): boolean {
+    return message.info.role === "system" && modelAcceptsEmptyContent(providerID);
+}
+
+/**
+ * Neutralize a whole message in place: replace its parts with one
+ * `makeWholeMessageSentinel` part, or with no parts at all when
+ * `wholeMessageNeutralizationRemoves` says the row must leave the request.
+ * The message object stays in the array either way, so index-addressed lanes
+ * later in the pass still line up.
+ */
+export function neutralizeWholeMessage(
+    message: { info: { role?: unknown }; parts: unknown[] },
+    providerID?: string,
+): void {
+    message.parts.length = 0;
+    if (!wholeMessageNeutralizationRemoves(message, providerID)) {
+        message.parts.push(makeWholeMessageSentinel(providerID));
+    }
+}
+
+/**
  * Detect whether a part is already a sentinel produced by `makeSentinel`
  * or `makeWholeMessageSentinel`. Used by strip functions to stay
  * idempotent — don't re-count or re-mutate a sentinel we already
@@ -257,12 +300,14 @@ export function isSentinel(part: unknown): boolean {
 
 /**
  * Replay persisted whole-message decisions onto a fresh host projection.
- * Canonical Anthropic keeps empty sentinels because its adapter filters them.
+ * Canonical Anthropic keeps empty sentinels because its adapter filters them,
+ * except on OpenCode 2 `system` rows, which are left with no parts (see
+ * `wholeMessageNeutralizationRemoves`).
  * For non-empty-sentinel providers, hidden seam rows are removed instead: they
  * were absent on the fold pass, so removal is the only byte-identical replay.
  */
 export function replaySentinelByMessageIds(
-    messages: Array<{ info: { id?: string }; parts: unknown[] }>,
+    messages: Array<{ info: { id?: string; role?: unknown }; parts: unknown[] }>,
     ids: Set<string>,
     providerID?: string,
     hiddenSeamIds: ReadonlySet<string> = new Set(),
@@ -281,8 +326,8 @@ export function replaySentinelByMessageIds(
             continue;
         }
         if (msg.parts.length === 1 && isSentinel(msg.parts[0])) continue;
-        msg.parts.length = 0;
-        msg.parts.push(makeWholeMessageSentinel(providerID));
+        if (wholeMessageNeutralizationRemoves(msg, providerID) && msg.parts.length === 0) continue;
+        neutralizeWholeMessage(msg, providerID);
         replayed += 1;
     }
     const missingIds: string[] = [];

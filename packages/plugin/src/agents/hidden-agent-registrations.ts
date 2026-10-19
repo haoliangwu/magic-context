@@ -1,3 +1,4 @@
+import { isToolFreeHiddenAgent, ZEN_READ_AGENT_SUFFIX } from "../shared/hidden-zen-read";
 import { buildAllowOnlyPermission } from "./permissions";
 
 /**
@@ -77,8 +78,8 @@ export interface HiddenAgentRegistration {
  * Hoisted function declaration: returns the hidden-agent registrations with
  * INLINE id / allow-list / step-cap literals (see {@link HiddenAgentRegistration}
  * for why these must not come from module-level `var` consts). Prompts and
- * computed overrides are passed in by the caller. Historians transform only
- * the text supplied in their prompt and never receive tools.
+ * computed overrides are passed in by the caller. The separate Zen carriers
+ * advertise read for provider compatibility; execution is refused by session.
  */
 export function buildHiddenAgentRegistrations(args: {
     dreamerPrompt: string | undefined;
@@ -88,7 +89,7 @@ export function buildHiddenAgentRegistrations(args: {
     historianEditorPrompt: string | undefined;
     dreamerOverrides?: Record<string, unknown>;
     historianOverrides?: Record<string, unknown>;
-    /** Legacy config input retained for compatibility; historians always have zero tools. */
+    /** Legacy config input retained for compatibility; it cannot grant historian tools. */
     historianDisallowed: readonly string[];
 }): HiddenAgentRegistration[] {
     return [
@@ -278,6 +279,19 @@ export function buildHiddenAgentRegistrations(args: {
     ];
 }
 
+/** Alternate carriers preserve the original registrations for all other providers. */
+export function buildZenReadAgentRegistrations(
+    registrations: HiddenAgentRegistration[],
+): HiddenAgentRegistration[] {
+    return registrations
+        .filter((registration) => isToolFreeHiddenAgent(registration.id))
+        .map((registration) => ({
+            ...registration,
+            id: `${registration.id}${ZEN_READ_AGENT_SUFFIX}`,
+            allowedTools: ["read"],
+        }));
+}
+
 /**
  * Build a hidden-agent config with a deny-everything-by-default permission
  * baseline and a hard tool-iteration ceiling. User overrides may lower
@@ -333,7 +347,11 @@ export function buildHiddenAgentConfig(
     // The plugin appends named Task routing denies after the general wildcard.
     // Seed an explicit Task deny so that routing also re-emits a final wildcard
     // deny for Task itself; otherwise OpenCode exposes a callable-but-refused tool.
-    if (lockPermissions && agentLabel?.startsWith("historian") && allowedTools.length === 0) {
+    if (
+        lockPermissions &&
+        ((agentLabel?.startsWith("historian") && allowedTools.length === 0) ||
+            agentLabel?.endsWith(ZEN_READ_AGENT_SUFFIX))
+    ) {
         basePermission.task = "deny";
     }
     return {

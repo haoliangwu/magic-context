@@ -36,9 +36,9 @@ import {
     buildChannel1Reminder,
     CHANNEL1_SENTINEL,
     type Channel1State,
+    currentReclaimableToolOutputCount,
     decideChannel1,
     formatChannel1Evaluation,
-    reclaimableToolOutputCount,
     toolOutputTokens,
 } from "./ctx-reduce-nudge";
 import { annotateEmptyTaskOutput } from "./empty-task-output";
@@ -283,7 +283,11 @@ export function createChatMessageHook(args: {
                 );
                 args.historyRefreshSessions.add(sessionId);
                 args.systemPromptRefreshSessions.add(sessionId);
-                args.pendingMaterializationSessions.add(sessionId);
+                requestPendingMaterialization(
+                    args.pendingMaterializationSessions,
+                    sessionId,
+                    "variant_change",
+                );
                 args.lastHeuristicsTurnId.delete(sessionId);
             } else {
                 // The provider's cache ignores request params, so a variant
@@ -458,7 +462,7 @@ export function createEventHook(args: {
             args.historyRefreshSessions.delete(sessionId);
             args.deferredHistoryRefreshSessions.delete(sessionId);
             args.systemPromptRefreshSessions.delete(sessionId);
-            args.pendingMaterializationSessions.delete(sessionId);
+            clearPendingMaterialization(args.pendingMaterializationSessions, sessionId);
             args.deferredMaterializationSessions.delete(sessionId);
             args.lastHeuristicsTurnId.delete(sessionId);
             args.commitSeenLastPass?.delete(sessionId);
@@ -588,7 +592,7 @@ function maybeInjectChannel1Nudge(
     out.output += buildChannel1Reminder(
         decision.level,
         decision.undroppedTokens,
-        reclaimableToolOutputCount(state.baselineParts),
+        currentReclaimableToolOutputCount(state),
         state.oldestReclaimableToolTags,
         decision.sticky,
     );
@@ -774,3 +778,8 @@ export function createToolExecuteAfterHook(args: {
         }
     };
 }
+
+import {
+    clearPendingMaterialization,
+    requestPendingMaterialization,
+} from "./pending-materialization";

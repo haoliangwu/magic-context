@@ -32,6 +32,9 @@ const ALLOWED_READERS = new Set<string>([
     "packages/cli/src/lib/omp-helpers.ts",
     "packages/cli/src/commands/setup-omp.ts",
     "packages/cli/src/commands/doctor-omp.ts",
+    // The privacy projection recognizes the setting's name in diagnostic text;
+    // it never reads the parsed configuration value.
+    "packages/cli/src/lib/issue-privacy.ts",
 ]);
 
 function sourceFiles(directory: string): string[] {

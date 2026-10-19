@@ -28,7 +28,6 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import {
     appendFileSync,
-    copyFileSync,
     existsSync,
     mkdirSync,
     readdirSync,
@@ -47,6 +46,7 @@ import {
 } from "@cortexkit/subc-client";
 
 import { prepareContextDatabase } from "../prepare-context-db";
+import { stageExecutable } from "./executable-staging";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 const MODULE_ID = "magic-context";
@@ -156,7 +156,6 @@ const RUST_E2E_CARGO_TARGET_DIR = join(
     REPO_ROOT,
     "packages/e2e-tests/.cache/rust-e2e-cargo-target",
 );
-const RUST_E2E_DEV_BIN_DIR = join(RUST_E2E_CARGO_TARGET_DIR, "dev-bin");
 
 /** ck-mc lives in THIS workspace; the lock-pinned ck-subc source is built separately. */
 const CK_MC_RELEASE = join(RUST_E2E_CARGO_TARGET_DIR, "release/ck-mc");
@@ -170,23 +169,16 @@ function currentTreeCkMcBinary(_configuredBinary: string | undefined): string {
     return CK_MC_RELEASE;
 }
 
-/** Give every test executable a distinct process name, regardless of its source path. */
-function stageDevBinary(
-    source: string,
-    filename: string,
-    targetDir = RUST_E2E_DEV_BIN_DIR,
-): string {
+function stageDevBinary(source: string, filename: string): string {
     if (!filename.startsWith("ckdev-")) {
         throw new Error(`test binary name must start with ckdev-: ${filename}`);
     }
-    mkdirSync(targetDir, { recursive: true });
-    const destination = join(targetDir, filename);
-    if (resolve(source) === resolve(destination)) return destination;
-    rmSync(destination, { force: true });
-    // A copy, never a hard link: on macOS a daemon exec'd through a hard link to
-    // cargo's output was occasionally SIGKILLed at startup, while a copy never was.
-    copyFileSync(source, destination);
-    return destination;
+    const identifier = filename === "ckdev-subc"
+        ? "ck-subc"
+        : filename.startsWith("ckdev-mc-") || filename === "ckdev-mc"
+          ? "ck-mc"
+          : filename.slice("ckdev-".length).replaceAll("-", "_");
+    return stageExecutable(source, filename, identifier);
 }
 
 /**
@@ -344,9 +336,8 @@ export async function buildHermeticBinaries(
     options: { driveFault?: boolean } = {},
 ): Promise<BuiltBinaries> {
     // The fault arms live behind a non-default Cargo feature, so a scenario that
-    // drives one needs a SEPARATE binary. Keying the memo (and the dev-named link)
-    // on the feature set keeps a fault build and a plain build from overwriting
-    // each other within one test process.
+    // drives one needs a SEPARATE binary. Keying the memo and staged executable name by feature
+    // set keeps a fault build and a plain build from overwriting each other within one test process.
     const buildKey = options.driveFault === true ? "drive-fault" : "default";
     const existing = buildPromises.get(buildKey);
     if (existing) return existing;
@@ -403,14 +394,16 @@ export async function buildHermeticBinaries(
 /** Build the test-only module that delays synchronous MC dispatch for health probes. */
 export async function buildSlowTransformProbe(): Promise<string> {
     const configured = process.env.MC_E2E_SLOW_TRANSFORM_PROBE_BIN;
-    if (configured && existsSync(configured)) return configured;
+    if (configured && existsSync(configured)) {
+        return stageDevBinary(configured, "ckdev-slow-transform-probe");
+    }
     const args = ["build", "--release", "-p", "mc-module", "--example", "slow_transform_probe"];
     const result = await runCargo(args, REPO_ROOT, rustE2eCargoEnv());
     const binary = join(RUST_E2E_CARGO_TARGET_DIR, "release/examples/slow_transform_probe");
     if (!result.ok || !existsSync(binary)) {
         throw new Error(`failed to build slow transform probe: ${result.stderr.slice(-4000)}`);
     }
-    return binary;
+    return stageDevBinary(binary, "ckdev-slow-transform-probe");
 }
 
 // ── daemon + module lifecycle ─────────────────────────────────────────────────

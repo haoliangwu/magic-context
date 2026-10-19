@@ -197,6 +197,133 @@ pub fn encode_ordinary(text: &str) -> Vec<Rank> {
     tokenizer().encode_ordinary(text)
 }
 
+/// Process-local ceiling for the session-history render counts, charged with the
+/// same per-entry convention as [`HISTORY_CACHE_BYTES`].
+const HISTORY_RENDER_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Counts for the session-history render only: compartment tier texts and the
+/// rendered history slice. They are kept apart from [`HISTORY_COUNTS`], which every
+/// other estimate in the process (tail blocks, tags, memories) shares. In a busy
+/// process that other traffic evicted a long session's tier counts between folds, and
+/// a fold that found the shared cache locked counted without it, so every fold
+/// re-tokenized its whole visible history.
+static HISTORY_RENDER_COUNTS: OnceLock<std::sync::Mutex<HistoryCounts>> = OnceLock::new();
+
+/// [`estimate_tokens`] for session-history render text, memoized in the history
+/// render cache. Returns exactly what `estimate_tokens` returns for the same text.
+pub fn estimate_history_render_tokens(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let cache = HISTORY_RENDER_COUNTS.get_or_init(Default::default);
+    let mut start = 0;
+    let mut total = 0;
+    for (offset, _) in text.match_indices("\n\n## ") {
+        let end = offset + 2;
+        total += count_render_piece(cache, &text[start..end], true);
+        start = end;
+    }
+    total + count_render_piece(cache, &text[start..], false)
+}
+
+/// [`history_paragraph_counts`] through the history render cache.
+pub fn history_render_paragraph_counts(text: &str) -> (usize, usize) {
+    let final_count = estimate_history_render_tokens(text);
+    let continued_count = estimate_history_render_tokens(&format!("{text}\n\n#")) - 1;
+    (final_count, continued_count)
+}
+
+/// One cached piece count. The lock is held only for the lookup and the insert,
+/// never while tokenizing, so concurrent folds wait for each other's map updates but
+/// not for each other's tokenization.
+fn count_render_piece(
+    cache: &std::sync::Mutex<HistoryCounts>,
+    piece: &str,
+    continued: bool,
+) -> usize {
+    let lock = || {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    };
+    if let Some(count) = lock().lookup(piece, continued) {
+        return count;
+    }
+    let count = count_piece(piece, continued);
+    lock().insert_counted(piece, continued, count, HISTORY_RENDER_CACHE_BYTES);
+    count
+}
+
+/// The uncached count of one piece. A piece followed by a `\n\n## ` heading
+/// (`continued`) is counted with a sentinel `#` appended, minus that one token, so its
+/// trailing newlines split as they do mid-text: the pre-tokenizer's `\s+(?!\S)` rule
+/// treats whitespace at end of input differently. Piece counts then sum to the
+/// whole text's count.
+fn count_piece(piece: &str, continued: bool) -> usize {
+    #[cfg(test)]
+    RENDER_PIECE_TOKENIZATIONS.with(|count| count.set(count.get() + 1));
+    if continued {
+        tokenizer().count_ordinary(&format!("{piece}#")) - 1
+    } else {
+        tokenizer().count_ordinary(piece)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Pieces this thread tokenized through the history render cache.
+    static RENDER_PIECE_TOKENIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl HistoryCounts {
+    /// A cached count, refreshing the entry's recency on a hit.
+    fn lookup(&mut self, text: &str, continued: bool) -> Option<usize> {
+        self.clock += 1;
+        let entry = self.entries.get_mut(text)?;
+        self.age.remove(&entry.age);
+        entry.age = self.clock;
+        self.age.insert(self.clock, Arc::clone(&entry.key));
+        entry.counts[usize::from(continued)]
+    }
+
+    /// Record a count computed outside the lock. Another thread may have inserted the
+    /// same text meanwhile; then only the slot is filled. A new entry takes a fresh
+    /// clock tick, so two inserts between lookups never share a recency key.
+    fn insert_counted(&mut self, text: &str, continued: bool, count: usize, budget: usize) {
+        let slot = usize::from(continued);
+        if let Some(entry) = self.entries.get_mut(text) {
+            entry.counts[slot] = Some(count);
+            return;
+        }
+        let cost = history_entry_cost(text.len());
+        if cost > budget {
+            return;
+        }
+        while self.bytes + cost > budget {
+            let (_, key) = self.age.pop_first().expect("non-empty bounded cache");
+            self.bytes -= history_entry_cost(key.len());
+            self.entries.remove(&*key);
+        }
+        self.clock += 1;
+        let mut counts = [None; 2];
+        counts[slot] = Some(count);
+        let key: Arc<str> = Arc::from(text);
+        self.entries.insert(
+            Arc::clone(&key),
+            HistoryCount {
+                counts,
+                age: self.clock,
+                key: Arc::clone(&key),
+            },
+        );
+        self.age.insert(self.clock, key);
+        self.bytes += cost;
+    }
+}
+
+#[cfg(test)]
+mod review_tests;
+
 #[cfg(test)]
 mod history_cache_tests {
     use super::*;
@@ -258,6 +385,108 @@ mod history_cache_tests {
                 .map(|s| s.len() * 2 + 128)
                 .sum::<usize>()
         );
+    }
+
+    #[test]
+    fn history_render_counts_equal_ordinary_encoding_cold_and_cached() {
+        let bodies = [
+            "",
+            "x",
+            "  ",
+            "x\n",
+            "x\n \t\n",
+            "é漢字🙂🚀",
+            "can't I'd we've",
+            "\u{2003}\u{2028}",
+            "## title\n## nested",
+            "<EOT>",
+            "x \r\n\t ",
+        ];
+        // The second round answers from the cache; both must match the encoder.
+        for round in 0..2 {
+            for left in bodies {
+                for right in bodies {
+                    let text = format!("## render {round}\n{left}\n\n## second\n{right}");
+                    let expected = encode_ordinary(&text).len();
+                    assert_eq!(estimate_history_render_tokens(&text), expected, "{text:?}");
+                    assert_eq!(estimate_tokens(&text), expected, "{text:?}");
+                    let first = format!("## render\n{left}");
+                    let second = format!("## second\n{right}");
+                    let joined = format!("{first}\n\n{second}");
+                    assert_eq!(
+                        history_render_paragraph_counts(&first),
+                        history_paragraph_counts(&first),
+                        "{first:?}"
+                    );
+                    assert_eq!(
+                        history_render_paragraph_counts(&first).1
+                            + history_render_paragraph_counts(&second).0,
+                        encode_ordinary(&joined).len(),
+                        "joined: {joined:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn history_render_cache_answers_a_repeat_without_tokenizing() {
+        // Text no other test produces, so a parallel test cannot have cached it.
+        let text = format!(
+            "## {:?} repeat\nbody one\n\n## second\nbody two",
+            std::thread::current().id()
+        );
+        let tokenizations = || RENDER_PIECE_TOKENIZATIONS.with(std::cell::Cell::get);
+        let before = tokenizations();
+        let cold = history_render_paragraph_counts(&text);
+        let cold_work = tokenizations() - before;
+        assert!(cold_work > 0);
+        let before = tokenizations();
+        assert_eq!(history_render_paragraph_counts(&text), cold);
+        assert_eq!(
+            tokenizations() - before,
+            0,
+            "a repeated count must be a cache hit"
+        );
+    }
+
+    #[test]
+    fn history_render_inserts_between_lookups_keep_the_byte_accounting_exact() {
+        const BUDGET: usize = 4 * 1024;
+        let mut cache = HistoryCounts::default();
+        let texts: Vec<String> = (0..30)
+            .map(|index| format!("## t{index}\n{}", "ab ".repeat(20 + index * 7)))
+            .collect();
+        for pair in texts.chunks(2) {
+            // Two misses are looked up before either count is recorded, as when two
+            // folds miss concurrently and insert after tokenizing outside the lock.
+            for text in pair {
+                assert_eq!(cache.lookup(text, false), None);
+            }
+            for text in pair {
+                cache.insert_counted(text, false, text.len(), BUDGET);
+            }
+            assert_eq!(cache.entries.len(), cache.age.len());
+            assert!(cache.bytes <= BUDGET);
+            assert_eq!(
+                cache.bytes,
+                cache
+                    .entries
+                    .keys()
+                    .map(|key| history_entry_cost(key.len()))
+                    .sum::<usize>()
+            );
+            for (age, key) in &cache.age {
+                assert_eq!(cache.entries[&**key].age, *age);
+            }
+        }
+        let newest = texts.last().unwrap();
+        assert_eq!(cache.lookup(newest, false), Some(newest.len()));
+        // A concurrent insert of a text already present fills its other slot only.
+        let bytes = cache.bytes;
+        cache.insert_counted(newest, true, 7, BUDGET);
+        assert_eq!(cache.bytes, bytes);
+        assert_eq!(cache.lookup(newest, true), Some(7));
     }
 
     /// The cache as it was before entries shared their text between the lookup

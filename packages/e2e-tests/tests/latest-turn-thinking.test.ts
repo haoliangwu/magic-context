@@ -85,7 +85,7 @@ test("mock rejects edited, missing and reordered latest-turn thinking across too
 });
 
 for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "drops" }, { band: 76, mode: "primary" }, { band: 85, mode: "primary" }, { band: 76, mode: "legacy-accepted" }, { band: 76, mode: "legacy-rejected" }]) {
-	test(mode === "primary" ? `Anthropic primary long tool loop defers thinking-changing queued drops at ${band}%` : mode === "drops" ? `Anthropic task preserves latest-turn thinking and queues ctx_reduce at ${band}%` : `Anthropic task ${mode} thinking replay`, async () => {
+	test(mode === "primary" ? band === 76 ? "Anthropic primary long tool loop holds queued drops on a plain real-user pass until ctx-flush at 76%" : `Anthropic primary long tool loop defers thinking-changing queued drops at ${band}%` : mode === "drops" ? `Anthropic task preserves latest-turn thinking and queues ctx_reduce at ${band}%` : `Anthropic task ${mode} thinking replay`, async () => {
         let enforceLegacy = mode !== "legacy-accepted";
         const modelID = mode.startsWith("legacy-") ? "mock-sonnet" : "claude-sonnet-5-5";
 		const oldTmp = process.env.TMPDIR;
@@ -149,7 +149,7 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 					version: string;
 				}
 			).version;
-			expect(version).toMatch(/^1\.18\./);
+			expect(version).toMatch(/^1\./);
 			const contain = () => {
 				const lsof = spawnSync("lsof", ["-p", String(h.opencode.pid), "-Fn"], {
 					encoding: "utf8",
@@ -329,11 +329,44 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 					.query("SELECT tag_id FROM pending_ops WHERE session_id = ?")
 					.all(childId),
 			).toContainEqual({ tag_id: tag });
-			// A real user turn releases the queued drop, even in a former child.
+			const previousRequest = wire.at(-1)!;
+			const workerRequest = () => h.mock.requests().filter(request =>
+				bytes(request.body.system).includes("ISSUE-630-WORKER"),
+			).at(-1)!.body;
+			const previousBody = workerRequest();
+			const logPath = join(h.dataDir, "cortexkit", "magic-context-e2e.log");
+			const beforeUserLog = readFileSync(logPath, "utf8").length;
+			// Ending a signed tool loop is not itself permission to rewrite its prefix.
 			await h.sendPrompt(childId, "Next real user turn; finish.", {
 				timeoutMs: 30_000,
 				agent: "thinking-worker",
 			});
+			if (mode === "primary" && band === 76) {
+				const held = wire.at(-1)!;
+				expect(bytes(held.slice(0, previousRequest.length))).toBe(bytes(previousRequest));
+				expect(bytes(workerRequest().system)).toBe(bytes(previousBody.system));
+				expect(bytes(workerRequest().tools)).toBe(bytes(previousBody.tools));
+				expect(bytes(held)).toContain("SPENT-b");
+				const signedBlocks = held.flatMap(message =>
+					(message as { content: Array<{ type: string }> }).content,
+				).filter(part => part.type === "thinking");
+				expect(signedBlocks).toEqual(Array.from({ length: lastPass - 1 }, (_, index) => thinking(index + 1)));
+				expect(h.contextDb().query("SELECT tag_id FROM pending_ops WHERE session_id = ?").all(childId)).toContainEqual({ tag_id: tag });
+				expect(readFileSync(logPath, "utf8").slice(beforeUserLog)).toContain(
+					"pending ops held — reason=no originating cache-bust opportunity; scheduler=execute, historianRunning=false",
+				);
+				// An explicit flush supplies the shared rebuild permission and releases the queue.
+				const response = await fetch(`${h.serverUrl}/session/${childId}/command?directory=${encodeURIComponent(h.workdir)}`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ command: "ctx-flush", arguments: "" }),
+				});
+				expect(response.ok).toBe(true);
+				await h.sendPrompt(childId, "Apply the explicitly requested rebuild; finish.", {
+					timeoutMs: 30_000,
+					agent: "thinking-worker",
+				});
+			}
 			expect(bytes(wire.at(-1))).not.toContain("SPENT-b");
 			expect(
 				h

@@ -59,10 +59,10 @@ function findUnpairedOpenCodeProducers(): string[] {
     for (const file of sourceFiles(base)) {
         const source = readFileSync(file, "utf8");
         for (const match of source.matchAll(/historyRefreshSessions\.add\(/g)) {
+            const block = blockAround(source, match.index ?? 0);
             if (
-                !blockAround(source, match.index ?? 0).includes(
-                    "pendingMaterializationSessions.add(",
-                )
+                !block.includes("pendingMaterializationSessions.add(") &&
+                !/requestPendingMaterialization\([^;]*pendingMaterializationSessions/.test(block)
             ) {
                 failures.push(relative(root, file));
             }

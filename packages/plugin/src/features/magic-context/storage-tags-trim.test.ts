@@ -35,6 +35,52 @@ function legacy(db: Database, session: string, ids: string[]): number {
 }
 
 describe("trimmed-message tag retirement", () => {
+    test("protected trim discovery seeks only eligible tag numbers and preserves retired state", () => {
+        const db = fixture();
+        try {
+            const insert = db.prepare(
+                "INSERT INTO tags(id, session_id, message_id, status) VALUES (?, 's', ?, 'dropped')",
+            );
+            db.transaction(() => {
+                for (let id = 1; id <= 70_000; id++) insert.run(id, id % 2 ? "root:p0" : "keep");
+            })();
+            const prepare = db.prepare.bind(db);
+            let discoveries = 0;
+            const intercept = spyOn(db, "prepare").mockImplementation((sql: string) => {
+                if (sql.includes("WITH ids AS MATERIALIZED")) {
+                    discoveries++;
+                    const plan = prepare(`EXPLAIN QUERY PLAN ${sql}`).all(
+                        '["root"]',
+                        "s",
+                        "[69999,70000]",
+                        0,
+                        0,
+                    ) as Array<{ detail: string }>;
+                    expect(plan.map((r) => r.detail).join(" | ")).toContain(
+                        "session_id=? AND tag_number=?",
+                    );
+                }
+                return prepare(sql);
+            });
+            try {
+                expect(
+                    markTagsCompactedByMessageIds(db, "s", ["root"], new Set([69_999, 70_000])),
+                ).toBe(1);
+                expect(discoveries).toBe(1);
+                expect(prepare("SELECT id FROM tags WHERE status='compacted'").all()).toEqual([
+                    { id: 69_999 },
+                ]);
+                expect(
+                    prepare("SELECT COUNT(*) AS n FROM tags WHERE status='dropped'").get(),
+                ).toEqual({ n: 69_999 });
+            } finally {
+                intercept.mockRestore();
+            }
+        } finally {
+            db.close();
+        }
+    });
+
     test("retires 100k tags with 4000 trimmed ids within two seconds", () => {
         const db = fixture();
         try {

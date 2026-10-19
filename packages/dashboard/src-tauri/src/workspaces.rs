@@ -558,7 +558,7 @@ pub fn create_workspace(conn: &mut Connection, name: &str) -> Result<i64, rusqli
         return Err(constraint_error("Workspace name cannot be empty."));
     }
     let now = now_millis();
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
     tx.execute(
         "INSERT INTO workspaces (name, created_at, updated_at) VALUES (?1, ?2, ?2)",
         params![trimmed, now],
@@ -581,7 +581,7 @@ pub fn rename_workspace(
         return Err(constraint_error("Workspace name cannot be empty."));
     }
     let now = now_millis();
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
     // No epoch bump: the workspace NAME is not rendered into m[0]/m[1] (only
     // member `display_name` affects the `source=` attribution), so renaming the
     // workspace must not force a hard m[0] re-fold in every member session.
@@ -597,7 +597,7 @@ pub fn delete_workspace(conn: &mut Connection, workspace_id: i64) -> Result<(), 
     if !workspace_schema_ready(conn)? {
         return Err(workspace_not_ready_error());
     }
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
     let old_members = members_of_workspace(&tx, workspace_id)?;
     tx.execute(
         "DELETE FROM workspaces WHERE id = ?1",
@@ -634,7 +634,7 @@ pub fn apply_workspace_changes(
         .transpose()?;
 
     let now = now_millis();
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
     let has_share_categories = workspace_share_categories_column_exists_tx(&tx)?;
     let (current_name, old_share_categories) =
         workspace_metadata(&tx, workspace_id, has_share_categories)?;

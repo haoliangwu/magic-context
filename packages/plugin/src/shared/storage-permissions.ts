@@ -10,6 +10,7 @@ import {
     chmodSync,
     closeSync,
     createWriteStream,
+    fsyncSync,
     lstatSync,
     mkdirSync,
     openSync,
@@ -54,6 +55,15 @@ export function ensureStorageDirectorySync(
     });
 }
 
+/** Replay-authorizing files require a private real directory, even after a permissive restore. */
+export function ensurePrivateStorageDirectorySync(directory: string): void {
+    ensureStorageDirectorySync(directory, true);
+    const stat = lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink())
+        throw new Error("Private storage directory is not a real directory");
+    if (process.platform !== "win32") chmodSync(directory, 0o700);
+}
+
 /** Create or replace a storage file using a private mode from the first byte. */
 export function writeStorageFileSync(
     filePath: string,
@@ -82,6 +92,42 @@ export function writeStorageFileAtomicSync(
     } catch (error) {
         rmSync(tempPath, { force: true });
         throw error;
+    }
+}
+
+/** Flush the namespace containing a safety-critical sidecar (POSIX only). */
+export function syncStorageDirectorySync(directory: string): void {
+    const fd = openSync(directory, "r");
+    try {
+        fsyncSync(fd);
+    } finally {
+        closeSync(fd);
+    }
+}
+
+/** Publish a safety record only after both its bytes and directory entry are durable. */
+export function writeStorageFileDurableAtomicSync(
+    filePath: string,
+    content: string,
+    afterTempSync?: () => void,
+): void {
+    const directory = dirname(filePath);
+    ensurePrivateStorageDirectorySync(directory);
+    const tempPath = `${filePath}.${process.pid}.${randomBytes(12).toString("hex")}.tmp`;
+    let fd: number | undefined;
+    try {
+        fd = openStorageFileSync(tempPath, "wx", true);
+        writeFileSync(fd, content, "utf8");
+        fsyncSync(fd);
+        closeSync(fd);
+        fd = undefined;
+        afterTempSync?.();
+        renameSync(tempPath, filePath);
+        syncStorageDirectorySync(directory);
+        syncStorageDirectorySync(dirname(directory));
+    } finally {
+        if (fd !== undefined) closeSync(fd);
+        rmSync(tempPath, { force: true });
     }
 }
 

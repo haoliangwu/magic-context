@@ -7,7 +7,7 @@
  * `globalThis.fetch`, so Bun's default request timer applies and a synchronous
  * `session.prompt` held open for a long agent loop rejects after 300-360 s with
  * `TimeoutError: The operation timed out.` while the host keeps running the
- * child (docs/reports/dreamer-host-fetch-timeout.md).
+ * child. A timed-out client request does not prove the host stopped its child.
  *
  * This drives the plugin's shared prompt-retry chain with exactly such a client
  * against the real host, with a model that never answers and a fallback model

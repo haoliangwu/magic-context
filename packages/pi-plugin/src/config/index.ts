@@ -8,6 +8,10 @@ import {
 import "@magic-context/core/config/prune-config-leaf";
 import { existsSync } from "node:fs";
 import { migrateLegacyAgentEnabledInMemory } from "@magic-context/core/config/agent-disable";
+import {
+	warnDeprecatedMuralModel,
+	warnDeprecatedWindowOverlayPath,
+} from "@magic-context/core/config/deprecated-config";
 import { migrateDreamerV2 } from "@magic-context/core/config/migrate-dreamer-v2";
 import { migrateLegacyExperimental } from "@magic-context/core/config/migrate-experimental";
 import { resolveConfigProfile } from "@magic-context/core/config/profiles";
@@ -38,7 +42,6 @@ import {
 } from "@magic-context/core/shared/jsonc-parser";
 import { setOutputReserveConfig } from "@magic-context/core/shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "@magic-context/core/shared/prompt-surface";
-import { setWindowOverlayPath } from "@magic-context/core/shared/window-geometry";
 
 export interface LoadPiConfigOptions {
 	cwd?: string;
@@ -327,10 +330,13 @@ function parsePiConfig(
 	// top-level; auto_search, git_commit_indexing → memory.*; user_memories,
 	// pin_key_files → dreamer.*). Shared with OpenCode so both harnesses preserve
 	// a user's opt-in/opt-out across the upgrade.
-	const migrated = migrateDreamerV2(
-		migrateLegacyExperimental(agentMigrated, preMigrationWarnings),
+	const migratedExperimental = migrateLegacyExperimental(
+		agentMigrated,
 		preMigrationWarnings,
 	);
+	warnDeprecatedMuralModel(migratedExperimental, preMigrationWarnings);
+	warnDeprecatedWindowOverlayPath(migratedExperimental, preMigrationWarnings);
+	const migrated = migrateDreamerV2(migratedExperimental, preMigrationWarnings);
 	const parsed = MagicContextConfigSchema.safeParse(migrated);
 	if (parsed.success) {
 		return { config: parsed.data, warnings: preMigrationWarnings };
@@ -696,7 +702,6 @@ export function loadPiConfigDetailed(
 		parsed.config.profile = profileResolution.activeProfile;
 	if (applyRuntimeGlobals) {
 		setOutputReserveConfig(parsed.config.output_reserve);
-		setWindowOverlayPath(parsed.config.models?.window_overlay_path);
 	}
 	warnings.push(
 		...parsed.warnings.map((warning) => `[merged config] ${warning}`),

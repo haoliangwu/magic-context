@@ -152,7 +152,7 @@ const SECRET_TEXT_PATTERNS: Array<{
         replacement: "<GITHUB_PAT_REDACTED>",
     },
     {
-        pattern: /\b(?:gh[opsu]|ghr)_[A-Za-z0-9]{30,}/g,
+        pattern: /\b(?:gh[opsu]|ghr)_[A-Za-z0-9_-]{30,}/g,
         replacement: "<GITHUB_TOKEN_REDACTED>",
     },
     {
@@ -189,6 +189,13 @@ const SECRET_TEXT_PATTERNS: Array<{
             /\b((?:x-)?(?:api-?key|api-?token|auth-?token|access-?token)\s*:\s*)([^\s'"`,;<>]{6,})/gi,
         replacement: (full: string, prefix: string, value: string) =>
             isNonSecretScalarValue(value) ? full : `${prefix}<REDACTED:api_key>`,
+    },
+    {
+        // Unquoted diagnostic prose also uses colon-delimited credentials.
+        pattern:
+            /\b((?:api[_-]?key|client[_-]?secret|access[_-]?token|token|secret|password|passwd|pwd)\s*:\s*)([^\s'"`,;<>]{6,})/gi,
+        replacement: (full: string, prefix: string, value: string) =>
+            isNonSecretScalarValue(value) ? full : `${prefix}<REDACTED:credential>`,
     },
     {
         // Credentials embedded in a URL: scheme://user:password@host.

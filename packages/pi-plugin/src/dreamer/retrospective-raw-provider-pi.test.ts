@@ -79,6 +79,54 @@ describe("PiRetrospectiveRawProvider", () => {
 			{ sessionId: "s1", path: "/sessions/s1.jsonl", updatedAt: 30 },
 		]);
 	});
+	// The retrospective reads this project's sessions by their recorded cwd. On
+	// Windows one directory has several spellings (separators, drive-letter
+	// case, a trailing separator); all are this project's, and a different
+	// directory never is.
+	it("lists sessions whose cwd is a Windows spelling of the project cwd, and no other directory", async () => {
+		const provider = new PiRetrospectiveRawProvider({
+			projectCwd: "D:\\coding\\siac\\wt\\app",
+			listSessions: () => [
+				{
+					id: "forward",
+					cwd: "D:/coding/siac/wt/app",
+					path: "/s/f.jsonl",
+					modified: 1,
+				},
+				{
+					id: "lower",
+					cwd: "d:\\coding\\siac\\wt\\app",
+					path: "/s/l.jsonl",
+					modified: 2,
+				},
+				{
+					id: "trailing",
+					cwd: "D:/coding/siac/wt/app/",
+					path: "/s/t.jsonl",
+					modified: 3,
+				},
+				{
+					id: "sibling",
+					cwd: "D:/coding/siac/wt/app-2",
+					path: "/s/s.jsonl",
+					modified: 4,
+				},
+				{
+					id: "other",
+					cwd: "D:/coding/siac/wt/other",
+					path: "/s/o.jsonl",
+					modified: 5,
+				},
+			],
+			loadEntriesFromFile: () => [],
+		});
+
+		expect(
+			(await provider.listProjectSessions("identity")).map(
+				({ sessionId }) => sessionId,
+			),
+		).toEqual(["forward", "lower", "trailing"]);
+	});
 
 	it("reads only typed user messages newer than sinceMs", async () => {
 		const provider = new PiRetrospectiveRawProvider({

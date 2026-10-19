@@ -46,7 +46,7 @@ Global on/off switches for the plugin and its agent-facing surface.
 | `todowrite.overlay` | boolean | `true` | Pi only: show the persistent todo overlay above the editor while tasks are active. |
 | `mural` | object | — | Experimental mural: a single deterministically-rendered image of project memories that did not fit the context budget. Cues are compressed per-memory by the compress-cues dreamer task. |
 | `mural.enabled` | boolean | `false` |  |
-| `mural.model` **Live** | string | — | Model for the compress-cues task that compresses each memory into a mural cue. The mural image itself is rendered deterministically (no author model). |
+| `mural.model` | unknown | — | Deprecated: ignored. compress-cues now uses the dreamer model for each harness, like every other dreamer task; override it with dreamer.opencode.tasks.compress-cues.model (or the pi/omp equivalent). Remove this key; it no longer does anything. |
 
 ## Prompt surface
 
@@ -127,8 +127,8 @@ The background agent that condenses old conversation into compact history.
 | `historian.host_runner.enabled` | boolean | — | Whether this process answers historian runs queued for a claimant (default true). Setting it to false stops the pull loop without changing historian.runner, so an operator can take one machine out of the lane and leave the queued runs for another claimant or for the runner setting to be changed deliberately. |
 | `historian.two_pass` **Live** | boolean | `false` | Run a second editor pass over historian output to clean low-signal U: lines and cross-compartment duplicates. Adds ~1 extra API call and ~1.3x cost per historian run. Useful for models without extended thinking support. (default: false) |
 | `historian.disallowed_tools` | `"\*"` \| `"read"` \| `"aft_outline"` \| `"aft_zoom"` \| `"aft_search"`[] | `[]` | Legacy compatibility setting. Historians, recomp and editor passes always run with zero tools and locked permissions; this list no longer changes their tool surface. (default: []) |
-| `historian_timeout_ms` **Live** | number (60000–) | `600000` | Timeout for each historian prompt call in both TypeScript and Rust transform modes, in milliseconds (default: 600000) |
-| `commit_cluster_trigger` | object | — | Commit-cluster trigger: fire historian when enough commit clusters accumulate in the unsummarized tail |
+| `historian_timeout_ms` **Live** | number (60000–) | `600000` | Timeout for each historian prompt call in both TypeScript and Rust transform modes, in milliseconds (default: 600000). A historian setting kept at the top level for compatibility; no effect while historian.disable is true or compaction.enabled is false. |
+| `commit_cluster_trigger` | object | — | Commit-cluster trigger: fire historian when enough commit clusters accumulate in the unsummarized tail. A historian setting kept at the top level for compatibility; no effect while historian.disable is true or compaction.enabled is false. |
 | `commit_cluster_trigger.enabled` **Live** | boolean | `true` | Enable commit-cluster based historian triggering (default: true) |
 | `commit_cluster_trigger.min_clusters` **Live** | number (1–) | `3` | Minimum commit clusters required to trigger historian (min: 1, default: 3) |
 
@@ -138,17 +138,17 @@ Durable project memory, semantic search, and recall features. OpenAI-compatible 
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `memory` | object | — | Cross-session memory configuration |
-| `memory.enabled` | boolean | `true` | Enable cross-session memory (default: true). Does not affect history embedding or semantic ctx_search over session history; set embedding.provider to 'off' to stop all embedding. |
+| `memory` | object | — | Cross-session memory configuration. auto_search and git_commit_indexing sit here for history but work with memory.enabled false. |
+| `memory.enabled` | boolean | `true` | Enable cross-session project memory (default: true). Also gates the dreamer's project-memory tasks: while false, map-memories, verify, verify-broad, curate, compress-cues, classify-memories, retrospective, promote-primers and refresh-primers neither run on schedule nor through /ctx-dream; maintain-docs, evaluate-smart-notes and review-user-memories still run. memory.auto_search and memory.git_commit_indexing do not depend on it. Does not affect history embedding or semantic ctx_search over session history; set embedding.provider to 'off' to stop all embedding. |
 | `memory.injection_budget_tokens` | number (500–20000) | `4000` | Token budget for memory injection on session start (min: 500, max: 20000, default: 4000) |
-| `memory.auto_promote` **Live** | boolean | `true` | Automatically promote eligible session facts into memory (default: true) |
-| `memory.retrieval_count_promotion_threshold` | number (1–) | `3` | retrieval_count threshold for promoting memory to permanent status (min: 1, default: 3) |
-| `memory.auto_search` | object | — | Auto-search hint: transform-time ctx_search on each new user message; when the top hit clears the threshold, append a compact <ctx-search-hint> block of vague fragments to that user message. Does NOT inject full content. Graduated from experimental.auto_search; enabled by default (set enabled: false to opt out). Independent of memory.enabled. |
-| `memory.auto_search.enabled` | boolean | `true` | Automatically append a compact <ctx-search-hint> to eligible user messages when relevant memories, conversation, or commits are found. Graduated from experimental.auto_search; on by default (set false to opt out). Independent of memory.enabled. |
+| `memory.auto_promote` **Live** | boolean | `true` | Automatically promote eligible session facts into memory (default: true). No effect while memory.enabled is false. |
+| `memory.retrieval_count_promotion_threshold` | number (1–) | `3` | Currently has no effect: no code reads this value, and memories are not promoted to permanent by retrieval count. Kept so existing configs stay valid (min: 1, default: 3). |
+| `memory.auto_search` | object | — | Auto-search hint: transform-time ctx_search on each new user message; when the top hit clears the threshold, append a compact <ctx-search-hint> block of vague fragments to that user message. Does NOT inject full content. Graduated from experimental.auto_search; enabled by default (set enabled: false to opt out). Independent of memory.enabled despite its place under memory: with memory off it still searches past conversation and commits. |
+| `memory.auto_search.enabled` | boolean | `true` | Automatically append a compact <ctx-search-hint> to eligible user messages when relevant memories, conversation, or commits are found. Graduated from experimental.auto_search; on by default (set false to opt out). Independent of memory.enabled despite its place under memory: with memory off it still searches past conversation and commits, only the memory source is skipped. |
 | `memory.auto_search.score_threshold` | number (0.3–0.95) | `0.6` | Top hit score must exceed this threshold for the hint to fire (min: 0.3, max: 0.95, default: 0.60) |
 | `memory.auto_search.min_prompt_chars` | number (5–500) | `20` | Skip hint when user message is shorter than this (min: 5, max: 500, default: 20) |
-| `memory.git_commit_indexing` | object | — | Index git commit messages from HEAD into ctx_search. Commits become a 4th searchable source alongside memories and session history. Graduated from experimental.git_commit_indexing; opt-in, default off (per-project embedding cost). Independent of memory.enabled. |
-| `memory.git_commit_indexing.enabled` **Live** | boolean | `false` | Index HEAD git commits for ctx_search (git_commit source). Graduated from experimental.git_commit_indexing; opt-in, default off. Independent of memory.enabled. |
+| `memory.git_commit_indexing` | object | — | Index git commit messages from HEAD into ctx_search. Commits become a 4th searchable source alongside memories and session history. Graduated from experimental.git_commit_indexing; opt-in, default off (per-project embedding cost). Independent of memory.enabled despite its place under memory. |
+| `memory.git_commit_indexing.enabled` **Live** | boolean | `false` | Index HEAD git commits for ctx_search (git_commit source). Graduated from experimental.git_commit_indexing; opt-in, default off. Independent of memory.enabled despite its place under memory. |
 | `memory.git_commit_indexing.since_days` **Live** | number (7–3650) | `365` | Days of HEAD history to index (min: 7, max: 3650, default: 365) |
 | `memory.git_commit_indexing.max_commits` **Live** | number (100–20000) | `2000` | Max commits kept per project; oldest evicted (min: 100, max: 20000, default: 2000) |
 | `embedding` | object | — | Embedding provider configuration |
@@ -163,7 +163,7 @@ Durable project memory, semantic search, and recall features. OpenAI-compatible 
 | `embedding.document_prefix` | string | — | OpenAI-compatible stored-document prefix override, prepended verbatim. Defaults to the model-family recipe (empty for Qwen3/gte/e5 instruct; 'search_document: ' for Nomic). Changing it changes stored vectors and triggers re-embedding. User-level only; project values are ignored. |
 | `embedding.truncate` | string | — | Optional truncate mode sent in the embedding request body (e.g. NVIDIA NIM accepts 'NONE' \| 'START' \| 'END'). Omitted from the request when unset. |
 | `embedding.max_input_tokens` | integer (–9007199254740991) | — | Optional maximum input tokens for chunk embeddings. Defaults conservatively to 512 when omitted. |
-| `embedding.local_runtime` | `"auto"` \| `"native"` \| `"wasm"` | `"auto"` | Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Inference runs in a dedicated worker. On Bun before 1.4.0, even explicit 'native' uses WASM because native worker teardown can crash the process. Set 'wasm' to avoid loading the native addon on newer hosts too. |
+| `embedding.local_runtime` | `"auto"` \| `"native"` \| `"wasm"` | `"auto"` | Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Inference runs in a dedicated worker after disabling POSIX telemetry in the native process environment. Compiled Bun hosts and hosts without a verified in-process opt-out use a subprocess instead. Windows native ONNX emits OS-controlled ETW diagnostics, not direct uploads. On Bun before 1.4.0, even explicit 'native' uses WASM because native worker teardown can crash the process. Set 'wasm' to avoid loading the native addon on newer hosts too. |
 | `embedding.local_dtype` | `"auto"` \| `"fp32"` \| `"fp16"` \| `"q8"` \| `"int8"` \| `"uint8"` \| `"q4"` \| `"bnb4"` \| `"q4f16"` \| `"q2"` \| `"q2f16"` \| `"q1"` \| `"q1f16"` | — | Local provider only: ONNX model dtype passed to the transformers.js feature-extraction pipeline. Accepts the @huggingface/transformers DataType strings (auto, fp32, fp16, q8, int8, uint8, q4, bnb4, q4f16, q2, q2f16, q1, q1f16). Omitted keeps today's behavior (fp32). A non-default value changes the produced vectors and folds into the embedding model identity, so switching dtype re-embeds rather than mixing vector spaces. Useful for selecting a quantized variant (e.g. q8) of a larger multilingual model to cut memory and CPU cost; see issue #259. |
 
 ## Background agents
@@ -172,12 +172,12 @@ Off-hours maintenance through Dreamer.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `dreamer` | object | — | Dreamer metadata and scheduling plus independent strict OpenCode, Pi, and OMP execution blocks. schedule and promotion_threshold stay at dreamer.tasks; model, fallback_models, variant, thinking_level, and timeout_minutes belong only in the matching harness block. |
+| `dreamer` | object | — | Dreamer metadata and scheduling plus independent strict OpenCode, Pi, and OMP execution blocks. schedule and promotion_threshold stay at dreamer.tasks; model, fallback_models, variant, thinking_level, and timeout_minutes belong only in the matching harness block. Each task follows the setting it serves: memory tasks need memory.enabled, evaluate-smart-notes needs smart_notes.enabled, review-user-memories needs its schedule, maintain-docs only a runnable dreamer. |
 | `dreamer.temperature` | number (0–2) | — | Sampling temperature (0-2) |
 | `dreamer.top_p` | number (0–1) | — | Nucleus sampling top_p (0-1) |
 | `dreamer.prompt` | string | — | Additional system prompt text |
 | `dreamer.tools` | map<string, boolean> | — | Tool enable/disable overrides |
-| `dreamer.disable` **Live** | boolean | — | Disable this agent |
+| `dreamer.disable` **Live** | boolean | — | Disable the dreamer: no scheduled or manual dream task runs. Also turns off smart notes (ctx_note drops surface_condition even with smart_notes.enabled true) and the historian's collection of user observations for review-user-memories. dreamer.inject_docs still applies. |
 | `dreamer.description` | string | — | Agent description |
 | `dreamer.mode` | `"subagent"` \| `"primary"` \| `"all"` | — | Agent mode (subagent, primary, or all) |
 | `dreamer.color` | string | — | Hex color for the agent (e.g. '#a1b2c3') |
@@ -226,6 +226,7 @@ Off-hours maintenance through Dreamer.
 | `dreamer.tasks.maintain-docs.max_tokens` | integer (–9007199254740991) | `12000` | Maximum combined token count of proposed ARCHITECTURE.md and STRUCTURE.md |
 | `dreamer.tasks.evaluate-smart-notes.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
 | `dreamer.tasks.evaluate-smart-notes.token_budget` | integer (–9007199254740991) | — | Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget. |
+| `dreamer.tasks.review-user-memories` | object | — | Promote recurring user observations into the <user-profile> block. A non-empty schedule also makes the historian collect user observations, but only while the dreamer is runnable (dreamer.disable not true); collection and review follow that one gate and do not depend on memory.enabled. |
 | `dreamer.tasks.review-user-memories.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
 | `dreamer.tasks.review-user-memories.token_budget` | integer (–9007199254740991) | — | Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget. |
 | `dreamer.tasks.review-user-memories.promotion_threshold` **Live** | number (2–20) | `3` | review-user-memories: min candidate observations before promotion is considered (default: 3) |
@@ -234,7 +235,9 @@ Off-hours maintenance through Dreamer.
 | `dreamer.tasks.promote-primers.promotion_threshold` **Live** | number (2–20) | `2` | promote-primers: min recurring source days before promotion is considered (default: 2) |
 | `dreamer.tasks.refresh-primers.schedule` **Live** | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
 | `dreamer.tasks.refresh-primers.token_budget` | integer (–9007199254740991) | — | Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget. |
-| `dreamer.inject_docs` | boolean | `true` | Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true) |
+| `dreamer.inject_docs` | boolean | `true` | Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true). Not a dreamer setting despite its place under dreamer: it applies on every host, also with dreamer.disable true. |
+
+On Pi and Oh My Pi, historian and dreamer models, including `fallback_models` and per-task model overrides, must use provider names that host serves. `opencode/*` models are served only by OpenCode's own provider, so Pi and Oh My Pi drop them at startup and log `dropping Pi model not found: <model>`. If every fallback is an `opencode/*` model, only the primary model is left. To see valid names, run `omp models` on Oh My Pi or `pi --list-models` on Pi. `/ctx-status` warns when a dreamer task or the historian has no usable model left.
 
 ## Advanced
 
@@ -259,8 +262,9 @@ Behavior tuning most installs never need to touch.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
+| `smart_notes.enabled` | boolean | `true` | Enable smart-note authoring and condition evaluation. Needs a runnable dreamer, which evaluates the conditions: with dreamer.disable true (or no dreamer block) ctx_note offers no surface_condition whatever this says. User-level only: tool definitions are process-wide. Changes require a host restart and rebuild each session's cached prompt once. Pending notes remain stored and unchecked; already-ready notes still surface. |
 | `smart_notes.retina_handoff` | boolean | `false` | When true, dreamer skips smart notes whose surface conditions compiled to retina provider configs at authoring time. Default false keeps both paths active until the retina consumer is deployed. |
-| `models.window_overlay_path` | string | — |  |
+| `models.window_overlay_path` | unknown | — | Deprecated: ignored. Fusiform no longer publishes window-overlay data, so this setting no longer changes model window geometry. Remove this key. |
 | `toast_duration_ms` **Live** | number (0–60000) | `5000` | TUI toast lifetime in milliseconds for Magic Context notifications. Set to 0 to disable Magic Context toasts entirely (min: 0, max: 60000, default: 5000) |
 | `subc.connection_file` | string | — | Path to the owner-only subc connection file. |
 | `debug_rpc` | boolean | `false` | Developer-only: enable authenticated loopback RPCs for memory counters and heap snapshots. Disabled by default. USER-LEVEL ONLY and requires a restart. |

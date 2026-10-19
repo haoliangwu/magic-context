@@ -1,12 +1,5 @@
 import { parentPort, workerData } from "node:worker_threads";
-import { ensureMemoryEmbeddings } from "../../features/magic-context/memory/embedding-backfill";
-import { getProjectEmbeddings } from "../../features/magic-context/memory/embedding-cache";
-import { getMemoriesByProject } from "../../features/magic-context/memory/storage-memory";
-import { installProjectEmbeddingSearchBridge } from "../../features/magic-context/project-embedding-registry";
-import { unifiedSearch } from "../../features/magic-context/search";
-import { setEmbeddingSessionBusy } from "../../shared/embedding-activity";
-import { setHarness } from "../../shared/harness";
-import { Database } from "../../shared/sqlite";
+import type { Database as DatabaseHandle } from "../../shared/sqlite";
 import type {
     AutoSearchEmbeddingReply,
     AutoSearchWorkerInput,
@@ -16,14 +9,42 @@ import type {
 const port = parentPort;
 if (!port) throw new Error("auto-search worker requires a parent port");
 const input = workerData as AutoSearchWorkerInput;
+// Tell a message-search caller the worker is running before loading the search
+// modules: the caller's first deadline only has to cover thread start, and a
+// worker that never gets this far is replaced by the in-process search.
+if (input.job === "messages") {
+    port.postMessage({ kind: "accepted" } satisfies AutoSearchWorkerReply);
+}
+const [
+    { ensureMemoryEmbeddings },
+    { getProjectEmbeddings },
+    { getMemoriesByProject },
+    { installProjectEmbeddingSearchBridge },
+    { searchMessageHistory, unifiedSearch },
+    { setEmbeddingSessionBusy },
+    { getHarness, setHarness },
+    { Database, registerSqliteDiagnosticSink },
+    { log },
+] = await Promise.all([
+    import("../../features/magic-context/memory/embedding-backfill"),
+    import("../../features/magic-context/memory/embedding-cache"),
+    import("../../features/magic-context/memory/storage-memory"),
+    import("../../features/magic-context/project-embedding-registry"),
+    import("../../features/magic-context/search"),
+    import("../../shared/embedding-activity"),
+    import("../../shared/harness"),
+    import("../../shared/sqlite"),
+    import("../../shared/logger"),
+]);
 // Workers have their own module globals; session rows must retain their owner's
 // harness identity, and Pi/OMP must never inherit OpenCode-store ownership.
 setHarness(input.harness);
+registerSqliteDiagnosticSink(log, getHarness);
 setEmbeddingSessionBusy(input.sessionId, input.embeddingHostBusy === true);
 let nextId = 0;
 const pending = new Map<number, (reply: AutoSearchEmbeddingReply) => void>();
 let queryDimensions: number | null = null;
-let db: Database;
+let db: DatabaseHandle;
 port.on("message", (reply: AutoSearchEmbeddingReply) => {
     // Backfill's busy-host gate is owner state, not this worker's empty activity
     // tracker. Refresh it when an embedding continuation is about to resume SQL.
@@ -106,6 +127,10 @@ try {
             }
         }
         port.postMessage({ kind: "result", results: [] } satisfies AutoSearchWorkerReply);
+    } else if (input.job === "messages") {
+        if (!input.messageRequest) throw new Error("message search job carries no request");
+        const outcome = searchMessageHistory(db, input.messageRequest);
+        port.postMessage({ kind: "messages", outcome } satisfies AutoSearchWorkerReply);
     } else {
         const results = await unifiedSearch(db, input.sessionId, input.projectPath, input.query, {
             ...input.options,

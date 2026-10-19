@@ -1,4 +1,0 @@
-After unconditional git add -A, mutation diff against index:
- crates/mc-module/src/transform/reasoning_clear.rs | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-After git checkout -- path && touch path, diff against index (empty):

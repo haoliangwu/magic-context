@@ -1,7 +1,7 @@
 //! Schema-pinned move inventory, generated from fresh context/store migration heads.
 //!
 //! This module is intentionally path-importable until the move API wires it into
-//! mc-store. See docs/designs/mc-move-deviations.md for the standalone test harness.
+//! mc-store. Inventory checks must precede writes so a refused move leaves both stores unchanged.
 //! New schema objects must be reviewed here before any exporter reads row data.
 
 use rusqlite::Connection;

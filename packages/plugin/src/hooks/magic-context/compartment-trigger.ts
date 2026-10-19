@@ -10,7 +10,7 @@ import {
     getTriggerTagTokenUpperBound,
     loadProtectedTailMeta,
 } from "../../features/magic-context/storage";
-import { getReasoningTokenEstimatesByMessage } from "../../features/magic-context/storage-tags";
+import { tryGetReasoningTokenEstimatesByMessage } from "../../features/magic-context/storage-tags";
 import type { ContextUsage, SessionMeta, TagEntry } from "../../features/magic-context/types";
 import { escalationBands } from "../../shared/escalation-bands";
 import { sessionLog } from "../../shared/logger";
@@ -252,11 +252,12 @@ function estimateProjectedPostDropPercentage(
         keepReasoningTokens !== undefined &&
         clearedReasoningThroughTag !== undefined
     ) {
-        const estimates = getReasoningTokenEstimatesByMessage(
+        const estimates = tryGetReasoningTokenEstimatesByMessage(
             db,
             sessionId,
             sessionDecisionCalibration(db, sessionId).proseRatio,
         );
+        if (!estimates) return null;
         const groups = new Map<string, { tag: number; cost: number }>();
         for (const tag of activeTags) {
             const id = tag.type === "tool" ? tag.toolOwnerMessageId : tag.messageId;

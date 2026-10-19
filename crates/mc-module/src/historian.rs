@@ -1910,6 +1910,44 @@ pub(crate) fn producer_input_token_limit_with_input(
     (limit > 0).then_some(limit)
 }
 
+/// The input limit the per-attempt admission check measures a historian prompt
+/// against before sending it to `model`, or None when no positive limit can be
+/// derived (an unknown window, or one the output reserve fills) and the prompt
+/// goes out unguarded.
+///
+/// `legacy_window` is the older single-window setting for this chain entry: the
+/// configured historian context limit for the primary, a supplied fallback limit
+/// otherwise. The chunk assembler sizes the chunk with this same function, so a
+/// prompt it builds passes the check for every model it was sized for.
+pub(crate) fn attempt_producer_input_limit(
+    model: &str,
+    model_limits: &std::collections::BTreeMap<String, HistorianModelLimits>,
+    legacy_window: Option<usize>,
+    historian_context_limit_tokens: Option<usize>,
+    max_output_tokens: u32,
+) -> Option<usize> {
+    let resolved = model_limits.get(model);
+    let current_window = resolved
+        .and_then(|limit| limit.context)
+        .or(legacy_window)
+        .or(historian_context_limit_tokens)
+        .map(|window| {
+            if resolved.and_then(|limit| limit.input).is_some() {
+                window
+            } else {
+                historian_context_limit_tokens.map_or(window, |cap| window.min(cap))
+            }
+        });
+    let output = resolved
+        .and_then(|limit| limit.output)
+        .unwrap_or(max_output_tokens);
+    producer_input_token_limit_with_input(
+        current_window,
+        resolved.and_then(|limit| limit.input),
+        output,
+    )
+}
+
 pub(crate) fn producer_window_failure_reason_with_input(
     producer_source_tokens: usize,
     context_limit_tokens: Option<usize>,
@@ -1975,6 +2013,130 @@ pub(crate) async fn run_historian_firing_with_model_cache<P>(
 where
     P: HistorianProducerDriver + ?Sized,
 {
+    let (store, session_id, harness, started_at, from, to, completed_at) = (
+        request.store,
+        request.session_id,
+        request.harness,
+        request.now_ms,
+        request.from_ordinal,
+        request.to_ordinal,
+        request.completion_now_ms,
+    );
+    let result = drive_historian_with_model_cache(
+        producer,
+        request,
+        runner_refusal_cache,
+        model_chain_generation,
+    )
+    .await;
+    if let Err(error) = &result {
+        record_failed_run(
+            store,
+            session_id,
+            harness,
+            started_at,
+            (Some(from), Some(to)),
+            completed_at(),
+            error,
+        );
+    }
+    result
+}
+
+fn record_failed_run(
+    store: &McStore,
+    session_id: &str,
+    harness: &str,
+    started_at: i64,
+    range: (Option<u64>, Option<u64>),
+    completed_at: i64,
+    error: &impl std::fmt::Display,
+) {
+    store.record_historian_run(
+        session_id,
+        harness,
+        &mc_store::HistorianRunTelemetry {
+            started_at,
+            run_kind: "incremental".into(),
+            status: "failed".into(),
+            failure_reason: Some(error.to_string()),
+            chunk_start_ordinal: range.0,
+            chunk_end_ordinal: range.1,
+            created_at: completed_at,
+            ..Default::default()
+        },
+    );
+}
+
+fn record_producer_attempt(
+    request: &HistorianFireRequest<'_>,
+    model: &str,
+    started_at: i64,
+    output: Option<&ProducerOutput>,
+    error: Option<&HistorianProducerError>,
+    parent_id: &mut Option<i64>,
+) {
+    let attempt = producer_invocation(
+        Some(model),
+        started_at,
+        (request.completion_now_ms)(),
+        output,
+        error,
+    );
+    *parent_id = request.store.record_historian_invocations(
+        request.session_id,
+        request.harness,
+        "historian",
+        &[attempt],
+        *parent_id,
+    );
+}
+
+fn producer_invocation(
+    model: Option<&str>,
+    started_at: i64,
+    ended_at: i64,
+    output: Option<&ProducerOutput>,
+    error: Option<&HistorianProducerError>,
+) -> mc_store::HistorianInvocation {
+    let (provider, model_id) = model
+        .map(|model| {
+            model
+                .split_once('/')
+                .map_or((None, model), |(p, m)| (Some(p), m))
+        })
+        .map_or((None, None), |(provider, model)| (provider, Some(model)));
+    let usage = output.and_then(|output| output.usage).unwrap_or_default();
+    let status = match error {
+        Some(HistorianProducerError::TimedOut) => "timed_out",
+        Some(HistorianProducerError::Subc(body)) if body.code == "aborted" => "aborted",
+        Some(_) => "failed",
+        None if output.is_some_and(|output| output.text.trim().is_empty()) => "empty",
+        None => "completed",
+    };
+    mc_store::HistorianInvocation {
+        provider_id: provider.map(str::to_string),
+        model_id: model_id.map(str::to_string),
+        started_at,
+        ended_at,
+        status: status.into(),
+        input_tokens: usage.input.min(i64::MAX as u64) as i64,
+        output_tokens: usage.output.min(i64::MAX as u64) as i64,
+        cache_read_tokens: usage.cache_read.min(i64::MAX as u64) as i64,
+        cache_write_tokens: usage.cache_write.min(i64::MAX as u64) as i64,
+        error: error.map(ToString::to_string),
+    }
+}
+
+async fn drive_historian_with_model_cache<P>(
+    producer: &mut P,
+    request: HistorianFireRequest<'_>,
+    runner_refusal_cache: Option<&HistorianRunnerRefusalCache>,
+    model_chain_generation: u64,
+) -> Result<HistorianDriveOutcome, HistorianDriveError>
+where
+    P: HistorianProducerDriver + ?Sized,
+{
     if request.model_chain.is_empty() {
         return Err(HistorianDriveError::NoModels);
     }
@@ -2014,6 +2176,7 @@ where
         .max(1);
     let mut runner_refusal_failures = Vec::new();
     let mut prompt = request.prompt.to_string();
+    let mut parent_invocation_id = None;
 
     for (index, model) in request.model_chain.iter().enumerate() {
         if provider_is_auth_blocked(&auth_blocked_providers, model) {
@@ -2038,32 +2201,17 @@ where
             },
             true,
         );
-        let resolved = request.model_limits.get(model);
         let legacy_window = if index == 0 {
             request.historian_context_limit_tokens
         } else {
             request.fallback_context_limits.get(model).copied()
         };
-        let current_window = resolved
-            .and_then(|limit| limit.context)
-            .or(legacy_window)
-            .or(request.historian_context_limit_tokens)
-            .map(|window| {
-                if resolved.and_then(|limit| limit.input).is_some() {
-                    window
-                } else {
-                    request
-                        .historian_context_limit_tokens
-                        .map_or(window, |cap| window.min(cap))
-                }
-            });
-        let output = resolved
-            .and_then(|limit| limit.output)
-            .unwrap_or(request.max_output_tokens);
-        let fit_limit = producer_input_token_limit_with_input(
-            current_window,
-            resolved.and_then(|limit| limit.input),
-            output,
+        let fit_limit = attempt_producer_input_limit(
+            model,
+            &request.model_limits,
+            legacy_window,
+            request.historian_context_limit_tokens,
+            request.max_output_tokens,
         );
         if fit_limit.is_none() {
             static UNKNOWN_WINDOWS: std::sync::OnceLock<
@@ -2119,6 +2267,7 @@ where
             request.session_id,
             fired.firing_seq,
         );
+        let attempt_started_at = (request.completion_now_ms)();
         let handle = match producer
             .start_with_temperature(
                 &producer_session_id,
@@ -2137,6 +2286,14 @@ where
                 handle
             }
             Err(err) => {
+                record_producer_attempt(
+                    &request,
+                    model,
+                    attempt_started_at,
+                    None,
+                    Some(&err),
+                    &mut parent_invocation_id,
+                );
                 if let Some(refusal) = err.runner_refusal() {
                     let retry_at_ms = runner_refusal_cache
                         .and_then(|cache| {
@@ -2286,6 +2443,14 @@ where
                         } else {
                             &timed_out
                         };
+                        record_producer_attempt(
+                            &request,
+                            model,
+                            attempt_started_at,
+                            None,
+                            Some(deciding_err),
+                            &mut parent_invocation_id,
+                        );
                         let mut decision = decide_producer_failure(
                             deciding_err,
                             model,
@@ -2333,6 +2498,14 @@ where
                 }
             }
             Err(err) => {
+                record_producer_attempt(
+                    &request,
+                    model,
+                    attempt_started_at,
+                    None,
+                    Some(&err),
+                    &mut parent_invocation_id,
+                );
                 let _ = producer.cancel(&handle.run_id).await;
                 let completed_at_ms = (request.completion_now_ms)();
                 let failure_backoff_at_ms = completion_failure_backoff_at_ms(
@@ -2392,6 +2565,14 @@ where
         // Always release both routes, whether publish succeeds or the validate/publish
         // path errors out — an early `?` return here would leak the command + subscribe
         // routes for this firing on the shared consumer connection.
+        record_producer_attempt(
+            &request,
+            model,
+            attempt_started_at,
+            Some(&output),
+            None,
+            &mut parent_invocation_id,
+        );
         let publish_result = publish_output_from_awaiting(PublishOutputRequest {
             store: request.store,
             session_id: request.session_id,
@@ -2495,6 +2676,35 @@ pub const HISTORIAN_HEARTBEAT_INTERVAL_MS: i64 = mc_store::HISTORIAN_HEARTBEAT_I
 /// module's failure taxonomy treats that failure the same way it treats a
 /// producer error.
 pub async fn run_historian_firing_on_host(
+    ledger: &std::sync::Arc<crate::historian_host::HostRunLedger>,
+    request: HistorianFireRequest<'_>,
+    await_budget: Duration,
+) -> Result<HistorianDriveOutcome, HistorianDriveError> {
+    let (store, session_id, harness, started_at, from, to, completed_at) = (
+        request.store,
+        request.session_id,
+        request.harness,
+        request.now_ms,
+        request.from_ordinal,
+        request.to_ordinal,
+        request.completion_now_ms,
+    );
+    let result = drive_historian_on_host(ledger, request, await_budget).await;
+    if let Err(error) = &result {
+        record_failed_run(
+            store,
+            session_id,
+            harness,
+            started_at,
+            (Some(from), Some(to)),
+            completed_at(),
+            error,
+        );
+    }
+    result
+}
+
+async fn drive_historian_on_host(
     ledger: &std::sync::Arc<crate::historian_host::HostRunLedger>,
     request: HistorianFireRequest<'_>,
     await_budget: Duration,
@@ -2607,6 +2817,9 @@ pub async fn run_historian_firing_on_host(
         request.failure_backoff_at_ms,
         completed_at_ms,
     );
+    let report = report.map(|report| {
+        report.record_invocations(request.store, request.session_id, request.harness)
+    });
     let output = match report {
         Some(crate::historian_host::HostRunReport::Output(output)) => output,
         Some(crate::historian_host::HostRunReport::Failed { code, message }) => {
@@ -2620,6 +2833,7 @@ pub async fn run_historian_firing_on_host(
                 ProducerErrorBody::untagged(code, message),
             )));
         }
+        Some(crate::historian_host::HostRunReport::WithInvocations { .. }) => unreachable!(),
         None => {
             abandon_current_state_with_detail(
                 request.store,
@@ -2737,14 +2951,27 @@ pub fn adopt_historian_run_on_host(
         return Ok(HostRunAdoption::NotParked);
     };
     let run_id = parked.run_id.clone();
+    let original = request.store.load_meta(request.session_id)?.meta.historian;
     let release = |detail: String| -> Result<(), HistorianDriveError> {
         abandon_current_state_with_detail(
             request.store,
             request.session_id,
             request.failure_backoff_at_ms,
-            Some(detail),
+            Some(detail.clone()),
         )?;
         let _ = request.store.finish_historian_pending_run(&run_id);
+        record_failed_run(
+            request.store,
+            request.session_id,
+            request.harness,
+            original.fired_at_ms.unwrap_or(request.now_ms),
+            (
+                original.chunk_range.as_ref().map(|r| r.from_ordinal),
+                original.chunk_range.as_ref().map(|r| r.to_ordinal),
+            ),
+            (request.completion_now_ms)(),
+            &detail,
+        );
         Ok(())
     };
 
@@ -2820,6 +3047,20 @@ pub fn adopt_historian_run_on_host(
     // carried has been spent either way, and leaving it would offer the same
     // rejected document to the next pass forever.
     let _ = request.store.finish_historian_pending_run(&run_id);
+    if let Err(error) = &publish_result {
+        record_failed_run(
+            request.store,
+            request.session_id,
+            request.harness,
+            original.fired_at_ms.unwrap_or(request.now_ms),
+            (
+                original.chunk_range.as_ref().map(|r| r.from_ordinal),
+                original.chunk_range.as_ref().map(|r| r.to_ordinal),
+            ),
+            (request.completion_now_ms)(),
+            error,
+        );
+    }
     let row_version = publish_result?;
     Ok(HostRunAdoption::Published(Box::new(HistorianRunSuccess {
         row_version,
@@ -2866,6 +3107,56 @@ pub fn reoffer_parked_historian_run(store: &McStore, run_id: &str, now_ms: i64) 
 }
 
 pub async fn reattach_historian_producer<P>(
+    producer: &mut P,
+    request: HistorianReattachRequest<'_>,
+) -> Result<HistorianReattachOutcome, HistorianDriveError>
+where
+    P: HistorianProducerDriver + ?Sized,
+{
+    let original = request.store.load_meta(request.session_id)?.meta.historian;
+    let (store, session_id, harness, now, completed_at) = (
+        request.store,
+        request.session_id,
+        request.harness,
+        request.now_ms,
+        request.completion_now_ms,
+    );
+    let result = drive_reattached_historian(producer, request).await;
+    if let Err(error) = &result {
+        if let HistorianDriveError::Producer(producer_error) = error {
+            let model = original
+                .recent_decisions
+                .last()
+                .and_then(|d| d.producer_model.as_deref());
+            store.record_missing_historian_invocation(
+                session_id,
+                harness,
+                &producer_invocation(
+                    model,
+                    original.fired_at_ms.unwrap_or(now),
+                    completed_at(),
+                    None,
+                    Some(producer_error),
+                ),
+            );
+        }
+        record_failed_run(
+            store,
+            session_id,
+            harness,
+            original.fired_at_ms.unwrap_or(now),
+            (
+                original.chunk_range.as_ref().map(|r| r.from_ordinal),
+                original.chunk_range.as_ref().map(|r| r.to_ordinal),
+            ),
+            completed_at(),
+            error,
+        );
+    }
+    result
+}
+
+async fn drive_reattached_historian<P>(
     producer: &mut P,
     request: HistorianReattachRequest<'_>,
 ) -> Result<HistorianReattachOutcome, HistorianDriveError>
@@ -2930,6 +3221,18 @@ where
         .await
     {
         Ok(output) => output,
+        Err(err) if err.is_expired() => {
+            // Retention expiry means the old transcript is unavailable. Allow a new
+            // attempt instead of recording the read as a model failure.
+            let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+                request.now_ms,
+                request.failure_backoff_at_ms,
+                (request.completion_now_ms)(),
+            );
+            abandon_current_state(request.store, request.session_id, failure_backoff_at_ms)?;
+            producer.close().await;
+            return Ok(HistorianReattachOutcome::RefireEligible { firing_seq });
+        }
         Err(err) => {
             let _ = producer.cancel(&producer_run_id).await;
             let detail_prefix = match err
@@ -3066,6 +3369,25 @@ fn publish_output_from_awaiting(
         tokens = %tokens,
         "historian response received"
     );
+    let model = if awaiting.coordinator_token.is_some() {
+        None
+    } else {
+        awaiting
+            .recent_decisions
+            .last()
+            .and_then(|decision| decision.producer_model.as_deref())
+    };
+    store.record_missing_historian_invocation(
+        session_id,
+        harness,
+        &producer_invocation(
+            model,
+            awaiting.fired_at_ms.unwrap_or(created_at_ms),
+            completion_now_ms(),
+            Some(&output),
+            None,
+        ),
+    );
     let validating = output_received(&awaiting, &output.text)?;
     persist_historian_state(store, session_id, validating.clone())?;
 
@@ -3138,6 +3460,52 @@ fn publish_output_from_awaiting(
             publication_fence,
         },
     )?;
+    let importance: Vec<i64> = validated
+        .compartments
+        .iter()
+        .map(|c| c.importance.unwrap_or(50).min(i64::MAX as u64) as i64)
+        .collect();
+    let mut categories = serde_json::Map::new();
+    for fact in &validated.facts {
+        let count = categories
+            .entry(fact.category.clone())
+            .or_insert(serde_json::json!(0));
+        *count = serde_json::json!(count.as_u64().unwrap_or(0) + 1);
+    }
+    store.record_historian_run(
+        session_id,
+        harness,
+        &mc_store::HistorianRunTelemetry {
+            started_at: awaiting.fired_at_ms.unwrap_or(created_at_ms),
+            run_kind: "incremental".into(),
+            status: if validated.compartments.is_empty() {
+                "noop"
+            } else {
+                "success"
+            }
+            .into(),
+            chunk_start_ordinal: awaiting
+                .chunk_range
+                .as_ref()
+                .map(|range| range.from_ordinal),
+            chunk_end_ordinal: awaiting.chunk_range.as_ref().map(|range| range.to_ordinal),
+            unprocessed_from: Some(validated.unprocessed_from),
+            compartments_produced: validated.compartments.len(),
+            facts_emitted: validated.facts.len(),
+            facts_by_category: serde_json::Value::Object(categories),
+            facts_promoted: published.promoted_refs.len(),
+            events_emitted: validated.events.len(),
+            events_created_at: created_at_ms,
+            importance_min: importance.iter().min().copied(),
+            importance_max: importance.iter().max().copied(),
+            importance_avg: (!importance.is_empty()).then(|| {
+                importance.iter().map(|n| *n as f64).sum::<f64>() / importance.len() as f64
+            }),
+            discarded_last: validated.discarded_last,
+            created_at: completion_now_ms(),
+            ..Default::default()
+        },
+    );
     Ok(published.row_version)
 }
 
@@ -3227,6 +3595,10 @@ fn abandon_matching_run_with_detail(
 }
 
 #[cfg(test)]
+#[path = "../../../packages/dashboard/src-tauri/src/historian_telemetry.rs"]
+mod dashboard_reader;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
@@ -3237,6 +3609,224 @@ mod tests {
 
     use crate::ck_wire::{self, CkIngressMessage, CkWireMessage};
     use crate::transform::{transform, ProducerContext, TransformRequest};
+
+    #[tokio::test]
+    async fn rust_historian_dashboard_shape_and_status_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/broken".into(), "other/good".into()];
+        let mut output = producer_output(historian_xml("accounted output").replace("</compartments>",
+            "</compartments><facts><ARCHITECTURE>* [at_compartment=1] Account historian calls.</ARCHITECTURE></facts>\
+             <events><causal_incident at_compartment=\"1\"><summary>accounted event</summary></causal_incident></events>"));
+        output.usage = Some(crate::historian_producer::ProducerUsage {
+            input: 120,
+            output: 40,
+            cache_read: 80,
+            cache_write: 10,
+        });
+        let mut producer = ScriptedProducer::default()
+            .with_start(Err(HistorianProducerError::retryable_model_failure(
+                "provider unavailable",
+            )))
+            .with_start(Ok(run_handle("accounted-run")))
+            .with_output(Ok(output));
+        let mut request = fire_request(&store, "prompt", &models, &chunk, &prior);
+        request.harness = "opencode2";
+        assert!(matches!(
+            run_historian_firing(&mut producer, request).await.unwrap(),
+            HistorianDriveOutcome::Completed(_)
+        ));
+        let conn = rusqlite::Connection::open(dir.path().join("context.db")).unwrap();
+        let rows = dashboard_reader::get_subagent_invocations(&conn, "ses").unwrap();
+        assert_eq!(rows.len(), 2, "dashboard must see both model attempts");
+        let primary = rows
+            .iter()
+            .find(|row| row.model_id.as_deref() == Some("broken"))
+            .unwrap();
+        let fallback = rows
+            .iter()
+            .find(|row| row.model_id.as_deref() == Some("good"))
+            .unwrap();
+        assert_eq!(primary.status, "failed");
+        assert!(primary
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("provider unavailable"));
+        assert_eq!(fallback.parent_invocation_id, Some(primary.id));
+        assert_eq!(fallback.task.as_deref(), Some("fallback"));
+        assert_eq!(fallback.harness, "opencode2");
+        assert_eq!(fallback.provider_id.as_deref(), Some("other"));
+        assert_eq!(fallback.status, "completed");
+        assert_eq!(
+            (
+                fallback.input_tokens,
+                fallback.output_tokens,
+                fallback.cache_read_tokens,
+                fallback.cache_write_tokens
+            ),
+            (120, 40, 80, 10)
+        );
+        assert_eq!(dashboard_reader::count_historian_runs(&conn, "ses"), 1);
+        assert_eq!(
+            dashboard_reader::count_historian_runs(&conn, "another-session"),
+            0
+        );
+        let run: (i64, String, String, i64, i64, i64, i64, i64, f64) = conn.query_row(
+            "SELECT subagent_invocation_id,run_kind,status,chunk_start_ordinal,chunk_end_ordinal,
+             compartments_produced,importance_min,importance_max,importance_avg FROM historian_runs WHERE session_id='ses'",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)),
+        ).unwrap();
+        assert_eq!(
+            run,
+            (
+                fallback.id,
+                "incremental".into(),
+                "success".into(),
+                2,
+                4,
+                1,
+                60,
+                60,
+                60.0
+            )
+        );
+        let (min, max): (i64, i64) = conn
+            .query_row(
+                "SELECT compartment_id_min,compartment_id_max FROM historian_runs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(min, max);
+        let (facts, events, categories): (i64, i64, String) = conn
+            .query_row(
+                "SELECT facts_emitted,events_emitted,facts_by_category_json FROM historian_runs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((facts, events), (1, 1));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&categories).unwrap(),
+            serde_json::json!({"ARCHITECTURE": 1,"facts_promoted": 1,"events_published": 1})
+        );
+        // Export Rust-written rows for rust-historian-telemetry.test.ts, which exercises
+        // the run-count reader used by the session status command (/ctx-status).
+        if let Ok(path) = std::env::var("MC_HISTORIAN_TEST_DB") {
+            conn.execute("VACUUM INTO ?1", [path]).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rust_historian_records_timeout_empty_and_validation_refusal() {
+        for (name, output, status) in [
+            (
+                "timeout",
+                Err(HistorianProducerError::TimedOut),
+                "timed_out",
+            ),
+            ("empty", Ok(producer_output(String::new())), "empty"),
+            (
+                "validation",
+                Ok(producer_output("not a historian document".into())),
+                "completed",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            seed_prior_compartment(&store);
+            let chunk = historian_chunk();
+            let prior = prior_ranges();
+            let models = vec!["prov/model".into()];
+            let mut producer = ScriptedProducer::default()
+                .with_start(Ok(run_handle(name)))
+                .with_output(output)
+                .with_output(Err(HistorianProducerError::UnexpectedStreamEnd));
+            assert!(run_historian_firing(
+                &mut producer,
+                fire_request(&store, "prompt", &models, &chunk, &prior)
+            )
+            .await
+            .is_err());
+            let conn = rusqlite::Connection::open(dir.path().join("context.db")).unwrap();
+            let rows = dashboard_reader::get_subagent_invocations(&conn, "ses").unwrap();
+            assert_eq!(rows.len(), 1, "{name}");
+            assert_eq!(rows[0].status, status, "{name}");
+            let (id, run_status, reason): (i64, String, String) = conn
+                .query_row(
+                    "SELECT subagent_invocation_id,status,failure_reason FROM historian_runs",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(id, rows[0].id);
+            assert_eq!(run_status, "failed");
+            assert!(!reason.is_empty());
+            assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn rust_historian_publication_survives_missing_telemetry_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let conn = rusqlite::Connection::open(dir.path().join("context.db")).unwrap();
+        conn.execute_batch("DROP TABLE subagent_invocations; DROP TABLE historian_runs;")
+            .unwrap();
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model".into()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run")))
+            .with_output(Ok(producer_output(historian_xml(
+                "published despite accounting failure",
+            ))));
+        assert!(matches!(
+            run_historian_firing(
+                &mut producer,
+                fire_request(&store, "prompt", &models, &chunk, &prior)
+            )
+            .await
+            .unwrap(),
+            HistorianDriveOutcome::Completed(_)
+        ));
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rust_historian_default_importance_matches_persisted_compartments() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model".into()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run")))
+            .with_output(Ok(producer_output(
+                historian_xml("default importance").replace(" importance=\"60\"", ""),
+            )));
+        run_historian_firing(
+            &mut producer,
+            fire_request(&store, "prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("context.db")).unwrap();
+        let (min, max, avg, legacy): (i64, i64, f64, i64) = conn
+            .query_row(
+                "SELECT importance_min,importance_max,importance_avg,legacy FROM historian_runs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((min, max, avg, legacy), (50, 50, 50.0, 0));
+    }
 
     fn store(dir: &std::path::Path) -> McStore {
         McStore::open_for_test(&StorageDescriptor {
@@ -3275,6 +3865,8 @@ mod tests {
 
     fn req(messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
+            raw_replay_rebuild: None,
+            served_raw_block_ids: Vec::new(),
             cache_ttl: None,
             effective_execute_threshold: None,
             auto_search_enabled: true,
@@ -5516,6 +6108,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reattach_expired_transcript_refires_without_failure_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            CompartmentSetGeneration::default(),
+            1,
+            None,
+        )
+        .unwrap()
+        {
+            FireOutcome::Fired(state) => state,
+            FireOutcome::Busy(_) => unreachable!(),
+        };
+        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        store
+            .commit(
+                "ses",
+                None,
+                &CoreState::default(),
+                &test_meta_with_historian(awaiting),
+            )
+            .unwrap();
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let expired = HistorianProducerError::Subc(ProducerErrorBody::untagged(
+            "expired",
+            "session transcript has expired",
+        ));
+        let mut producer = ScriptedProducer::default()
+            .with_status(Ok(RunState::Terminal))
+            .with_output(Err(expired));
+
+        let outcome =
+            reattach_historian_producer(&mut producer, reattach_request(&store, &chunk, &prior))
+                .await
+                .unwrap();
+        assert_eq!(
+            outcome,
+            HistorianReattachOutcome::RefireEligible { firing_seq: 1 }
+        );
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert_eq!(state.failure_backoff_at_ms, Some(999));
+        assert_eq!(state.last_failure, None);
+        assert_eq!(producer.closes, 1);
+        assert!(producer.cancels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reattach_expired_status_refires_without_failure_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            CompartmentSetGeneration::default(),
+            1,
+            None,
+        )
+        .unwrap()
+        {
+            FireOutcome::Fired(state) => state,
+            FireOutcome::Busy(_) => unreachable!(),
+        };
+        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        store
+            .commit(
+                "ses",
+                None,
+                &CoreState::default(),
+                &test_meta_with_historian(awaiting),
+            )
+            .unwrap();
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let expired = HistorianProducerError::Subc(ProducerErrorBody::untagged(
+            "expired",
+            "session transcript has expired",
+        ));
+        let mut producer = ScriptedProducer::default().with_status(Err(expired));
+
+        let outcome =
+            reattach_historian_producer(&mut producer, reattach_request(&store, &chunk, &prior))
+                .await
+                .unwrap();
+        assert_eq!(
+            outcome,
+            HistorianReattachOutcome::RefireEligible { firing_seq: 1 }
+        );
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert_eq!(state.failure_backoff_at_ms, Some(999));
+        assert_eq!(state.last_failure, None);
+        assert_eq!(producer.closes, 1);
+        assert!(producer.await_run_ids.is_empty());
+    }
+
+    #[tokio::test]
     async fn configured_historian_timeout_reaches_producer_await_and_completion_budget() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -7370,9 +8070,23 @@ mod tests {
                 ledger
                     .deliver(
                         &claim.run_id,
-                        crate::historian_host::HostRunReport::Output(producer_output(
-                            output.to_string(),
-                        )),
+                        crate::historian_host::HostRunReport::WithInvocations {
+                            report: Box::new(crate::historian_host::HostRunReport::Output(
+                                producer_output(output.to_string()),
+                            )),
+                            invocations: vec![mc_store::HistorianInvocation {
+                                provider_id: Some("prov".into()),
+                                model_id: Some("model-a".into()),
+                                started_at: 123,
+                                ended_at: 124,
+                                status: "completed".into(),
+                                input_tokens: 120,
+                                output_tokens: 40,
+                                cache_read_tokens: 80,
+                                cache_write_tokens: 10,
+                                error: None,
+                            }],
+                        },
                     )
                     .expect("the firing that queued the run is waiting for this");
                 return claim.attempt;
@@ -7435,6 +8149,20 @@ mod tests {
             .list_pending_historian_runs(FIRE_PROJECT, None, 123)
             .unwrap()
             .is_empty());
+        let conn = rusqlite::Connection::open(host_dir.path().join("context.db")).unwrap();
+        let invocations = dashboard_reader::get_subagent_invocations(&conn, "ses").unwrap();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].input_tokens, 120);
+        assert_eq!(invocations[0].harness, "opencode");
+        assert_eq!(dashboard_reader::count_historian_runs(&conn, "ses"), 1);
+        let linked: i64 = conn
+            .query_row(
+                "SELECT subagent_invocation_id FROM historian_runs",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked, invocations[0].id);
     }
 
     #[tokio::test(flavor = "current_thread")]

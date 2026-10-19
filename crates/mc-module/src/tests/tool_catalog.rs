@@ -1,10 +1,11 @@
-//! `tool.catalog` and `role.describe` against the design's pinned payloads.
+//! `tool.catalog` and `role.describe` against pinned payloads.
 //!
-//! `docs/designs/mc-tool-catalog-v1/` holds the exact bytes the module must serve
-//! for each example request under the example config, and
+//! `src/tests/fixtures/tool-catalog/` holds the exact bytes the module must serve
+//! for each example request under `config.json` (prompt surface, tool enablement,
+//! and guidance feature flags), and
 //! `testdata/tool-catalog-guidance-matrix.json` the digest of every guidance text
-//! for every combination of config inputs. Both are written by the design's
-//! generator from the same shared definition the module serves from, so these
+//! for every combination of config inputs. Both are written by
+//! `gen/gen-tool-catalog.ts` from the same shared definition the module serves from, so these
 //! tests hold the generator's TypeScript renderer and this module's Rust one to
 //! the same bytes.
 
@@ -17,7 +18,7 @@ use super::*;
 use crate::tool_catalog::{self, CatalogConfig, CatalogError, Surface, TextFlags};
 
 fn examples_dir() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/designs/mc-tool-catalog-v1")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tests/fixtures/tool-catalog")
 }
 
 /// The example config, as `config.json` records it.
@@ -37,6 +38,7 @@ fn example_catalog_config() -> CatalogConfig {
         other => panic!("not a surface: {other:?}"),
     };
     CatalogConfig {
+        smart_notes_enabled: true,
         compaction_enabled: config["compaction_enabled"].as_bool().unwrap(),
         memory_enabled: config["memory_enabled"].as_bool().unwrap(),
         dreamer_runnable: config["dreamer_runnable"].as_bool().unwrap(),
@@ -106,7 +108,7 @@ fn examples() -> Vec<(String, Value, Vec<u8>)> {
 fn every_example_request_gets_exactly_the_pinned_answer_bytes() {
     let config = example_catalog_config();
     let examples = examples();
-    assert_eq!(examples.len(), 11, "the design pins eleven examples");
+    assert_eq!(examples.len(), 11, "the fixture pins eleven examples");
     for (name, request, expected) in examples {
         let actual = tool_catalog::catalog_answer_bytes(&request, &config)
             .unwrap_or_else(|error| panic!("{name}: {error:?}"));
@@ -117,6 +119,38 @@ fn every_example_request_gets_exactly_the_pinned_answer_bytes() {
             String::from_utf8_lossy(&expected)
         );
     }
+}
+
+#[test]
+fn disabled_smart_notes_catalog_has_no_authoring_or_guidance_on_either_surface() {
+    let mut config = example_catalog_config();
+    config.smart_notes_enabled = false;
+    for surface in ["full", "light"] {
+        for compacting in [false, true] {
+            let answer =
+                tool_catalog::catalog_answer(&role_request("head", compacting, surface), &config)
+                    .unwrap();
+            let note = answer["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == "ctx_note")
+                .unwrap();
+            assert!(note["input_schema"]["properties"]
+                .get("surface_condition")
+                .is_none());
+            let text = format!("{} {}", note, answer["system_text"]["text"]);
+            assert!(!text.contains("surface_condition"), "{text}");
+            assert!(!text.contains("smart note"), "{text}");
+            assert!(!text.contains("outside checker"), "{text}");
+        }
+    }
+    config.guidance_override = Some("Custom guidance\n### Smart notes\n#### Verification\nUse an external condition to park work.\n### Ordinary notes\nKeep intentions in ctx_note.".to_string());
+    let answer =
+        tool_catalog::catalog_answer(&role_request("head", true, "full"), &config).unwrap();
+    let text = answer["system_text"]["text"].as_str().unwrap();
+    assert!(!text.contains("external condition"));
+    assert!(text.contains("Keep intentions in ctx_note"));
 }
 
 #[test]

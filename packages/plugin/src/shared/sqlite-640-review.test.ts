@@ -2,9 +2,10 @@ import { expect, spyOn, test } from "bun:test";
 import { openDatabase } from "../features/magic-context/storage-db";
 import { getOrCreateSessionMeta, updateSessionMeta } from "../features/magic-context/storage-meta";
 import { recordToolDefinition } from "../features/magic-context/tool-definition-tokens";
+import { saveLkgSlotToDb } from "../hooks/magic-context/lkg-persist";
 import { captureLkgSlot } from "../hooks/magic-context/lkg-replay";
 import { lkgReplayFits } from "../hooks/magic-context/lkg-replay-fit";
-import { resetLkgSlotsForTest } from "../hooks/magic-context/lkg-slot";
+import { getSlot, resetLkgSlotsForTest } from "../hooks/magic-context/lkg-slot";
 import type { MessageLike } from "../hooks/magic-context/transform-operations";
 import { createMessagesTransformHandler } from "../plugin/messages-transform";
 import { refreshModelLimitsFromApi } from "./models-dev-cache";
@@ -141,6 +142,9 @@ test("review: OpenCode tries a valid saved request before backed-off writer retr
             providerKey: "openai",
         }),
     ).toBe(true);
+    expect(saveLkgSlotToDb(db, sessionId, getSlot(sessionId)!, undefined, { rebuild: true })).toBe(
+        true,
+    );
     expect(
         lkgReplayFits({
             db,

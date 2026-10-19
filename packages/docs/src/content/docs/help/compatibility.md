@@ -61,6 +61,23 @@ OMO is broadly compatible with Magic Context — most of its features work fine 
 
 **Resolution:** Setup offers to disable these three hooks. Doctor detects them and offers the same fix. All other OMO hooks and features are unaffected.
 
+## Settings that can block turns
+
+These settings don't make Magic Context disable itself, but they can stop turns from going through. `doctor --harness omp` warns when it finds one in your OMP settings files.
+
+### OMP Hide Secrets
+
+**Key:** `secrets.enabled` in OMP's `config.yml` (shown as **Hide Secrets** in OMP's settings; off by default)
+
+**What happens:** With Hide Secrets on, OMP replaces secrets in message text after Magic Context has prepared the request. The request then no longer matches what Magic Context checked, so Magic Context refuses to send it and shows "Magic Context could not safely prepare this turn; send your message again." Sending again usually hits the same refusal, because OMP masks the same text the same way. This happens when:
+
+- **A reply from the agent contains a secret** and your model uses OpenAI's Responses API (OMP API types `openai-responses`, `azure-openai-responses` and `openai-codex-responses`). Every turn in that session is refused after you restart OMP.
+- **A tool result contains a secret** and the tool call that produced it is no longer in the conversation. Most providers are affected.
+
+Secrets in your own messages, and in tool results whose tool call is still in the conversation, don't cause refusals.
+
+**Workaround:** Turn Hide Secrets off for sessions that Magic Context manages. If a session is already stuck, start a new session.
+
 ## What "Magic Context disabled itself" looks like
 
 When a conflict is active:

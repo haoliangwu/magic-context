@@ -1,6 +1,6 @@
 # Stored-compartment rescoring trial
 
-Investigative harness only: no production renderer, model configuration, migration or compartment writes. Findings live in `docs/reports/compartment-rescore-trial.md`; shipping proposal in `docs/designs/compartment-rescore.md`. Bun 1.4.2 and installed repository dependencies are required.
+Investigative harness only: no production renderer, model configuration, migration or compartment writes. Bun 1.4.2 and installed repository dependencies are required.
 
 ## Isolation and inputs
 

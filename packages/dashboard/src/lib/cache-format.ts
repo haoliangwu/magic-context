@@ -117,18 +117,95 @@ const CACHE_CAUSE_LABELS: Record<string, string> = {
   mc_transform_missing: "No attribution recorded",
 };
 
+/**
+ * Causes the backend names for a cache loss on the provider's side, on a
+ * request whose prompt Magic Context recorded no change to. The idle label
+ * carries the idle time ("Cache expired after 11 min idle"), so it is matched
+ * by its prefix.
+ */
+export const PROVIDER_CACHE_MISS_CAUSE =
+  "Provider cache miss (no change recorded by Magic Context)";
+export const IDLE_EXPIRY_CAUSE_PREFIX = "Cache expired after ";
+
+function isProviderSideCause(cause: string): boolean {
+  return cause === PROVIDER_CACHE_MISS_CAUSE || cause.startsWith(IDLE_EXPIRY_CAUSE_PREFIX);
+}
+
 export function cacheCauseLabel(cause: string): string {
   return CACHE_CAUSE_LABELS[cause] ?? cause;
 }
 
+/** The cause line, worded the same in the Turns table and the timeline tooltip. */
+export function cacheCauseText(cause: string): string {
+  return `Cause: ${cacheCauseLabel(cause)}`;
+}
+
+export const UNMANAGED_DROP_TITLE = "Prompt tokens dropped";
+export const UNMANAGED_DROP_DETAIL = "Magic Context does not manage this session.";
+export const DROP_REQUEST_NOT_SMALLER =
+  "The request did not get smaller; the provider counted fewer tokens.";
+export const DROP_REQUEST_SMALLER = "The request got smaller.";
+
+type DropFields = Pick<DbCacheEvent, "cause" | "context_reduced_by_mc" | "drop_request_size">;
+
+/**
+ * The explanation for a drop in a session Magic Context does not manage. It
+ * says what the request size shows only when the source recorded the size of
+ * both requests, and otherwise claims no cause.
+ */
+function unmanagedDropDetail(event: DropFields): string {
+  if (event.drop_request_size === "not_smaller") {
+    return `${UNMANAGED_DROP_DETAIL} ${DROP_REQUEST_NOT_SMALLER}`;
+  }
+  if (event.drop_request_size === "smaller") {
+    return `${UNMANAGED_DROP_DETAIL} ${DROP_REQUEST_SMALLER}`;
+  }
+  return UNMANAGED_DROP_DETAIL;
+}
+
+/**
+ * Title and explanation for a step whose prompt shrank (`is_drop`). Only a
+ * session whose context Magic Context manages is credited with the reclaim;
+ * in any other session the drop is reported without a Magic Context cause.
+ */
+export function cacheDropText(event: DropFields): { title: string; detail: string } {
+  if (!event.context_reduced_by_mc) {
+    return { title: UNMANAGED_DROP_TITLE, detail: unmanagedDropDetail(event) };
+  }
+  return {
+    title: "Magic Context reclaimed context",
+    detail: event.cause ? cacheCauseText(event.cause) : "Cause not recorded",
+  };
+}
+
+/** The drop line in a timeline bar's tooltip, worded like the drop marker. */
+export function cacheDropLine(event: DropFields): string {
+  if (!event.context_reduced_by_mc) {
+    return `⬇ ${UNMANAGED_DROP_TITLE} — ${unmanagedDropDetail(event)}`;
+  }
+  return `⬇ MC reclaimed context${event.cause ? ` — ${cacheCauseLabel(event.cause)}` : ""}`;
+}
+
+/**
+ * CSS color variable name for a cause line. A provider-side loss is set in the
+ * secondary text color so it reads as context, not as something Magic Context did.
+ */
 export function cacheCauseColor(cause: string): string {
-  return cause === "mc_transform_failed_open" ? "red" : "amber";
+  if (cause === "mc_transform_failed_open") return "red";
+  return isProviderSideCause(cause) ? "text-secondary" : "amber";
 }
 
 export function cacheCauseTooltip(cause: string): string | undefined {
-  return cause === "mc_transform_failed_open"
-    ? "Magic Context recorded a transform error and returned the original messages for this pass."
-    : undefined;
+  if (cause === "mc_transform_failed_open") {
+    return "Magic Context recorded a transform error and returned the original messages for this pass.";
+  }
+  if (cause === PROVIDER_CACHE_MISS_CAUSE) {
+    return "The previous request read the cache moments earlier, within its lifetime. This request's prompt did not shrink and Magic Context recorded no change to it, yet the provider did not reuse its cache.";
+  }
+  if (cause.startsWith(IDLE_EXPIRY_CAUSE_PREFIX)) {
+    return "The time since the previous request is longer than the cache lifetime, so the provider dropped the cache. Magic Context recorded no change to this request's prompt.";
+  }
+  return undefined;
 }
 
 // Collapse ESTIMATED (max-prompt fallback) context limits to a single stable

@@ -116,6 +116,8 @@ pub struct McModuleConfig {
     /// Whether compaction is enabled, as resolved during host startup. This determines which
     /// component controls context-window compaction for the request.
     pub compaction_enabled: bool,
+    /// Enable smart-note authoring for the user; frozen when the process first resolves config.
+    pub smart_notes_enabled: bool,
     pub memory_enabled: bool,
     /// Independent transform-time hint controls from `memory.auto_search`.
     pub auto_search: AutoSearchConfig,
@@ -124,8 +126,12 @@ pub struct McModuleConfig {
     /// Mirrors the TS auto-promote switch. Facts are dropped when this is false.
     pub auto_promote: bool,
     /// Privacy gate controlling whether historian user observations may be collected for later
-    /// review and promotion.
+    /// review and promotion. False whenever `dreamer.disable` is true, because the dreamer runs
+    /// the review that would read them.
     pub user_memory_collection_enabled: bool,
+    /// Whether the historian prompt asks for `<user_observations>` at all: false when the
+    /// dreamer is not runnable (the plugin's `userObservationsRequested`).
+    pub user_observations_requested: bool,
     /// Historian model context limit; configurable until the module has a model catalog.
     pub historian_context_limit_tokens: usize,
     /// True only when the user supplied a known historian model window.
@@ -186,11 +192,13 @@ impl Default for McModuleConfig {
             protected_tokens_project: None,
             keep_reasoning_tokens: None,
             compaction_enabled: true,
+            smart_notes_enabled: true,
             memory_enabled: true,
             auto_search: AutoSearchConfig::default(),
             caveman: CavemanConfig::default(),
             auto_promote: true,
             user_memory_collection_enabled: false,
+            user_observations_requested: true,
             historian_context_limit_tokens: DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS,
             historian_context_limit_known: false,
             memory_budget_tokens: DEFAULT_MEMORY_BUDGET_TOKENS,
@@ -390,12 +398,16 @@ struct TierConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct ConfigCache {
+    startup_smart_notes_enabled: Option<bool>,
     user: TierConfig,
     project: TierConfig,
     effective: McModuleConfig,
 }
 
 impl ConfigCache {
+    pub fn freeze_smart_notes_enabled(&mut self, enabled: bool) {
+        self.startup_smart_notes_enabled = Some(enabled);
+    }
     pub fn effective_for_project(&mut self, project_root: &Path) -> McModuleConfig {
         let user_path = user_config_path();
         self.effective_for_paths(&user_path, project_root)
@@ -407,6 +419,9 @@ impl ConfigCache {
         let project = read_tier_cached(&mut self.project, project_path);
         let (mut effective, mut warnings) =
             merge_tiers_with_warnings(user.as_ref(), project.as_ref());
+        effective.smart_notes_enabled = *self
+            .startup_smart_notes_enabled
+            .get_or_insert(effective.smart_notes_enabled);
         resolve_user_guidance_override(&mut effective, user.as_ref(), user_path, &mut warnings);
         emit_warnings(warnings);
         self.effective = effective;
@@ -455,6 +470,18 @@ pub struct ConfiguredRunners {
 /// host runner. The optional provider runner route is declared independently.
 pub fn user_configured_runners() -> ConfiguredRunners {
     user_configured_runners_at(&user_config_path())
+}
+
+pub fn user_smart_notes_enabled() -> bool {
+    fs::read_to_string(user_config_path())
+        .ok()
+        .and_then(|raw| parse_config_text(&raw).ok())
+        .and_then(|config| {
+            config
+                .pointer("/smart_notes/enabled")
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(true)
 }
 
 /// [`user_configured_runners`] against an explicit user config file.
@@ -704,6 +731,8 @@ fn merge_tiers_with_warnings(
 ) -> (McModuleConfig, Vec<String>) {
     let mut cfg = McModuleConfig::default();
     let mut warnings = Vec::new();
+    // What the tiers say about the review-user-memories schedule; None if neither does.
+    let mut review_schedule_enabled: Option<bool> = None;
     for (tier, value) in [("user", user), ("project", project)] {
         let Some(value) = value else {
             continue;
@@ -798,7 +827,7 @@ fn merge_tiers_with_warnings(
             cfg.auto_promote = enabled;
         }
         if let Some(enabled) = user_memory_collection_at(user) {
-            cfg.user_memory_collection_enabled = enabled;
+            review_schedule_enabled = Some(enabled);
         }
         if let Some(limit) = positive_usize_at(user, "/historian/context_limit_tokens") {
             cfg.historian_context_limit_tokens = limit;
@@ -855,7 +884,7 @@ fn merge_tiers_with_warnings(
             cfg.auto_promote = enabled;
         }
         if let Some(enabled) = user_memory_collection_at(project) {
-            cfg.user_memory_collection_enabled = enabled;
+            review_schedule_enabled = Some(enabled);
         }
         warn_ignored_project_key(project, "/memory/budget_tokens", &mut warnings);
         warn_ignored_project_key(project, "/memory/user_profile_budget_tokens", &mut warnings);
@@ -897,6 +926,22 @@ fn merge_tiers_with_warnings(
     }
 
     apply_catalog_config(&mut cfg.catalog, user, project);
+    // Mirrors the plugin's userObservationCollectionEnabled: the review schedule
+    // (the last tier that says anything wins; with neither, the plugin schema's
+    // default "0 3 * * *" applies, so collection is on) AND a runnable dreamer,
+    // because the dreamer runs review-user-memories and nothing else reads the
+    // observations. The historian prompt asks for them only while the dreamer
+    // is runnable, matching the plugin's userObservationsRequested.
+    cfg.user_memory_collection_enabled =
+        cfg.catalog.dreamer_runnable && review_schedule_enabled.unwrap_or(true);
+    cfg.user_observations_requested = cfg.catalog.dreamer_runnable;
+    cfg.smart_notes_enabled = user
+        .and_then(|value| value.pointer("/smart_notes/enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if let Some(project) = project {
+        warn_ignored_project_key(project, "/smart_notes/enabled", &mut warnings);
+    }
     for tier in [user, project].into_iter().flatten() {
         if let Some(entries) = tier
             .pointer("/historian/expand_tools")
@@ -976,13 +1021,17 @@ fn apply_catalog_config(
         .into_iter()
         .flatten()
         .any(|tier| tier.pointer("/dreamer").is_some_and(Value::is_object));
-    // The project tier's `disable` takes precedence over the user tier's.
-    let disabled = [project, user]
+    catalog.dreamer_runnable = configured && !dreamer_disabled(user, project);
+}
+
+/// `dreamer.disable` across both tiers; the project tier's value takes
+/// precedence over the user tier's.
+fn dreamer_disabled(user: Option<&Value>, project: Option<&Value>) -> bool {
+    [project, user]
         .into_iter()
         .flatten()
         .find_map(|tier| tier.pointer("/dreamer/disable").and_then(Value::as_bool))
-        .unwrap_or(false);
-    catalog.dreamer_runnable = configured && !disabled;
+        .unwrap_or(false)
 }
 
 fn warn_ignored_project_key(value: &Value, pointer: &str, warnings: &mut Vec<String>) {
@@ -1355,6 +1404,38 @@ mod cache_ttl_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn smart_notes_enabled_is_user_only_and_frozen_after_initial_resolution() {
+        let user = serde_json::json!({"smart_notes": {"enabled": false}});
+        let project = serde_json::json!({"smart_notes": {"enabled": true}});
+        let (config, warnings) = super::merge_tiers_with_warnings(Some(&user), Some(&project));
+        assert!(!config.smart_notes_enabled);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("/smart_notes/enabled")));
+        assert!(super::McModuleConfig::default().smart_notes_enabled);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.jsonc");
+        std::fs::write(&path, user.to_string()).unwrap();
+        let mut cache = super::ConfigCache::default();
+        assert!(
+            !cache
+                .effective_for_paths(&path, dir.path())
+                .smart_notes_enabled
+        );
+        std::fs::write(&path, project.to_string()).unwrap();
+        cache.user.mtime = None;
+        assert!(
+            !cache
+                .effective_for_paths(&path, dir.path())
+                .smart_notes_enabled
+        );
+        assert!(
+            super::ConfigCache::default()
+                .effective_for_paths(&path, dir.path())
+                .smart_notes_enabled
+        );
+    }
 
     use super::*;
 
@@ -2020,6 +2101,60 @@ mod tests {
             "user_memories": { "enabled": false }
         });
         assert!(!user_memory_collection_at(&legacy_disabled).unwrap());
+    }
+
+    #[test]
+    fn user_memory_collection_matches_the_plugin_for_unset_empty_and_set_schedules() {
+        let raw = include_str!("../testdata/user-memory-collection-parity.json");
+        let parity: Value = serde_json::from_str(raw).expect("parse collection parity cases");
+        let cases = parity["cases"].as_array().expect("cases array");
+        assert_eq!(cases.len(), 7);
+        for case in cases {
+            let label = case["label"].as_str().unwrap_or("?");
+            let cfg = merge_tiers(Some(&case["user"]), None);
+            assert_eq!(
+                cfg.user_memory_collection_enabled,
+                case["collect"].as_bool().unwrap(),
+                "collection for '{label}'"
+            );
+            assert_eq!(
+                cfg.user_observations_requested,
+                case["requested"].as_bool().unwrap(),
+                "request for '{label}'"
+            );
+        }
+    }
+
+    #[test]
+    fn dreamer_disable_stops_user_observation_collection_and_request() {
+        let scheduled = serde_json::json!({
+            "dreamer": { "tasks": { "review-user-memories": { "schedule": "0 3 * * *" } } }
+        });
+        let enabled = merge_tiers(Some(&scheduled), None);
+        assert!(enabled.user_memory_collection_enabled);
+        assert!(enabled.user_observations_requested);
+
+        // A project-tier disable wins over the user tier's schedule.
+        let project_off = serde_json::json!({ "dreamer": { "disable": true } });
+        let disabled = merge_tiers(Some(&scheduled), Some(&project_off));
+        assert!(!disabled.user_memory_collection_enabled);
+        assert!(!disabled.user_observations_requested);
+
+        // ...and a project-tier `disable: false` wins over a user-tier `true`.
+        let user_off = serde_json::json!({
+            "dreamer": {
+                "disable": true,
+                "tasks": { "review-user-memories": { "schedule": "0 3 * * *" } }
+            }
+        });
+        let project_on = serde_json::json!({ "dreamer": { "disable": false } });
+        let reenabled = merge_tiers(Some(&user_off), Some(&project_on));
+        assert!(reenabled.user_memory_collection_enabled);
+        assert!(reenabled.user_observations_requested);
+
+        // With no dreamer block the dreamer never runs, so nothing is requested.
+        let none = merge_tiers(Some(&serde_json::json!({})), None);
+        assert!(!none.user_observations_requested);
     }
 
     #[test]

@@ -30,6 +30,7 @@ import {
 } from "./index";
 import {
 	assistantMessage,
+	assistantToolCall,
 	createFakePi,
 	createTestDb,
 	fakeContext,
@@ -69,6 +70,7 @@ function setup(
 	cacheTtlConfig:
 		| string
 		| (Record<string, string> & { default: string }) = CACHE_TTL_CONFIG,
+	protectedTokens?: number,
 ) {
 	const logs: string[] = [];
 	spyOn(loggerModule, "sessionLog").mockImplementation(
@@ -84,6 +86,7 @@ function setup(
 		heuristics: {},
 		injection: { injectionBudgetTokens: 10_000 },
 		protectedTags: 1,
+		protectedTokens,
 		scheduler: { executeThresholdPercentage: 65 },
 	});
 	const handler = fake.handlers.get("context") as (
@@ -114,7 +117,11 @@ function setup(
 		});
 	};
 
-	const runPass = async (messages: PiMessage[], percent: number) => {
+	const runPass = async (
+		messages: PiMessage[],
+		percent: number,
+		nextModel = model,
+	) => {
 		await handler({ messages: messages as never[] }, {
 			...fakeContext(
 				sessionId,
@@ -122,7 +129,7 @@ function setup(
 				messages.map((_message, index) => `entry-${index}`),
 				messages,
 			),
-			model: { ...model, contextWindow: 100_000 },
+			model: { ...nextModel, contextWindow: 100_000 },
 			getContextUsage: () => ({
 				tokens: percent * 1_000,
 				percent,
@@ -404,6 +411,233 @@ describe("Pi idle past the cache TTL applies queued drops (issue 545)", () => {
 			);
 			expect(getPendingOps(ctx.db, sessionId)).toHaveLength(1);
 			expect(tagStatus(ctx, sessionId, target)).toBe("active");
+		} finally {
+			ctx.cleanup();
+		}
+	});
+});
+
+describe("Pi/Oh My Pi distance-based age bookmark", () => {
+	afterEach(() => {
+		setSystemTime();
+		mock.restore();
+	});
+
+	it.each([
+		2, 3, 5,
+	])("keeps current-task outputs through %i TTL rebuilds and a model switch", async (rebuilds) => {
+		const sessionId = `ses-pi-distance-${rebuilds}`;
+		const ctx = setup(sessionId, MODEL, "5m", 4000);
+		const messages: PiMessage[] = [userMessage("implement the feature")];
+		for (let index = 0; index < 8; index++) {
+			messages.push(
+				assistantToolCall(
+					`call-${index}`,
+					"bash",
+					{ command: `inspect ${index}` },
+					index * 2 + 2,
+				),
+			);
+			messages.push({
+				...toolResultMessage(
+					`call-${index}`,
+					`result ${index} ${"payload ".repeat(1500)}`,
+					index * 2 + 3,
+				),
+				toolName: "bash",
+			});
+		}
+		try {
+			setSystemTime(new Date(T0 - 5000));
+			await ctx.runPass([...messages], 2);
+			setSystemTime(new Date(T0));
+			await ctx.messageEnd(
+				assistantMessage("done", 100, { ...providerUsage(2000) }),
+			);
+			for (let pass = 1; pass <= rebuilds; pass++) {
+				setSystemTime(new Date(T0 + pass * 6 * MINUTE));
+				await ctx.runPass([...messages], 2);
+				expect(
+					getTagsBySession(ctx.db, sessionId).filter(
+						(tag) => tag.type === "tool" && tag.status === "active",
+					),
+				).toHaveLength(8);
+				expect(
+					getOrCreateSessionMeta(ctx.db, sessionId).toolReclaimWatermark,
+				).toBe(0);
+				expect(
+					ctx.logs.filter((line) =>
+						line.startsWith("pi m[0] HARD fold firing: reason=ttl_idle"),
+					),
+				).toHaveLength(pass);
+				setSystemTime(new Date(T0 + pass * 6 * MINUTE + 1000));
+				await ctx.messageEnd(
+					assistantMessage("still working", 100 + pass, {
+						...providerUsage(2000),
+					}),
+				);
+			}
+			await ctx.runPass([...messages], 2, {
+				provider: "test-provider",
+				id: "other-model",
+			});
+			expect(
+				getOrCreateSessionMeta(ctx.db, sessionId).toolReclaimWatermark,
+			).toBe(0);
+			const tools = getTagsBySession(ctx.db, sessionId).filter(
+				(tag) => tag.type === "tool",
+			);
+			expect(tools.every((tag) => tag.status === "active")).toBe(true);
+			setSystemTime(new Date(T0 + rebuilds * 6 * MINUTE + 2000));
+			await ctx.messageEnd(
+				assistantMessage("switched", 200, {
+					model: "other-model",
+					...providerUsage(2000),
+				}),
+			);
+			queuePendingOp(ctx.db, sessionId, tools[0]!.id, "drop");
+			setSystemTime(new Date(T0 + (rebuilds + 1) * 6 * MINUTE));
+			await ctx.runPass([...messages], 2);
+			expect(getPendingOps(ctx.db, sessionId)).toHaveLength(0);
+			expect(
+				getTagsBySession(ctx.db, sessionId).filter(
+					(tag) => tag.type === "tool" && tag.status === "dropped",
+				),
+			).toHaveLength(1);
+		} finally {
+			ctx.cleanup();
+		}
+	});
+
+	it("single-user tool loop ages only the output followed by a quarter-window of tokens", async () => {
+		const sessionId = "ses-pi-token-distance";
+		const ctx = setup(sessionId, MODEL, "5m", 4000);
+		const messages: PiMessage[] = [userMessage("one coding task")];
+		for (let index = 0; index < 4; index++) {
+			messages.push(
+				assistantToolCall(
+					`loop-${index}`,
+					"bash",
+					{ command: `inspect ${index}` },
+					index * 2 + 2,
+				),
+			);
+			messages.push({
+				...toolResultMessage(
+					`loop-${index}`,
+					`result ${index} ${"payload ".repeat(index === 0 ? 500 : 9000)}`,
+					index * 2 + 3,
+				),
+				toolName: "bash",
+			});
+		}
+		try {
+			setSystemTime(new Date(T0 - 5000));
+			await ctx.runPass([...messages], 2);
+			const tools = getTagsBySession(ctx.db, sessionId).filter(
+				(tag) => tag.type === "tool",
+			);
+			expect(tools.map((tag) => tag.status)).toEqual(Array(4).fill("active"));
+			expect(
+				getOrCreateSessionMeta(ctx.db, sessionId).toolReclaimWatermark,
+			).toBe(tools[0]!.tagNumber);
+			setSystemTime(new Date(T0));
+			await ctx.messageEnd(
+				assistantMessage("still working", 100, { ...providerUsage(2000) }),
+			);
+			setSystemTime(new Date(T0 + 6 * MINUTE));
+			await ctx.runPass([...messages], 2);
+			expect(
+				getTagsBySession(ctx.db, sessionId)
+					.filter((tag) => tag.type === "tool")
+					.map((tag) => tag.status),
+			).toEqual(["dropped", "active", "active", "active"]);
+		} finally {
+			ctx.cleanup();
+		}
+	});
+
+	it("distant outputs and edits survive one free rebuild, then reclaim at low usage", async () => {
+		const sessionId = "ses-pi-distance-edits";
+		const ctx = setup(sessionId, MODEL, "5m", 4000);
+		const messages: PiMessage[] = [userMessage("edit the feature")];
+		for (let index = 0; index < 2; index++) {
+			messages.push(
+				assistantToolCall(
+					`edit-${index}`,
+					"edit",
+					{ filePath: "/feature.ts", oldText: "a", newText: "b" },
+					index * 2 + 2,
+				),
+			);
+			messages.push({
+				...toolResultMessage(`edit-${index}`, "edited", index * 2 + 3),
+				toolName: "edit",
+			});
+		}
+		messages.push(
+			assistantToolCall("old-bash", "bash", { command: "inspect" }, 6),
+		);
+		messages.push({
+			...toolResultMessage("old-bash", "payload ".repeat(500), 7),
+			toolName: "bash",
+		});
+		for (let index = 0; index < 24; index++) {
+			messages.push(
+				index < 3
+					? userMessage(
+							"<system-reminder>Background task finished.</system-reminder>",
+							index + 10,
+						)
+					: assistantMessage(`continuation ${index}`, index + 10),
+			);
+		}
+		for (let index = 0; index < 3; index++) {
+			messages.push(
+				assistantToolCall(
+					`guard-${index}`,
+					"bash",
+					{ command: `guard ${index}` },
+					100 + index * 2,
+				),
+			);
+			messages.push({
+				...toolResultMessage(
+					`guard-${index}`,
+					`guard ${index} ${"tail ".repeat(2000)}`,
+					101 + index * 2,
+				),
+				toolName: "bash",
+			});
+		}
+		try {
+			setSystemTime(new Date(T0 - 5000));
+			await ctx.runPass([...messages], 2);
+			const tools = getTagsBySession(ctx.db, sessionId).filter(
+				(tag) => tag.type === "tool",
+			);
+			expect(tools.map((tag) => tag.status)).toEqual(Array(6).fill("active"));
+			expect(
+				getOrCreateSessionMeta(ctx.db, sessionId).toolReclaimWatermark,
+			).toBe(tools[2]!.tagNumber);
+			setSystemTime(new Date(T0));
+			await ctx.messageEnd(
+				assistantMessage("done", 100, { ...providerUsage(2000) }),
+			);
+			setSystemTime(new Date(T0 + 6 * MINUTE));
+			await ctx.runPass([...messages], 2);
+			const after = getTagsBySession(ctx.db, sessionId).filter(
+				(tag) => tag.type === "tool",
+			);
+			expect(after.map((tag) => tag.status)).toEqual([
+				"dropped",
+				"active",
+				"dropped",
+				"active",
+				"active",
+				"active",
+			]);
+			expect(after[0]!.dropMode).toBe("edit_marker");
 		} finally {
 			ctx.cleanup();
 		}

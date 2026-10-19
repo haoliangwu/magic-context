@@ -2,7 +2,10 @@ import {
     type AutoSearchHintNoHintReason,
     appendAutoSearchHintDecision,
 } from "../../features/magic-context/storage-meta-persisted";
-import { cancelAutoSearchWork } from "../../shared/auto-search-lifecycle";
+import {
+    cancelAutoSearchWork,
+    rememberUnpublishedAutoSearchNoHint,
+} from "../../shared/auto-search-lifecycle";
 import { assertTransformWrite, type Database } from "../../shared/sqlite";
 
 export const AUTO_SEARCH_TIMEOUT_MS = 3_000;
@@ -67,6 +70,7 @@ export function persistAutoSearchSkip(
     // The SQLite write may have failed because the pass expired. Recheck before
     // suppressing future searches for this message in the process-local cache.
     assertTransformWrite();
+    if (!ok) rememberUnpublishedAutoSearchNoHint(sessionId, messageId, reason);
     const persistence = Promise.resolve(ok);
     messages.set(messageId, persistence);
     return persistence;

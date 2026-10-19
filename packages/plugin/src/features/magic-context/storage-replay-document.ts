@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import type { Database } from "../../shared/sqlite";
@@ -5,6 +6,37 @@ import { ensureSessionMetaRow } from "./storage-meta-shared";
 
 const CAS_RETRY_LIMIT = 5;
 const MISSING_REPLAY_DOCUMENT_COLUMN = Symbol("missing replay document column");
+
+type RawReplayDocument = string | null | undefined | typeof MISSING_REPLAY_DOCUMENT_COLUMN;
+const replaySnapshots = new AsyncLocalStorage<{
+    db: Database;
+    sessionId: string;
+    active: boolean;
+    loaded: boolean;
+    raw?: RawReplayDocument;
+}>();
+
+/** Share immutable envelope bytes within one host pass, never with a later pass or background task. */
+export async function withReplayEnvelopeSnapshot<T>(
+    db: Database,
+    sessionId: string,
+    work: () => Promise<T>,
+): Promise<T> {
+    const snapshot = { db, sessionId, active: true, loaded: false };
+    return replaySnapshots.run(snapshot, async () => {
+        try {
+            return await work();
+        } finally {
+            snapshot.active = false;
+        }
+    });
+}
+
+/** Writes and module handoffs invalidate the read view; compare-and-swap always reads the database directly. */
+export function invalidateReplayEnvelopeSnapshot(db: Database, sessionId: string): void {
+    const snapshot = replaySnapshots.getStore();
+    if (snapshot?.db === db && snapshot.sessionId === sessionId) snapshot.loaded = false;
+}
 
 /**
  * A marker may make the host omit earlier messages on its next request.
@@ -226,16 +258,33 @@ function readDecisionRows(
 function readRawReplayDocument(
     db: Database,
     sessionId: string,
+    fresh = false,
 ): string | null | undefined | typeof MISSING_REPLAY_DOCUMENT_COLUMN {
+    const snapshot = replaySnapshots.getStore();
+    const reusable =
+        !fresh && snapshot?.active && snapshot.db === db && snapshot.sessionId === sessionId;
+    if (reusable && snapshot.loaded) return snapshot.raw;
     try {
         const row = db
             .prepare("SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?")
             .get(sessionId) as { trailing_blank_decisions?: unknown } | undefined;
         const raw = row?.trailing_blank_decisions;
-        if (raw === null || raw === undefined || typeof raw === "string") return raw;
+        if (raw === null || raw === undefined || typeof raw === "string") {
+            if (reusable) {
+                snapshot.raw = raw;
+                snapshot.loaded = true;
+            }
+            return raw;
+        }
         throw invalidReplayDocument("stored value is not text");
     } catch (error) {
-        if (isMissingReplayDocumentColumn(error)) return MISSING_REPLAY_DOCUMENT_COLUMN;
+        if (isMissingReplayDocumentColumn(error)) {
+            if (reusable) {
+                snapshot.raw = MISSING_REPLAY_DOCUMENT_COLUMN;
+                snapshot.loaded = true;
+            }
+            return MISSING_REPLAY_DOCUMENT_COLUMN;
+        }
         throw error;
     }
 }
@@ -393,9 +442,10 @@ export function updateReplayDocument(
     sessionId: string,
     mutate: (doc: ReplayDocument) => boolean,
 ): boolean {
+    invalidateReplayEnvelopeSnapshot(db, sessionId);
     let initial: string | null | undefined | typeof MISSING_REPLAY_DOCUMENT_COLUMN;
     try {
-        initial = readRawReplayDocument(db, sessionId);
+        initial = readRawReplayDocument(db, sessionId, true);
     } catch (error) {
         if (error instanceof ReplayDocumentError) return false;
         throw error;
@@ -406,7 +456,7 @@ export function updateReplayDocument(
     for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
         let raw: string | null | undefined | typeof MISSING_REPLAY_DOCUMENT_COLUMN;
         try {
-            raw = readRawReplayDocument(db, sessionId);
+            raw = readRawReplayDocument(db, sessionId, true);
         } catch (error) {
             if (error instanceof ReplayDocumentError) return false;
             throw error;
@@ -480,7 +530,7 @@ export function updateTrailingBlankDecisions(
 
     let initial: string | null | undefined | typeof MISSING_REPLAY_DOCUMENT_COLUMN;
     try {
-        initial = readRawReplayDocument(db, sessionId);
+        initial = readRawReplayDocument(db, sessionId, true);
     } catch (error) {
         if (error instanceof ReplayDocumentError) return false;
         throw error;
@@ -491,7 +541,7 @@ export function updateTrailingBlankDecisions(
     for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
         let columnDecisions: Record<string, PersistedTrailingBlankDecision>;
         try {
-            const raw = readRawReplayDocument(db, sessionId);
+            const raw = readRawReplayDocument(db, sessionId, true);
             if (raw === MISSING_REPLAY_DOCUMENT_COLUMN) return false;
             // Strict, like the document CAS: an unreadable document refuses writes.
             columnDecisions = parseReplayDocument(raw).trailingBlank;
@@ -557,6 +607,7 @@ export function updateTrailingBlankDecisions(
  * document. The caller owns the surrounding transaction.
  */
 export function writeReplayDocument(db: Database, sessionId: string, doc: ReplayDocument): void {
+    invalidateReplayEnvelopeSnapshot(db, sessionId);
     if (!hasReplayDecisionTable(db)) {
         db.prepare("UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?").run(
             serializeReplayDocument(doc),

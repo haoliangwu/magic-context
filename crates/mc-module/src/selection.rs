@@ -233,9 +233,9 @@ pub struct SelectionContext {
     pub current_total_input_tokens: f64,
     /// ceiling = contextLimit × executeThreshold%.
     pub ceiling_tokens: f64,
-    /// The frozen two-pass watermark: tool items with `ordinal <= last_execute_ordinal`
-    /// may join the next riding/force batch (0 = none). It advances only after that
-    /// batch is applied, so execute-band residency cannot age in one new arc per pass.
+    /// Greatest tool-call ordinal whose result had three newer user turns or
+    /// newer content totaling 25% of the usable window at an earlier rebuild (0 = none).
+    /// Selection reads this saved boundary before the current pass advances it.
     pub last_execute_ordinal: u64,
     /// True only for a scheduler execute caused by a context-pressure threshold crossing.
     pub scheduler_pressure_execute: bool,
@@ -1727,7 +1727,11 @@ pub(crate) fn select_reductions_with_outcome(
                 // observed when it next opens summarizes everything accumulated between rides.
                 let mut intents =
                     select_supersession(&active_arcs, &supersession_recent_message_ids);
-                intents.retain(|id, _| !protected_tools.contains(id));
+                intents.retain(|id, intent| {
+                    !protected_tools.contains(id)
+                        && (!intent.edit_marker
+                            || arc_by_id[id.as_str()].ordinal <= ctx.last_execute_ordinal)
+                });
                 eligible_supersession_arc_ids =
                     Some(intents.keys().cloned().collect::<HashSet<_>>());
                 for (arc_id, intent) in intents {
@@ -1759,7 +1763,11 @@ pub(crate) fn select_reductions_with_outcome(
                 // Count the exact selector output before overlap precedence removes members.
                 let mut intents =
                     select_supersession(&active_arcs, &supersession_recent_message_ids);
-                intents.retain(|id, _| !protected_tools.contains(id));
+                intents.retain(|id, intent| {
+                    !protected_tools.contains(id)
+                        && (!intent.edit_marker
+                            || arc_by_id[id.as_str()].ordinal <= ctx.last_execute_ordinal)
+                });
                 eligible_supersession_arc_ids =
                     Some(intents.keys().cloned().collect::<HashSet<_>>());
                 for (arc_id, intent) in intents {
@@ -2639,6 +2647,26 @@ mod tests {
         }
     }
 
+    // Marker fixtures represent edits already distant at a previous rebuild.
+    // Keep their known total below 250 tokens so marker payload and
+    // protection assertions still exercise compression, not ordinary age drops.
+    fn distant_edit_fixture(items: &mut [SelItem]) -> u64 {
+        let mut bookmark = 0;
+        for item in items {
+            match &item.kind {
+                SelKind::ToolCall { name, .. } if is_edit_tool(name) => {
+                    bookmark = bookmark.max(item.ordinal);
+                    item.token_count = Some(0);
+                }
+                SelKind::ToolResult { tool_name } if is_edit_tool(tool_name) => {
+                    item.token_count = Some(100);
+                }
+                _ => {}
+            }
+        }
+        bookmark
+    }
+
     #[test]
     fn natural_bust_drains_a_single_command_remainder() {
         let items = vec![SelItem {
@@ -3113,6 +3141,7 @@ mod tests {
             ..SelectionConfig::default()
         };
         let mut protected = base_ctx(PassClass::Execute);
+        protected.last_execute_ordinal = distant_edit_fixture(&mut items);
         protected.supersession_ride_available = true;
         protected
             .tag_window_protected_block_ids
@@ -3132,6 +3161,7 @@ mod tests {
         assert!(withheld.decisions.is_empty());
 
         let mut tag_only = base_ctx(PassClass::Execute);
+        tag_only.last_execute_ordinal = protected.last_execute_ordinal;
         tag_only.supersession_ride_available = true;
         tag_only
             .tag_window_protected_block_ids
@@ -3149,6 +3179,7 @@ mod tests {
         assert_eq!(partially_withheld.applied_supersession_count, Some(1));
 
         let mut unprotected = base_ctx(PassClass::Execute);
+        unprotected.last_execute_ordinal = protected.last_execute_ordinal;
         unprotected.supersession_ride_available = true;
         let applied =
             select_reductions_with_outcome(&items, &HashSet::new(), &unprotected, &config);
@@ -3213,7 +3244,7 @@ mod tests {
         }
 
         let mut ctx = base_ctx(PassClass::EmergencyForce);
-        ctx.last_execute_ordinal = 1;
+        ctx.last_execute_ordinal = distant_edit_fixture(&mut items);
         ctx.scheduler_pressure_execute = true;
         ctx.current_total_input_tokens = 90_000.0;
         ctx.ceiling_tokens = 100_000.0;
@@ -3358,6 +3389,7 @@ mod tests {
         }
 
         let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.last_execute_ordinal = distant_edit_fixture(&mut items);
         ctx.current_total_input_tokens = 90_000.0;
         ctx.ceiling_tokens = 100_000.0;
         ctx.pass_already_busting = true;
@@ -3429,6 +3461,7 @@ mod tests {
             }
 
             let mut ctx = base_ctx(PassClass::Execute);
+            ctx.last_execute_ordinal = distant_edit_fixture(&mut items);
             ctx.scheduler_pressure_execute = true;
             assert!(
                 select_reductions(&items, &HashSet::new(), &ctx, &cfg).is_empty(),
@@ -3461,8 +3494,8 @@ mod tests {
         for n in 0..RECENT_TOOL_SKELETON_WINDOW {
             items.push(text_with_id(&format!("tail-{n}#0"), 5 + n as u64, 1));
         }
-
         let mut ctx = base_ctx(PassClass::Execute);
+        ctx.last_execute_ordinal = distant_edit_fixture(&mut items);
         ctx.scheduler_pressure_execute = true;
         ctx.pass_already_busting = true;
         ctx.supersession_ride_available = true;
@@ -3600,6 +3633,7 @@ mod tests {
         ));
         items.push(tool_result("emergency", next_ordinal, "bash", 40_000));
         let mut bust_ctx = base_ctx(PassClass::EmergencyForce);
+        bust_ctx.last_execute_ordinal = distant_edit_fixture(&mut items);
         bust_ctx.current_total_input_tokens = 90_000.0;
         bust_ctx.ceiling_tokens = 100_000.0;
         bust_ctx.pass_already_busting = true;
@@ -3709,6 +3743,7 @@ mod tests {
         }
 
         let mut ctx = base_ctx(PassClass::Execute);
+        ctx.last_execute_ordinal = distant_edit_fixture(&mut items);
         ctx.pass_already_busting = true;
         ctx.supersession_ride_available = true;
         // The owner-message floor retains c11..c30, while the active odd tool-tag
@@ -3806,6 +3841,7 @@ mod tests {
         }
 
         let mut ctx = base_ctx(PassClass::Execute);
+        ctx.last_execute_ordinal = distant_edit_fixture(&mut items);
         ctx.pass_already_busting = true;
         ctx.supersession_ride_available = true;
         let decisions = select_reductions(
@@ -4558,8 +4594,8 @@ mod tests {
         // c1/c2/c3 are all edits to a.ts; c3 (newest) stays full, c1+c2 are older →
         // edit_marker candidates. Context B varies agent_drop_ids (drops UNRELATED c9,
         // so the produced set genuinely differs) plus the pressure/latch fields, chosen
-        // so c1 stays an edit_marker in BOTH (last_execute_ordinal stays 0, so c1 is
-        // never a two-pass FullDrop that would change its shape). A payload fn that
+        // so c1 stays an edit_marker in BOTH (known sub-floor token mass prevents
+        // a two-pass FullDrop that would change its shape). A payload fn that
         // accidentally read ctx would diverge here; a pure one cannot.
         let mut items = vec![
             tool_call(
@@ -4592,6 +4628,7 @@ mod tests {
         for n in 0..RECENT_TOOL_SKELETON_WINDOW {
             items.push(text_with_id(&format!("tail-{n}#0"), 10 + n as u64, 1));
         }
+        let edit_bookmark = distant_edit_fixture(&mut items);
         let c1_marker_payload = |ctx: &SelectionContext| -> Option<String> {
             let out = select_reductions(
                 &items,
@@ -4609,13 +4646,15 @@ mod tests {
 
         // Context A: no agent drops, zero pressure fields.
         let mut ctx_a = base_ctx(PassClass::Execute);
+        ctx_a.last_execute_ordinal = edit_bookmark;
         ctx_a.pass_already_busting = true;
         ctx_a.supersession_ride_available = true;
         // Context B: a genuinely different produced set — an unrelated agent drop (c9)
-        // plus non-zero pressure/latch fields. last_execute_ordinal stays 0 so c1 is NOT
-        // a two-pass drop candidate (keeps it an edit_marker in both).
+        // plus non-zero pressure/latch fields. The same prior bookmark and known
+        // sub-floor mass keep c1 an edit_marker in both.
         let ctx_b = SelectionContext {
             calibration: None,
+            last_execute_ordinal: edit_bookmark,
             agent_drop_ids: vec![result_block_id("c9")],
             current_total_input_tokens: 123_456.0,
             ceiling_tokens: 200_000.0,
@@ -5238,6 +5277,9 @@ mod tests {
                 PassClass::Execute
             });
             ctx.last_execute_ordinal = if case.lane == "age" { 4 } else { 0 };
+            if case.lane == "edit" {
+                ctx.last_execute_ordinal = distant_edit_fixture(&mut items);
+            }
             ctx.current_total_input_tokens = 4000.0;
             ctx.ceiling_tokens = 1.0;
             ctx.emergency_window_yields = true;

@@ -248,7 +248,7 @@ describe("compartment chunk embedding core", () => {
         expect(windows.map((w) => w.windowIndex)).toEqual(windows.map((_, i) => i));
     });
 
-    test("storage replaces chunks idempotently and clearSession removes rows", () => {
+    test("storage replaces chunks idempotently and clearSession removes rows", async () => {
         const db = createDb();
         try {
             appendCompartments(db, "ses-store", [
@@ -282,7 +282,7 @@ describe("compartment chunk embedding core", () => {
                 true,
             );
             expect(
-                loadCompartmentChunkEmbeddingsForSearch(
+                await loadCompartmentChunkEmbeddingsForSearch(
                     db,
                     "ses-store",
                     "/repo/store",
@@ -292,7 +292,7 @@ describe("compartment chunk embedding core", () => {
 
             clearSession(db, "ses-store");
             expect(
-                loadCompartmentChunkEmbeddingsForSearch(
+                await loadCompartmentChunkEmbeddingsForSearch(
                     db,
                     "ses-store",
                     "/repo/store",
@@ -304,7 +304,7 @@ describe("compartment chunk embedding core", () => {
         }
     });
 
-    test("search pool reflects compartment ranges rewritten after the pool was cached", () => {
+    test("search pool reflects compartment ranges rewritten after the pool was cached", async () => {
         const db = createDb();
         try {
             appendCompartments(db, "ses-rebased", [
@@ -331,14 +331,16 @@ describe("compartment chunk embedding core", () => {
                     vector: new Float32Array([1, 0]),
                 })),
             );
-            const ranges = () =>
-                loadCompartmentChunkEmbeddingsForSearch(
-                    db,
-                    "ses-rebased",
-                    "/repo/rebased",
-                    "mock:model",
+            const ranges = async () =>
+                (
+                    await loadCompartmentChunkEmbeddingsForSearch(
+                        db,
+                        "ses-rebased",
+                        "/repo/rebased",
+                        "mock:model",
+                    )
                 ).map((row) => [row.startOrdinal, row.endOrdinal]);
-            expect(ranges()).toEqual([[1, 2]]);
+            expect(await ranges()).toEqual([[1, 2]]);
 
             // A coordinate rebase rewrites compartment ranges in place and leaves
             // the embedding rows untouched.
@@ -346,7 +348,7 @@ describe("compartment chunk embedding core", () => {
                 "UPDATE compartments SET start_message = 5, end_message = 6 WHERE id = ?",
             ).run(compartment.id);
 
-            expect(ranges()).toEqual([[5, 6]]);
+            expect(await ranges()).toEqual([[5, 6]]);
         } finally {
             closeQuietly(db);
         }
@@ -428,7 +430,7 @@ describe("compartment chunk embedding core", () => {
                 total: 0,
             });
             expect(embeddedTexts).toEqual([]);
-            const stored = loadCompartmentChunkEmbeddingsForSearch(
+            const stored = await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 sessionId,
                 projectPath,
@@ -451,7 +453,7 @@ describe("compartment chunk embedding core", () => {
         }
     });
 
-    test("classification keeps a hash-mismatched one-based window set stale", () => {
+    test("classification keeps a hash-mismatched one-based window set stale", async () => {
         const db = createDb();
         const sessionId = "ses-shifted-stale";
         const projectPath = "/repo/shifted-stale";
@@ -513,16 +515,21 @@ describe("compartment chunk embedding core", () => {
                 ).map((candidate) => candidate.id),
             ).toEqual([compartment.id]);
             expect(
-                loadCompartmentChunkEmbeddingsForSearch(db, sessionId, projectPath, modelId).map(
-                    (row) => row.windowIndex,
-                ),
+                (
+                    await loadCompartmentChunkEmbeddingsForSearch(
+                        db,
+                        sessionId,
+                        projectPath,
+                        modelId,
+                    )
+                ).map((row) => row.windowIndex),
             ).toEqual(expectedWindows.map((window) => window.windowIndex + 1));
         } finally {
             closeQuietly(db);
         }
     });
 
-    test("reuses decoded search vectors until the pool probe changes", () => {
+    test("reuses decoded search vectors until the pool probe changes", async () => {
         const db = createDb();
         try {
             appendCompartments(db, "ses-cache", [
@@ -552,13 +559,13 @@ describe("compartment chunk embedding core", () => {
                 ]);
 
             writeVector(new Float32Array([1, 0]));
-            const first = loadCompartmentChunkEmbeddingsForSearch(
+            const first = await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-cache",
                 "/repo/cache",
                 "mock:model",
             );
-            const cached = loadCompartmentChunkEmbeddingsForSearch(
+            const cached = await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-cache",
                 "/repo/cache",
@@ -569,7 +576,7 @@ describe("compartment chunk embedding core", () => {
             // Replacement preserves the row count but advances the maximum id,
             // so the cheap probe must invalidate the decoded pool.
             writeVector(new Float32Array([0, 1]));
-            const replaced = loadCompartmentChunkEmbeddingsForSearch(
+            const replaced = await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-cache",
                 "/repo/cache",
@@ -620,7 +627,7 @@ describe("compartment chunk embedding core", () => {
 
             expect(embeddedTexts).toEqual(["[1] U: Keep this line"]);
             expect(
-                loadCompartmentChunkEmbeddingsForSearch(
+                await loadCompartmentChunkEmbeddingsForSearch(
                     db,
                     "ses-publish",
                     "/repo/publish",
@@ -708,7 +715,7 @@ describe("compartment chunk embedding core", () => {
                 })),
             );
 
-            const stored = loadCompartmentChunkEmbeddingsForSearch(
+            const stored = await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 sessionId,
                 projectPath,
@@ -782,7 +789,7 @@ describe("compartment chunk embedding core", () => {
                 "Executed background oracle audit for oxc engine\nRan the background oracle audit to verify the oxc cutover.",
             ]);
             expect(
-                loadCompartmentChunkEmbeddingsForSearch(
+                await loadCompartmentChunkEmbeddingsForSearch(
                     db,
                     "ses-fallback",
                     "/repo/fallback",
@@ -1419,7 +1426,7 @@ describe("recorded window sources skip re-chunking after a restart", () => {
                 [current.id, oneBased.id].map((id) => `chunk_embed_windows:${id}`).sort(),
             );
             expect(
-                loadCompartmentChunkEmbeddingsForSearch(db, sessionId, projectPath, modelId)
+                (await loadCompartmentChunkEmbeddingsForSearch(db, sessionId, projectPath, modelId))
                     .filter((row) => row.compartmentId === oneBased.id)
                     .map((row) => row.windowIndex),
             ).toEqual(oneBasedRows.windows.map((window) => window.windowIndex));

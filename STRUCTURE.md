@@ -20,7 +20,7 @@ packages/
   e2e-tests/      end-to-end suites against real OpenCode 1, OpenCode 2, Pi, OMP and Rust stacks
   retina-local-fs/ local file and git checks for smart-note conditions
 scripts/          release, version sync, diagnostics (cache-bust analysis, context dumps)
-docs/             design references and audit evidence (docs/private is gitignored)
+docs/             public documentation (internal references: ignored .cortexkit/internal-docs/)
 ```
 
 ## `packages/plugin/src`

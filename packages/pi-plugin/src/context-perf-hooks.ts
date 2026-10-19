@@ -1,4 +1,10 @@
 export interface PiTransformTimingSample {
+	/** Per-pass counts for number-only publication, skipped evidence, or optional write failures. */
+	publication?: {
+		status: "numbers_only" | "skipped" | "commit_failed" | "mirror_failed";
+		reason: string;
+		count: number;
+	};
 	sessionId: string;
 	stage: string;
 	elapsedMs: number;

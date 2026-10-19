@@ -529,23 +529,14 @@ describe("bundleIssueReport secret redaction", () => {
             const body = readFileSync(bundled.path, "utf-8");
 
             expect(body).toContain("## Title");
-            expect(body).toContain("Title with /Users/<USER>/private and token=<REDACTED:token>");
-            expect(body).toContain(
-                "Description with /Users/<USER>/private and token=<REDACTED:token>",
-            );
-            expect(body).toContain(
-                "Config from `/Users/<USER>/.config/cortexkit/magic-context.jsonc`:",
-            );
-            expect(body).toContain(
-                '"title": "Problem at /Users/<USER>/private token=<REDACTED:token>"',
-            );
+            expect(body).toContain("## Title\n<text omitted>");
+            expect(body).toContain("## Description\n<text omitted>");
+            expect(body).toContain("Config from `~/path-5`:");
+            expect(body).toContain('"title": "<text omitted>"');
+            expect(body).toContain('"directory": "~/project-1"');
             expect(body).toContain("### OpenCode installations");
-            expect(body).toContain(
-                "| [active] | `/Users/<USER>/.opencode/bin/opencode` | 1.18.0 | PATH |",
-            );
-            expect(body).toContain(
-                "|  | `/Users/<USER>/Applications/OpenCode.app` | unknown | app |",
-            );
+            expect(body).toContain("| [active] | `~/path-1` | 1.18.0 | PATH |");
+            expect(body).toContain("|  | `~/path-2` | unknown | app |");
             expect(body).not.toContain("alice");
             expect(body).not.toContain("abc123");
         } finally {
@@ -561,9 +552,11 @@ describe("bundleIssueReport size and session fallbacks", () => {
         const logPath = join(root, "opencode.log");
         writeFileSync(
             logPath,
-            Array.from({ length: 400 }, (_, index) => `line ${index} ${"x".repeat(400)}`).join(
-                "\n",
-            ),
+            Array.from(
+                { length: 400 },
+                (_, index) =>
+                    `2026-09-05T10:41:03.130Z INFO  magic-context.perf: count=${index} tokens=${"9".repeat(400)}`,
+            ).join("\n"),
         );
         const report: DiagnosticReport = {
             timestamp: "2026-05-11T12:00:00.000Z",
@@ -634,9 +627,9 @@ describe("bundleIssueReport size and session fallbacks", () => {
             expect(existsSync(bundled.fullPath)).toBe(true);
             expect(Buffer.byteLength(bundled.bodyMarkdown, "utf8")).toBeLessThanOrEqual(60_000);
             expect(readFileSync(bundled.fullPath, "utf8")).toContain("## Session context");
-            expect(readFileSync(bundled.fullPath, "utf8")).toContain(
-                "- Parent session: ses_parent001",
-            );
+            expect(readFileSync(bundled.fullPath, "utf8")).toContain("- Parent session: session-1");
+            expect(readFileSync(bundled.fullPath, "utf8")).not.toContain("ses_parent001");
+            expect(readFileSync(bundled.fullPath, "utf8")).not.toContain(root);
         } finally {
             process.chdir(originalCwd);
         }

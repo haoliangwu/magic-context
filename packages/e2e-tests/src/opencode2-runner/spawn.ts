@@ -17,6 +17,7 @@ import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { hostExtractCache } from '../host-extract-cache';
 import { pinMockAgents } from "../mock-routing";
+import { seedModelsCatalog } from "../models-catalog";
 import { prepareContextDatabase } from "../prepare-context-db";
 import { pinnedOpenCode2Version, resolveOpenCode2CLI, sharedOpenCode2Root } from "./cli-resolution";
 import { isolateStoreDirectories } from "./store-directories";
@@ -263,6 +264,10 @@ export interface OpenCode2SpawnOptions {
     /** Built plugin snapshot used before a same-store upgrade. */
     magicContextPlugin?: string;
 	probePlugin?: string;
+	/** Absolute path to a plugin loaded before Magic Context, so its session hooks
+	 * shape the draft Magic Context receives, the way another user plugin listed
+	 * ahead of it would. */
+	prePlugin?: string;
 	providerID?: string;
 	probeStandalone?: boolean;
 	defaultModelID?: string;
@@ -281,6 +286,13 @@ export interface OpenCode2SpawnOptions {
 	 * follows `modelOutputLimit`. Default: the historian uses the session model.
 	 */
 	historianModel?: { id: string; contextLimit: number };
+	/**
+	 * A second provider on the mock, pinned as the historian's model while the session
+	 * keeps `providerID`. `package` selects its wire format.
+	 */
+	historianProvider?: { providerID: string; modelID: string; package: string };
+	/** models.dev catalogue copied into the throwaway host cache before boot. */
+	modelsCatalog?: string;
 	compactionAuto?: boolean;
 	existingIsolation?: OpenCode2Isolation;
 	existingMock?: { mock: MockProvider; baseURL: string };
@@ -333,12 +345,17 @@ export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 			defaultModelID,
 			...(options.additionalModelIDs ?? []),
 			...(options.historianModel ? [options.historianModel.id] : []),
+			// A historian on the session's own provider is one more model on that provider.
+			...(options.historianProvider?.providerID === providerID
+				? [options.historianProvider.modelID]
+				: []),
 		]);
 		writeFileSync(
 			join(fixture.cwd, "opencode.json"),
 			JSON.stringify({
 				...options.extraConfig,
 				plugins: [
+					...(options.prePlugin ? [options.prePlugin] : []),
 					...(options.includeMagicContext === false ? [] : [options.magicContextPlugin ?? PLUGIN]),
 					...(options.probePlugin ? [options.probePlugin] : []),
 					SCHEMA_GUARD,
@@ -368,6 +385,23 @@ export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 							]),
 						),
 					},
+					...(options.historianProvider && options.historianProvider.providerID !== providerID
+						? {
+								[options.historianProvider.providerID]: {
+									package: options.historianProvider.package,
+									settings: { baseURL: provider.baseURL, apiKey: "mock-key" },
+									models: {
+										[options.historianProvider.modelID]: {
+											name: options.historianProvider.modelID,
+											limit: {
+												context: options.modelContextLimit ?? 200_000,
+												output: options.modelOutputLimit ?? 32768,
+											},
+										},
+									},
+								},
+							}
+						: {}),
 				},
 			}),
 		);
@@ -387,15 +421,23 @@ export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 							`${providerID}/${defaultModelID}`,
 							// Both OpenCode host generations use the `agents.*.opencode` config block.
 							"opencode",
-							options.historianModel
-								? { historian: `${providerID}/${options.historianModel.id}` }
-								: {},
+							options.historianProvider
+								? {
+										historian: `${options.historianProvider.providerID}/${options.historianProvider.modelID}`,
+									}
+								: options.historianModel
+									? { historian: `${providerID}/${options.historianModel.id}` }
+									: {},
 						),
 					},
 					null,
 					2,
 				),
 			);
+		}
+		if (options.modelsCatalog) {
+			seedModelsCatalog(fixture.env.XDG_CACHE_HOME!, options.modelsCatalog);
+			fixture.env.OPENCODE_DISABLE_MODELS_FETCH = "1";
 		}
 		// serve owns its server directly; --standalone is a TUI/run flag, not a serve option.
 		const child = spawn(

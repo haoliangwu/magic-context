@@ -7,6 +7,7 @@ import {
   getUserMemories,
   getUserMemoryCandidates,
   promoteUserMemoryCandidate,
+  restoreUserMemory,
   updateUserMemoryContent,
 } from "../../lib/api";
 import FilterSelect from "../shared/FilterSelect";
@@ -76,6 +77,16 @@ export default function UserMemories() {
       refetchMemories();
     } catch (e: unknown) {
       setError(`Failed to dismiss memory: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  const handleRestore = async (id: number) => {
+    try {
+      setError(null);
+      await restoreUserMemory(id);
+      refetchMemories();
+    } catch (e: unknown) {
+      setError(`Failed to restore memory: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
 
@@ -272,6 +283,15 @@ export default function UserMemories() {
                                 onClick={() => handleDismiss(memory.id)}
                               >
                                 Dismiss
+                              </button>
+                            </Show>
+                            <Show when={memory.status === "dismissed"}>
+                              <button
+                                type="button"
+                                class="btn sm"
+                                onClick={() => handleRestore(memory.id)}
+                              >
+                                Restore
                               </button>
                             </Show>
                             <button

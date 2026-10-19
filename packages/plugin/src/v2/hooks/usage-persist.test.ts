@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createScheduler } from "../../features/magic-context/scheduler";
@@ -17,7 +17,7 @@ import type { TransformDeps } from "../../hooks/magic-context/transform";
 import { ABSOLUTE_EMERGENCY_PERCENTAGE } from "../../shared/escalation-bands";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
-import { clearWindowOverlayCacheForTest, setWindowOverlayPath } from "../../shared/window-geometry";
+import { clearWindowGeometryLogForTest } from "../../shared/window-geometry";
 import { persistV2UsageReading } from "./usage-persist";
 import { resolveUsageReading } from "./usage-reading";
 
@@ -27,8 +27,7 @@ const originalXdgDataHome = process.env.XDG_DATA_HOME;
 afterEach(() => {
     closeDatabase();
     clearModelsDevCache();
-    setWindowOverlayPath(undefined);
-    clearWindowOverlayCacheForTest();
+    clearWindowGeometryLogForTest();
     if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = originalXdgDataHome;
     for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
@@ -41,35 +40,8 @@ function makeTempDir(prefix: string): string {
     return dir;
 }
 
-// A model whose window is configured at 272K, both in the catalog and in a
-// measured overlay cell (the strongest wall the resolver knows).
+// Catalog metadata provides the configured window for this test model.
 async function configure272kWindow(): Promise<void> {
-    const overlayPath = join(makeTempDir("v2-usage-overlay-"), "window-overlay.json");
-    writeFileSync(
-        overlayPath,
-        JSON.stringify({
-            schema: "fusiform-window-overlay/v1",
-            generated_at: "2026-09-11T00:00:00Z",
-            minted_provider_ids: [],
-            cells: [
-                {
-                    provider_id: "test-provider",
-                    model_id: "test-model",
-                    facts: {
-                        "window.enforced": {
-                            value: { kind: "stated", value: 272_000 },
-                            grade: "measured",
-                            units: "provider",
-                            boundary: "Observed",
-                            source_ref: "usage persist fixture",
-                            observed_at: "2026-09-11T00:00:00Z",
-                        },
-                    },
-                },
-            ],
-        }),
-    );
-    setWindowOverlayPath(overlayPath);
     await refreshModelLimitsFromApi({
         config: {
             providers: async () => ({
@@ -78,7 +50,7 @@ async function configure272kWindow(): Promise<void> {
                         {
                             id: "test-provider",
                             models: {
-                                "test-model": { limit: { context: 272_000, output: 128_000 } },
+                                "test-model": { limit: { context: 272_000, output: 32_000 } },
                             },
                         },
                     ],

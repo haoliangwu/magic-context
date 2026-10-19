@@ -26,6 +26,7 @@ export function registerCtxDreamCommand(
 			projectIdentity: string;
 		};
 		dreamerEnabled?: boolean;
+		smartNotesEnabled?: boolean;
 		resolveDreamerEnabled?: (ctx: { cwd: string }) => boolean | undefined;
 		onProjectSeen?: (projectIdentity: string) => void;
 		ensureRegistered?: (ctx: {
@@ -82,7 +83,10 @@ export function registerCtxDreamCommand(
 				);
 				return;
 			}
-			const backlogTasks = task ? [task] : CANONICAL_DREAM_TASKS;
+			const backlogTasks = (task ? [task] : CANONICAL_DREAM_TASKS).filter(
+				(task) =>
+					deps.smartNotesEnabled !== false || task !== "evaluate-smart-notes",
+			);
 			const backlogBefore = getDreamTaskBacklogs(
 				deps.db,
 				project.projectIdentity,

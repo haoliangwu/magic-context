@@ -1,8 +1,10 @@
 import { createMemo, createSignal, For, Show } from "solid-js";
 import { formatDateTime } from "../../lib/api";
 import {
-  cacheCauseLabel,
+  cacheCauseText,
   cacheCauseTooltip,
+  cacheDropLine,
+  cacheDropText,
   cacheEventColorClass,
   cacheEventLabel,
   cacheWriteLabel,
@@ -59,8 +61,10 @@ function formatLimitLabel(limit: number): string {
  * is the cached (cheap) portion, colored by the step's severity; busts also get
  * a red-tinted bar and a red tick above it so they stand out at any density.
  * A vertical "old → new" divider marks where the window changed. Steps where
- * Magic Context reclaimed context get a full-height marker line whose tooltip
- * explains why.
+ * the prompt shrank get a full-height marker line whose tooltip explains why:
+ * Magic Context's reclaim in a session it manages; otherwise it says Magic
+ * Context does not manage the session, plus what the request size shows when
+ * the source recorded it.
  *
  * Shared by the global Cache Diagnostics page and the per-session viewer; the
  * caller owns scroll-to-list behavior via onBarClick.
@@ -112,9 +116,10 @@ export default function CacheTimeline(props: {
       isUnknown || !event.cache_reported
         ? "Cache: not reported by provider"
         : `Cached: ${event.cache_read.toLocaleString()} (${cachedOfPrompt.toFixed(0)}% of prompt)`;
-    const dropLine = event.is_drop
-      ? `\n⬇ MC reclaimed context${event.cause ? ` — ${cacheCauseLabel(event.cause)}` : ""}`
-      : "";
+    const dropLine = event.is_drop ? `\n${cacheDropLine(event)}` : "";
+    // A cause on a step that is not a drop gets its own line, worded as in the
+    // Turns table; a drop already names its cause on the drop line.
+    const causeLine = !event.is_drop && event.cause ? `\n${cacheCauseText(event.cause)}` : "";
     const isSelected = () => props.selectedStepId === event.message_id;
     const barProps = {
       role: "button" as const,
@@ -129,7 +134,7 @@ export default function CacheTimeline(props: {
     };
     const windowLabel = g.limit > 0 ? g.limit.toLocaleString() : "unknown";
     const causeTip = event.cause ? cacheCauseTooltip(event.cause) : undefined;
-    const title = `${formatDateTime(event.timestamp)}\n${cacheEventLabel(event)}${g.overflow ? " · OVERFLOW" : ""}\nPrompt: ${g.prompt.toLocaleString()} / ${windowLabel} (${pctOfWindow.toFixed(1)}% of window)\n${cachedLine}\nUncached: ${(event.input_tokens + event.cache_write).toLocaleString()}\nCache writes: ${cacheWriteLabel([event])}${dropLine}${causeTip ? `\n${causeTip}` : ""}\n(click → jump to step in list)`;
+    const title = `${formatDateTime(event.timestamp)}\n${cacheEventLabel(event)}${g.overflow ? " · OVERFLOW" : ""}\nPrompt: ${g.prompt.toLocaleString()} / ${windowLabel} (${pctOfWindow.toFixed(1)}% of window)\n${cachedLine}\nUncached: ${(event.input_tokens + event.cache_write).toLocaleString()}\nCache writes: ${cacheWriteLabel([event])}${dropLine}${causeLine}${causeTip ? `\n${causeTip}` : ""}\n(click → jump to step in list)`;
     return (
       <div class="ctx-bar-slot">
         <Show when={isBust}>
@@ -139,7 +144,7 @@ export default function CacheTimeline(props: {
           <button
             type="button"
             class="ctx-drop-line"
-            aria-label="Magic Context reclaim — jump to step"
+            aria-label={`${cacheDropText(event).title} — jump to step`}
             onMouseEnter={(e) => showDropTip(event, e.currentTarget)}
             onMouseLeave={() => setHoveredDrop(null)}
             onClick={(e) => {
@@ -176,14 +181,9 @@ export default function CacheTimeline(props: {
                 left: `${Math.min(92, Math.max(8, tip().xPct))}%`,
               }}
             >
-              <div class="ctx-drop-tip-title">⬇ Magic Context reclaimed context</div>
+              <div class="ctx-drop-tip-title">⬇ {cacheDropText(tip().event).title}</div>
               <div class="ctx-drop-tip-row">{formatDateTime(tip().event.timestamp)}</div>
-              <div class="ctx-drop-tip-row">
-                {(() => {
-                  const cause = tip().event.cause;
-                  return cause ? `Cause: ${cacheCauseLabel(cause)}` : "Cause not recorded";
-                })()}
-              </div>
+              <div class="ctx-drop-tip-row">{cacheDropText(tip().event).detail}</div>
               <div class="ctx-drop-tip-hint">click → jump to step</div>
             </div>
           )}
@@ -261,7 +261,7 @@ export default function CacheTimeline(props: {
         </span>
         <span class="ctx-legend-item">
           <span class="ctx-legend-swatch reclaim" />
-          Context reclaimed
+          Context reduced
         </span>
       </div>
     </div>

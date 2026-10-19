@@ -1662,6 +1662,82 @@ body {
   color: var(--text-primary);
 }
 
+.historian-table th,
+.historian-table td {
+  padding: 5px 10px 5px 0;
+  vertical-align: top;
+}
+
+.historian-table td:nth-child(2),
+.historian-table td:nth-child(3),
+.historian-table td:nth-child(4),
+.historian-table td:nth-child(5),
+.historian-table td:nth-child(6) {
+  white-space: nowrap;
+}
+
+/* Errors can be long (provider JSON, stop reasons), so the cell shows only an
+   icon and the full text opens in a card on hover. The card is a child of the
+   icon, so moving the pointer into it keeps it open and its text stays
+   selectable. It opens leftwards because this is the last column. */
+.historian-table td.historian-error-cell {
+  width: 1%;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.historian-error {
+  position: relative;
+  display: inline-flex;
+  cursor: help;
+}
+
+.historian-error-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--danger);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.historian-error-card {
+  display: none;
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 20;
+  width: max-content;
+  max-width: min(480px, 70vw);
+  padding: 8px 10px;
+  border: 1px solid var(--error-border);
+  border-radius: var(--radius-md);
+  background: var(--error-bg);
+  color: var(--error-text);
+  box-shadow: var(--shadow-popover);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  cursor: text;
+}
+
+.historian-error:hover .historian-error-card {
+  display: block;
+}
+
+.historian-fallback {
+  margin-left: 5px;
+  vertical-align: middle;
+}
+
 /* ── Dreamer flat run table (embedded project view) ───── */
 /* Reuses .kv-table for borders/sizing but is a real multi-column table, so undo
    the key-value first/last-column styling and give every cell consistent padding. */
@@ -1761,7 +1837,7 @@ body {
    Outer bar height = prompt / context_window (how full the window is).
    Inner segment (bottom) = cache_read / prompt (the cached, cheap portion),
    colored by severity. The neutral top gap = uncached tokens (full-price).
-   A full-height marker line flags steps where MC reclaimed context. */
+   A full-height marker line flags steps where the prompt shrank. */
 .ctx-chart {
   position: relative;
   height: 148px;

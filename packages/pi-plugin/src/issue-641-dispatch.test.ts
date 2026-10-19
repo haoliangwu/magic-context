@@ -72,13 +72,13 @@ test("OMP dispatch fence refuses missing and in-progress receipts but preserves 
 		h.ctx,
 	);
 	h.order.length = 0;
-	fence({ payload: { messages: [] } }, h.ctx);
+	fence({ payload: { messages: [userMessage("managed", 2)] } }, h.ctx);
 	expect(h.order).toEqual([]);
 	// The transformed messages already returned before the preparation deadline;
 	// a delayed provider attempt must not abort that completed request.
 	budget.elapsed = () => 32000;
 	const entryCount = h.entries.length;
-	fence({ payload: { messages: [] } }, h.ctx);
+	fence({ payload: { messages: [userMessage("managed", 2)] } }, h.ctx);
 	expect(h.entries).toHaveLength(entryCount);
 	expect(h.order).toEqual([]);
 });
@@ -113,7 +113,7 @@ test("late old pass cannot abort or overwrite the newer operation receipt", asyn
 	expect(await old).toContain("superseded");
 	expect(oldAborts).toBe(0);
 	h.handlers.get("before_provider_request")?.(
-		{ payload: { messages: [] } },
+		{ payload: { messages: [userMessage("new", 2)] } },
 		h.ctx,
 	);
 	expect(h.order).toEqual([]);
@@ -128,7 +128,7 @@ test("payload retries require the current pass receipt and reset at the next tur
 	);
 	for (let retry = 0; retry < 3; retry++)
 		h.handlers.get("before_provider_request")?.(
-			{ payload: { messages: [] } },
+			{ payload: { messages: [userMessage("managed", 1)] } },
 			h.ctx,
 		);
 	expect(h.order).toEqual([]);

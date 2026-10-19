@@ -44,7 +44,18 @@ test.skipIf(process.env.REVIEW_OUTPUT === undefined)(
 		const { resetLkgSlotsForTest } = await load(
 			"plugin/src/hooks/magic-context/lkg-slot.ts",
 		);
-		const db = createTestDb();
+		const { setPiTransformTimingObserver } = await load(
+			"pi-plugin/src/context-perf-hooks.ts",
+		);
+		const lkgTimes: number[] = [];
+		const transformTimes: number[] = [];
+		const restoreTiming = setPiTransformTimingObserver(
+			(sample: { stage: string; elapsedMs: number }) => {
+				if (sample.stage === "lkgCapture") lkgTimes.push(sample.elapsedMs);
+				if (sample.stage === "total") transformTimes.push(sample.elapsedMs);
+			},
+		);
+		const db = createTestDb(join(evidenceRoot(), "pi-context.db"));
 		const fake = createFakePi();
 		registerPiContextHandler(fake.pi, {
 			db,
@@ -56,15 +67,34 @@ test.skipIf(process.env.REVIEW_OUTPUT === undefined)(
 				temporalAwareness: false,
 			},
 		});
-		const raw = Array.from({ length: 600 }, (_, i) =>
+		// Scale only the disposable Pi history; the default message count keeps its bytes unchanged.
+		const messageCount = Number(process.env.REVIEW_PI_MESSAGES ?? 600);
+		if (!Number.isSafeInteger(messageCount) || messageCount < 1)
+			throw new Error("Invalid REVIEW_PI_MESSAGES");
+		const raw = Array.from({ length: messageCount }, (_, i) =>
 			i % 2
 				? assistantMessage(`answer ${i}: fixed fixture text`, i + 1)
 				: userMessage(`question ${i}: fixed fixture text`, i + 1),
 		);
-		raw.push(assistantToolCall("call", "read", { path: "fixture.ts" }, 601));
-		raw.push(toolResultMessage("call", "export const budget = 21000;", 602));
-		raw.push(assistantMessage("The budget includes preparation.", 603));
-		raw.push(userMessage("Please inspect writer admission", 604));
+		raw.push(
+			assistantToolCall(
+				"call",
+				"read",
+				{ path: "fixture.ts" },
+				messageCount + 1,
+			),
+		);
+		raw.push(
+			toolResultMessage(
+				"call",
+				"export const budget = 21000;",
+				messageCount + 2,
+			),
+		);
+		raw.push(
+			assistantMessage("The budget includes preparation.", messageCount + 3),
+		);
+		raw.push(userMessage("Please inspect writer admission", messageCount + 4));
 		const ctx = fakeContext(
 			"review-pi",
 			process.env.REVIEW_CWD ?? process.cwd(),
@@ -84,6 +114,8 @@ test.skipIf(process.env.REVIEW_OUTPUT === undefined)(
 				await new Promise((resolve) => setImmediate(resolve));
 			}
 			expect(wires.every((wire) => wire === wires[0])).toBe(true);
+			expect(lkgTimes).toHaveLength(32);
+			expect(transformTimes).toHaveLength(32);
 			expect(wires[0]).toContain("§1§");
 			writeFileSync(join(evidenceRoot(), "pi.json"), wires[0]);
 			console.log(
@@ -92,9 +124,19 @@ test.skipIf(process.env.REVIEW_OUTPUT === undefined)(
 					source,
 
 					samples: 30,
+					messages: raw.length,
 					bytes: Buffer.byteLength(wires[0]),
 					sha256: digest(wires[0]),
 					coldMs: times[0],
+					lkgColdMs: lkgTimes[0],
+					lkgWarmMedianMs: median(lkgTimes.slice(2)),
+					lkgWarmMaxMs: Math.max(...lkgTimes.slice(2)),
+					publicationColdMs: times[0] - transformTimes[0],
+					publicationWarmMedianMs: median(
+						times
+							.slice(2)
+							.map((time, index) => time - transformTimes[index + 2]),
+					),
 					warmMedianMs: median(times.slice(2)),
 					warmMinMs: Math.min(...times.slice(2)),
 					warmMaxMs: Math.max(...times.slice(2)),
@@ -102,6 +144,7 @@ test.skipIf(process.env.REVIEW_OUTPUT === undefined)(
 				}),
 			);
 		} finally {
+			restoreTiming();
 			clearContextHandlerSession("review-pi");
 			resetLkgSlotsForTest();
 			db.close();

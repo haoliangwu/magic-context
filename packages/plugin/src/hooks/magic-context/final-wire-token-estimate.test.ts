@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import {
     __resetToolDefinitionMeasurements,
     getLargestMeasuredToolDefinitionTokens,
     recordToolDefinition,
 } from "../../features/magic-context/tool-definition-tokens";
+import * as logger from "../../shared/logger";
 import { outgoingContextRefusal } from "./emergency-fail-closed";
 import {
     createFinalWireUsageTracker,
@@ -141,6 +142,112 @@ it("OpenCode correlated provider usage wins over full-prefix estimates and rejec
         {},
     );
     expect(tracker.estimate("session", { messages, ...envelope }).refusalBasis).toBe("calibrated");
+});
+
+it("signed requests use exact provider-prefix fit and emit one estimate drift line", () => {
+    const route = { providerID: "anthropic", modelID: "claude-opus-5-5", agentName: "build" };
+    recordToolDefinition(route.providerID, route.modelID, route.agentName, "probe", "A probe", {});
+    const tracker = createFinalWireUsageTracker();
+    const prefix = [
+        {
+            info: { id: "signed", role: "assistant" },
+            parts: [
+                {
+                    type: "thinking",
+                    thinking: "A kept thought",
+                    signature: "opaque".repeat(50_000),
+                },
+            ],
+        },
+        { info: { id: "input", role: "user" }, parts: [{ type: "text", text: "Continue" }] },
+    ] as unknown as MessageLike[];
+    const envelope = { ...route, systemPromptTokens: 100, systemPromptHash: "stable" };
+    tracker.capture("signed-session", { ...envelope, messages: prefix });
+    const reply = {
+        info: {
+            id: "reply",
+            role: "assistant",
+            parentID: "input",
+            ...route,
+            finish: "tool-calls",
+            time: { completed: Date.now() + 1 },
+            tokens: { input: 657_477, cache: { read: 0, write: 0 } },
+        },
+        parts: [{ type: "thinking", thinking: "Next thought", signature: "opaque".repeat(50_000) }],
+    } as unknown as MessageLike;
+    const log = spyOn(logger, "sessionLog");
+    try {
+        const estimate = tracker.estimate("signed-session", {
+            ...envelope,
+            messages: [...prefix, reply],
+        });
+        expect(estimate.refusalBasis).toBe("provider-prefix");
+        expect(estimate.refusalTokens).toBeGreaterThanOrEqual(657_477);
+        expect(estimate.refusalTokens).toBeLessThan(658_477);
+        const drift = log.mock.calls.filter((call) =>
+            String(call[1]).includes("thinking estimate drift:"),
+        );
+        expect(drift).toHaveLength(1);
+        expect(String(drift[0]?.[1])).toContain("provider=657477 ratio=");
+        tracker.capture("signed-session", { ...envelope, messages: [...prefix, reply] });
+        expect(
+            log.mock.calls.filter((call) => String(call[1]).includes("thinking estimate drift:")),
+        ).toHaveLength(1);
+        log.mockClear();
+        const warm = createFinalWireUsageTracker();
+        warm.capture("warm-session", { ...envelope, messages: prefix });
+        const changed = structuredClone(prefix);
+        (changed[0]!.parts[0] as { thinking: string }).thinking = "Changed head on this request";
+        warm.capture("warm-session", {
+            ...envelope,
+            messages: [
+                ...changed,
+                {
+                    ...reply,
+                    info: { ...reply.info, time: { completed: Date.now() + 1 } },
+                } as unknown as MessageLike,
+            ],
+        });
+        expect(
+            log.mock.calls.filter((call) => String(call[1]).includes("thinking estimate drift:")),
+        ).toHaveLength(1);
+    } finally {
+        log.mockRestore();
+    }
+});
+
+it("opaque fallback telemetry logs once on execute and warm capture", () => {
+    const route = { providerID: "anthropic", modelID: "claude-opus-5-5", agentName: "build" };
+    recordToolDefinition(route.providerID, route.modelID, route.agentName, "probe", "A probe", {});
+    const input = {
+        ...route,
+        systemPromptTokens: 100,
+        systemPromptHash: "stable",
+        messages: [
+            { info: { id: "input", role: "user" }, parts: [{ type: "text", text: "Continue" }] },
+            {
+                info: { id: "hidden", role: "assistant" },
+                parts: [{ type: "thinking", thinking: "", signature: "opaque" }],
+            },
+        ] as unknown as MessageLike[],
+    };
+    const tracker = createFinalWireUsageTracker();
+    const log = spyOn(logger, "sessionLog");
+    try {
+        tracker.estimate("opaque-session", input, 872_000);
+        tracker.capture("opaque-session", input);
+        expect(
+            log.mock.calls.filter((call) => String(call[1]).includes("opaque thinking fallback:")),
+        ).toHaveLength(1);
+        log.mockClear();
+        tracker.capture("opaque-session", input);
+        expect(
+            log.mock.calls.filter((call) => String(call[1]).includes("opaque thinking fallback:")),
+        ).toHaveLength(1);
+        expect(String(log.mock.calls[0]?.[1])).toContain("steps=1 tokensPerStep=1000");
+    } finally {
+        log.mockRestore();
+    }
 });
 
 it("OpenCode measured preceding overflow does not refuse a fitting protected subset", () => {

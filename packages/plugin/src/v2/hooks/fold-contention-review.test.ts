@@ -4,11 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as configLoader from "../../config";
 import { MagicContextConfigSchema } from "../../config/schema/magic-context";
-import {
-    type FakeSubcDaemon,
-    fakeFleetResponder,
-    startFakeSubcDaemon,
-} from "../../features/magic-context/checkout-claim-fake-subc.test-support";
 import { closeDatabase, openDatabase } from "../../features/magic-context/storage-db";
 import { resetCtxReduceRegisteredGloballyForTest } from "../../hooks/magic-context/ctx-reduce-availability";
 import { resetLkgSlotsForTest } from "../../hooks/magic-context/lkg-slot";
@@ -40,7 +35,6 @@ test("re-review: a busy fold capture after successful transform never interrupts
         cache_ttl: "never",
         subc: { connection_file: join(dir, "run", "subc-connection.json") },
     });
-    let daemon: FakeSubcDaemon | undefined;
     let duties: Awaited<ReturnType<typeof registerContext>>;
     const oldFlag = process.env.MC_OC2_INVISIBLE_FOLD;
     process.env.MC_OC2_INVISIBLE_FOLD = "1";
@@ -74,10 +68,6 @@ test("re-review: a busy fold capture after successful transform never interrupts
     );
     try {
         resetLkgSlotsForTest();
-        daemon = await startFakeSubcDaemon(
-            join(dir, "run", "subc-connection.json"),
-            fakeFleetResponder({ agents: {}, claims: {} }),
-        );
         const context = {
             location: { directory: dir },
             agent: { transform: async () => {}, reload: async () => {} },
@@ -120,7 +110,6 @@ test("re-review: a busy fold capture after successful transform never interrupts
         if (captureReached) blocker.exec("ROLLBACK");
         lockAtCapture.mockRestore();
         await duties?.dispose();
-        await daemon?.close();
         load.mockRestore();
         gate.mockRestore();
         path.mockRestore();

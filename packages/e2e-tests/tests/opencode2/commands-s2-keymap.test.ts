@@ -13,14 +13,13 @@ import {
 } from "../../src/opencode2-runner/tui-capture";
 
 /**
- * OpenCode 2 has no `command.execute.before` hook, so the TUI keymap layer is
- * the only place a `/ctx-*` command can come from on this host. The plugin
- * reports the accepted layer's slash names once registration succeeds, so what
- * this asserts is the real TUI's own record of what the host received — a name
- * missing here is missing from the host's command palette.
+ * The server command registry supplies the OpenCode 2 palette and slash entries,
+ * including clients with no TUI. A second TUI keymap registration would duplicate
+ * those commands, so this checks the server list and then verifies the real TUI
+ * does not add another slash layer.
  *
- * The report is read from the plugin's diagnostic log rather than the screen
- * because the host owns the terminal and drops plugin console output.
+ * The TUI log is read rather than the screen because the host owns the terminal
+ * and drops plugin console output.
  */
 const EXPECTED_COMMANDS = [
 	"ctx-status",
@@ -32,7 +31,7 @@ const EXPECTED_COMMANDS = [
 ];
 const REGISTRATION_PREFIX = "registered slash commands:";
 
-test("the OpenCode 2 TUI registers every /ctx-* command through the keymap layer", async () => {
+test("OpenCode 2 has one server registration for each /ctx-* command", async () => {
 	// Without a PTY allocator the TUI never boots, so the claim cannot be
 	// checked at all; say that rather than passing on an unrun assertion.
 	expect(ptyCaptureAvailable()).toBe(true);
@@ -53,6 +52,14 @@ test("the OpenCode 2 TUI registers every /ctx-* command through the keymap layer
 		});
 		await waitForPluginActive(client, host.cwd);
 
+		const listed = await client.command.list({ location: { directory: host.cwd } });
+		const names = listed.data
+			.filter((command) => command.name.startsWith("ctx-"))
+			.map((command) => command.name)
+			.sort();
+		expect(names).toEqual([...EXPECTED_COMMANDS].sort());
+		expect(new Set(names).size).toBe(EXPECTED_COMMANDS.length);
+
 		// The TUI boots its own server against the same throwaway roots, so the
 		// serve host has to let go of the store first.
 		await host.stopHost();
@@ -64,22 +71,17 @@ test("the OpenCode 2 TUI registers every /ctx-* command through the keymap layer
 			root: host.root,
 			cwd: host.cwd,
 			sessionID: session.id,
-			markers: ["Magic Context"],
+			keys: ["/ctx-status", "\r", "\r"],
+			markers: ["Magic Context", "⚡ Magic Context Status"],
 			timeoutMs: 120_000,
 		});
 		expect({ missing: capture.missing }).toEqual({ missing: [] });
 
 		if (!existsSync(logPath)) throw new Error("the TUI wrote no plugin log");
-		const line = readFileSync(logPath, "utf8")
+		const registrations = readFileSync(logPath, "utf8")
 			.split("\n")
-			.find((row) => row.includes(REGISTRATION_PREFIX));
-		if (!line) throw new Error("the TUI logged no command registration line");
-		const registered = line
-			.slice(line.indexOf(REGISTRATION_PREFIX) + REGISTRATION_PREFIX.length)
-			.trim()
-			.split(/\s+/)
-			.filter((name) => name.startsWith("ctx-"));
-		expect(registered).toEqual(EXPECTED_COMMANDS);
+			.filter((row) => row.includes(REGISTRATION_PREFIX));
+		expect(registrations).toEqual([]);
 
 		// Live-store rule: every database the TUI process group held open was
 		// inside the throwaway root (captureTui throws on any database outside it).

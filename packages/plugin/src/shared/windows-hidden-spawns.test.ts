@@ -4,6 +4,13 @@ import { join, relative, resolve } from "node:path";
 import ts from "typescript";
 
 const root = resolve(import.meta.dir, "../../../..");
+const visibleGuiInstallers = [
+    {
+        path: "packages/cli/src/lib/dashboard-install.ts",
+        callee: "installerPath",
+        reason: "GUI installer in passive mode: its progress window must stay visible.",
+    },
+] as const;
 const subprocessNames = new Set([
     "exec",
     "execSync",
@@ -20,8 +27,7 @@ function sourceFiles(dir: string): string[] {
     });
 }
 
-function missingHiddenOptions(path: string): string[] {
-    const text = readFileSync(path, "utf8");
+function missingHiddenOptions(path: string, text = readFileSync(path, "utf8")): string[] {
     if (!/node:child_process|Bun\.spawn/.test(text)) return [];
     const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
     const imports = new Set<string>();
@@ -67,6 +73,18 @@ function missingHiddenOptions(path: string): string[] {
         }
         return false;
     }
+    function explicitlyVisible(node: ts.Expression | undefined): boolean {
+        if (!node || !ts.isObjectLiteralExpression(node)) return false;
+        for (const property of [...node.properties].reverse()) {
+            if (ts.isSpreadAssignment(property)) return false;
+            if (
+                ts.isPropertyAssignment(property) &&
+                property.name.getText(source) === "windowsHide"
+            )
+                return property.initializer.kind === ts.SyntaxKind.FalseKeyword;
+        }
+        return false;
+    }
     const failures: string[] = [];
     function visit(node: ts.Node): void {
         if (ts.isCallExpression(node)) {
@@ -109,7 +127,15 @@ function missingHiddenOptions(path: string): string[] {
                           : 2;
                 // A single-argument Bun.spawnSync({cmd, ...}) passes options as its first argument.
                 const option = node.arguments[index];
-                if (!hidden(option)) {
+                const visibleGuiInstaller =
+                    name === "execFileAsync" &&
+                    visibleGuiInstallers.some(
+                        (entry) =>
+                            relative(root, path).replaceAll("\\", "/") === entry.path &&
+                            node.arguments[0]?.getText(source) === entry.callee,
+                    ) &&
+                    explicitlyVisible(option);
+                if (!hidden(option) && !visibleGuiInstaller) {
                     const line =
                         source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
                     failures.push(`${relative(root, path)}:${line} ${name}`);
@@ -125,8 +151,38 @@ function missingHiddenOptions(path: string): string[] {
 describe("Windows child processes", () => {
     test("every plugin, Pi and CLI subprocess hides its Windows console", () => {
         const failures = ["plugin", "pi-plugin", "cli"].flatMap((pkg) =>
-            sourceFiles(join(root, "packages", pkg, "src")).flatMap(missingHiddenOptions),
+            sourceFiles(join(root, "packages", pkg, "src")).flatMap((path) =>
+                missingHiddenOptions(path),
+            ),
         );
         expect(failures).toEqual([]);
+    });
+
+    test("another dashboard subprocess still requires windowsHide true", () => {
+        const path = join(root, "packages/cli/src/lib/dashboard-install.ts");
+        const text = `import { execFile } from "node:child_process";
+            execFileAsync(installerPath, ["/P"], { windowsHide: false });
+            execFileAsync("tar", [], { windowsHide: false });`;
+        expect(missingHiddenOptions(path, text)).toEqual([
+            "packages/cli/src/lib/dashboard-install.ts:3 execFileAsync",
+        ]);
+    });
+
+    test("the GUI installer exemption requires explicit windowsHide false", () => {
+        const path = join(root, "packages/cli/src/lib/dashboard-install.ts");
+        const text = `import { execFile } from "node:child_process";
+            execFileAsync(installerPath, ["/P"]);`;
+        expect(missingHiddenOptions(path, text)).toEqual([
+            "packages/cli/src/lib/dashboard-install.ts:2 execFileAsync",
+        ]);
+    });
+
+    test("the GUI installer callee is not exempt in a different file", () => {
+        const path = join(root, "packages/cli/src/lib/other-installer.ts");
+        const text = `import { execFile } from "node:child_process";
+            execFileAsync(installerPath, ["/P"], { windowsHide: false });`;
+        expect(missingHiddenOptions(path, text)).toEqual([
+            "packages/cli/src/lib/other-installer.ts:2 execFileAsync",
+        ]);
     });
 });

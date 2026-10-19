@@ -37,13 +37,13 @@ mkdir -p "$DATA" "$RUN/data/opencode" "$RUN/home" "$RUN/config" "$RUN/state" "$R
 # The migration engine reads only context.db and store.db; OpenCode's database is
 # cloned into the host roots later, not here.
 cp -c "$SNAP/context.db" "$SNAP/store.db" "$DATA/"
-cp "$CK_MC" "$RUN/bin/ckdev-mc"
+CK_MC="$(bun "$WORKTREE/packages/e2e-tests/scripts/stage-executable.ts" "$CK_MC" ckdev-mc ck-mc)"
 
 export HOME="$RUN/home" XDG_DATA_HOME="$RUN/data" XDG_CONFIG_HOME="$RUN/config"
 export XDG_STATE_HOME="$RUN/state" XDG_CACHE_HOME="$RUN/cache" XDG_RUNTIME_DIR="$RUN/runtime"
 export TMPDIR="$RUN/tmp" MAGIC_CONTEXT_STORAGE_DIR="$DATA"
 unset OPENCODE_DB
-CLI=(node "$WORKTREE/packages/cli/dist/index.js" doctor single-store migrate --ck-mc "$RUN/bin/ckdev-mc" ${MIGRATE_EXTRA_ARGS:-})
+CLI=(node "$WORKTREE/packages/cli/dist/index.js" doctor single-store migrate --ck-mc "$CK_MC" ${MIGRATE_EXTRA_ARGS:-})
 
 state() {
     echo "--- $1"

@@ -50,8 +50,16 @@ import type {
 	SubagentRunOptions,
 	SubagentRunResult,
 } from "@magic-context/core/shared/subagent-runner";
+import { logTemperatureDecision } from "@magic-context/core/shared/subagent-temperature";
 import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child-stderr";
 import { type PiHarnessKind, resolvePiHarnessKind } from "./pi-harness-kind";
+import {
+	classifyZenFreeTierFailure,
+	isZenFreeTierRefusal,
+	isZenModel,
+	ZEN_FREE_TIER_FAILURE,
+	zenFreeTierMessage,
+} from "./pi-zen-free-tier";
 import { SubagentTelemetry, subagentStepCap } from "./subagent-telemetry";
 
 const PI_CODING_AGENT_MODULE = "@earendil-works/pi-coding-agent";
@@ -585,6 +593,18 @@ function resolveModelRefForTarget(
 }
 let configuredSubagentExtensions: readonly string[] | undefined;
 
+// Mirrors Pi 1.1.0's isLocalPath() non-local source prefixes; these entries
+// must reach Pi as sources instead of being resolved as filesystem paths.
+const PI_NON_LOCAL_EXTENSION_PREFIXES = [
+	"npm:",
+	"git:",
+	"github:",
+	"http:",
+	"https:",
+	"ssh:",
+	"builtin:",
+] as const;
+
 /** Configure the user-tier extension allowlist used by new Pi child runners. */
 export function configurePiSubagentExtensions(
 	extensions: readonly string[] | undefined,
@@ -598,9 +618,29 @@ function resolveSubagentExtensionEntry(
 ): string {
 	const trimmed = entry.trim();
 	const isNpmSource = trimmed.startsWith("npm:");
-	return !isNpmSource && !isAbsolute(trimmed)
-		? resolvePath(getHostAgentSettingsDir(targetHarness), trimmed)
-		: trimmed;
+	const isPiSource = PI_NON_LOCAL_EXTENSION_PREFIXES.some((prefix) =>
+		trimmed.startsWith(prefix),
+	);
+	// OMP's extension loader resolves configured entries as paths; remote packages
+	// use `omp install`. Preserve its existing npm: passthrough without implying
+	// that OMP loads npm: entries remotely.
+	if (isNpmSource || (targetHarness === "pi" && isPiSource)) return trimmed;
+
+	let normalized = trimmed;
+	if (normalized === "~") {
+		normalized = homedir();
+	} else if (
+		normalized.startsWith("~/") ||
+		(process.platform === "win32" && normalized.startsWith("~\\"))
+	) {
+		normalized = join(homedir(), normalized.slice(2));
+	} else if (/^file:\/\//.test(normalized)) {
+		normalized = fileURLToPath(normalized);
+	}
+
+	return isAbsolute(normalized)
+		? normalized
+		: resolvePath(getHostAgentSettingsDir(targetHarness), normalized);
 }
 
 const PI_READ_ONLY_BUILTINS = ["read", "grep", "find", "ls"] as const;
@@ -1155,6 +1195,10 @@ export class PiSubagentRunner implements SubagentRunner {
 		modelRefOverride?: string,
 	): Promise<SubagentRunResult> {
 		const startTime = Date.now();
+		const zenChild =
+			STRICT_TOOL_ALLOWLIST.has(options.agent) && isZenModel(options.model);
+		let deferredZenStderr = "";
+		let reportedZenStderr = false;
 		let recordedAccounting = false;
 		const cap = subagentStepCap(options.agent);
 		const budget = options.tokenBudget
@@ -1178,6 +1222,10 @@ export class PiSubagentRunner implements SubagentRunner {
 			}
 			if (!options.accountingSessionId || recordedAccounting) return;
 			recordedAccounting = true;
+			const modelRef =
+				typeof options.model === "string" ? options.model : undefined;
+			const providerSeparator = modelRef?.indexOf("/") ?? -1;
+			const hasProvider = providerSeparator > 0;
 			recordChildInvocation({
 				db: openDatabase(),
 				parentSessionId: options.accountingSessionId,
@@ -1188,23 +1236,23 @@ export class PiSubagentRunner implements SubagentRunner {
 				startedAt: startTime,
 				status: result.ok
 					? "completed"
-					: result.reason === "abort"
-						? "aborted"
-						: result.reason === "timeout"
-							? "timed_out"
-							: result.reason === "no_assistant" ||
-									result.reason === "truncated"
-								? "empty"
-								: "failed",
+					: result.meta?.failureClass === ZEN_FREE_TIER_FAILURE
+						? "failed"
+						: result.reason === "abort"
+							? "aborted"
+							: result.reason === "timeout"
+								? "timed_out"
+								: result.reason === "no_assistant" ||
+										result.reason === "truncated"
+									? "empty"
+									: "failed",
 				messages,
-				providerId:
-					typeof options.model === "string"
-						? options.model.split("/")[0]
-						: null,
-				modelId:
-					typeof options.model === "string"
-						? options.model.split("/").slice(1).join("/")
-						: null,
+				providerId: hasProvider
+					? modelRef?.slice(0, providerSeparator)
+					: undefined,
+				modelId: hasProvider
+					? modelRef?.slice(providerSeparator + 1)
+					: modelRef,
 				error: result.ok ? null : result.error,
 				parentInvocationId: options.accountingParentInvocationId ?? null,
 			});
@@ -1363,6 +1411,10 @@ export class PiSubagentRunner implements SubagentRunner {
 
 		return new Promise<SubagentRunResult>((resolve) => {
 			let accountingMessages: unknown[] = [];
+			let mappingMessages: unknown[] = [];
+			const isMemoryMapper =
+				options.agent.replace(/^magic-context-/, "") ===
+				"dreamer-memory-mapper";
 			// Track whether we've already resolved so timeout/abort/exit don't
 			// double-resolve. JS promises tolerate double-resolve silently but
 			// we want explicit control so we can distinguish "timeout fired
@@ -1372,6 +1424,44 @@ export class PiSubagentRunner implements SubagentRunner {
 			const settle = (result: SubagentRunResult) => {
 				if (settled) return;
 				settled = true;
+				if (zenChild) {
+					const classified = classifyZenFreeTierFailure(
+						result,
+						options.model,
+						options.agent,
+						this.invocation.targetHarness,
+					);
+					if (classified !== result && !classified.ok) {
+						sessionLog(
+							options.accountingSessionId ?? "subagent",
+							classified.error,
+						);
+					}
+					result = classified;
+					if (deferredZenStderr && !reportedZenStderr) {
+						emitProgress({
+							type: "stderr",
+							chunk:
+								result.meta?.failureClass === ZEN_FREE_TIER_FAILURE
+									? zenFreeTierMessage(
+											options.agent,
+											this.invocation.targetHarness,
+										)
+									: deferredZenStderr,
+						});
+					}
+				}
+				// Mapping emits decisions between tool turns. Preserve those turns on
+				// every settlement so a timeout cannot erase already located files.
+				if (
+					isMemoryMapper &&
+					result.meta?.failureClass !== ZEN_FREE_TIER_FAILURE
+				) {
+					result = {
+						...result,
+						meta: { ...result.meta, mappingMessages: [...mappingMessages] },
+					};
+				}
 				if (
 					accountingMessages.length > 0 &&
 					/historian|dreamer|classify/i.test(options.agent)
@@ -1435,6 +1525,16 @@ export class PiSubagentRunner implements SubagentRunner {
 			// log handlers must not be allowed to crash the runner.
 			const emitProgress = (event: SubagentProgressEvent) => {
 				if (!options.onProgress) return;
+				if (
+					zenChild &&
+					event.type === "raw_event" &&
+					isZenFreeTierRefusal(JSON.stringify(event.event))
+				) {
+					event = {
+						...event,
+						event: { type: event.eventType, error: { type: "FreeTierError" } },
+					};
+				}
 				try {
 					options.onProgress(event);
 				} catch {
@@ -1443,53 +1543,58 @@ export class PiSubagentRunner implements SubagentRunner {
 			};
 
 			let child: ReturnType<typeof childProcess.spawn>;
+			const parentEnv = { ...process.env };
+			// Calibration belongs to this invocation, not to a spawning historian child.
+			delete parentEnv.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE;
 			try {
-				child = this.spawnImpl(
-					this.invocation.command,
-					[...this.invocation.prefixArgs, ...this.extraArgs, ...args],
-					{
-						windowsHide: true,
-						cwd: options.cwd,
-						// Merge over the parent env so PATH/HOME/auth variables flow
-						// through for provider extensions. The guard only disables Magic
-						// Context's full entry; it must not replace the process env.
-						env: {
-							...process.env,
-							[MAGIC_CONTEXT_PI_SUBAGENT_ENV]: "1",
-							MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE: systemPromptPath,
-							MAGIC_CONTEXT_SUBAGENT_BUDGET_GUARD_FILE: budgetGuardFile,
-							MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY:
-								/^(magic-context-)?historian(?:-recomp|-editor)?$/.test(
-									options.agent,
-								)
-									? undefined
-									: "1",
-							...(options.temperature !== undefined
-								? {
-										MAGIC_CONTEXT_HISTORIAN_TEMPERATURE: String(
-											options.temperature,
-										),
-									}
-								: {}),
-							...(options.maxOutputTokens !== undefined
-								? {
-										MAGIC_CONTEXT_HISTORIAN_MAX_OUTPUT_TOKENS: String(
-											options.maxOutputTokens,
-										),
-									}
-								: {}),
+				child = inRootAsyncContext(() =>
+					this.spawnImpl(
+						this.invocation.command,
+						[...this.invocation.prefixArgs, ...this.extraArgs, ...args],
+						{
+							windowsHide: true,
+							cwd: options.cwd,
+							// Merge over the parent env so PATH/HOME/auth variables flow
+							// through for provider extensions. The guard only disables Magic
+							// Context's full entry; it must not replace the process env.
+							env: {
+								...parentEnv,
+								[MAGIC_CONTEXT_PI_SUBAGENT_ENV]: "1",
+								MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE: systemPromptPath,
+								MAGIC_CONTEXT_SUBAGENT_BUDGET_GUARD_FILE: budgetGuardFile,
+								MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY:
+									/^(magic-context-)?historian(?:-recomp|-editor)?$/.test(
+										options.agent,
+									)
+										? undefined
+										: "1",
+								...(options.temperature !== undefined
+									? {
+											MAGIC_CONTEXT_HISTORIAN_TEMPERATURE: String(
+												options.temperature,
+											),
+										}
+									: {}),
+								...(options.maxOutputTokens !== undefined
+									? {
+											MAGIC_CONTEXT_HISTORIAN_MAX_OUTPUT_TOKENS: String(
+												options.maxOutputTokens,
+											),
+										}
+									: {}),
+							},
+							// stdout = JSON events; stderr = diagnostics. stdin is a pipe
+							// when we deliver the user message there (always on Windows, or
+							// for oversized prompts elsewhere). Otherwise it stays closed
+							// because the message rides in argv and print-mode would block
+							// reading an open, idle stdin.
+							stdio: [
+								deliverViaStdin || rpcBudget ? "pipe" : "ignore",
+								"pipe",
+								"pipe",
+							],
 						},
-						// stdout = JSON events; stderr = diagnostics. stdin is a pipe
-						// when we deliver the user message there (always on Windows, or
-						// for oversized prompts elsewhere). Otherwise it stays closed
-						// because the message rides in argv and print-mode would block
-						// reading an open, idle stdin.
-						stdio: [
-							deliverViaStdin || rpcBudget ? "pipe" : "ignore",
-							"pipe",
-							"pipe",
-						],
-					},
+					),
 				);
 			} catch (error) {
 				cleanupSystemPromptFile();
@@ -1555,12 +1660,47 @@ export class PiSubagentRunner implements SubagentRunner {
 				}
 			}
 
+			const observeTemperatureDecision = (event: unknown): void => {
+				if (!event || typeof event !== "object") return;
+				const notice = event as {
+					type?: string;
+					model?: unknown;
+					supported?: unknown;
+					source?: unknown;
+					entry?: unknown;
+				};
+				if (
+					notice.type !== "mc_temperature" ||
+					typeof notice.model !== "string"
+				)
+					return;
+				if (
+					notice.source !== "host" &&
+					notice.source !== "catalog" &&
+					notice.source !== "none"
+				)
+					return;
+				if (notice.supported !== null && typeof notice.supported !== "boolean")
+					return;
+				logTemperatureDecision(
+					notice.model,
+					{
+						supported: notice.supported ?? undefined,
+						source: notice.source,
+						...(typeof notice.entry === "string"
+							? { entry: notice.entry }
+							: {}),
+					},
+					(message) =>
+						sessionLog(options.accountingSessionId ?? "pi-subagent", message),
+				);
+			};
+
 			// Capture stderr so we can attach it to error reasons. Pi prints
 			// unrecoverable errors (auth failures, network) here before the
-			// process exits. Also forward each chunk to the progress channel
-			// so historian failure logs see the message immediately rather
-			// than only at child exit (a hung child wouldn't surface this
-			// otherwise).
+			// process exits. Outside Zen, also forward each chunk to the progress
+			// channel so historian failure logs see the message immediately.
+			// Zen stderr is buffered below until refusal text can be classified.
 			let stderr = "";
 			let stderrLine = "";
 			// Pipe chunks split anywhere, including inside a multibyte UTF-8
@@ -1570,22 +1710,45 @@ export class PiSubagentRunner implements SubagentRunner {
 				const text = stderrDecoder.write(chunk);
 				if (text.length === 0) return;
 				// Pi 0.87 redirects extension stdout writes to stderr to protect its
-				// protocol. Accept only our content-free provenance event there.
+				// protocol. Accept only our content-free diagnostic events there.
 				stderrLine += text;
 				const lines = stderrLine.split("\n");
 				stderrLine = (lines.pop() ?? "").slice(-4096);
 				for (const line of lines) {
-					if (settled || !line.startsWith('{"type":"mc_system_prompt"'))
+					if (
+						settled ||
+						!(
+							line.startsWith('{"type":"mc_system_prompt"') ||
+							line.startsWith('{"type":"mc_temperature"')
+						)
+					)
 						continue;
 					const parsed = parsePiEventLine(line);
-					if (parsed.ok) telemetry.observe(parsed.event);
+					if (parsed.ok) {
+						telemetry.observe(parsed.event);
+						observeTemperatureDecision(parsed.event);
+					}
 				}
 				stderr += text;
 				// Cap to prevent unbounded growth on chatty failures.
 				if (stderr.length > 16_000) {
 					stderr = `…[truncated]${stderr.slice(-16_000)}`;
 				}
-				emitProgress({ type: "stderr", chunk: text });
+				if (zenChild) {
+					// Buffer arbitrary chunk boundaries so a split refusal body cannot
+					// reach the caller's log before its error class is recognized.
+					deferredZenStderr = stderr;
+					if (!reportedZenStderr && isZenFreeTierRefusal(stderr)) {
+						reportedZenStderr = true;
+						emitProgress({
+							type: "stderr",
+							chunk: zenFreeTierMessage(
+								options.agent,
+								this.invocation.targetHarness,
+							),
+						});
+					}
+				} else emitProgress({ type: "stderr", chunk: text });
 			});
 			// A pipe 'error' (EPIPE/ECONNRESET on the child's stderr, e.g. child
 			// died mid-write) emits on the stream; with no listener Node rethrows
@@ -1700,6 +1863,7 @@ export class PiSubagentRunner implements SubagentRunner {
 					return;
 				}
 				const event = parsed.event;
+				observeTemperatureDecision(event);
 
 				if (typeof event !== "object" || event === null) return;
 				const e = event as {
@@ -1707,6 +1871,13 @@ export class PiSubagentRunner implements SubagentRunner {
 					messages?: unknown;
 					message?: unknown;
 				};
+				// Capture the current decision before a token/step guard can settle.
+				if (isMemoryMapper) {
+					if (e.type === "message_end" && e.message)
+						mappingMessages.push(e.message);
+					if (e.type === "agent_end" && Array.isArray(e.messages))
+						mappingMessages = e.messages;
+				}
 
 				if (
 					rpcBudget &&
@@ -2875,3 +3046,5 @@ export const __test = {
 		loggedUnavailableBuiltinTools.clear();
 	},
 };
+
+import { inRootAsyncContext } from "@magic-context/core/shared/sqlite";

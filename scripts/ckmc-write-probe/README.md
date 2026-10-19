@@ -1,6 +1,6 @@
 # ck-mc write probe
 
-Tools behind `docs/reports/ckmc-write-amplification-design.md`. They measure how many bytes ck-mc writes per transform pass and which table owns each written page. Nothing here opens a live store: the live `context.db`, `store.db` and `opencode.db` are only ever read by `cp -c` (an APFS clone), and every measurement runs against the clones.
+Offline write-amplification probes. They measure how many bytes ck-mc writes per transform pass and which table owns each written page. Nothing here opens a live store: the live `context.db`, `store.db` and `opencode.db` are only ever read by `cp -c` (an APFS clone), and every measurement runs against the clones.
 
 Work files go to `$TMPDIR/magic-context/ckmc-writes` unless `CKMC_PROBE_DIR` says otherwise.
 

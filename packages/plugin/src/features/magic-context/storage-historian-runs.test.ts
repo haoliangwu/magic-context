@@ -101,7 +101,7 @@ test("records a success run with full metrics and reads back", () => {
     expect(row.legacy).toBe(0);
 });
 
-test("records a failure run with a reason and no compartments", () => {
+test("records an MC-authored failure reason without rewriting it", () => {
     const db = openDatabase();
     const id = recordHistorianRun(db, {
         sessionId: "ses-2",
@@ -119,6 +119,51 @@ test("records a failure run with a reason and no compartments", () => {
     expect(row.failure_reason).toBe("validation: bad output");
     expect(row.compartments_produced).toBe(0);
     expect(row.subagent_invocation_id).toBeNull();
+});
+
+test("uses provider_error only for missing reasons and caps MC-authored reasons verbatim", () => {
+    const db = openDatabase();
+    const missingReasonId = recordHistorianRun(db, {
+        sessionId: "ses-missing-reason",
+        harness: "pi",
+        runKind: "incremental",
+        status: "failed",
+        failureReason: "  ",
+    });
+    const opencodeMissingReasonId = recordHistorianRun(db, {
+        sessionId: "ses-opencode-missing-reason",
+        harness: "opencode",
+        runKind: "incremental",
+        status: "failed",
+        failureReason: null,
+    });
+    const producerReason = "producer_prompt_unfit: 32k window cannot hold the fixed prompt";
+    const producerReasonId = recordHistorianRun(db, {
+        sessionId: "ses-producer-reason",
+        harness: "pi",
+        runKind: "incremental",
+        status: "failed",
+        failureReason: producerReason,
+    });
+    const longReasonId = recordHistorianRun(db, {
+        sessionId: "ses-long-reason",
+        harness: "opencode",
+        runKind: "incremental",
+        status: "failed",
+        failureReason: `${producerReason} ${"x".repeat(600)}`,
+    });
+
+    const storedReasons = db
+        .prepare("SELECT failure_reason FROM historian_runs WHERE id IN (?, ?, ?, ?) ORDER BY id")
+        .all(missingReasonId, opencodeMissingReasonId, producerReasonId, longReasonId) as Array<{
+        failure_reason: string;
+    }>;
+    expect(storedReasons.map((row) => row.failure_reason)).toEqual([
+        "provider_error",
+        "provider_error",
+        producerReason,
+        `${producerReason} ${"x".repeat(512 - producerReason.length - 1)}`,
+    ]);
 });
 
 test("clearSession deletes a session's historian_runs", () => {

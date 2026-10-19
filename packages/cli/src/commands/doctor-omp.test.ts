@@ -106,7 +106,97 @@ describe("OMP doctor", () => {
 
         expect(code).toBe(0);
         expect(prompts.messages.join("\n")).toContain("OMP 17.1.7 detected");
+        expect(prompts.messages.join("\n")).toContain(
+            `warn:WARN Magic Context storage is at ${join(root, ".local", "share", "cortexkit", "magic-context")}, outside the folder Engram backs up (~/.local/share/cortexkit/magic-context). It is not included in CortexKit backups.`,
+        );
         expect(prompts.messages.join("\n")).toContain("FAIL 0");
+    });
+
+    it("does not fail or run OMP checks when Magic Context is not installed", async () => {
+        const root = createTestTempDirFromPath(join(tmpdir(), "mc-omp-doctor-uninstalled-"));
+        roots.push(root);
+        const agentDir = join(root, ".omp", "agent");
+        const configDir = join(root, ".config", "cortexkit");
+        mkdirSync(agentDir, { recursive: true });
+        mkdirSync(configDir, { recursive: true });
+        writeFileSync(join(configDir, "magic-context.jsonc"), "{}\n");
+        process.env.HOME = root;
+        process.env.PI_CODING_AGENT_DIR = agentDir;
+        process.env.XDG_CONFIG_HOME = join(root, ".config");
+        process.env.XDG_DATA_HOME = join(root, ".local", "share");
+        const prompts = new MockPrompts();
+
+        const code = await runDoctor({
+            cwd: root,
+            prompts,
+            deps: {
+                detectOmpBinary: () => ({ path: "/fake/omp", source: "path" }),
+                getOmpVersion: () => "17.0.0",
+                listOmpPlugins: () => [],
+                getOmpSetting: (() => {
+                    throw new Error("OMP settings should not be checked without the plugin");
+                }) as never,
+                runOmpCommand: () => {
+                    throw new Error("OMP configuration should not be checked without the plugin");
+                },
+            },
+        });
+
+        expect(code).toBe(0);
+        expect(prompts.messages).toContain(
+            "info:INFO Oh My Pi 17.0.0 found; Magic Context is not installed there (run setup to add it)",
+        );
+        expect(
+            prompts.messages.filter((message) => message.startsWith("info:INFO Oh My Pi ")),
+        ).toHaveLength(1);
+        expect(prompts.messages.filter((message) => message.startsWith("error:"))).toHaveLength(0);
+        expect(prompts.messages.join("\n")).toContain("FAIL 0");
+    });
+
+    it("still fails when Magic Context is installed on an old OMP version", async () => {
+        const root = createTestTempDirFromPath(join(tmpdir(), "mc-omp-doctor-old-version-"));
+        roots.push(root);
+        const agentDir = join(root, ".omp", "agent");
+        const pluginDir = join(root, "plugin");
+        const configDir = join(root, ".config", "cortexkit");
+        mkdirSync(agentDir, { recursive: true });
+        mkdirSync(pluginDir, { recursive: true });
+        mkdirSync(configDir, { recursive: true });
+        writeFileSync(
+            join(pluginDir, "package.json"),
+            JSON.stringify({ omp: { extensions: ["./dist/index.js"] } }),
+        );
+        writeFileSync(join(configDir, "magic-context.jsonc"), "{}\n");
+        process.env.HOME = root;
+        process.env.PI_CODING_AGENT_DIR = agentDir;
+        process.env.XDG_CONFIG_HOME = join(root, ".config");
+        process.env.XDG_DATA_HOME = join(root, ".local", "share");
+        const prompts = new MockPrompts();
+
+        const code = await runDoctor({
+            cwd: root,
+            prompts,
+            deps: {
+                detectOmpBinary: () => ({ path: "/fake/omp", source: "path" }),
+                getOmpVersion: () => "17.0.0",
+                listOmpPlugins: () => [
+                    {
+                        name: "@cortexkit/pi-magic-context",
+                        version: "0.33.0",
+                        enabled: true,
+                        path: pluginDir,
+                    },
+                ],
+                getOmpSetting: ((_path: string, key: string) =>
+                    key === "compaction.enabled" ? false : "off") as never,
+                runOmpCommand: () => ({ ok: true, stdout: agentDir, stderr: "" }),
+            },
+        });
+
+        expect(code).toBe(1);
+        expect(prompts.messages.join("\n")).toContain(
+            "OMP 17.0.0 is older than tested minimum 17.1.7",
+        );
     });
 
     /**
@@ -460,5 +550,113 @@ describe("OMP doctor", () => {
             "Magic Context user config migration refused",
         );
         expect(prompts.messages.join("\n")).not.toContain("Wrote default Magic Context config");
+    });
+});
+
+describe("OMP doctor Hide Secrets check", () => {
+    /**
+     * OMP install with Magic Context installed and enabled, built under
+     * $TMPDIR/magic-context/omp-hide-secrets/ so the real ~/.omp is never read.
+     * `userConfig` is the OMP agent config.yml content; undefined writes no
+     * file, and `{ directory: true }` puts a directory there so reading fails.
+     */
+    async function runWithUserConfig(
+        userConfig: string | undefined | { directory: true },
+    ): Promise<{ code: number; messages: string[] }> {
+        const parent = join(tmpdir(), "magic-context", "omp-hide-secrets");
+        mkdirSync(parent, { recursive: true });
+        const root = createTestTempDirFromPath(join(parent, "doctor-"));
+        roots.push(root);
+        const agentDir = join(root, ".omp", "agent");
+        const pluginDir = join(root, "plugin");
+        const configDir = join(root, ".config", "cortexkit");
+        mkdirSync(agentDir, { recursive: true });
+        mkdirSync(pluginDir, { recursive: true });
+        mkdirSync(configDir, { recursive: true });
+        writeFileSync(
+            join(pluginDir, "package.json"),
+            JSON.stringify({ omp: { extensions: ["./dist/index.js"] } }),
+        );
+        writeFileSync(join(configDir, "magic-context.jsonc"), "{}\n");
+        const configPath = join(agentDir, "config.yml");
+        if (typeof userConfig === "string") writeFileSync(configPath, userConfig);
+        else if (userConfig) mkdirSync(configPath);
+        // The secrets list lives in its own file; doctor must never echo it.
+        writeFileSync(
+            join(agentDir, "secrets.yml"),
+            "- type: plain\n  content: sk-fixture-SECRET\n",
+        );
+        process.env.HOME = root;
+        process.env.PI_CODING_AGENT_DIR = agentDir;
+        process.env.XDG_CONFIG_HOME = join(root, ".config");
+        process.env.XDG_DATA_HOME = join(root, ".local", "share");
+        delete process.env.PI_CONFIG_FILES;
+        const prompts = new MockPrompts();
+
+        const code = await runDoctor({
+            cwd: root,
+            prompts,
+            deps: {
+                detectOmpBinary: () => ({ path: "/fake/omp", source: "path" }),
+                getOmpVersion: () => "18.11.3",
+                listOmpPlugins: () => [
+                    {
+                        name: "@cortexkit/pi-magic-context",
+                        version: "0.49.9",
+                        enabled: true,
+                        path: pluginDir,
+                    },
+                ],
+                getOmpSetting: ((_path: string, key: string) =>
+                    key === "compaction.enabled" ? false : "off") as never,
+                runOmpCommand: () => ({ ok: true, stdout: agentDir, stderr: "" }),
+            },
+        });
+        return { code, messages: prompts.messages };
+    }
+
+    const docsLink = "https://docs.cortexkit.io/magic-context/help/compatibility/#omp-hide-secrets";
+
+    it("warns with a docs link when Hide Secrets is on, without failing", async () => {
+        const { code, messages } = await runWithUserConfig(
+            "secrets:\n  enabled: true\ncompaction:\n  enabled: false\n",
+        );
+
+        const warning = messages.find((message) => message.includes("Hide Secrets"));
+        expect(code).toBe(0);
+        expect(warning).toStartWith("warn:WARN OMP Hide Secrets (secrets.enabled) is on");
+        expect(warning).toContain(docsLink);
+        expect(warning).toContain("CLI flags and live settings toggles can't be detected");
+        expect(messages.join("\n")).not.toContain("sk-fixture-SECRET");
+    });
+
+    it("passes when Hide Secrets is off", async () => {
+        const { messages } = await runWithUserConfig("secrets:\n  enabled: false\n");
+
+        expect(messages).toContain(
+            "success:PASS OMP Hide Secrets (secrets.enabled) is off in OMP settings files (CLI flags and live settings toggles can't be detected)",
+        );
+        expect(messages.some((message) => message.startsWith("warn:WARN OMP Hide"))).toBe(false);
+    });
+
+    it("passes when OMP has no settings file", async () => {
+        const { messages } = await runWithUserConfig(undefined);
+
+        expect(
+            messages.some((message) =>
+                message.startsWith(
+                    "success:PASS OMP Hide Secrets (secrets.enabled) is not set in OMP settings files",
+                ),
+            ),
+        ).toBe(true);
+    });
+
+    it("warns when the OMP settings file cannot be read", async () => {
+        const { code, messages } = await runWithUserConfig({ directory: true });
+
+        const warning = messages.find((message) => message.includes("Hide Secrets"));
+        expect(code).toBe(0);
+        expect(warning).toStartWith("warn:WARN Could not check OMP Hide Secrets (secrets.enabled)");
+        expect(warning).toContain(docsLink);
     });
 });

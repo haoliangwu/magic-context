@@ -182,6 +182,8 @@ export interface SearchGitCommitsOptions {
     queryModelId?: string | null;
     from?: number;
     to?: number;
+    /** Capture independent lexical/vector rankings without repeating either retrieval pass. */
+    captureLanes?: (fts: GitCommitSearchHit[], vector: GitCommitSearchHit[]) => void;
 }
 
 function clamp01(value: number): number {
@@ -275,6 +277,31 @@ export function searchGitCommitsSync(
         for (const row of rows) bySha.set(row.sha, rowToCommit(row));
     }
 
+    if (options.captureLanes) {
+        const fts = [...bySha.values()]
+            .filter((commit) => ftsScores.has(commit.sha))
+            .map(
+                (commit): GitCommitSearchHit => ({
+                    commit,
+                    matchType: "fts",
+                    score: (ftsScores.get(commit.sha) ?? 0) * singleSourcePenalty,
+                }),
+            )
+            .sort((a, b) => b.score - a.score || b.commit.committedAtMs - a.commit.committedAtMs)
+            .slice(0, 25);
+        const vector = [...bySha.values()]
+            .filter((commit) => (semanticScores.get(commit.sha) ?? 0) > 0)
+            .map(
+                (commit): GitCommitSearchHit => ({
+                    commit,
+                    matchType: "semantic",
+                    score: semanticScores.get(commit.sha) ?? 0,
+                }),
+            )
+            .sort((a, b) => b.score - a.score || b.commit.committedAtMs - a.commit.committedAtMs)
+            .slice(0, 25);
+        options.captureLanes(fts, vector);
+    }
     const results: GitCommitSearchHit[] = [];
     for (const [sha, commit] of bySha.entries()) {
         const sem = semanticScores.get(sha);

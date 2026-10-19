@@ -132,3 +132,19 @@ describe("redaction gaps: unambiguous secret key names and header/URL credential
         expect(apiKey).toContain("x-api-key");
     });
 });
+
+describe("public diagnostic credential shapes", () => {
+    test("redacts unquoted colon credentials without removing scalar diagnostics", () => {
+        expect(redactSecretText("password: colonSecret700 token: anotherSecret700")).toBe(
+            "password: <REDACTED:credential> token: <REDACTED:credential>",
+        );
+        expect(redactSecretText("token: 1234567 secret: false")).toBe(
+            "token: 1234567 secret: false",
+        );
+    });
+    test("redacts hyphenated and underscored GitHub token payloads completely", () => {
+        expect(redactSecretText("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890-extra_payload")).toBe(
+            "<GITHUB_TOKEN_REDACTED>",
+        );
+    });
+});

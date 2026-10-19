@@ -5,6 +5,7 @@ import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
+import { sessionDecisionCalibration } from "../../features/magic-context/session-decision-calibration";
 import {
     closeDatabase,
     getHistorianFailureState,
@@ -29,6 +30,7 @@ import {
 import { resolveOpenCodeProtectedTailBoundary } from "./protected-tail-boundary";
 import { withRawMessageProvider } from "./read-session-chunk";
 import type { RawMessage } from "./read-session-raw";
+import { prewarmTagOwners } from "./tag-owner-warmup";
 
 it("does not fire at 88.3% for a tiny capped head even when later eligible history is large", () => {
     useTempDataHome("compartment-trigger-capped-head-");
@@ -655,7 +657,7 @@ describe("checkCompartmentTrigger", () => {
         }
     });
 
-    it("projects over-budget reasoning only when the provider can clear it from the wire", () => {
+    it("projects over-budget reasoning only when the provider can clear it from the wire", async () => {
         // Match issue #274's shape: at 36.8% usage, 70% of tagged bytes are
         // aged reasoning. Counting it as reclaimable projects 11.0%, below the
         // 16.2% post-drop target; a provider that cannot clear it must instead
@@ -680,6 +682,13 @@ describe("checkCompartmentTrigger", () => {
         // enough for clearing because tag 51 establishes the age cutoff.
         insertTag(db, sessionId, "m-1", "message", 299, 1, 700);
         insertTag(db, sessionId, "m-11", "message", 1, 51);
+        expect(
+            await prewarmTagOwners(
+                db,
+                sessionId,
+                sessionDecisionCalibration(db, sessionId).proseRatio,
+            ),
+        ).toBe(true);
         const runTrigger = (reasoningProjection: {
             providerID?: string;
             canClearReasoning?: boolean;

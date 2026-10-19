@@ -1,9 +1,14 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, mock, test } from "bun:test";
-
+import {
+    buildHiddenAgentConfig,
+    buildHiddenAgentRegistrations,
+    buildZenReadAgentRegistrations,
+} from "../../agents/hidden-agent-registrations";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { shapeV1HiddenMessage } from "../../shared/hidden-zen-read";
 import {
     type PromptArgs,
     promptSyncWithModelSuggestionRetry,
@@ -13,6 +18,7 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createV1HiddenCompletionExecutor } from "./compartment-runner-historian";
 import type { HiddenRunIdentity } from "./compartment-runner-types";
+import { createDroppedInputToolExecuteBeforeHook } from "./dropped-input-guard";
 
 function freshDb(): Database {
     const db = new Database(":memory:");
@@ -247,4 +253,197 @@ describe("OpenCode 1 historian under a host request timer", () => {
             closeQuietly(db);
         }
     });
+});
+
+const toolFreeAgents = [
+    "historian",
+    "historian-recomp",
+    "historian-editor",
+    "dreamer-classifier",
+    "smart-note-compiler",
+    "dreamer-reviewer",
+];
+const genuineToolAgents = [
+    "dreamer",
+    "dreamer-docs",
+    "dreamer-retrospective",
+    "dreamer-primer-investigator",
+    "dreamer-memory-mapper",
+];
+
+function agentRun(agent: string): HiddenRunIdentity {
+    return { ...run(agent.startsWith("historian") ? "historian" : "dreamer-task"), agent };
+}
+
+for (const providerID of ["anthropic", "openai", "opencode"]) {
+    test(`v1 preserves complete request bytes for unaffected agents on ${providerID}`, async () => {
+        const db = freshDb();
+        try {
+            const h = host();
+            const sent: string[] = [];
+            delete (h.client as { session: { promptAsync?: unknown } }).session.promptAsync;
+            h.prompt.mockImplementation(async (...args: unknown[]) => {
+                const shaped = structuredClone(args[0]) as PromptArgs;
+                shapeV1HiddenMessage(shaped.path.id, shaped.body);
+                sent.push(JSON.stringify(shaped));
+                return {} as never;
+            });
+            const executor = createV1HiddenCompletionExecutor(h.client, db, "/repo");
+            for (const agent of providerID === "opencode"
+                ? genuineToolAgents
+                : [...toolFreeAgents, ...genuineToolAgents]) {
+                const handle = await executor.open(agentRun(agent));
+                const original = {
+                    ...request,
+                    body: {
+                        ...request.body,
+                        agent,
+                        system: "original system\n",
+                        temperature: 0.3,
+                        model: { providerID, modelID: "fixture" },
+                    },
+                };
+                const bytes = JSON.stringify(original);
+                await executor.attempt(handle, original);
+                expect(sent.at(-1)).toBe(bytes);
+                expect(JSON.stringify(original)).toBe(bytes);
+                await executor.close(handle, {
+                    promptSettled: true,
+                    privacySensitive: false,
+                    context: "test",
+                    log() {},
+                });
+            }
+        } finally {
+            closeQuietly(db);
+        }
+    });
+}
+
+test("v1 Zen operand-only prompts advertise read with exactly one task instruction", async () => {
+    const db = freshDb();
+    try {
+        const h = host();
+        const sent: Array<{ body: Record<string, unknown> }> = [];
+        delete (h.client as { session: { promptAsync?: unknown } }).session.promptAsync;
+        h.prompt.mockImplementation(async (...args: unknown[]) => {
+            const shaped = structuredClone(args[0]) as PromptArgs;
+            shapeV1HiddenMessage(shaped.path.id, shaped.body);
+            sent.push(shaped);
+            return {} as never;
+        });
+        const executor = createV1HiddenCompletionExecutor(h.client, db, "/repo");
+        const registrations = buildHiddenAgentRegistrations({
+            dreamerPrompt: "dreamer",
+            smartNoteCompilerPrompt: "compiler",
+            historianPrompt: "historian",
+            historianEditorPrompt: "editor",
+            historianDisallowed: [],
+        });
+        registrations.push(...buildZenReadAgentRegistrations(registrations));
+        for (const agent of toolFreeAgents) {
+            const handle = await executor.open(agentRun(agent));
+            const original = {
+                ...request,
+                body: {
+                    ...request.body,
+                    agent,
+                    model: { providerID: "opencode", modelID: "free" },
+                },
+            };
+            await executor.attempt(handle, original);
+            const body = sent.at(-1)!.body;
+            expect(body.agent).toBe(`${agent}-zen-blocked-read`);
+            const registration = registrations.find((entry) => entry.id === body.agent)!;
+            expect(registration.allowedTools).toEqual(["read"]);
+            const config = buildHiddenAgentConfig(
+                registration.prompt!,
+                registration.allowedTools,
+                registration.maxSteps,
+                {},
+                registration.id,
+                true,
+            );
+            expect(config.permission.read).toBe("allow");
+            expect(config.permission.task).toBe("deny");
+            expect((body.system as string).match(/Do not call tools\./g)).toHaveLength(1);
+            if (agent.startsWith("historian"))
+                expect(body.system).toBe(
+                    "Summarize only the supplied conversation and memory context. Do not call tools.",
+                );
+            expect(original.body).not.toHaveProperty("system");
+            await executor.close(handle, {
+                promptSettled: true,
+                privacySensitive: false,
+                context: "test",
+                log() {},
+            });
+        }
+    } finally {
+        closeQuietly(db);
+    }
+});
+
+test("v1 blocked read refuses before the executor and the task completes", async () => {
+    const db = freshDb();
+    const execute = mock(() => "filesystem content must never be fetched");
+    const before = createDroppedInputToolExecuteBeforeHook();
+    let toolError = "";
+    const h = host();
+    delete (h.client as { session: { promptAsync?: unknown } }).session.promptAsync;
+    h.prompt.mockImplementation(async (...args: unknown[]) => {
+        const shaped = structuredClone(args[0]) as PromptArgs;
+        shapeV1HiddenMessage(shaped.path.id, shaped.body);
+        try {
+            await before(
+                { sessionID: "ses-child", tool: "read" },
+                { args: { filePath: "/repo/sentinel" } },
+            );
+            execute();
+        } catch (error) {
+            toolError = (error as Error).message;
+        }
+        return {} as never;
+    });
+    const executor = createV1HiddenCompletionExecutor(h.client, db, "/repo");
+    const handle = await executor.open(agentRun("historian"));
+    try {
+        await executor.attempt(handle, {
+            ...request,
+            body: {
+                ...request.body,
+                agent: "historian",
+                model: { providerID: "opencode", modelID: "free" },
+            },
+        });
+        expect(toolError).toBe("tool use is disabled for this task");
+        expect(execute).not.toHaveBeenCalled();
+        await expect(
+            before(
+                { sessionID: "ordinary-user", tool: "read" },
+                { args: { filePath: "/repo/sentinel" } },
+            ),
+        ).resolves.toBeUndefined();
+        // The same child can fall back to a non-Zen model without retaining the compatibility surface.
+        await executor.attempt(handle, {
+            ...request,
+            body: {
+                ...request.body,
+                agent: "historian",
+                model: { providerID: "mock", modelID: "fallback" },
+            },
+        });
+        expect(execute).toHaveBeenCalledTimes(1);
+    } finally {
+        await executor.close(handle, {
+            promptSettled: true,
+            privacySensitive: false,
+            context: "test",
+            log() {},
+        });
+        closeQuietly(db);
+    }
+    await expect(
+        before({ sessionID: "ses-child", tool: "read" }, { args: {} }),
+    ).resolves.toBeUndefined();
 });

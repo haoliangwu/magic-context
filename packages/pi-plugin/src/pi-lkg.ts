@@ -1,7 +1,15 @@
 import {
 	createDbLkgPersistence,
+	loadPersistedLkgSlot,
 	saveLkgSlotToDb,
 } from "@magic-context/core/hooks/magic-context/lkg-persist";
+import {
+	clearLkgFenceProcessState,
+	lkgFenceRequiresRebuild,
+	lkgRecoveryFenceUnclean,
+	markLkgRecoveryDirty,
+	ownsLkgDirtyFence,
+} from "@magic-context/core/hooks/magic-context/lkg-recovery-fence";
 import { replayLkg } from "@magic-context/core/hooks/magic-context/lkg-replay";
 import {
 	captureSlot,
@@ -10,6 +18,7 @@ import {
 	exactReusablePrefix,
 	getSlot,
 	incrementalLkgContentDigests,
+	isLegacyLkgDigest,
 	LKG_SNAPSHOT_ARRAY,
 	LKG_SNAPSHOT_BOOLEAN,
 	LKG_SNAPSHOT_KEY,
@@ -21,8 +30,11 @@ import {
 	type LkgContentField,
 	type LkgEntryNote,
 	type LkgSlot,
+	legacyLkgDigestFromFields,
 	lkgContentDigestFromFields,
 	lkgContentFields,
+	lkgFieldsMatchDigest,
+	lkgSlotRejection,
 	registerLkgPersistence,
 	signatureForFields,
 } from "@magic-context/core/hooks/magic-context/lkg-slot";
@@ -42,6 +54,8 @@ interface PiLkgInputSnapshot {
 }
 
 export interface PiLkgPassSnapshot {
+	/** Whether the request builder omits root completedAt and contextSnapshot fields. */
+	omitsBookkeeping?: boolean;
 	systemEntries?: readonly string[];
 	sessionId: string;
 	inputs: PiLkgInputSnapshot[];
@@ -69,7 +83,19 @@ export interface PiLkgSerializedOutput {
 	json: string;
 }
 
+export interface PiLkgRecoveryPrefix {
+	fenceRevision: string;
+	modelKey: string | null;
+	providerKey: string | null;
+	systemEntries?: readonly string[];
+	inputs: readonly PiLkgInputSnapshot[];
+	json: string;
+	outputEntryIds: readonly (string | null)[];
+	untaggedInputIds: ReadonlySet<string>;
+}
+
 interface PiLkgSessionState {
+	recoveryPrefix?: PiLkgRecoveryPrefix;
 	captureSequence: number;
 	syncCaptureRequired: boolean;
 	acceptedInputs: readonly PiLkgInputSnapshot[] | null;
@@ -204,9 +230,21 @@ export function clearPiLkgSessionState(sessionId: string): void {
 	const state = piLkgSessionStates.get(sessionId);
 	if (state) state.captureSequence += 1;
 	piLkgSessionStates.delete(sessionId);
+	clearLkgFenceProcessState(sessionId);
 }
 
 export interface PiLkgCoordinator {
+	/** Retain the AgentMessage[] sent during recovery without reading tag assignments or allocating numbers. */
+	noteRecovery(
+		snapshot: PiLkgPassSnapshot,
+		messages: readonly unknown[],
+		entryIds?: readonly (string | null)[],
+	): void;
+	recoveryEntryIds(snapshot: PiLkgPassSnapshot): (string | null)[];
+	recoveryFor(snapshot: PiLkgPassSnapshot): {
+		prefix?: PiLkgRecoveryPrefix;
+		rebuildReason?: string;
+	};
 	beginPass(args: {
 		sessionId: string;
 		messages: readonly unknown[];
@@ -227,13 +265,27 @@ export interface PiLkgCoordinator {
 		parentOf?: (id: string) => string | null | undefined,
 	): PiMeasuredPrefixFit | undefined;
 	captureAppliedPass(args: {
+		/** Publish served identities inside the synchronous last-good request transaction. */
+		publishServedNumbers?: () => void;
 		assertCurrentPass?: () => void;
 		snapshot: PiLkgPassSnapshot;
 		outputMessages: readonly unknown[];
 		outputEntryIds?: readonly (string | null | undefined)[];
 		cacheBusting: boolean;
+		releaseRecovery?: boolean;
 		hostEnvelopeSignature?: string;
 	}): PiLkgSerializedOutput | undefined;
+}
+
+/** A request that cannot be saved for replay can still be served with its admitted tag numbers recorded. */
+export class PiLkgUncapturable extends Error {
+	constructor(
+		readonly reason: string,
+		message: string,
+		cause?: unknown,
+	) {
+		super(message, { cause });
+	}
 }
 
 export function isTransientPiStorageError(error: unknown): boolean {
@@ -507,6 +559,61 @@ function piProviderInput(message: unknown): unknown {
 	return Object.create(Object.getPrototypeOf(message), descriptors);
 }
 
+/** Rebuild retry input from session entries only when every message matches its pre-render snapshot. */
+export function restorePiLkgInputForFit(
+	snapshot: PiLkgPassSnapshot | undefined,
+	branchEntries: readonly unknown[] | null | undefined,
+): unknown[] | undefined {
+	if (
+		!snapshot ||
+		snapshot.preparationFailure ||
+		!branchEntries ||
+		!snapshot.inputs.length
+	)
+		return;
+	const byId = new Map<string, unknown>();
+	for (const value of branchEntries) {
+		const entry = value as {
+			type?: unknown;
+			id?: unknown;
+			message?: unknown;
+		} | null;
+		if (entry?.type !== "message" || typeof entry.id !== "string") continue;
+		if (byId.has(entry.id)) return;
+		byId.set(entry.id, entry.message);
+	}
+	const input: unknown[] = [];
+	for (const saved of snapshot.inputs) {
+		if (!byId.has(saved.id)) return;
+		const message = byId.get(saved.id);
+		if (
+			!message ||
+			typeof message !== "object" ||
+			Array.isArray(message) ||
+			Object.hasOwn(message, "parts")
+		)
+			return;
+		const fields = plainJsonFields(
+			snapshot.omitsBookkeeping ? piProviderInput(message) : message,
+		);
+		if (
+			!fields ||
+			fields.length !== saved.fields.length ||
+			fields.some((field, i) => field !== saved.fields[i])
+		)
+			return;
+		input.push(message);
+	}
+	// Session entries can outlive the array the renderers edited. Copy only now,
+	// after checking every input against its pre-render snapshot. Extension-only
+	// and synthetic frames have no canonical entry and must not be guessed here.
+	try {
+		return structuredClone(input);
+	} catch {
+		return;
+	}
+}
+
 /** Compact JSON arrays preserve the exact serialized rows before their closing
  * bracket. A measurement cannot cover a rewritten row, even with the same ids. */
 function extendsMeasuredRequest(
@@ -522,10 +629,10 @@ function extendsMeasuredRequest(
 
 /**
  * Adapt Pi's JSONL entry ids and native AgentMessage shape to the shared LKG
- * slot/replay implementation. FNV/SHA digest work and durable writes run from
- * setImmediate; only detached field tokens and the exact served JSON bytes are
- * captured synchronously, so a later pass cannot hash objects the handler has
- * already mutated.
+ * slot/replay implementation. Capturable managed results commit synchronously,
+ * sharing their request transaction with their new tag identities. The caller
+ * can still serve an uncapturable result and record its admitted numbers alone.
+ * Detached inputs also protect deferred diagnostic captures from later mutations.
  */
 export function createPiLkgCoordinator(
 	db: Database,
@@ -548,16 +655,113 @@ export function createPiLkgCoordinator(
 		}
 		return state;
 	};
+	const recoveryFor: PiLkgCoordinator["recoveryFor"] = (snapshot) => {
+		const state = stateFor(snapshot.sessionId);
+		const prefix = state.recoveryPrefix;
+		if (!prefix) {
+			const slot = getSlot(snapshot.sessionId);
+			return lkgRecoveryFenceUnclean(snapshot.sessionId) ||
+				(slot &&
+					lkgFenceRequiresRebuild(
+						snapshot.sessionId,
+						state.acceptedInputs
+							? slot
+							: (loadPersistedLkgSlot(db, snapshot.sessionId) ?? slot),
+						!!state.acceptedInputs,
+					))
+				? { rebuildReason: "lkg_restart_rebuild" }
+				: {};
+		}
+		const durableSlot =
+			loadPersistedLkgSlot(db, snapshot.sessionId) ??
+			getSlot(snapshot.sessionId);
+		if (
+			snapshot.preparationFailure ||
+			!durableSlot ||
+			!ownsLkgDirtyFence(snapshot.sessionId, prefix.fenceRevision) ||
+			prefix.modelKey !== snapshot.modelKey ||
+			prefix.providerKey !== snapshot.providerKey ||
+			JSON.stringify(prefix.systemEntries) !==
+				JSON.stringify(snapshot.systemEntries) ||
+			exactReusablePrefix(snapshot.inputs, prefix.inputs) !==
+				prefix.inputs.length
+		)
+			return { rebuildReason: "lkg_recovery_input_rebuild" };
+		return { prefix };
+	};
+	const recoveryEntryIds: PiLkgCoordinator["recoveryEntryIds"] = (snapshot) => {
+		const anchor = snapshot.replayAnchorInputIndex;
+		const slot = getSlot(snapshot.sessionId);
+		if (
+			snapshot.preparationFailure ||
+			anchor === null ||
+			!slot?.piOutputEntryIds
+		)
+			throw new PiLkgUncapturable(
+				"lkg_output_mapping_unavailable",
+				"Cannot retain recovered output ownership",
+			);
+		const surviving = new Set(snapshot.inputs.map((input) => input.id));
+		return [
+			...slot.piOutputEntryIds.filter((id) => id === null || surviving.has(id)),
+			...snapshot.inputs.slice(anchor + 1).map((input) => input.id),
+		];
+	};
+	const noteRecovery: PiLkgCoordinator["noteRecovery"] = (
+		snapshot,
+		messages,
+		entryIds,
+	) => {
+		const state = stateFor(snapshot.sessionId);
+		const slot = getSlot(snapshot.sessionId);
+		if (!slot)
+			throw new PiLkgUncapturable(
+				"lkg_miss",
+				"Cannot retain recovery without a saved request",
+			);
+		const anchor = snapshot.replayAnchorInputIndex;
+		if (anchor === null)
+			throw new PiLkgUncapturable(
+				"lkg_miss",
+				"Cannot retain recovery without an input anchor",
+			);
+		const outputEntryIds = entryIds ?? recoveryEntryIds(snapshot);
+		if (outputEntryIds.length !== messages.length)
+			throw new PiLkgUncapturable(
+				"lkg_output_mapping_unavailable",
+				"Recovered output ownership does not match the served array",
+			);
+		state.recoveryPrefix = {
+			fenceRevision: markLkgRecoveryDirty({
+				sessionId: snapshot.sessionId,
+				slot,
+				processLocalProof: !!state.acceptedInputs,
+				ownDirtyRevision: state.recoveryPrefix?.fenceRevision,
+			}),
+			modelKey: snapshot.modelKey,
+			providerKey: snapshot.providerKey,
+			systemEntries: snapshot.systemEntries,
+			inputs: snapshot.inputs,
+			json: JSON.stringify(messages),
+			outputEntryIds,
+			untaggedInputIds: new Set([
+				...(state.recoveryPrefix?.untaggedInputIds ?? []),
+				...snapshot.inputs.slice(anchor + 1).map((input) => input.id),
+			]),
+		};
+	};
 
 	const beginPass: PiLkgCoordinator["beginPass"] = (args) => {
+		const omitsBookkeeping = omitsRootBookkeeping(args);
 		const snapped = snapshotInputs(
 			args.messages,
 			args.entryIds,
-			omitsRootBookkeeping(args),
+			omitsBookkeeping,
 		);
 		const slot = getSlot(args.sessionId);
 		if (snapped.failure || !slot) {
 			return {
+				omitsBookkeeping,
 				sessionId: args.sessionId,
 				inputs: snapped.inputs,
 				preparationFailure: snapped.failure,
@@ -573,6 +777,7 @@ export function createPiLkgCoordinator(
 		);
 		if (stableAnchorIndex < 0) {
 			return {
+				omitsBookkeeping,
 				sessionId: args.sessionId,
 				inputs: snapped.inputs,
 				preparationFailure: null,
@@ -586,6 +791,7 @@ export function createPiLkgCoordinator(
 		const messageAnchorIndex = snapped.inputs[stableAnchorIndex]?.messageIndex;
 		if (messageAnchorIndex === undefined) {
 			return {
+				omitsBookkeeping,
 				sessionId: args.sessionId,
 				inputs: snapped.inputs,
 				preparationFailure: null,
@@ -598,6 +804,7 @@ export function createPiLkgCoordinator(
 		}
 		try {
 			return {
+				omitsBookkeeping,
 				sessionId: args.sessionId,
 				inputs: snapped.inputs,
 				preparationFailure: null,
@@ -611,6 +818,7 @@ export function createPiLkgCoordinator(
 			};
 		} catch {
 			return {
+				omitsBookkeeping,
 				sessionId: args.sessionId,
 				inputs: snapped.inputs,
 				preparationFailure: null,
@@ -686,6 +894,7 @@ export function createPiLkgCoordinator(
 			inputTokens: request.usage.inputTokens,
 			envelopeSignature: request.envelopeSignature,
 			appendedMessages,
+			previousMessages: JSON.parse(request.jsonPrefix) as unknown[],
 		};
 	};
 	const replay: PiLkgCoordinator["replay"] = (snapshot, parentOf) => {
@@ -727,8 +936,10 @@ export function createPiLkgCoordinator(
 			if (
 				surviving.some(
 					(input, index) =>
-						lkgContentDigestFromFields(input.fields) !==
-						slot.inputContentDigests[start + index],
+						!lkgFieldsMatchDigest(
+							input.fields,
+							slot.inputContentDigests[start + index],
+						),
 				)
 			)
 				return { ok: false, reason: "lkg_content_mismatch" };
@@ -749,12 +960,25 @@ export function createPiLkgCoordinator(
 				],
 			};
 		}
+		const prefixInputs = snapshot.inputs.slice(
+			0,
+			snapshot.replayAnchorInputIndex + 1,
+		);
 		const entry: LkgEntryNote = {
 			pristineTail: snapshot.pristineTail,
 			entryInputIds: snapshot.inputs.map((input) => input.id),
-			entryContentDigests: snapshot.inputs
-				.slice(0, snapshot.replayAnchorInputIndex + 1)
-				.map((input) => lkgContentDigestFromFields(input.fields)),
+			entryContentDigests: prefixInputs.map((input) =>
+				lkgContentDigestFromFields(input.fields),
+			),
+			// A slot written before the current digest format is verified with the
+			// legacy digest of the same tokens (Pi's tokens are the same in both).
+			...(slot?.inputContentDigests.some(isLegacyLkgDigest)
+				? {
+						entryLegacyContentDigests: prefixInputs.map((input) =>
+							legacyLkgDigestFromFields(input.fields),
+						),
+					}
+				: {}),
 			anchorIndex: snapshot.replayAnchorInputIndex,
 		};
 		const result = replayLkg({
@@ -778,7 +1002,14 @@ export function createPiLkgCoordinator(
 	const captureAppliedPass: PiLkgCoordinator["captureAppliedPass"] = (args) => {
 		args.assertCurrentPass?.();
 		const { snapshot } = args;
-		if (snapshot.preparationFailure || snapshot.inputs.length === 0) return;
+		if (snapshot.preparationFailure || snapshot.inputs.length === 0) {
+			if (args.publishServedNumbers)
+				throw new PiLkgUncapturable(
+					snapshot.preparationFailure ?? "lkg_inputs_empty",
+					"Pi LKG input preparation failed",
+				);
+			return;
+		}
 		const state = stateFor(snapshot.sessionId);
 		let jsonPrefix: string;
 		try {
@@ -814,6 +1045,12 @@ export function createPiLkgCoordinator(
 				: null;
 		} catch (error) {
 			args.assertCurrentPass?.();
+			if (args.publishServedNumbers)
+				throw new PiLkgUncapturable(
+					"lkg_output_serialize_failed",
+					error instanceof Error ? error.message : String(error),
+					error,
+				);
 			dropSlot(snapshot.sessionId, "lkg_snapshot_serialize_failed");
 			const failedState = stateFor(snapshot.sessionId);
 			failedState.syncCaptureRequired = true;
@@ -861,18 +1098,21 @@ export function createPiLkgCoordinator(
 		};
 		// Capturing an unmeasured retry must not erase evidence for its unchanged
 		// served prefix. A rebuild, edited row, route or envelope does erase it.
-		if (
-			state.measuredRequest &&
-			(state.measuredRequest.modelKey !== plan.modelKey ||
-				state.measuredRequest.providerKey !== plan.providerKey ||
-				state.measuredRequest.envelopeSignature !==
-					args.hostEnvelopeSignature ||
-				!extendsMeasuredRequest(state.measuredRequest.jsonPrefix, jsonPrefix))
-		)
-			state.measuredRequest = undefined;
-		state.capturedRequest = args.hostEnvelopeSignature
-			? { ...plan, envelopeSignature: args.hostEnvelopeSignature }
-			: undefined;
+		const noteCapturedRequest = () => {
+			if (
+				state.measuredRequest &&
+				(state.measuredRequest.modelKey !== plan.modelKey ||
+					state.measuredRequest.providerKey !== plan.providerKey ||
+					state.measuredRequest.envelopeSignature !==
+						args.hostEnvelopeSignature ||
+					!extendsMeasuredRequest(state.measuredRequest.jsonPrefix, jsonPrefix))
+			)
+				state.measuredRequest = undefined;
+			state.capturedRequest = args.hostEnvelopeSignature
+				? { ...plan, envelopeSignature: args.hostEnvelopeSignature }
+				: undefined;
+		};
+		if (!args.publishServedNumbers) noteCapturedRequest();
 		const livePrior = getSlot(snapshot.sessionId);
 		const unchanged =
 			livePrior &&
@@ -884,7 +1124,7 @@ export function createPiLkgCoordinator(
 				plan.inputs.length &&
 			JSON.stringify(livePrior.piOutputEntryIds) === JSON.stringify(ownership);
 		args.assertCurrentPass?.();
-		if (unchanged && !state.syncCaptureRequired) {
+		if (unchanged && !state.syncCaptureRequired && !args.publishServedNumbers) {
 			// Provider usage can arrive before the deferred commit. Refresh the
 			// replay slot's identity in memory now without rewriting unchanged
 			// durable bytes. The new capturedRequest awaits its own usage; the last
@@ -919,6 +1159,7 @@ export function createPiLkgCoordinator(
 			try {
 				args.assertCurrentPass?.();
 			} catch (error) {
+				if (args.publishServedNumbers) throw error;
 				sessionLog(
 					plan.sessionId,
 					"DISCARDED CONTEXT RESULT: queued LKG capture",
@@ -951,25 +1192,59 @@ export function createPiLkgCoordinator(
 						.slice(reusablePrefix)
 						.map((input) => signatureForFields(input.fields)),
 				];
-				const incremental = incrementalLkgContentDigests(
-					plan.inputs.map((input, index) => ({
-						id: input.id,
-						signature: inputContentSignatures[index] ?? "",
-						fields: input.fields,
-					})),
-					reusePrior
+				// Exact field validation above proves the prefix of our own accepted
+				// slot. A foreign/reloaded slot still needs the ordinary id/signature
+				// check, and legacy digest formats must never cross into a new slot.
+				const verifiedOwnPrefix =
+					reusePrior &&
+					digestPrior === state.acceptedSlot &&
+					reusePrior.slot.inputIdSeq.length === reusePrior.signatures.length &&
+					reusePrior.signatures.length ===
+						reusePrior.slot.inputContentDigests.length;
+				let digestPrefix = 0;
+				if (verifiedOwnPrefix && reusePrior) {
+					while (
+						digestPrefix < reusablePrefix &&
+						!isLegacyLkgDigest(
+							reusePrior.slot.inputContentDigests[digestPrefix] ?? "",
+						)
+					)
+						digestPrefix++;
+				}
+				const incremental =
+					verifiedOwnPrefix && reusePrior
 						? {
-								ids: reusePrior.slot.inputIdSeq.slice(0, reusablePrefix),
-								signatures: reusePrior.signatures.slice(0, reusablePrefix),
-								digests: reusePrior.slot.inputContentDigests.slice(
-									0,
-									reusablePrefix,
-								),
+								reusedPrefix: digestPrefix,
+								digests: [
+									...reusePrior.slot.inputContentDigests.slice(0, digestPrefix),
+									...plan.inputs
+										.slice(digestPrefix)
+										.map((input) => lkgContentDigestFromFields(input.fields)),
+								],
 							}
-						: undefined,
-				);
+						: incrementalLkgContentDigests(
+								plan.inputs.map((input, index) => ({
+									id: input.id,
+									signature: inputContentSignatures[index] ?? "",
+									fields: input.fields,
+								})),
+								reusePrior
+									? {
+											ids: reusePrior.slot.inputIdSeq.slice(0, reusablePrefix),
+											signatures: reusePrior.signatures.slice(
+												0,
+												reusablePrefix,
+											),
+											digests: reusePrior.slot.inputContentDigests.slice(
+												0,
+												reusablePrefix,
+											),
+										}
+									: undefined,
+							);
 				reusedPrefix = incremental.reusedPrefix;
 				if (
+					!args.publishServedNumbers &&
 					!state.syncCaptureRequired &&
 					prior &&
 					reusedPrefix === plan.inputs.length &&
@@ -994,14 +1269,62 @@ export function createPiLkgCoordinator(
 					captureSequence: plan.captureSequence,
 				};
 				args.assertCurrentPass?.();
+				if (args.publishServedNumbers) {
+					if (lkgSlotRejection(plan.sessionId, slot))
+						throw new PiLkgUncapturable(
+							"lkg_slot_rejected",
+							"LKG slot rejected the Pi snapshot",
+						);
+					if (
+						!saveLkgSlotToDb(
+							db,
+							plan.sessionId,
+							slot,
+							args.publishServedNumbers,
+							{
+								rebuild: args.releaseRecovery,
+								retainDirtyRevision: !args.releaseRecovery
+									? state.recoveryPrefix?.fenceRevision
+									: undefined,
+							},
+						)
+					) {
+						throw new Error("Pi LKG/served publication failed");
+					}
+					// SQLite can return after the outcome deadline. The request and identities
+					// are durable, but the handler must refuse rather than dispatch a late result.
+					args.assertCurrentPass?.();
+				}
 				if (!captureSlot(plan.sessionId, slot)) {
 					throw new Error("LKG slot rejected the Pi snapshot");
 				}
 				state.acceptedInputs = plan.inputs;
 				state.acceptedSlot = slot;
-				const persisted = saveLkgSlotToDb(db, plan.sessionId, slot);
+				if (state.recoveryPrefix) {
+					state.recoveryPrefix = args.releaseRecovery
+						? undefined
+						: {
+								...state.recoveryPrefix,
+								inputs: plan.inputs,
+								json: plan.jsonPrefix,
+								outputEntryIds:
+									ownership ?? state.recoveryPrefix.outputEntryIds,
+							};
+				}
+				const persisted = args.publishServedNumbers
+					? true
+					: saveLkgSlotToDb(db, plan.sessionId, slot, undefined, {
+							rebuild: args.releaseRecovery,
+							retainDirtyRevision: state.recoveryPrefix?.fenceRevision,
+						});
 				state.syncCaptureRequired = !persisted;
+				if (args.publishServedNumbers) noteCapturedRequest();
 			} catch (error) {
+				if (args.publishServedNumbers) {
+					state.syncCaptureRequired = true;
+					state.acceptedInputs = null;
+					throw error;
+				}
 				try {
 					args.assertCurrentPass?.();
 				} catch (discarded) {
@@ -1033,7 +1356,7 @@ export function createPiLkgCoordinator(
 				}
 			}
 		};
-		if (state.syncCaptureRequired) {
+		if (args.publishServedNumbers || state.syncCaptureRequired) {
 			commit();
 		} else {
 			try {
@@ -1053,6 +1376,9 @@ export function createPiLkgCoordinator(
 	};
 
 	return {
+		noteRecovery,
+		recoveryEntryIds,
+		recoveryFor,
 		beginPass(args) {
 			return {
 				...beginPass(args),

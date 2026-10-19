@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { subagentTemperature } from "@magic-context/core/shared/subagent-temperature";
 import { readHostSystemPrompt } from "./host-system-prompt";
 import { promptFingerprint } from "./subagent-telemetry";
 
@@ -74,6 +75,23 @@ export function calibrateHistorianProviderPayload(
 	return calibrated;
 }
 
+/** Remove inherited sampling defaults as well as our override on unsupported models. */
+export function withoutProviderTemperature(payload: unknown): unknown {
+	if (!payload || typeof payload !== "object" || Array.isArray(payload))
+		return payload;
+	const clean = { ...(payload as Record<string, unknown>) };
+	delete clean.temperature;
+	for (const key of ["generationConfig", "inferenceConfig"]) {
+		const nested = clean[key];
+		if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+			const options = { ...(nested as Record<string, unknown>) };
+			delete options.temperature;
+			clean[key] = options;
+		}
+	}
+	return clean;
+}
+
 export default function historianCalibrationExtension(pi: ExtensionAPI): void {
 	const intendedPath = process.env.MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE;
 	if (intendedPath) {
@@ -95,11 +113,27 @@ export default function historianCalibrationExtension(pi: ExtensionAPI): void {
 		process.env[HISTORIAN_MAX_OUTPUT_TOKENS_ENV],
 	);
 	if (temperature === undefined && maxOutputTokens === undefined) return;
-	pi.on("before_provider_request", (event) =>
-		calibrateHistorianProviderPayload(
-			event.payload,
+	pi.on("before_provider_request", (event, ctx) => {
+		const model = ctx.model;
+		const key = `${model?.provider ?? "unknown"}/${model?.id ?? "unknown"}`;
+		const sampling = subagentTemperature(
+			key,
+			model,
 			temperature,
+			(_message, decision) => {
+				// Pi may redirect extension stdout to stderr; the parent accepts both
+				// and writes the session log line from these fields.
+				process.stdout.write(
+					`${JSON.stringify({ type: "mc_temperature", model: key, supported: decision.supported ?? null, source: decision.source, ...(decision.entry ? { entry: decision.entry } : {}) })}\n`,
+				);
+			},
+		);
+		return calibrateHistorianProviderPayload(
+			sampling === undefined
+				? withoutProviderTemperature(event.payload)
+				: event.payload,
+			sampling,
 			maxOutputTokens,
-		),
-	);
+		);
+	});
 }

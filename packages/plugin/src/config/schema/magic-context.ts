@@ -613,6 +613,8 @@ export const DreamTasksSchema = z
         ),
         "review-user-memories": ReviewUserMemoriesTaskConfigSchema.default(() =>
             ReviewUserMemoriesTaskConfigSchema.parse(defaultTaskConfig("review-user-memories")),
+        ).describe(
+            "Promote recurring user observations into the <user-profile> block. A non-empty schedule also makes the historian collect user observations, but only while the dreamer is runnable (dreamer.disable not true); collection and review follow that one gate and do not depend on memory.enabled.",
         ),
         "promote-primers": PromotePrimersTaskConfigSchema.default(() =>
             PromotePrimersTaskConfigSchema.parse(defaultTaskConfig("promote-primers")),
@@ -644,7 +646,12 @@ export const DreamerConfigSchema = AgentMetadataSchema.extend({
     // Its own node rather than the one shared with the historian through
     // AgentMetadataSchema: `dreamer.disable` is a live-reload key and the
     // historian's is not, and the live marker is set on the schema node.
-    disable: z.boolean().optional().describe("Disable this agent"),
+    disable: z
+        .boolean()
+        .optional()
+        .describe(
+            "Disable the dreamer: no scheduled or manual dream task runs. Also turns off smart notes (ctx_note drops surface_condition even with smart_notes.enabled true) and the historian's collection of user observations for review-user-memories. dreamer.inject_docs still applies.",
+        ),
     runner: z
         .enum(["broca", "host"])
         .optional()
@@ -659,7 +666,7 @@ export const DreamerConfigSchema = AgentMetadataSchema.extend({
         .boolean()
         .default(true)
         .describe(
-            "Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true)",
+            "Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true). Not a dreamer setting despite its place under dreamer: it applies on every host, also with dreamer.disable true.",
         ),
 });
 export type DreamerConfig = z.infer<typeof DreamerConfigSchema>;
@@ -792,7 +799,7 @@ const BaseEmbeddingConfigSchema = z
             .enum(["auto", "native", "wasm"])
             .default("auto")
             .describe(
-                "Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Inference runs in a dedicated worker. On Bun before 1.4.0, even explicit 'native' uses WASM because native worker teardown can crash the process. Set 'wasm' to avoid loading the native addon on newer hosts too.",
+                "Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Inference runs in a dedicated worker after disabling POSIX telemetry in the native process environment. Compiled Bun hosts and hosts without a verified in-process opt-out use a subprocess instead. Windows native ONNX emits OS-controlled ETW diagnostics, not direct uploads. On Bun before 1.4.0, even explicit 'native' uses WASM because native worker teardown can crash the process. Set 'wasm' to avoid loading the native addon on newer hosts too.",
             ),
         local_dtype: z
             .enum([
@@ -917,9 +924,9 @@ export interface ShadowEmbeddingConfig {
 
 export interface MuralConfig {
     enabled: boolean;
-    /** The CUE COMPRESSOR model for the compress-cues dreamer task (the mural is
-     *  now rendered deterministically, so this no longer names an author model). */
-    model?: string;
+    /** Deprecated and ignored: compress-cues takes its model from each
+     *  harness's dreamer settings, like every other dreamer task. */
+    model?: unknown;
 }
 
 export interface MagicContextConfig {
@@ -943,6 +950,8 @@ export interface MagicContextConfig {
     historian?: HistorianConfig;
     dreamer?: DreamerConfig;
     smart_notes: {
+        /** Enable smart-note authoring and checks for the user; read at process startup. */
+        enabled: boolean;
         /** Flip ownership of authoring-compiled conditions from dreamer to retina. */
         retina_handoff: boolean;
     };
@@ -951,8 +960,8 @@ export interface MagicContextConfig {
     prompt_surface: PromptSurfaceConfig;
     /** User-only output-token reservation override. Zero disables reservation. */
     output_reserve?: number | { default: number; [modelKey: string]: number };
-    /** User-only model metadata inputs. */
-    models?: { window_overlay_path?: string };
+    /** Deprecated user-only window metadata path; parsed only so loaders can warn and ignore it. */
+    models?: { window_overlay_path?: unknown };
     /** TUI toast lifetime in milliseconds for Magic Context notifications. Default: 5000. */
     toast_duration_ms?: number;
     execute_threshold_percentage: number | { default: number; [modelKey: string]: number };
@@ -1121,13 +1130,12 @@ export const MagicContextConfigSchema = z
             .object({
                 enabled: z.boolean().default(false),
                 model: z
-                    .string()
-                    .trim()
-                    .min(1)
+                    .unknown()
                     .optional()
                     .describe(
-                        "Model for the compress-cues task that compresses each memory into a mural cue. The mural image itself is rendered deterministically (no author model).",
-                    ),
+                        "Deprecated: ignored. compress-cues now uses the dreamer model for each harness, like every other dreamer task; override it with dreamer.opencode.tasks.compress-cues.model (or the pi/omp equivalent). Remove this key; it no longer does anything.",
+                    )
+                    .meta({ deprecated: true }),
             })
             .default({ enabled: false })
             .describe(
@@ -1180,10 +1188,16 @@ export const MagicContextConfigSchema = z
             "Historian metadata plus independent strict OpenCode, Pi, and OMP execution blocks. Retained metadata stays at historian; model, fallback_models, variant, and thinking_level belong only in historian.opencode, historian.pi, or historian.omp.",
         ),
         dreamer: DreamerConfigSchema.optional().describe(
-            "Dreamer metadata and scheduling plus independent strict OpenCode, Pi, and OMP execution blocks. schedule and promotion_threshold stay at dreamer.tasks; model, fallback_models, variant, thinking_level, and timeout_minutes belong only in the matching harness block.",
+            "Dreamer metadata and scheduling plus independent strict OpenCode, Pi, and OMP execution blocks. schedule and promotion_threshold stay at dreamer.tasks; model, fallback_models, variant, thinking_level, and timeout_minutes belong only in the matching harness block. Each task follows the setting it serves: memory tasks need memory.enabled, evaluate-smart-notes needs smart_notes.enabled, review-user-memories needs its schedule, maintain-docs only a runnable dreamer.",
         ),
         smart_notes: z
             .object({
+                enabled: z
+                    .boolean()
+                    .default(true)
+                    .describe(
+                        "Enable smart-note authoring and condition evaluation. Needs a runnable dreamer, which evaluates the conditions: with dreamer.disable true (or no dreamer block) ctx_note offers no surface_condition whatever this says. User-level only: tool definitions are process-wide. Changes require a host restart and rebuild each session's cached prompt once. Pending notes remain stored and unchecked; already-ready notes still surface.",
+                    ),
                 retina_handoff: z
                     .boolean()
                     .default(false)
@@ -1191,7 +1205,7 @@ export const MagicContextConfigSchema = z
                         "When true, dreamer skips smart notes whose surface conditions compiled to retina provider configs at authoring time. Default false keeps both paths active until the retina consumer is deployed.",
                     ),
             })
-            .default({ retina_handoff: false })
+            .default({ enabled: true, retina_handoff: false })
             .describe("Smart-note ownership transition controls."),
         cache_ttl: z
             .union([z.string(), z.object({ default: z.string() }).catchall(z.string())])
@@ -1213,12 +1227,16 @@ export const MagicContextConfigSchema = z
             ),
         models: z
             .object({
-                window_overlay_path: z.string().trim().min(1).optional(),
+                window_overlay_path: z
+                    .unknown()
+                    .optional()
+                    .describe(
+                        "Deprecated: ignored. Fusiform no longer publishes window-overlay data, so this setting no longer changes model window geometry. Remove this key.",
+                    )
+                    .meta({ deprecated: true }),
             })
             .optional()
-            .describe(
-                "User-only Fusiform window-overlay settings. The path defaults to <dataDir>/fusiform/window-overlay.json.",
-            ),
+            .describe("Deprecated user-only Fusiform window-overlay settings; ignored."),
         toast_duration_ms: z
             .number()
             .min(0)
@@ -1292,7 +1310,7 @@ export const MagicContextConfigSchema = z
             .min(60_000)
             .default(DEFAULT_HISTORIAN_TIMEOUT_MS)
             .describe(
-                "Timeout for each historian prompt call in both TypeScript and Rust transform modes, in milliseconds (default: 600000)",
+                "Timeout for each historian prompt call in both TypeScript and Rust transform modes, in milliseconds (default: 600000). A historian setting kept at the top level for compatibility; no effect while historian.disable is true or compaction.enabled is false.",
             ),
         commit_cluster_trigger: z
             .object({
@@ -1310,7 +1328,7 @@ export const MagicContextConfigSchema = z
             })
             .default({ enabled: true, min_clusters: 3 })
             .describe(
-                "Commit-cluster trigger: fire historian when enough commit clusters accumulate in the unsummarized tail",
+                "Commit-cluster trigger: fire historian when enough commit clusters accumulate in the unsummarized tail. A historian setting kept at the top level for compatibility; no effect while historian.disable is true or compaction.enabled is false.",
             ),
         system_prompt_injection: z
             .object({
@@ -1499,7 +1517,7 @@ export const MagicContextConfigSchema = z
                     .boolean()
                     .default(true)
                     .describe(
-                        "Enable cross-session memory (default: true). Does not affect history embedding or semantic ctx_search over session history; set embedding.provider to 'off' to stop all embedding.",
+                        "Enable cross-session project memory (default: true). Also gates the dreamer's project-memory tasks: while false, map-memories, verify, verify-broad, curate, compress-cues, classify-memories, retrospective, promote-primers and refresh-primers neither run on schedule nor through /ctx-dream; maintain-docs, evaluate-smart-notes and review-user-memories still run. memory.auto_search and memory.git_commit_indexing do not depend on it. Does not affect history embedding or semantic ctx_search over session history; set embedding.provider to 'off' to stop all embedding.",
                     ),
                 injection_budget_tokens: z
                     .number()
@@ -1513,14 +1531,14 @@ export const MagicContextConfigSchema = z
                     .boolean()
                     .default(true)
                     .describe(
-                        "Automatically promote eligible session facts into memory (default: true)",
+                        "Automatically promote eligible session facts into memory (default: true). No effect while memory.enabled is false.",
                     ),
                 retrieval_count_promotion_threshold: z
                     .number()
                     .min(1)
                     .default(3)
                     .describe(
-                        "retrieval_count threshold for promoting memory to permanent status (min: 1, default: 3)",
+                        "Currently has no effect: no code reads this value, and memories are not promoted to permanent by retrieval count. Kept so existing configs stay valid (min: 1, default: 3).",
                     ),
                 auto_search: z
                     .object({
@@ -1528,7 +1546,7 @@ export const MagicContextConfigSchema = z
                             .boolean()
                             .default(true)
                             .describe(
-                                "Automatically append a compact <ctx-search-hint> to eligible user messages when relevant memories, conversation, or commits are found. Graduated from experimental.auto_search; on by default (set false to opt out). Independent of memory.enabled.",
+                                "Automatically append a compact <ctx-search-hint> to eligible user messages when relevant memories, conversation, or commits are found. Graduated from experimental.auto_search; on by default (set false to opt out). Independent of memory.enabled despite its place under memory: with memory off it still searches past conversation and commits, only the memory source is skipped.",
                             ),
                         score_threshold: z
                             .number()
@@ -1549,7 +1567,7 @@ export const MagicContextConfigSchema = z
                     })
                     .default({ enabled: true, score_threshold: 0.6, min_prompt_chars: 20 })
                     .describe(
-                        "Auto-search hint: transform-time ctx_search on each new user message; when the top hit clears the threshold, append a compact <ctx-search-hint> block of vague fragments to that user message. Does NOT inject full content. Graduated from experimental.auto_search; enabled by default (set enabled: false to opt out). Independent of memory.enabled.",
+                        "Auto-search hint: transform-time ctx_search on each new user message; when the top hit clears the threshold, append a compact <ctx-search-hint> block of vague fragments to that user message. Does NOT inject full content. Graduated from experimental.auto_search; enabled by default (set enabled: false to opt out). Independent of memory.enabled despite its place under memory: with memory off it still searches past conversation and commits.",
                     ),
                 git_commit_indexing: z
                     .object({
@@ -1557,7 +1575,7 @@ export const MagicContextConfigSchema = z
                             .boolean()
                             .default(false)
                             .describe(
-                                "Index HEAD git commits for ctx_search (git_commit source). Graduated from experimental.git_commit_indexing; opt-in, default off. Independent of memory.enabled.",
+                                "Index HEAD git commits for ctx_search (git_commit source). Graduated from experimental.git_commit_indexing; opt-in, default off. Independent of memory.enabled despite its place under memory.",
                             ),
                         since_days: z
                             .number()
@@ -1578,7 +1596,7 @@ export const MagicContextConfigSchema = z
                     })
                     .default({ enabled: false, since_days: 365, max_commits: 2000 })
                     .describe(
-                        "Index git commit messages from HEAD into ctx_search. Commits become a 4th searchable source alongside memories and session history. Graduated from experimental.git_commit_indexing; opt-in, default off (per-project embedding cost). Independent of memory.enabled.",
+                        "Index git commit messages from HEAD into ctx_search. Commits become a 4th searchable source alongside memories and session history. Graduated from experimental.git_commit_indexing; opt-in, default off (per-project embedding cost). Independent of memory.enabled despite its place under memory.",
                     ),
             })
             .default({
@@ -1589,7 +1607,9 @@ export const MagicContextConfigSchema = z
                 auto_search: { enabled: true, score_threshold: 0.6, min_prompt_chars: 20 },
                 git_commit_indexing: { enabled: false, since_days: 365, max_commits: 2000 },
             })
-            .describe("Cross-session memory configuration"),
+            .describe(
+                "Cross-session memory configuration. auto_search and git_commit_indexing sit here for history but work with memory.enabled false.",
+            ),
     })
     .transform((data): MagicContextConfig => {
         return {
@@ -1601,7 +1621,6 @@ export const MagicContextConfigSchema = z
 /** Settings whose fresh values can be used by later agent runs without changing rendered prompt bytes. */
 export const LIVE_RELOAD_CONFIG_PATHS = [
     "cache_ttl",
-    "mural.model",
     "toast_duration_ms",
     "historian.opencode.model",
     "historian.opencode.fallback_models",

@@ -8,11 +8,9 @@ import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
  * Reporter shape: a resumed OpenCode session whose loaded window starts after
  * the boundary, so the boundary id never appears in the live array. That is a
  * boundary that sorts before the whole window: there is nothing to cut, and the
- * trim must say so instead of refusing on every pass. A boundary that sorts
- * inside the window but whose row is missing, or a boundary that no longer
- * resolves at all, is a degraded state: the whole window is served on every
- * pass, exactly as before, until a cache-busting pass moves the baseline
- * boundary to a compartment end that is in the window and the id trim applies.
+ * trim must say so instead of refusing on every pass. A boundary absent only
+ * from the live array can still prove a cut by its persisted position. An
+ * unresolvable boundary remains degraded until a safe anchor can be established.
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
@@ -27,12 +25,14 @@ import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
+    capturePrefixTrimSourceOrder,
     type InjectM0M1Result,
     injectM0M1,
     type M0HardSignals,
     type M0M1State,
     resetPrefixTrimFallbackState,
 } from "./inject-compartments";
+import { withRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import type { MessageLike } from "./tag-messages";
 
@@ -159,6 +159,144 @@ const sha = (messages: readonly MessageLike[]): string =>
     createHash("sha256").update(JSON.stringify(messages)).digest("hex");
 
 describe("prefix trim with a boundary absent from the live window", () => {
+    it("in-order differential preserves exact provider message bytes", () => {
+        seedOpenCodeSession(40);
+        const db = contextDb();
+        const hashes: string[] = [];
+        for (const snapshot of [false, true]) {
+            for (const busting of [true, false]) {
+                const source = liveWindow(1, 20);
+                const messages = structuredClone(source);
+                const result = injectM0M1({
+                    db,
+                    sessionId: SESSION_ID,
+                    state: getOrCreateSessionMeta(db, SESSION_ID),
+                    messages,
+                    preparedPrefix: preparedPrefix(idOf(6)),
+                    isCacheBustingPass: busting,
+                    prefixTrimSourceOrder: snapshot
+                        ? capturePrefixTrimSourceOrder(source)
+                        : undefined,
+                });
+                expect(result.prefixTrimStatus).toBe("applied");
+                expect(ids(messages)).toEqual([undefined, ...ids(liveWindow(7, 20))]);
+                hashes.push(sha(messages));
+            }
+        }
+        expect(new Set(hashes).size).toBe(1);
+        console.log(`IN_ORDER_DIFFERENTIAL ${JSON.stringify(hashes)}`);
+    });
+
+    it("does not reanchor when a live row is unknown or stored order is reversed", () => {
+        seedOpenCodeSession(30);
+        const db = contextDb();
+        for (const source of [
+            [...liveWindow(5, 11), ...liveWindow(13, 14)].reverse(),
+            [...liveWindow(5, 11), ...liveWindow(31, 31)],
+        ]) {
+            const messages = structuredClone(source);
+            const result = injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                state: getOrCreateSessionMeta(db, SESSION_ID),
+                messages,
+                preparedPrefix: preparedPrefix(idOf(12)),
+                prefixTrimSourceOrder: capturePrefixTrimSourceOrder(source),
+            });
+            expect(result.prefixTrimStatus).toBe("refused");
+            expect(ids(messages).slice(1)).toEqual(ids(source));
+        }
+    });
+
+    it("OpenCode 2 reanchors by sparse store seq even when ids and raw ordinals cannot place a control row", () => {
+        const db = contextDb();
+        const order: Record<string, number> = {
+            msg_z_control: 100,
+            msg_z_old: 121,
+            msg_a_boundary: 144,
+            msg_b_new: 190,
+        };
+        const source: MessageLike[] = ["msg_z_control", "msg_z_old", "msg_b_new"].map((id) => ({
+            info: { id, role: "user", sessionID: SESSION_ID },
+            parts: [{ type: "text", text: id }],
+        }));
+        withRawMessageProvider(
+            SESSION_ID,
+            {
+                readMessages: () => {
+                    throw new Error("no full-history read");
+                },
+                readMessageOrderById: (id) => order[id] ?? null,
+                readMessageOrdinalById: () => null,
+            },
+            () => {
+                const messages = structuredClone(source);
+                const result = injectM0M1({
+                    db,
+                    sessionId: SESSION_ID,
+                    state: getOrCreateSessionMeta(db, SESSION_ID),
+                    messages,
+                    preparedPrefix: preparedPrefix("msg_a_boundary"),
+                    prefixTrimSourceOrder: capturePrefixTrimSourceOrder(source),
+                });
+                expect(result.prefixTrimStatus).toBe("applied");
+                expect(ids(messages)).toEqual([undefined, "msg_b_new"]);
+            },
+        );
+    });
+    for (const host of ["opencode1", "opencode2"] as const) {
+        for (const scenario of ["session_move", "offline row deletion"] as const) {
+            it(`${host}: reanchors a present boundary after ${scenario} on priced and cache-preserving passes`, () => {
+                seedOpenCodeSession(30);
+                const db = contextDb();
+                const boundary = idOf(12);
+                const source = liveWindow(
+                    5,
+                    30,
+                    scenario === "session_move" ? [12] : [6, 7, 12, 15],
+                );
+                const run = () => {
+                    const outputs = [true, false, false].map((isCacheBustingPass) => {
+                        const messages = structuredClone(source);
+                        const result = injectM0M1({
+                            db,
+                            sessionId: SESSION_ID,
+                            state: getOrCreateSessionMeta(db, SESSION_ID),
+                            messages,
+                            preparedPrefix: preparedPrefix(boundary),
+                            prefixTrimSourceOrder: capturePrefixTrimSourceOrder(source),
+                            isCacheBustingPass,
+                        });
+                        expect(result.prefixTrimStatus).toBe("applied");
+                        expect(ids(messages)).toEqual([
+                            undefined,
+                            ...ids(liveWindow(13, 30, scenario === "session_move" ? [] : [15])),
+                        ]);
+                        return JSON.stringify(messages);
+                    });
+                    expect(new Set(outputs).size).toBe(1);
+                };
+                if (host === "opencode1") run();
+                else {
+                    // OpenCode 2's provider numbers surviving rows in store seq order,
+                    // not by the timestamp encoded in a message id.
+                    withRawMessageProvider(
+                        SESSION_ID,
+                        {
+                            readMessages: () => {
+                                throw new Error("must not read full history");
+                            },
+                            readMessageOrdinalById: (id) => {
+                                const ordinal = Number(id.slice(4));
+                                return ordinal >= 1 && ordinal <= 30 ? ordinal : null;
+                            },
+                        },
+                        run,
+                    );
+                }
+            });
+        }
+    }
     it("treats a resumed window that starts after the boundary as nothing to cut, on every pass", () => {
         // 40 persisted rows; the boundary is row 12; the resumed host window
         // holds only rows 25..40.
@@ -187,10 +325,9 @@ describe("prefix trim with a boundary absent from the live window", () => {
         expect(deferGrown).toHaveLength(priced.length + 1);
     });
 
-    it("serves the whole window on every pass when the boundary sorts inside the window but its row is missing", () => {
-        // The boundary row 12 sorts inside the window (rows 5..30) but is not
-        // in the live array. No pass cuts: the served bytes stay what they were
-        // before, and the next baseline refresh is what heals it.
+    it("cuts at the persisted seam when the boundary row is absent only from the live array", () => {
+        // Row 12 is still persisted, so its position proves which live rows the
+        // cached summary covers without waiting for another baseline refresh.
         seedOpenCodeSession(30);
         const db = contextDb();
         const boundary = idOf(12);
@@ -198,8 +335,8 @@ describe("prefix trim with a boundary absent from the live window", () => {
         const served: MessageLike[][] = [];
         for (const busting of [false, true, false]) {
             const live = liveWindow(5, 30, [12]);
-            expect(servePass(db, live, boundary, busting).prefixTrimStatus).toBe("refused");
-            expect(ids(live)).toEqual([undefined, ...ids(liveWindow(5, 30, [12]))]);
+            expect(servePass(db, live, boundary, busting).prefixTrimStatus).toBe("applied");
+            expect(ids(live)).toEqual([undefined, ...ids(liveWindow(13, 30))]);
             served.push(live);
         }
         expect(new Set(served.map(sha)).size).toBe(1);
@@ -309,8 +446,8 @@ describe("recovery from a boundary missing inside the window", () => {
         const degraded = liveWindow(1, 20, [4]);
         const degradedResult = run(degraded, false);
         expect(degradedResult.preparedTrimBoundaryId).toBe(idOf(4));
-        expect(degradedResult.prefixTrimStatus).toBe("refused");
-        expect(ids(degraded).slice(-19)).toEqual(ids(liveWindow(1, 20, [4])));
+        expect(degradedResult.prefixTrimStatus).toBe("applied");
+        expect(ids(degraded).filter((id) => id !== undefined)).toEqual(ids(liveWindow(5, 20)));
 
         // The next cache-busting pass refreshes m[1] and its baseline to B's end,
         // which is in the window, so the ordinary id trim applies.

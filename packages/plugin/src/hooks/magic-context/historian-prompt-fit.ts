@@ -10,7 +10,9 @@
  * session was never summarized again.
  *
  * `fitHistorianPrompt` reserves the fixed parts and the output first, then gives
- * the chunk what remains. When the full requested chunk does not fit, it trims
+ * the chunk what remains in the smallest window among the models the prompt may
+ * be sent to (the primary and its fallbacks): the prompt is built once and every
+ * attempt sends the same bytes. When the full requested chunk does not fit, it trims
  * the fixed context in this order until it does: diverse older compartments,
  * recent compartments (oldest first), project-memory lines (lowest priority
  * first), then seed examples. Recent examples preserve continuity without scores
@@ -23,6 +25,7 @@
 
 import { withContentLanguageDirective } from "../../agents/language-directive";
 import type { Memory } from "../../features/magic-context/memory/types";
+import { readEnabledProjectMemories } from "../../features/magic-context/memory-enabled";
 import type { ModelInput } from "../../shared/model-resolution";
 import { getSdkOutputLimit } from "../../shared/models-dev-cache";
 import { toModelEntry } from "../../shared/resolve-fallbacks";
@@ -103,6 +106,14 @@ export function resolveHistorianProducerWindow(
 
 export interface HistorianPromptFitArgs {
     window: HistorianProducerWindow;
+    /**
+     * The other models the same prompt may be sent to, in chain order (the
+     * configured fallbacks and the session-model last resort). Every attempt
+     * sends the bytes built once from this fit, so the chunk is sized to the
+     * smallest window among `window` and each of these that can hold a minimal
+     * prompt on its own. Models with an unknown window add no limit.
+     */
+    fallbackWindows?: readonly HistorianProducerWindow[];
     systemPrompt: string;
     /** Chunk budget the caller would use without a window, in local tokens. */
     requestedChunkTokens: number;
@@ -113,8 +124,10 @@ export interface HistorianPromptFitArgs {
     lastOrdinal: number;
     sessionCompartments: ReferenceCompartment[];
     /** Memories for the `<project-memory>` block; empty when there is none. */
-    memories: Memory[];
+    memories: Memory[] | (() => Memory[]);
     memoryEnabled: boolean;
+    /** Whether the historian is asked for user observations; see buildCompartmentAgentPrompt. */
+    userObservationsRequested?: boolean;
     extractionFree?: boolean;
 }
 
@@ -187,6 +200,14 @@ export function describeHistorianPromptTrim(
     return `chunkTokens=${fit.chunkTokens} sessionReferences=${kept.sessionReferences} memories=${kept.memories}/${kept.memoriesTotal} seeds=${kept.seeds}/${kept.seedsTotal}`;
 }
 
+/** One model's input limit and the calibrated prompt size it is checked against. */
+interface FitLimit {
+    modelKey?: string;
+    limit: number;
+    /** Calibrated prompt tokens for the system prompt plus `proseLocal` local tokens. */
+    mass: (proseLocal: number) => number;
+}
+
 export function fitHistorianPrompt(args: HistorianPromptFitArgs): HistorianPromptFit {
     const requested = Math.max(0, Math.floor(args.requestedChunkTokens));
     const seeds = selectSeeds(args.sessionId, args.chunkStart);
@@ -196,7 +217,11 @@ export function fitHistorianPrompt(args: HistorianPromptFitArgs): HistorianPromp
         args.sessionId,
         args.chunkStart,
     );
-    const memories = orderHistorianMemories(args.memories);
+    const memories = orderHistorianMemories(
+        readEnabledProjectMemories(args.memoryEnabled, () =>
+            typeof args.memories === "function" ? args.memories() : args.memories,
+        ),
+    );
     const render = (refs: number, memoryCount: number, seedCount: number) => ({
         seedExamples: renderSeedExamplesBlock(seeds.slice(0, seedCount)),
         sessionReferences: renderSessionReferencesBlock(references, refs),
@@ -210,32 +235,47 @@ export function fitHistorianPrompt(args: HistorianPromptFitArgs): HistorianPromp
         seedsTotal: seeds.length,
     });
 
-    const limit = producerInputTokenLimit(
-        args.window.contextLimitTokens,
-        args.window.maxOutputTokens,
-        args.window.inputLimitTokens,
-    );
-    if (limit === undefined) {
+    let systemLocal: number | undefined;
+    const fitLimitFor = (window: HistorianProducerWindow): FitLimit | undefined => {
+        const limit = producerInputTokenLimit(
+            window.contextLimitTokens,
+            window.maxOutputTokens,
+            window.inputLimitTokens,
+        );
+        if (limit === undefined) return undefined;
+        const calibration = calibrationForModelKey(window.modelKey);
+        systemLocal ??= estimateFixedPromptTokens(args.systemPrompt);
+        const system = systemLocal;
         return {
-            ok: true,
-            guarded: false,
-            chunkTokens: requested,
-            ...render(references.length, memories.length, seeds.length),
-            trimmed: false,
-            kept: kept(references.length, memories.length, seeds.length),
+            modelKey: window.modelKey,
+            limit,
+            mass: (proseLocal: number) =>
+                providerMass({ prose: proseLocal, system }, calibration, true),
         };
-    }
-
-    const calibration = calibrationForModelKey(args.window.modelKey);
-    const systemLocal = estimateFixedPromptTokens(args.systemPrompt);
-    const mass = (proseLocal: number) =>
-        providerMass({ prose: proseLocal, system: systemLocal }, calibration, true);
-    if (!Number.isFinite(mass(0)) || mass(0) <= 0) {
+    };
+    const primary = fitLimitFor(args.window);
+    if (primary && (!Number.isFinite(primary.mass(0)) || primary.mass(0) <= 0)) {
         return {
             ok: false,
             reason: `producer_prompt_fit_unavailable model=${args.window.modelKey ?? "unknown"}`,
         };
     }
+    const fallbackLimits = (args.fallbackWindows ?? [])
+        .map(fitLimitFor)
+        .filter(
+            (entry): entry is FitLimit =>
+                entry !== undefined && Number.isFinite(entry.mass(0)) && entry.mass(0) > 0,
+        );
+    // An unknown window sends the full prompt unguarded.
+    const unguarded = (): HistorianPromptFit => ({
+        ok: true,
+        guarded: false,
+        chunkTokens: requested,
+        ...render(references.length, memories.length, seeds.length),
+        trimmed: false,
+        kept: kept(references.length, memories.length, seeds.length),
+    });
+    if (!primary && fallbackLimits.length === 0) return unguarded();
 
     const chunkHeader = `Messages ${args.chunkStart}-${args.lastOrdinal}:\n\n`;
     // Trimming levels often render the same text (fewer compartments than the
@@ -246,6 +286,7 @@ export function fitHistorianPrompt(args: HistorianPromptFitArgs): HistorianPromp
             ...blocks,
             inputSource: header,
             memoryEnabled: args.memoryEnabled,
+            userObservationsRequested: args.userObservationsRequested,
             extractionFree: args.extractionFree,
         });
         let tokens = counted.get(text);
@@ -255,10 +296,9 @@ export function fitHistorianPrompt(args: HistorianPromptFitArgs): HistorianPromp
         }
         return tokens;
     };
-    // Largest chunk (local tokens) that keeps the calibrated prompt within the
-    // limit, or -1 when the fixed parts alone do not fit.
-    const roomFor = (blocks: ReturnType<typeof render>): number => {
-        const fixed = fixedLocal(blocks);
+    // Largest chunk (local tokens) that keeps the calibrated prompt within one
+    // model's limit, before the slack, or -1 when the fixed parts alone do not fit.
+    const roomUnder = ({ mass, limit }: FitLimit, fixed: number): number => {
         if (mass(fixed) > limit) return -1;
         let lo = 0;
         let hi = 1;
@@ -271,8 +311,33 @@ export function fitHistorianPrompt(args: HistorianPromptFitArgs): HistorianPromp
             if (mass(fixed + mid) <= limit) lo = mid;
             else hi = mid;
         }
-        return Math.max(0, lo - FIT_SLACK_TOKENS);
+        return lo;
     };
+    // Largest chunk (local tokens) that keeps the calibrated prompt within the
+    // limit of every model in `limits`, or -1 when the fixed parts alone do not
+    // fit one of them.
+    const roomAmong = (limits: readonly FitLimit[], blocks: ReturnType<typeof render>): number => {
+        const fixed = fixedLocal(blocks);
+        let room = Infinity;
+        for (const entry of limits) {
+            const one = roomUnder(entry, fixed);
+            if (one < 0) return -1;
+            room = Math.min(room, one);
+        }
+        return Math.max(0, room - FIT_SLACK_TOKENS);
+    };
+    const floor = Math.min(requested, HISTORIAN_MIN_FIT_CHUNK_TOKENS);
+    // The primary always takes part, so a primary that cannot hold the prompt is
+    // refused exactly as before. A fallback that cannot hold even a minimal
+    // prompt on its own is left out: shrinking the chunk for it would not make it
+    // fit, and its own pre-send check refuses it anyway.
+    const sizedFor: FitLimit[] = primary ? [primary] : [];
+    for (const entry of fallbackLimits) {
+        const alone = roomAmong([entry], render(0, 0, 0));
+        if (alone >= floor && alone > 0) sizedFor.push(entry);
+    }
+    if (sizedFor.length === 0) return unguarded();
+    const roomFor = (blocks: ReturnType<typeof render>): number => roomAmong(sizedFor, blocks);
     const accept = (refs: number, memoryCount: number, seedCount: number, chunkTokens: number) => ({
         ok: true as const,
         guarded: true,
@@ -309,16 +374,17 @@ export function fitHistorianPrompt(args: HistorianPromptFitArgs): HistorianPromp
         }
     }
     // 4. Everything trimmed: the chunk takes whatever room is left.
-    const floor = Math.min(requested, HISTORIAN_MIN_FIT_CHUNK_TOKENS);
     const room = roomFor(render(0, 0, 0));
     if (room >= floor && room > 0) return accept(0, 0, 0, Math.min(requested, room));
 
     // The refusal reason is what callers back off on, so it must not move as the
     // session grows: count the fixed parts with a constant header, not the
-    // chunk's ordinals.
-    const fixedTokens = mass(fixedLocal(render(0, 0, 0), "Messages 1-1:\n\n"));
+    // chunk's ordinals. Only the primary can be the model that does not fit,
+    // because a fallback joins the fit only when it holds a minimal prompt.
+    const refused = sizedFor[0];
+    const fixedTokens = refused.mass(fixedLocal(render(0, 0, 0), "Messages 1-1:\n\n"));
     return {
         ok: false,
-        reason: `producer_prompt_unfit model=${args.window.modelKey ?? "unknown"} limit=${limit} fixed_tokens=${fixedTokens} min_chunk_tokens=${floor}`,
+        reason: `producer_prompt_unfit model=${refused.modelKey ?? "unknown"} limit=${refused.limit} fixed_tokens=${fixedTokens} min_chunk_tokens=${floor}`,
     };
 }

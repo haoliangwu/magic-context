@@ -14,7 +14,7 @@ import {
     getMagicContextStorageDir,
 } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
-import { harnessOwnsOpenCodeStore } from "../../shared/harness";
+import { getHarness, harnessOwnsOpenCodeStore } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import {
     type AsyncProcessInspection,
@@ -73,6 +73,7 @@ import {
 } from "./migrations";
 import { installCompartmentHistoryVersions } from "./storage-compartment-history-version";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
+import { installTagIdentityRevisionTrigger } from "./storage-tag-identity-revision";
 import {
     loadToolDefinitionMeasurements,
     setDatabase as setToolDefinitionDatabase,
@@ -84,7 +85,7 @@ import { runToolOwnerBackfill } from "./tool-owner-backfill";
 // this module, so registering here covers privileged writes and writer
 // acquisition/hold diagnostics on both runtimes.
 registerSlowWriteReporter(logSlowWriteTransaction);
-registerSqliteDiagnosticSink((message) => log(message));
+registerSqliteDiagnosticSink((message) => log(message), getHarness);
 
 // Re-exported so existing `from "./storage-db"` importers (and tests) keep
 // resolving these; the definitions live in the leaf module to break the
@@ -2538,6 +2539,11 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // Fresh stores include the v95 temporal decision table. Older stores wait
     // for the same migration step rather than installing a new schema lane.
     if (version === 0 || version >= 95) installV95PerfSchema(db, false, version === 0);
+    // A TEMP trigger on this connection that bumps a per-session revision row
+    // whenever this connection rewrites a tag's identity or reasoning count;
+    // other connections' tag caches compare that row after each foreign commit
+    // (see storage-tag-identity-revision.ts).
+    installTagIdentityRevisionTrigger(db);
 }
 
 const CHANNEL2_CLAIM_TTL_MS = 10 * 60_000;
@@ -2691,6 +2697,9 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
             }
         } else runMigrations(db);
         ensureContextStoreUuid(db);
+        // Dropping and recreating `tags` (as a table-rebuild migration would) drops
+        // TEMP triggers on it, so install the identity-revision trigger again.
+        installTagIdentityRevisionTrigger(db);
         return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
     } catch (error) {
         // The connection is not cached until the open succeeds, so nothing else
@@ -2824,6 +2833,9 @@ export async function openDatabaseAsync(
                 );
             }
             ensureContextStoreUuid(db);
+            // Dropping and recreating `tags` (as a table-rebuild migration would) drops
+            // TEMP triggers on it, so install the identity-revision trigger again.
+            installTagIdentityRevisionTrigger(db);
             const opened = finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
             migrateMs = performance.now() - migrateStartedAt;
             return opened;

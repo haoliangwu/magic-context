@@ -16,21 +16,26 @@ import { Database } from "bun:sqlite";
  * | accounted_hard_epoch | yes | matched HARD/m0 pass records a project, render, or session epoch change |
  * | accounted_hard_pressure_refold | yes | matched HARD/m0 pass records materialize_reason=pressure_refold |
  * | accounted_hard_fold | yes | matched pass records another materialized HARD/m0 fold; tiny mid-history defer/first_render seams are excluded |
+ * | accounted_tag_identity_repair | yes | matched pass records materialize_reason=tag_identity_repair (Pi kept the newest of two tag numbers for one call or message and rebuilt once) |
  * | accounted_ctx_reduce | yes | matched pass applies drops at an agent ctx_reduce landing |
  * | accounted_drop_applied | yes | matched pass records applied drops |
  * | accounted_soft_m1_execute | yes | matched canonical execute pass refreshes m1 |
  * | usage_missing | yes | provider cache read and direct input are both 0 or usage is absent; in-flight/unmetered pass is never a bust baseline |
  * | provider_full_miss | yes | provider cache read is exactly 0 with prevTotal ≥ 10,000; ordinary short reads stay unaccounted; show wire model prev → cur when it changes |
+ * | accounted_lkg_frozen_release | yes | matched pass records why it stopped serving the frozen last-known-good request in materialize_reason |
  * | unaccounted_defer_pass | no | matched canonical defer pass, including a tiny mid-history first_render seam, diverges |
  * | accounted_provider_system_prompt_change | yes | matched non-defer pass has a user-visible provider change |
  * | unaccounted_double_bust | no | matched otherwise-unattributed pass repeats the previous divergence offset |
  * | unaccounted_tail_rewrite | no | matched otherwise-unattributed pass rewrites the previous request tail |
  * | unaccounted_rewrite | no | matched pass has no accounted attribution |
+ * | provider_short_read_after_reclaim | no | overrides provider_short_read_identical_bytes right after a reclaim bust: the bytes extend the reclaim request, but the provider did not serve its prefix (provider-side; one crossing billed twice) |
+ * | double_bust_after_reclaim | no | overrides any other accounted class right after a reclaim bust; the wake names the overridden class as cause |
  *
  * By default the process stays alive and scans every 60 seconds. Use --once from
- * launchd/cron or for a manual pass. --send is the only switch that opens subc;
- * without it, each new event is printed as one JSON line. Sending delivers a
- * high-urgency registry peer message through prefrontal-core's agent.deliver op.
+ * launchd/cron or for a manual pass. Without --send, each new event is printed
+ * as one JSON line and nothing is sent. With --send, the sentinel connects to
+ * subc (the CortexKit module daemon) and asks the prefrontal-core module, which
+ * delivers agent messages, to send each event as a high-urgency peer message.
  */
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -48,7 +53,9 @@ import { analyzeOpenCodeCacheBustSession } from "./analyze-cache-busts";
 import {
     type AnalyzedCacheRequest,
     type CacheBustDecisionAttribution,
+    type CacheBustDivergenceClass,
     type CacheBustSessionAnalysis,
+    classifyBustAfterReclaim,
     isUnaccountedCacheBustClass,
 } from "./cache-bust-attribution";
 
@@ -115,6 +122,8 @@ export interface CacheBustEvent {
         analyzer_cmd: string;
         /** Render-identity components the matched pass changed, when it logged them. */
         identity_delta?: string[];
+        /** For a bust right after a reclaim: the class the request had on its own. */
+        cause?: string;
     };
 }
 
@@ -151,12 +160,20 @@ export interface CacheBustTransport {
 interface OpenBustWindowState {
     startMs: number;
     lastBustMs: number;
+    /**
+     * Class of the newest bust in the window. A bust in the next run that
+     * continues the window is judged against it, because that earlier row is no
+     * longer among the rows the next run analyzes.
+     */
+    lastBustClass?: string;
 }
 
 interface SessionWatermarkState {
     lastAnalyzedRequestTimestampMs: number;
     openWindow?: OpenBustWindowState;
     scanCursor?: string;
+    /** When a run last analyzed this session; orders sessions so none is starved. */
+    lastScannedAtMs?: number;
 }
 
 interface SentWindowState {
@@ -270,12 +287,22 @@ export function loadSentinelState(path: string): CacheBustSentinelState {
         const open = recordValue(row?.openWindow);
         const startMs = finiteNonnegative(open?.startMs);
         const lastBustMs = finiteNonnegative(open?.lastBustMs);
+        const lastBustClass =
+            typeof open?.lastBustClass === "string" ? open.lastBustClass : undefined;
+        const lastScannedAtMs = finiteNonnegative(row?.lastScannedAtMs);
         state.sessions[sessionId] = {
             lastAnalyzedRequestTimestampMs: highWater,
             ...(open && startMs !== undefined && lastBustMs !== undefined
-                ? { openWindow: { startMs, lastBustMs } }
+                ? {
+                      openWindow: {
+                          startMs,
+                          lastBustMs,
+                          ...(lastBustClass ? { lastBustClass } : {}),
+                      },
+                  }
                 : {}),
             ...(typeof row?.scanCursor === "string" ? { scanCursor: row.scanCursor } : {}),
+            ...(lastScannedAtMs !== undefined ? { lastScannedAtMs } : {}),
         };
     }
     for (const [key, raw] of Object.entries(windows)) {
@@ -516,14 +543,37 @@ export function loadSessionDecisions(
             "last_received_at_ms",
         );
         if (timestampMs === undefined) return undefined;
-        const materializeReason =
-            stringField(
-                row,
-                "materialize_reason",
-                "materialization_reason",
-                "fold_reason",
-                "hard_reason",
-            ) ?? null;
+        const persistedMaterializeReason = stringField(
+            row,
+            "materialize_reason",
+            "materialization_reason",
+            "fold_reason",
+            "hard_reason",
+        );
+        const releaseMarkerPrefix = "lkg_frozen_release:";
+        const releaseAndMaterializeReasons = persistedMaterializeReason?.startsWith(
+            releaseMarkerPrefix,
+        )
+            ? persistedMaterializeReason.slice(releaseMarkerPrefix.length)
+            : "";
+        const hasLkgFrozenRelease = persistedMaterializeReason?.startsWith(
+            releaseMarkerPrefix,
+        ) ?? false;
+        const materializeReasonSeparator = releaseAndMaterializeReasons.indexOf(
+            ";materialize_reason=",
+        );
+        const lkgFrozenReleaseReason = hasLkgFrozenRelease
+            ? (materializeReasonSeparator < 0
+                  ? releaseAndMaterializeReasons
+                  : releaseAndMaterializeReasons.slice(0, materializeReasonSeparator)) || undefined
+            : undefined;
+        const materializeReason = hasLkgFrozenRelease
+            ? materializeReasonSeparator < 0
+                ? null
+                : releaseAndMaterializeReasons.slice(
+                      materializeReasonSeparator + ";materialize_reason=".length,
+                  ) || null
+            : persistedMaterializeReason ?? null;
         const appliedDrops = numberField(
             row,
             "applied_drop_count",
@@ -541,6 +591,7 @@ export function loadSessionDecisions(
             canonicalDecision: stringField(row, "canonical_decision"),
             deferReason: stringField(row, "defer_reason") ?? null,
             appliedRide: stringField(row, "applied_ride", "reclaim_ride"),
+            lkgFrozenReleaseReason,
             materialized:
                 booleanField(row, "materialized", "m0_materialized", "fold_applied") ||
                 materializeReason !== null,
@@ -560,7 +611,7 @@ export function loadSessionDecisions(
             identityDelta: stringListField(row, "identity_delta", "render_identity_delta"),
             flush:
                 booleanField(row, "flush", "flush_applied", "explicit_flush") ||
-                materializeReason === "explicit_flush",
+                materializeReason === "explicit_flush" || materializeReason === "user_flush",
             source,
         };
     };
@@ -666,6 +717,7 @@ export function loadSessionDecisions(
             prior.canonicalDecision ??= record.canonicalDecision;
             prior.deferReason ??= record.deferReason;
             prior.appliedRide ??= record.appliedRide;
+            prior.lkgFrozenReleaseReason ??= record.lkgFrozenReleaseReason;
             prior.materialized ||= record.materialized;
             prior.materializeReason ??= record.materializeReason;
             prior.emergency ||= record.emergency;
@@ -788,7 +840,9 @@ export function groupBustWindows(
           }
         : undefined;
     let previousWasBust = Boolean(seed);
-    for (const request of ordered) {
+    let previousBustClass: string | undefined = seed?.lastBustClass;
+    for (const original of ordered) {
+        let request = original;
         if (request.divergenceClass === "usage_missing") {
             // When the newest request is still in flight, do not start or continue
             // a window; keep its watermark at the most recent request that reported usage.
@@ -812,6 +866,15 @@ export function groupBustWindows(
             previousWasBust &&
             request.timestampMs - current.lastBustMs <= BUST_WINDOW_MS
         ) {
+            // A bust right after a reclaim bust alerts even when its own class is
+            // accounted: one threshold crossing must cost one bust. An analyzer
+            // that already judged the pair returns the relabelled class, which
+            // this leaves unchanged.
+            const own = request.divergenceClass as CacheBustDivergenceClass;
+            const relabelled = classifyBustAfterReclaim(previousBustClass, own);
+            if (relabelled !== own) {
+                request = { ...request, divergenceClass: relabelled, cause: request.cause ?? own };
+            }
             current.rows.push(request);
             current.lastBustMs = request.timestampMs;
         } else {
@@ -824,6 +887,7 @@ export function groupBustWindows(
             };
         }
         previousWasBust = true;
+        previousBustClass = request.divergenceClass;
     }
     if (current?.rows.length) windows.push(current);
     return windows;
@@ -854,7 +918,9 @@ export function eventForWindow(
         isUnaccountedCacheBustClass(row.divergenceClass as string),
     );
     if (unaccounted.length === 0) return null;
-    const representative = unaccounted[0];
+    // A second bust right after a reclaim is the more specific finding than the
+    // reclaim it follows, so it speaks for the window and names its cause.
+    const representative = unaccounted.find((row) => row.cause) ?? unaccounted[0];
     const divergenceClass = representative.divergenceClass as string;
     const key = windowKey(window.sessionId, window.startMs);
     const prior = state.windows[key];
@@ -885,6 +951,7 @@ export function eventForWindow(
             ...(representative.identityDelta?.length
                 ? { identity_delta: representative.identityDelta }
                 : {}),
+            ...(representative.cause ? { cause: representative.cause } : {}),
         },
     };
     state.windows[key] = {
@@ -908,7 +975,7 @@ export function agentDeliverRequest(
             from_agent: fromAgent,
             from_session_id: SENTINEL_FROM_SESSION_ID,
             from_harness: SENTINEL_FROM_HARNESS,
-            content: `${event.session_id}: cache bust detected in directory ${event.directory} at ${event.payload.at}; rewritten_tokens=${event.payload.rewritten_tokens}; divergence_class=${event.payload.divergence_class}; first_divergence=${event.payload.first_divergence}${event.payload.identity_delta ? `; identity_delta=${event.payload.identity_delta.join(",")}` : ""}; analyzer_cmd=${event.payload.analyzer_cmd}`,
+            content: `${event.session_id}: cache bust detected in directory ${event.directory} at ${event.payload.at}; rewritten_tokens=${event.payload.rewritten_tokens}; divergence_class=${event.payload.divergence_class}; first_divergence=${event.payload.first_divergence}${event.payload.identity_delta ? `; identity_delta=${event.payload.identity_delta.join(",")}` : ""}${event.payload.cause ? `; cause=${event.payload.cause}` : ""}; analyzer_cmd=${event.payload.analyzer_cmd}`,
             one_way: true,
         },
         urgency: "high",
@@ -1087,11 +1154,40 @@ function updateOpenWindowState(
         .reverse()
         .find((candidate) => candidate.rows.some((row) => row.timestampMs === latest.timestampMs));
     if (window) {
+        const lastBustClass = window.rows.at(-1)?.divergenceClass;
         sessionState.openWindow = {
             startMs: window.startMs,
             lastBustMs: window.lastBustMs,
+            ...(lastBustClass ? { lastBustClass } : {}),
         };
     }
+}
+
+/**
+ * Order a run's sessions so that the run budget cannot starve one of them.
+ *
+ * A run stops at its deadline, and one large Pi session can take the whole
+ * budget. The database returns sessions in a fixed order, so in listed order
+ * the same session would be scanned first on every run, and a session listed
+ * after it could go unscanned indefinitely while its watermark never moved.
+ * Sessions with activity since their last scan come first, then the one scanned
+ * longest ago, then the most recently active.
+ */
+export function orderSessionsForScan(
+    sessions: readonly ActiveCacheBustSession[],
+    state: CacheBustSentinelState,
+): ActiveCacheBustSession[] {
+    const lastScanned = (session: ActiveCacheBustSession): number =>
+        state.sessions[session.sessionId]?.lastScannedAtMs ?? 0;
+    const hasNewActivity = (session: ActiveCacheBustSession): boolean =>
+        session.activityMs > lastScanned(session);
+    return [...sessions].sort(
+        (left, right) =>
+            Number(hasNewActivity(right)) - Number(hasNewActivity(left)) ||
+            lastScanned(left) - lastScanned(right) ||
+            right.activityMs - left.activityMs ||
+            left.sessionId.localeCompare(right.sessionId),
+    );
 }
 
 export async function runSentinelOnce(
@@ -1105,7 +1201,7 @@ export async function runSentinelOnce(
     const stderr = deps.stderr ?? console.error;
     const state = loadSentinelState(options.stateFile);
     const listSessions = deps.listActiveSessions ?? enumerateActiveSessions;
-    const sessions = listSessions(state, nowMs, options);
+    const sessions = orderSessionsForScan(listSessions(state, nowMs, options), state);
     const counters = emptyCounters();
     counters.sessions = sessions.length;
     stderr(JSON.stringify({ kind: "cache_bust_sentinel_start", at: new Date(nowMs).toISOString() }));
@@ -1147,6 +1243,7 @@ export async function runSentinelOnce(
             const sessionState: SessionWatermarkState = priorSession ?? {
                 lastAnalyzedRequestTimestampMs: sinceExclusiveMs,
             };
+            sessionState.lastScannedAtMs = nowMs;
             const windows = groupBustWindows(requests, sessionState.openWindow);
             counters.bustWindows += windows.length;
             for (const window of windows) {

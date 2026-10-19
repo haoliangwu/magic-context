@@ -6,6 +6,7 @@ import {
     createPromptSurfaceGuidanceEpochCache,
     createPromptSurfaceRuntime,
     LIGHT_TOOL_DESCRIPTIONS,
+    systemPromptFingerprint,
 } from "./prompt-surface-runtime";
 import { createTestTempDirFromPath } from "./test-temp-dir";
 
@@ -25,6 +26,20 @@ afterEach(() => {
 });
 
 describe("prompt-surface runtime", () => {
+    it("preserves legacy full-preset digests and fingerprints resolved content and presets", () => {
+        expect(systemPromptFingerprint("hello")).toBe("5d41402abc4b2a76b9719d911017c592");
+        expect(systemPromptFingerprint("hello", "full")).toBe(systemPromptFingerprint("hello"));
+        expect(systemPromptFingerprint("hello", "light")).not.toBe(
+            systemPromptFingerprint("hello"),
+        );
+        expect(systemPromptFingerprint("hello\nToday's date: 2026-01-01")).not.toBe(
+            systemPromptFingerprint("hello\nToday's date: 2026-01-02"),
+        );
+        expect(systemPromptFingerprint("changed instructions")).not.toBe(
+            systemPromptFingerprint("hello"),
+        );
+    });
+
     it("rejects guidance overrides with zero or two section markers", () => {
         for (const [name, content, expectedCount] of [
             ["zero.md", "Custom guidance without a section marker", 0],

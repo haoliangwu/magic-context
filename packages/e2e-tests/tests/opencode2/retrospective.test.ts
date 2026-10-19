@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OpenCode } from "@opencode/client";
 import { CANONICAL_DREAM_TASKS } from "../../../plugin/src/features/magic-context/dreamer/task-registry";
+import { BOOT_SQLITE_BUSY_TIMEOUT_MS } from "../../../plugin/src/features/magic-context/storage-db";
 import { getDreamTaskBacklog } from "../../../plugin/src/features/magic-context/dreamer/task-gates";
 import { Database } from "../../../plugin/src/shared/sqlite";
 import { gaDatabasePath } from "../../../plugin/src/v2/store-reader";
@@ -50,6 +51,14 @@ for (const mode of ["manual", "scheduled"] as const) {
                 await client.session.wait({ sessionID: session.id }, { signal: AbortSignal.timeout(20000) });
             }
             contextDb = new Database(join(host.env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db"));
+            contextDb.exec(`PRAGMA busy_timeout=${BOOT_SQLITE_BUSY_TIMEOUT_MS}`);
+            const reschedule = (project: string) => {
+                // Own the writer before changing the fixture's schedule; a completed
+                // prompt can still be publishing its first-render state on another connection.
+                contextDb!.transaction(() => {
+                    contextDb!.prepare("UPDATE task_schedule_state SET next_due_at = 1 WHERE project_path = ? AND task = 'retrospective'").run(project);
+                }).immediate();
+            };
             hostDb = new Database(gaDatabasePath(host.env.XDG_DATA_HOME!, "latest", host.env), { readonly: true, fileMustExist: true });
             const project = (contextDb.prepare("SELECT project_path FROM session_projects WHERE session_id = ? AND harness = 'opencode2'").get(sessions[0]!) as { project_path: string }).project_path;
             expect(getDreamTaskBacklog(contextDb, project, "retrospective").pending).toBe(5);
@@ -59,14 +68,14 @@ for (const mode of ["manual", "scheduled"] as const) {
             if (mode === "manual") {
                 await client.session.command({ sessionID: sessions[0]!, name: "ctx-dream", text: "retrospective" });
             } else {
-                contextDb.prepare("UPDATE task_schedule_state SET next_due_at = 1 WHERE project_path = ? AND task = 'retrospective'").run(project);
+                reschedule(project);
                 await client.session.prompt({ sessionID: sessions[0]!, text: "RETROSPECTIVE_REAL_USER_WAKE: Please continue." });
                 await client.session.wait({ sessionID: sessions[0]! }, { signal: AbortSignal.timeout(20000) });
             }
             const deadline = Date.now() + 20000;
             for (;;) {
                 const run = contextDb.prepare("SELECT tasks_json FROM dream_runs WHERE project_path = ? ORDER BY id DESC LIMIT 1").get(project) as { tasks_json: string } | undefined;
-                if (run) break;
+                if (run && getDreamTaskBacklog(contextDb, project, "retrospective").pending === 0) break;
                 if (Date.now() > deadline) throw new Error(`No ${mode} retrospective run: ${host.pluginLog()}`);
                 await Bun.sleep(50);
             }
@@ -81,7 +90,7 @@ for (const mode of ["manual", "scheduled"] as const) {
             expect(getDreamTaskBacklog(contextDb, project, "retrospective").pending).toBe(0);
             // A later real user turn must reopen the gate on the same root;
             // completion-time or missing activity keys can falsely hide it.
-            if (mode === "scheduled") contextDb.prepare("UPDATE task_schedule_state SET next_due_at = 1 WHERE project_path = ? AND task = 'retrospective'").run(project);
+            if (mode === "scheduled") reschedule(project);
             await client.session.prompt({ sessionID: sessions[0]!, text: "RETROSPECTIVE_REAL_USER_NEXT: Please revisit that rule." });
             await client.session.wait({ sessionID: sessions[0]! }, { signal: AbortSignal.timeout(20000) });
             if (mode === "manual") await client.session.command({ sessionID: sessions[0]!, name: "ctx-dream", text: "retrospective" });
@@ -89,7 +98,7 @@ for (const mode of ["manual", "scheduled"] as const) {
             let second: { tasks_json: string };
             for (;;) {
                 const runs = contextDb.prepare("SELECT tasks_json FROM dream_runs WHERE project_path = ? ORDER BY id").all(project) as Array<{ tasks_json: string }>;
-                if (runs.length === 2) { second = runs[1]!; break; }
+                if (runs.length === 2 && getDreamTaskBacklog(contextDb, project, "retrospective").pending === 0) { second = runs[1]!; break; }
                 if (Date.now() > secondDeadline) throw new Error("Later user activity did not reopen retrospective");
                 await Bun.sleep(50);
             }

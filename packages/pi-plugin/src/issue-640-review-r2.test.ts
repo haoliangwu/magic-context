@@ -2,7 +2,11 @@ import { expect, spyOn, test } from "bun:test";
 import * as embedding from "@magic-context/core/features/magic-context/memory/embedding";
 import * as projectIdentity from "@magic-context/core/features/magic-context/memory/project-identity";
 import { getAutoSearchHintDecisions } from "@magic-context/core/features/magic-context/storage-meta-persisted";
-import { adoptPiFallbackMessageTag } from "@magic-context/core/features/magic-context/storage-tags";
+import { getPendingOps } from "@magic-context/core/features/magic-context/storage-ops";
+import {
+	adoptPiFallbackMessageTag,
+	PiTagIdentityConflictError,
+} from "@magic-context/core/features/magic-context/storage-tags";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { autoSearchTestSnapshot } from "@magic-context/core/hooks/magic-context/auto-search-snapshot.fixture";
 import * as search from "@magic-context/core/hooks/magic-context/auto-search-worker-client";
@@ -16,6 +20,7 @@ import {
 	registerPiContextHandler,
 } from "./context-handler";
 import { createPiLkgCoordinator } from "./pi-lkg";
+import { observePiPublicationForTest } from "./publication-observer-fixture.test";
 import { capturePiServedArray } from "./served-array-ledger";
 import {
 	createFakePi,
@@ -39,67 +44,6 @@ function deferred<T>() {
 }
 
 for (const cancellation of ["successor", "signal"] as const) {
-	test(`r2: ${cancellation} fences checkout-claim resumption before all writes`, async () => {
-		const db = createTestDb();
-		const sessionId = `r2-claim-${cancellation}`;
-		const paused = deferred<null>();
-		const entered = deferred<void>();
-		let calls = 0;
-		const fake = createFakePi();
-		registerPiContextHandler(
-			fake.pi as never,
-			{ db },
-			{
-				checkoutClaim: {
-					refusal: async () => {
-						if (++calls === 1) {
-							entered.resolve();
-							return paused.promise;
-						}
-						return null;
-					},
-				},
-			},
-		);
-		const handler = fake.handlers.get("context") as unknown as Handler;
-		const controller = new AbortController();
-		const raw = [userMessage("old claim input")];
-		const old = handler(
-			{ messages: raw },
-			{
-				...fakeContext(sessionId, process.cwd(), ["old"], raw),
-				signal: controller.signal,
-			},
-		).catch((error: Error) => error);
-		try {
-			await entered.promise;
-			if (cancellation === "signal")
-				controller.abort(new Error("cancelled claim"));
-			else {
-				const newer = [userMessage("new claim input", 2)];
-				await handler(
-					{ messages: newer },
-					fakeContext(sessionId, process.cwd(), ["new"], newer),
-				);
-			}
-			paused.resolve(null);
-			expect(((await old) as Error).message).toBe(
-				cancellation === "signal"
-					? "cancelled claim"
-					: "Pi context pass superseded before writer admission",
-			);
-			expect(
-				db.prepare("SELECT * FROM tags WHERE message_id='old:p0'").all(),
-			).toEqual([]);
-		} finally {
-			paused.resolve(null);
-			await old;
-			clearContextHandlerSession(sessionId);
-			resetLkgSlotsForTest();
-			db.close();
-		}
-	});
-
 	test(`r2: ${cancellation} fences real auto-search continuation and LKG publication`, async () => {
 		const db = createTestDb();
 		const sessionId = `r2-search-${cancellation}`;
@@ -156,11 +100,12 @@ for (const cancellation of ["successor", "signal"] as const) {
 				);
 			}
 			paused.resolve([]);
-			expect(((await old) as Error).message).toBe(
-				cancellation === "signal"
-					? "cancelled search"
-					: "Pi context pass superseded before writer admission",
-			);
+			const outcome = await old;
+			if (cancellation === "signal") expect(outcome).toBeUndefined();
+			else
+				expect((outcome as Error).message).toBe(
+					"Pi context pass superseded: no longer valid for this operation",
+				);
 			await new Promise<void>((done) => setImmediate(done));
 			expect(getSlot(sessionId)?.jsonPrefix ?? "").not.toContain(
 				"previous implementation",
@@ -237,6 +182,7 @@ for (const api of [
 test("r2: distinct multi-block real messages must not collide with one served fallback", async () => {
 	const db = createTestDb();
 	const sessionId = "r2-identical-real";
+	const publication = observePiPublicationForTest(sessionId);
 	const fake = createFakePi();
 	registerPiContextHandler(fake.pi as never, { db });
 	const handler = fake.handlers.get("context") as unknown as Handler;
@@ -262,6 +208,7 @@ test("r2: distinct multi-block real messages must not collide with one served fa
 			fakeContext(sessionId, process.cwd(), ["first"], [raw[0]]),
 		);
 		expect(textOf(real.messages[0])).toBe("§1§ repeat§2§ alpha");
+		publication.reset();
 		const unavailable = fakeContext(sessionId);
 		unavailable.sessionManager.getBranch = () => {
 			throw new Error("entry unavailable");
@@ -271,6 +218,8 @@ test("r2: distinct multi-block real messages must not collide with one served fa
 			unavailable,
 		);
 		expect(textOf(fallback.messages[0])).toBe("§3§ repeat§4§ beta");
+		expect(getSlot(sessionId)?.jsonPrefix).toBe(JSON.stringify(real.messages));
+		publication.expect("numbers_only", "lkg_entry_ids_unavailable", 1);
 		const result = await handler(
 			{ messages: structuredClone(raw) },
 			fakeContext(sessionId, process.cwd(), ["first", "second"], raw),
@@ -282,6 +231,7 @@ test("r2: distinct multi-block real messages must not collide with one served fa
 				"§3§ repeat§4§ beta",
 			]);
 	} finally {
+		publication.restore();
 		clearContextHandlerSession(sessionId);
 		resetLkgSlotsForTest();
 		db.close();
@@ -291,6 +241,7 @@ test("r2: distinct multi-block real messages must not collide with one served fa
 test("r2: an unserved racing real row is not served evidence merely because user text mentions its number", async () => {
 	const db = createTestDb();
 	const sessionId = "r2-literal-marker";
+	const publication = observePiPublicationForTest(sessionId);
 	const fake = createFakePi();
 	registerPiContextHandler(fake.pi as never, { db });
 	const handler = fake.handlers.get("context") as unknown as Handler;
@@ -310,6 +261,8 @@ test("r2: an unserved racing real row is not served evidence merely because user
 		expect(textOf(first.messages[0])).toBe(
 			"§1§ Explain the marker §9§ in this pasted example",
 		);
+		expect(getSlot(sessionId)).toBeUndefined();
+		publication.expect("numbers_only", "lkg_entry_ids_unavailable", 1);
 		db.prepare(
 			"INSERT INTO tags(message_id,type,status,session_id,tag_number,byte_size) VALUES ('real:p0','message','active',?,9,0)",
 		).run(sessionId);
@@ -325,13 +278,14 @@ test("r2: an unserved racing real row is not served evidence merely because user
 		if (!(result instanceof Error))
 			expect(textOf(result.messages[0])).toBe(textOf(first.messages[0]));
 	} finally {
+		publication.restore();
 		clearContextHandlerSession(sessionId);
 		resetLkgSlotsForTest();
 		db.close();
 	}
 });
 
-test("r2: three-row unserved ordinal collision retains the canonical real number", () => {
+test("r2: three-row unserved ordinal collision refuses without changing any row", () => {
 	const db = createTestDb();
 	const sessionId = "r2-three-way";
 	const raw = userMessage("same identity", 1);
@@ -349,18 +303,21 @@ test("r2: three-row unserved ordinal collision retains the canonical real number
 			db.prepare(
 				"INSERT INTO tags(message_id,type,status,session_id,tag_number,byte_size,entry_fingerprint) VALUES (?,'message','active',?,?,0,?)",
 			).run(id, sessionId, number, fingerprint);
-		__test.adoptPiFallbackTags(
-			db,
-			sessionId,
-			createTagger(),
-			new Map([["real", fingerprint]]),
-		);
+		expect(() =>
+			__test.adoptPiFallbackTags(
+				db,
+				sessionId,
+				createTagger(),
+				new Map([["real", fingerprint]]),
+			),
+		).toThrow(PiTagIdentityConflictError);
 		expect(
 			db
 				.prepare("SELECT message_id,tag_number FROM tags ORDER BY tag_number")
 				.all(),
 		).toEqual([
-			{ message_id: "real:p1", tag_number: 2 },
+			{ message_id: "pi-msg-a:p0", tag_number: 1 },
+			{ message_id: "pi-msg-a:p1", tag_number: 2 },
 			{ message_id: "real:p0", tag_number: 9 },
 		]);
 	} finally {
@@ -432,12 +389,22 @@ test("r2: same-connection revision change discovers a historical fallback drop",
 		});
 		restore = () => spy.mockRestore();
 		const next = [structuredClone(historical), userMessage("tail", 2)];
+		// The changed local revision must discover the dropped alias, preserving
+		// active bytes now and leaving the drop queued for a later execute.
 		const result = await handler(
 			{ messages: next },
 			fakeContext(sessionId, process.cwd(), ["history", "tail"], next),
 		);
 		expect(inserted).toBe(true);
-		expect(textOf(result.messages[0])).toBe("[dropped §1§]");
+		expect(textOf(result.messages[0])).toBe("§1§ historical text");
+		expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([1]);
+		expect(
+			db
+				.prepare(
+					"SELECT tag_number,status FROM tags WHERE session_id=? AND tag_number IN (1,9) ORDER BY tag_number",
+				)
+				.all(sessionId),
+		).toEqual([{ tag_number: 1, status: "active" }]);
 	} finally {
 		restore?.();
 		clearContextHandlerSession(sessionId);
@@ -484,9 +451,7 @@ test("r2: an event-aborted waiter superseded twice never aborts the latest turn"
 			);
 		}
 		controller.abort(new Error("host abandoned old event"));
-		expect(((await old) as Error).message).toBe(
-			"Pi context pass superseded before writer admission",
-		);
+		expect(await old).toBeUndefined();
 		expect(aborts).toBe(0);
 	} finally {
 		spy.mockRestore();
@@ -499,6 +464,7 @@ test("r2: an event-aborted waiter superseded twice never aborts the latest turn"
 test("r2: reloading a session must not forget its already-served fallback number", async () => {
 	const db = createTestDb();
 	const sessionId = "r2-reload-served";
+	const publication = observePiPublicationForTest(sessionId);
 	const original = userMessage("served before restart", 1);
 	const install = () => {
 		const fake = createFakePi();
@@ -515,6 +481,8 @@ test("r2: reloading a session must not forget its already-served fallback number
 			unavailable,
 		);
 		expect(textOf(first.messages[0])).toBe("§1§ served before restart");
+		expect(getSlot(sessionId)).toBeUndefined();
+		publication.expect("numbers_only", "lkg_entry_ids_unavailable", 1);
 		db.prepare(
 			"INSERT INTO tags(message_id,type,status,session_id,tag_number,byte_size) VALUES ('real:p0','message','active',?,9,0)",
 		).run(sessionId);
@@ -531,6 +499,7 @@ test("r2: reloading a session must not forget its already-served fallback number
 		);
 		expect(textOf(result.messages[0])).toBe(textOf(first.messages[0]));
 	} finally {
+		publication.restore();
 		clearContextHandlerSession(sessionId);
 		resetLkgSlotsForTest();
 		db.close();

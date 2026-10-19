@@ -1,10 +1,12 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { Host } from "@opencode/plugin/host";
-import * as logger from "../../shared/logger";
+import type { MagicContextRpcServer } from "../../shared/rpc-server";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { registerV2Commands } from "../hooks/commands";
+import type { V2CommandDomain } from "../hooks/types";
 import { setupWithJsx } from "./index";
 import type { V2SidebarState, V2SlotClaim, V2TuiContext } from "./types";
 
@@ -110,7 +112,7 @@ function v1Api(directory: string) {
     };
 }
 
-test("GA 2.0.5 resolves ./tui and executes the union setup contract", async () => {
+test("GA 2.0.5 registers each /ctx-* command once on the server, not the TUI keymap", async () => {
     const packageRoot = resolve(import.meta.dir, "../../..");
     const entrypoints = Host.resolve({
         name: "@cortexkit/opencode-magic-context",
@@ -125,76 +127,48 @@ test("GA 2.0.5 resolves ./tui and executes the union setup contract", async () =
         };
     };
     expect(typeof loaded.default.setup).toBe("function");
+    const serverCommands: string[] = [];
+    const commandDomain: V2CommandDomain = {
+        async transform(callback) {
+            callback({ add: (definition) => serverCommands.push(definition.name) });
+        },
+        async reload() {},
+    };
+    const serverRegistered = await registerV2Commands({
+        command: commandDomain,
+        rpc: { dispatch: async () => ({}) } as unknown as MagicContextRpcServer,
+        directory: process.cwd(),
+        compactionEnabled: true,
+    });
+    expect(serverRegistered).toBe(true);
+
     const fixture = v2Context();
     const cleanup = await setupWithJsx(fixture.context, (type, props) => ({ type, props }));
-    expect(fixture.claims.map((claim) => claim.append)).toEqual(["sidebar.content"]);
-    const sidebarClaim = fixture.claims[0]!;
-    if (sidebarClaim.append !== "sidebar.content") throw new Error("expected the sidebar claim");
-    expect(sidebarClaim.render({ sessionID: "ses-v2-tui" })).toEqual({
-        type: "text",
-        props: { children: expect.stringContaining("Magic Context") },
-    });
-    expect(fixture.layers[0]!.commands.map((command) => command.slash.name)).toEqual([
-        "ctx-status",
-        "ctx-recomp",
-        "ctx-dream",
-        "ctx-flush",
-        "ctx-embed",
-        "ctx-wrapup",
-    ]);
-    cleanup();
-});
-
-test("GA 2.0.5 registers the keymap layer from the app slot when setup runs outside the provider", async () => {
-    const fixture = v2Context();
-    let providerAvailable = false;
-    Object.assign(fixture.context.keymap, {
-        layer: (input: () => unknown) => {
-            if (!providerAvailable) throw new Error("Keymap.Provider is missing");
-            fixture.layers.push(input() as never);
-        },
-    });
-    const cleanup = await setupWithJsx(fixture.context, (type, props) => ({ type, props }));
-    expect(fixture.claims.map((claim) => claim.append)).toEqual(["sidebar.content", "app"]);
-    expect(fixture.layers).toHaveLength(0);
-
-    // The app slot render executes inside the component tree, where the provider resolves.
-    providerAvailable = true;
-    const appClaim = fixture.claims.find((claim) => claim.append === "app");
-    if (appClaim?.append !== "app") throw new Error("expected the app slot claim");
-    appClaim.render({});
-    expect(
-        fixture.layers.map((layer) => layer.commands.map((command) => command.slash.name)),
-    ).toEqual([["ctx-status", "ctx-recomp", "ctx-dream", "ctx-flush", "ctx-embed", "ctx-wrapup"]]);
-    // Repeated renders must not stack duplicate layers.
-    appClaim.render({});
-    expect(fixture.layers).toHaveLength(1);
-    cleanup();
-});
-
-test("GA 2.0.5 keeps the sidebar when the app-slot keymap registration also fails", async () => {
-    const fixture = v2Context();
-    Object.assign(fixture.context.keymap, {
-        layer: () => {
-            throw new Error("Keymap.Provider is missing");
-        },
-    });
-    // The gap is recorded in the plugin log; the TUI host drops console output.
-    const logged = spyOn(logger, "log");
     try {
-        const cleanup = await setupWithJsx(fixture.context, (type, props) => ({ type, props }));
-        expect(fixture.claims.map((claim) => claim.append)).toEqual(["sidebar.content", "app"]);
-        const appClaim = fixture.claims.find((claim) => claim.append === "app");
-        if (appClaim?.append !== "app") throw new Error("expected the app slot claim");
-        appClaim.render({});
-        appClaim.render({});
-        expect(fixture.layers).toHaveLength(0);
-        expect(
-            logged.mock.calls.filter(([line]) => line.includes("keymap.layer is unavailable")),
-        ).toHaveLength(1);
-        cleanup();
+        expect(fixture.claims.map((claim) => claim.append)).toEqual(["sidebar.content"]);
+        const sidebarClaim = fixture.claims[0]!;
+        if (sidebarClaim.append !== "sidebar.content")
+            throw new Error("expected the sidebar claim");
+        expect(sidebarClaim.render({ sessionID: "ses-v2-tui" })).toEqual({
+            type: "text",
+            props: { children: expect.stringContaining("Magic Context") },
+        });
+        const tuiCommands = fixture.layers.flatMap((layer) =>
+            layer.commands.map((command) => command.slash.name),
+        );
+        const allRegistrations = [...serverCommands, ...tuiCommands].sort();
+        const expectedCommands = [
+            "ctx-dream",
+            "ctx-embed",
+            "ctx-flush",
+            "ctx-recomp",
+            "ctx-status",
+            "ctx-wrapup",
+        ];
+        expect(allRegistrations).toEqual(expectedCommands);
+        expect(new Set(allRegistrations).size).toBe(expectedCommands.length);
     } finally {
-        logged.mockRestore();
+        cleanup();
     }
 });
 

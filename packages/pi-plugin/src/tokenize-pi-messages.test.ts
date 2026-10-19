@@ -42,7 +42,7 @@ describe("tokenizePiMessages", () => {
 		expect(counts.toolCall).toBe(0);
 	});
 
-	test("assistant thinking → conversation bucket (incl. signature)", () => {
+	test("assistant thinking → conversation bucket (signature is identity, not prose)", () => {
 		const counts = tokenizePiMessages([
 			{
 				role: "assistant",
@@ -57,6 +57,55 @@ describe("tokenizePiMessages", () => {
 		]);
 		expect(counts.conversation).toBeGreaterThan(0);
 		expect(counts.toolCall).toBe(0);
+		const unsigned = tokenizePiMessages([
+			{
+				role: "assistant",
+				content: [{ type: "thinking", thinking: "let me consider this" }],
+			},
+		]);
+		expect(counts).toEqual(unsigned);
+		expect(
+			tokenizePiMessages([
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "thinking",
+							thinking: "let me consider this",
+							thinkingSignature: "opaque".repeat(50_000),
+						},
+					],
+				},
+			]),
+		).toEqual(unsigned);
+	});
+
+	test("opaque thinking uses output usage or a fixed unknown-step fallback", () => {
+		const content = [
+			{
+				type: "thinking",
+				thinking: "",
+				thinkingSignature: "opaque".repeat(50_000),
+			},
+		];
+		expect(
+			tokenizePiMessages([{ role: "assistant", content }]).conversation,
+		).toBe(1000);
+		expect(
+			tokenizePiMessages([
+				{ role: "assistant", content, usage: { output: 456 } },
+			]).conversation,
+		).toBe(456);
+		expect(
+			tokenizePiMessages([
+				{
+					role: "assistant",
+					content: [
+						{ type: "redacted_thinking", data: "opaque".repeat(50_000) },
+					],
+				},
+			]).conversation,
+		).toBe(1000);
 	});
 
 	test("assistant toolCall → toolCall bucket (name + JSON args)", () => {

@@ -855,8 +855,9 @@ fn unclassified_rows_refuse() {
 }
 
 #[test]
-fn dangling_reference_refuses() {
+fn unresolved_reference_that_exists_in_the_other_id_space_refuses() {
     let fixture = Fixture::new(Extras::default());
+    fixture.context().execute("INSERT INTO memories(id, project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (777, 'git:unrelated', 'CONSTRAINTS', 'unrelated numeric collision', 'collision', 1, 1, 1, 1)", []).unwrap();
     fixture
         .store()
         .execute(
@@ -1405,4 +1406,676 @@ fn the_command_line_takes_prefer_history() {
     let mut bad = args.clone();
     bad[7] = "ses_a=both".into();
     assert!(parse_args(&bad).is_err());
+}
+
+fn seed_workspace(fixture: &Fixture, stale: bool, seeded_labels: bool) {
+    for (conn, prefix) in [(fixture.store(), "mc_"), (fixture.context(), "")] {
+        conn.execute(&format!("INSERT INTO {prefix}workspaces(id, name, created_at, updated_at) VALUES (1, 'shared', 1, 1)"), []).unwrap();
+        for (project, name) in [(STORE_PROJECT, "rust"), ("git:typescript", "typescript")] {
+            let label = if prefix == "mc_" && seeded_labels {
+                project
+            } else {
+                name
+            };
+            conn.execute(&format!("INSERT INTO {prefix}workspace_members(workspace_id, project_path, display_name, display_path, added_at) VALUES (1, ?1, ?2, '', 1)"), params![project, label]).unwrap();
+        }
+        let content = if prefix == "mc_" && stale {
+            "stale foreign"
+        } else {
+            "current foreign"
+        };
+        conn.execute(&format!("INSERT INTO {prefix}memories(id, project_path, category, content, normalized_hash, shareable, scope, created_at, updated_at, first_seen_at, last_seen_at) VALUES (50, 'git:typescript', 'CONSTRAINTS', ?1, 'foreign', 1, 'project', 1000, 1000, 1000, 1000)"), params![content]).unwrap();
+    }
+}
+
+#[test]
+fn issue682_stale_foreign_workspace_memories_use_context_on_both_sides() {
+    let fixture = Fixture::new(Extras::default());
+    seed_workspace(&fixture, true, false);
+    let report = fixture.migrate();
+    assert_eq!(report.render_check.passed, 1);
+    assert_eq!(memory_content(&fixture.context(), 50), "current foreign");
+}
+
+#[test]
+fn issue682_workspace_labels_are_copied_from_context() {
+    let fixture = Fixture::new(Extras::default());
+    seed_workspace(&fixture, false, true);
+    assert_eq!(
+        run(&fixture.options("b"), &mut CheckWorkspaceLabels)
+            .unwrap()
+            .render_check
+            .passed,
+        1
+    );
+}
+
+#[test]
+fn issue682_deleted_provenance_is_reported_and_existing_ids_are_preserved() {
+    let fixture = Fixture::new(Extras::default());
+    fixture.store().execute_batch("UPDATE mc_memories SET merged_from = '[1,777]', superseded_by_memory_id = 778 WHERE id = 5;
+        UPDATE mc_memories SET merged_from = '[1,779]' WHERE id = 2;").unwrap();
+    fixture
+        .context()
+        .execute_batch(
+            "UPDATE context_privilege_state SET enabled = 1;
+        UPDATE memories SET merged_from = '[1,779]' WHERE id = 6;
+        UPDATE context_privilege_state SET enabled = 0;",
+        )
+        .unwrap();
+    let report = fixture.migrate();
+    let context = fixture.context();
+    let five = context_id_of(&context, "store five");
+    let (merged, superseded): (String, Option<i64>) = context
+        .query_row(
+            "SELECT merged_from, superseded_by_memory_id FROM memories WHERE id = ?1",
+            params![five],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(merged, "[5]");
+    assert_eq!(superseded, None);
+    let seeded: String = context
+        .query_row("SELECT merged_from FROM memories WHERE id = 6", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        seeded, "[1]",
+        "the seeded twin's ids are context ids, not store ids"
+    );
+    let value = report.to_value();
+    assert_eq!(value["dropped_provenance_count"], 3);
+    let dropped = value["dropped_provenance"].as_array().unwrap();
+    for (memory, reference, field, space) in [
+        (5, 777, "merged_from", "store"),
+        (5, 778, "superseded_by_memory_id", "store"),
+        (6, 779, "merged_from", "context"),
+    ] {
+        assert!(
+            dropped.iter().any(|entry| entry["memory_id"] == memory
+                && entry["dropped_reference"] == reference
+                && entry["field"] == field
+                && entry["id_space"] == space),
+            "{value}"
+        );
+    }
+}
+
+fn seed_mid_session(fixture: &Fixture) {
+    let rows: Vec<Hist> = (0..=324)
+        .map(|seq| (seq, seq * 10, seq * 10 + 9, "history", 1000))
+        .collect();
+    seed_history(fixture, STORE_PROJECT, &rows[250..], &rows[..302]);
+    fixture.context().execute("UPDATE compartments SET start_message_id = start_message_id || '#0', end_message_id = end_message_id || '#0' WHERE session_id = ?1", params![HISTORY_SESSION]).unwrap();
+}
+
+#[test]
+fn issue682_store_history_keeps_a_contiguous_context_prefix() {
+    let fixture = Fixture::new(Extras::default());
+    seed_mid_session(&fixture);
+    let mut options = fixture.options("b");
+    options
+        .prefer_history
+        .insert(HISTORY_SESSION.into(), Winner::Store);
+    run(&options, &mut NoHooks).unwrap();
+    assert_eq!(
+        history_rows(&fixture)
+            .iter()
+            .map(|row| row.1)
+            .collect::<Vec<_>>(),
+        (0..=324).collect::<Vec<_>>()
+    );
+    assert_eq!(event_kinds(&fixture), vec!["context-event", "store-event"]);
+}
+
+#[test]
+fn issue682_own_memory_is_not_deduplicated_by_foreign_content_or_hash() {
+    let fixture = Fixture::new(Extras::default());
+    seed_workspace(&fixture, false, false);
+    fixture
+        .store()
+        .execute(
+            "UPDATE mc_memories SET content = 'store two', normalized_hash = 'h-s2' WHERE id = 50",
+            [],
+        )
+        .unwrap();
+    fixture
+        .context()
+        .execute(
+            "UPDATE memories SET content = 'store two', normalized_hash = 'h-s2' WHERE id = 50",
+            [],
+        )
+        .unwrap();
+    assert_eq!(fixture.migrate().render_check.passed, 1);
+    let count: i64 = fixture
+        .context()
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE content = 'store two'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn issue682_existing_provenance_does_not_hide_an_active_own_memory() {
+    let fixture = Fixture::new(Extras::default());
+    seed_workspace(&fixture, false, false);
+    fixture
+        .store()
+        .execute(
+            "UPDATE mc_memories SET merged_from = '[1]', superseded_by_memory_id = 1 WHERE id = 5",
+            [],
+        )
+        .unwrap();
+    assert_eq!(fixture.migrate().render_check.passed, 1);
+}
+
+#[test]
+fn issue682_own_visibility_does_not_require_workspace_sharing() {
+    let fixture = Fixture::new(Extras::default());
+    seed_workspace(&fixture, false, false);
+    fixture.store().execute("UPDATE mc_memories SET shareable = 0, scope = 'session', category = 'ARCHITECTURE' WHERE id = 2", []).unwrap();
+    assert_eq!(fixture.migrate().render_check.passed, 1);
+}
+
+#[test]
+fn issue682_foreign_context_id_can_equal_an_own_store_id() {
+    let fixture = Fixture::new(Extras::default());
+    seed_workspace(&fixture, false, false);
+    fixture
+        .context()
+        .execute("UPDATE memories SET id = 2 WHERE id = 50", [])
+        .unwrap();
+    assert_eq!(fixture.migrate().render_check.passed, 1);
+    assert_eq!(memory_content(&fixture.context(), 2), "current foreign");
+    assert_eq!(memory_content(&fixture.context(), 6), "store two");
+}
+
+#[test]
+fn issue682_id_only_remap_including_zero_and_order_preserves_every_own_render_line() {
+    let fixture = Fixture::new(Extras::default());
+    fixture
+        .context()
+        .execute_batch(
+            "UPDATE context_privilege_state SET enabled = 1;
+        UPDATE memories SET id = 0 WHERE id = 7;
+        UPDATE context_privilege_state SET enabled = 0;",
+        )
+        .unwrap();
+    fixture
+        .store()
+        .execute(
+            "UPDATE mc_memories SET content = 'line one\nline two\n' WHERE id = 3",
+            [],
+        )
+        .unwrap();
+    assert_eq!(fixture.migrate().render_check.passed, 1);
+    assert_eq!(
+        memory_content(&fixture.context(), 0),
+        "line one\nline two\n"
+    );
+    let own = composed_own_lines(&fixture, STORE_PROJECT);
+    assert_eq!(own.len(), 4);
+    assert_eq!(
+        own.get("project-memory/CONSTRAINTS|#: line one\n  line two\n  "),
+        Some(&1)
+    );
+}
+
+struct CheckWorkspaceLabels;
+impl EngineHooks for CheckWorkspaceLabels {
+    fn after_copy(&mut self, conn: &Connection) -> Result<(), EngineError> {
+        let name: String = conn.query_row("SELECT display_name FROM main.mc_workspace_members WHERE project_path = 'git:typescript'", [], |row| row.get(0))?;
+        assert_eq!(
+            name, "typescript",
+            "repair the label data, not the render comparison"
+        );
+        Ok(())
+    }
+}
+
+struct CorruptOwnMemory;
+impl EngineHooks for CorruptOwnMemory {
+    fn after_copy(&mut self, conn: &Connection) -> Result<(), EngineError> {
+        conn.execute_batch(
+            "UPDATE ctx.context_privilege_state SET enabled = 1;
+            UPDATE ctx.memories SET content = 'corrupted own memory' WHERE id = 6;
+            UPDATE ctx.context_privilege_state SET enabled = 0;",
+        )?;
+        Ok(())
+    }
+}
+
+#[test]
+fn issue682_corrupted_own_memory_still_refuses_with_stale_foreign_members() {
+    let fixture = Fixture::new(Extras::default());
+    seed_workspace(&fixture, true, true);
+    assert_refused_unchanged(
+        &fixture,
+        fixture.options("b"),
+        &mut CorruptOwnMemory,
+        VERIFY_MISMATCH,
+    );
+}
+
+struct CorruptOwnBaseline;
+impl EngineHooks for CorruptOwnBaseline {
+    fn after_copy(&mut self, conn: &Connection) -> Result<(), EngineError> {
+        conn.execute(
+            "UPDATE main.mc_memories SET content = 'wrong own baseline' WHERE id = 2",
+            [],
+        )?;
+        Ok(())
+    }
+}
+
+#[test]
+fn issue682_own_memory_render_comparison_remains_strict() {
+    let fixture = Fixture::new(Extras::default());
+    seed_workspace(&fixture, true, true);
+    assert_refused_unchanged(
+        &fixture,
+        fixture.options("b"),
+        &mut CorruptOwnBaseline,
+        RENDER_MISMATCH,
+    );
+}
+
+struct CorruptIdRemap;
+impl EngineHooks for CorruptIdRemap {
+    fn after_copy(&mut self, conn: &Connection) -> Result<(), EngineError> {
+        conn.execute_batch(
+            "UPDATE ctx.context_privilege_state SET enabled = 1;
+            UPDATE ctx.memories SET merged_from = '[1]' WHERE content = 'store four';
+            UPDATE ctx.context_privilege_state SET enabled = 0;",
+        )?;
+        Ok(())
+    }
+}
+
+#[test]
+fn issue682_wrong_remap_to_an_existing_id_still_refuses() {
+    let fixture = Fixture::new(Extras::default());
+    assert_refused_unchanged(
+        &fixture,
+        fixture.options("b"),
+        &mut CorruptIdRemap,
+        VERIFY_MISMATCH,
+    );
+}
+
+#[test]
+fn issue682_real_overlap_content_difference_still_refuses() {
+    let fixture = Fixture::new(Extras::default());
+    seed_mid_session(&fixture);
+    fixture.context().execute("UPDATE compartments SET content = 'a real rewrite' WHERE session_id = ?1 AND sequence = 250", params![HISTORY_SESSION]).unwrap();
+    let mut options = fixture.options("b");
+    options
+        .prefer_history
+        .insert(HISTORY_SESSION.into(), Winner::Store);
+    assert_refused_unchanged(&fixture, options, &mut NoHooks, HISTORY_DIVERGED);
+}
+
+#[test]
+fn issue682_nonzero_boundary_difference_still_refuses() {
+    let fixture = Fixture::new(Extras::default());
+    seed_mid_session(&fixture);
+    fixture.context().execute("UPDATE compartments SET start_message_id = 'm2500#7' WHERE session_id = ?1 AND sequence = 250", params![HISTORY_SESSION]).unwrap();
+    let mut options = fixture.options("b");
+    options
+        .prefer_history
+        .insert(HISTORY_SESSION.into(), Winner::Store);
+    assert_refused_unchanged(&fixture, options, &mut NoHooks, HISTORY_DIVERGED);
+}
+
+#[test]
+fn issue682_overlap_requires_both_named_block_index_columns() {
+    for name in ["start_block_index", "end_block_index"] {
+        assert!(
+            COMPARTMENT_COLUMNS.contains(&name),
+            "COMPARTMENT_COLUMNS must include {name}"
+        );
+    }
+}
+
+#[test]
+fn issue682_a_gap_in_the_joined_history_still_refuses() {
+    let fixture = Fixture::new(Extras::default());
+    seed_mid_session(&fixture);
+    fixture
+        .context()
+        .execute(
+            "DELETE FROM compartments WHERE session_id = ?1 AND sequence = 249",
+            params![HISTORY_SESSION],
+        )
+        .unwrap();
+    let mut options = fixture.options("b");
+    options
+        .prefer_history
+        .insert(HISTORY_SESSION.into(), Winner::Store);
+    assert_refused_unchanged(&fixture, options, &mut NoHooks, HISTORY_DIVERGED);
+}
+
+#[test]
+fn issue682_context_winning_dangling_provenance_is_also_reported() {
+    let fixture = Fixture::new(Extras::default());
+    fixture.context().execute("UPDATE memories SET merged_from = '[777,6]', superseded_by_memory_id = 778 WHERE id = 1", []).unwrap();
+    let report = fixture.migrate();
+    assert_eq!(report.dropped_provenance_count, 2);
+    assert!(report
+        .dropped_provenance
+        .iter()
+        .all(|entry| entry.id_space == Winner::Context && entry.memory_id == 1));
+    let refs: (String, Option<i64>) = fixture
+        .context()
+        .query_row(
+            "SELECT merged_from, superseded_by_memory_id FROM memories WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(refs, ("[6]".into(), None));
+}
+
+#[test]
+fn issue682_newly_allocated_id_does_not_resurrect_deleted_provenance() {
+    let fixture = Fixture::new(Extras::default());
+    fixture
+        .store()
+        .execute(
+            "UPDATE mc_memories SET merged_from = '[9]' WHERE id = 5",
+            [],
+        )
+        .unwrap();
+    let report = fixture.migrate();
+    assert_eq!(report.dropped_provenance_count, 1);
+    assert_eq!(report.dropped_provenance[0].dropped_reference, 9);
+    assert_eq!(
+        memory_content(&fixture.context(), 9),
+        "store seven",
+        "the new row is unrelated to the deleted source"
+    );
+    let refs: String = fixture
+        .context()
+        .query_row(
+            "SELECT merged_from FROM memories WHERE content = 'store five'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(refs, "[]");
+}
+
+#[test]
+fn issue682_context_reference_with_a_seeded_store_counterpart_is_remapped_not_dropped() {
+    let fixture = Fixture::new(Extras::default());
+    fixture
+        .context()
+        .execute("UPDATE memories SET merged_from = '[99]' WHERE id = 1", [])
+        .unwrap();
+    fixture.store().execute("INSERT INTO mc_memories(id, project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at, context_store_uuid, context_row_id) VALUES (8, ?1, 'CONSTRAINTS', 'source retained only in store', 'retained-source', 1, 1, 1, 1, ?2, 99)", params![STORE_PROJECT, FILE_UUID]).unwrap();
+    let report = fixture.migrate();
+    assert_eq!(report.dropped_provenance_count, 0);
+    let id = context_id_of(&fixture.context(), "source retained only in store");
+    let refs: String = fixture
+        .context()
+        .query_row("SELECT merged_from FROM memories WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(refs, format!("[{id}]"));
+}
+
+fn logical_query(conn: &Connection, sql: &str, project: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let width = stmt.column_count();
+    let mut rows: Vec<_> = stmt
+        .query_map(params![project], |row| {
+            let values = (0..width)
+                .map(|index| row.get::<_, SqlValue>(index))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(row_key(&values))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    rows.sort();
+    rows
+}
+
+fn composed_own_lines(fixture: &Fixture, project: &str) -> BTreeMap<String, usize> {
+    let conn = fixture.store();
+    conn.execute(
+        "ATTACH DATABASE ?1 AS ctx",
+        params![fixture.context_db.to_str().unwrap()],
+    )
+    .unwrap();
+    let inputs = M0ComposeInputs {
+        session_id: SESSION,
+        project_path: project,
+        project_directory: "",
+        now_ms: NOW,
+        history_budget_tokens: 1e12,
+        covered_system_messages: &[],
+        memory_enabled: true,
+        memory_budget_tokens: 1e15,
+        user_profile_budget_tokens: 0.0,
+        inject_docs: false,
+        temporal_awareness: true,
+        mural: None,
+    };
+    let composed =
+        compose_m0_from_store(&ContextSource(&conn), &inputs, |text| text.len() / 4).unwrap();
+    memory_multiset(&split_history(&composed.m0_bytes).1)
+        .into_iter()
+        .filter(|(line, _)| line.contains("|#: "))
+        .collect()
+}
+
+#[test]
+fn issue682_combined_dry_run_then_real_run_preserves_two_rust_projects() {
+    let fixture = Fixture::new(Extras::default());
+    seed_workspace(&fixture, true, true);
+    seed_mid_session(&fixture);
+    let store = fixture.store();
+    let context = fixture.context();
+    for domain in ["memories", "notes"] {
+        store.execute("INSERT INTO mc_authority(context_store_uuid, project, domain, state) VALUES (?1, ?2, ?3, 'MODULE')", params![FILE_UUID, CONTEXT_PROJECT, domain]).unwrap();
+    }
+    context.execute("INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?1, ?2, 1)", params![CONTEXT_PROJECT, FILE_UUID]).unwrap();
+    context.execute("INSERT INTO session_projects(session_id, harness, project_path, updated_at) VALUES ('ses_second_rust', 'opencode', ?1, 1)", params![CONTEXT_PROJECT]).unwrap();
+    store.execute("INSERT INTO mc_cache_state(session_id, row_version, core_state, meta, last_activity_at) VALUES ('ses_second_rust', 1, '{}', '{}', ?1)", params![NOW]).unwrap();
+    for (conn, prefix) in [(&store, "mc_"), (&context, "")] {
+        conn.execute(&format!("INSERT INTO {prefix}workspace_members(workspace_id, project_path, display_name, display_path, added_at) VALUES (1, ?1, 'second rust', '', 1)"), params![CONTEXT_PROJECT]).unwrap();
+        for member in 2..=5 {
+            let project = format!("git:typescript{member}");
+            let name = if prefix == "mc_" {
+                project.clone()
+            } else {
+                format!("typescript{member}")
+            };
+            conn.execute(&format!("INSERT INTO {prefix}workspace_members(workspace_id, project_path, display_name, display_path, added_at) VALUES (1, ?1, ?2, '', 1)"), params![project, name]).unwrap();
+            let content = if prefix == "mc_" { "stale" } else { "fresh" };
+            conn.execute(&format!("INSERT INTO {prefix}memories(id, project_path, category, content, normalized_hash, shareable, scope, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?1, ?2, 'CONSTRAINTS', ?3, ?2, 1, 'project', 1000, 1000, 1000, 1000)"), params![50+member, project, format!("{content} member {member}")]).unwrap();
+        }
+    }
+    // Deliberately collide a foreign context id with an own store id. Every reader must
+    // keep the two namespaces separate even when all seven workspace members render.
+    context
+        .execute("UPDATE memories SET id = 2 WHERE id = 50", [])
+        .unwrap();
+    store.execute_batch("UPDATE mc_memories SET merged_from = '[1,777]' WHERE id = 5;
+        UPDATE mc_privilege_state SET note_caller_project = 'git:store-wins';
+        UPDATE mc_notes SET status = 'ready';
+        UPDATE mc_privilege_state SET note_caller_project = 'git:context-wins';
+        INSERT INTO mc_notes(type, project_path, session_id, content, status, created_at_ms, updated_at_ms) VALUES ('session', 'git:context-wins', 'ses_second_rust', 'second rust note', 'ready', 3000, 3000);
+        UPDATE mc_privilege_state SET note_caller_project = '';") .unwrap();
+    store.execute("INSERT INTO mc_compartments(session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, importance, created_at) VALUES ('ses_second_rust', 0, 0, 9, 'second-start', 'second-end', 'second', 'second history', 50, 1000)", []).unwrap();
+
+    let memories_sql = format!(
+        "SELECT {} FROM mc_memories WHERE project_path = ?1",
+        column_list(MEMORY_COLUMNS)
+    );
+    let notes_expr: Vec<_> = NOTE_COLUMNS
+        .iter()
+        .map(|column| match *column {
+            "created_at" => "created_at_ms".to_string(),
+            "updated_at" => "updated_at_ms".to_string(),
+            "harness" => "'opencode'".to_string(),
+            other => format!("\"{other}\""),
+        })
+        .collect();
+    let notes_sql = format!(
+        "SELECT {} FROM mc_notes WHERE project_path = ?1",
+        notes_expr.join(",")
+    );
+    let compartments_expr: Vec<_> = COMPARTMENT_COLUMNS
+        .iter()
+        .map(|column| match *column {
+            "harness" => "'opencode'".to_string(),
+            "rebase_status" => "'ok'".to_string(),
+            "start_block_index" | "end_block_index" => "NULL".to_string(),
+            other => format!("\"{other}\""),
+        })
+        .collect();
+    let compartments_sql = format!(
+        "SELECT {} FROM mc_compartments WHERE session_id = ?1",
+        compartments_expr.join(",")
+    );
+    let expected_memories: Vec<_> = [STORE_PROJECT, CONTEXT_PROJECT]
+        .iter()
+        .map(|project| logical_query(&store, &memories_sql, project))
+        .collect();
+    let expected_notes: Vec<_> = [STORE_PROJECT, CONTEXT_PROJECT]
+        .iter()
+        .map(|project| logical_query(&store, &notes_sql, project))
+        .collect();
+    let expected_second_history = logical_query(&store, &compartments_sql, "ses_second_rust");
+    let expected_tail = logical_query(&store, &compartments_sql, HISTORY_SESSION);
+    let prefix_expr: Vec<_> = COMPARTMENT_COLUMNS
+        .iter()
+        .map(|column| match *column {
+            "start_message_id" | "end_message_id" => format!("replace(\"{column}\", '#0', '')"),
+            "start_block_index" | "end_block_index" => "0".to_string(),
+            other => format!("\"{other}\""),
+        })
+        .collect();
+    let mut expected_joined = logical_query(
+        &context,
+        &format!(
+            "SELECT {} FROM compartments WHERE session_id = ?1 AND sequence < 250",
+            prefix_expr.join(",")
+        ),
+        HISTORY_SESSION,
+    );
+    expected_joined.extend(expected_tail);
+    expected_joined.sort();
+    let expected_foreign = logical_query(&context, "SELECT id, project_path, category, content, shareable, scope FROM memories WHERE project_path LIKE 'git:typescript%' AND ?1 != ''", "all");
+    drop(context);
+    drop(store);
+    let before = fixture.digest();
+    let mut options = fixture.options("combined-backup");
+    options
+        .prefer_history
+        .insert(HISTORY_SESSION.into(), Winner::Store);
+    options.dry_run = true;
+    let preview = run(&options, &mut NoHooks).unwrap();
+    assert_eq!(
+        fixture.digest(),
+        before,
+        "preview leaves both source files unchanged"
+    );
+    assert!(!options.backup_dir.exists());
+    options.dry_run = false;
+    let report = run(&options, &mut NoHooks).unwrap();
+    let context = fixture.context();
+    let store = fixture.store();
+    assert_eq!(preview.render_check, report.render_check);
+    assert_eq!(report.render_check.passed, 2);
+    assert_eq!(report.dropped_provenance_count, 1);
+    assert_eq!(
+        history_decision(&report)
+            .unwrap()
+            .context_prefix_compartments,
+        250
+    );
+    for (index, project) in [STORE_PROJECT, CONTEXT_PROJECT].iter().enumerate() {
+        assert_eq!(
+            logical_query(
+                &context,
+                &format!(
+                    "SELECT {} FROM memories WHERE project_path = ?1",
+                    column_list(MEMORY_COLUMNS)
+                ),
+                project
+            ),
+            expected_memories[index]
+        );
+        assert_eq!(
+            logical_query(
+                &context,
+                &format!(
+                    "SELECT {} FROM notes WHERE project_path = ?1",
+                    column_list(NOTE_COLUMNS)
+                ),
+                project
+            ),
+            expected_notes[index]
+        );
+        let expected_lines: BTreeMap<_, _> = if *project == STORE_PROJECT {
+            ["store one", "store two", "three", "store five"]
+                .into_iter()
+                .map(|content| (format!("project-memory/CONSTRAINTS|#: {content}"), 1))
+                .collect()
+        } else {
+            ["store variant", "store seven"]
+                .into_iter()
+                .map(|content| (format!("project-memory/CONSTRAINTS|#: {content}"), 1))
+                .collect()
+        };
+        assert_eq!(
+            composed_own_lines(&fixture, project),
+            expected_lines,
+            "every own row renders, not just equal subsets"
+        );
+    }
+    assert_eq!(
+        logical_query(
+            &context,
+            &format!(
+                "SELECT {} FROM compartments WHERE session_id = ?1",
+                column_list(COMPARTMENT_COLUMNS)
+            ),
+            HISTORY_SESSION
+        ),
+        expected_joined
+    );
+    assert_eq!(
+        logical_query(
+            &context,
+            &format!(
+                "SELECT {} FROM compartments WHERE session_id = ?1",
+                column_list(COMPARTMENT_COLUMNS)
+            ),
+            "ses_second_rust"
+        ),
+        expected_second_history
+    );
+    assert_eq!(logical_query(&context, "SELECT id, project_path, category, content, shareable, scope FROM memories WHERE project_path LIKE 'git:typescript%' AND ?1 != ''", "all"), expected_foreign);
+    assert_eq!(
+        history_rows(&fixture)
+            .iter()
+            .map(|row| row.1)
+            .collect::<Vec<_>>(),
+        (0..=324).collect::<Vec<_>>()
+    );
+    for conn in [&context, &store] {
+        let check: String = conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
+    }
 }

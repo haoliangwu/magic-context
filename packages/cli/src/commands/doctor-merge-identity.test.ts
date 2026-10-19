@@ -1,9 +1,18 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import {
+    existsSync,
+    mkdirSync,
+    readdirSync,
+    readFileSync,
+    realpathSync,
+    rmSync,
+    statSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
     initializeDatabase,
     runMigrations,
@@ -39,6 +48,15 @@ function createCurrentDatabase(path: string): void {
 
 function fileHash(path: string): string {
     return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function directoryFileBytes(path: string): number {
+    return readdirSync(path, { withFileTypes: true }).reduce((size, entry) => {
+        const entryPath = join(path, entry.name);
+        return (
+            size + (entry.isDirectory() ? directoryFileBytes(entryPath) : statSync(entryPath).size)
+        );
+    }, 0);
 }
 
 afterEach(() => {
@@ -152,12 +170,100 @@ describe("offline identity command", () => {
         ).toThrow("context.db holders: 123");
         expect(fileHash(path)).toBe(before);
     }, 30_000);
+    it("preflight refuses an undersized backup volume before writing anything", () => {
+        const { path, args } = fixture();
+        const before = fileHash(path);
+        const sidecarRoot = join(dirname(path), "project-identities");
+        mkdirSync(sidecarRoot);
+        const sidecar = join(sidecarRoot, "existing.json");
+        const sidecarContent = '{"directory":"old","identity":"git:old"}';
+        writeFileSync(sidecar, sidecarContent);
+        let requiredBytes = 0;
+        let availableBytes = 0;
+        const backupRoot = join(dirname(path), "backup-root-not-created");
+        let probedPath: string | undefined;
+        let refusal: Error | undefined;
+        try {
+            runMergeIdentityCli([...args, "--apply", "--backup-root", backupRoot], {
+                inspectHolders: () => ({ safe: true, blockers: [] }),
+                probe: () => ({ status: "free" }),
+                freeBytes: (volume) => {
+                    probedPath = volume;
+                    const databaseBytes = ["", "-wal", "-shm"].reduce(
+                        (size, suffix) =>
+                            size +
+                            (existsSync(`${path}${suffix}`)
+                                ? statSync(`${path}${suffix}`).size
+                                : 0),
+                        0,
+                    );
+                    requiredBytes = Math.ceil((databaseBytes + statSync(sidecar).size) * 1.1);
+                    availableBytes = Math.ceil(databaseBytes * 1.1);
+                    return availableBytes;
+                },
+            });
+        } catch (error) {
+            refusal = error as Error;
+        }
+        expect(refusal).toBeInstanceOf(Error);
+        expect(refusal?.message ?? "").toContain(
+            `merge_identity_disk_space: refusing identity merge: backup needs ${requiredBytes} bytes; have ${availableBytes} bytes`,
+        );
+        expect(probedPath).toBe(dirname(path));
+        expect(existsSync(backupRoot)).toBe(false);
+        expect(
+            readdirSync(dirname(path)).some((name) => name.startsWith("identity-merge-backup-")),
+        ).toBe(false);
+        expect(fileHash(path)).toBe(before);
+        expect(readFileSync(sidecar, "utf8")).toBe(sidecarContent);
+    }, 30_000);
+    it("stores a private backup under --backup-root and reports its path and size", () => {
+        const { path, args } = fixture();
+        const before = fileHash(path);
+        const backupRoot = join(dirname(path), "external-backups");
+        const sidecarRoot = join(dirname(path), "project-identities");
+        mkdirSync(sidecarRoot);
+        writeFileSync(
+            join(sidecarRoot, "existing.json"),
+            '{"directory":"old","identity":"git:old"}',
+        );
+        const output: string[] = [];
+        const originalLog = console.log;
+        console.log = (...values: unknown[]) => output.push(values.join(" "));
+        try {
+            expect(
+                runMergeIdentityCli([...args, "--apply", "--backup-root", backupRoot], {
+                    inspectHolders: () => ({ safe: true, blockers: [] }),
+                    probe: () => ({ status: "free" }),
+                }),
+            ).toBe(0);
+        } finally {
+            console.log = originalLog;
+        }
+        expect((statSync(backupRoot).mode & 0o777).toString(8)).toBe("700");
+        const backupName = readdirSync(backupRoot).find((name) =>
+            name.startsWith("identity-merge-backup-"),
+        );
+        expect(backupName).toBeDefined();
+        const backup = join(backupRoot, backupName as string);
+        const backupDatabase = join(backup, "context.db");
+        const bytes = directoryFileBytes(backup);
+        expect((statSync(backup).mode & 0o777).toString(8)).toBe("700");
+        expect((statSync(backupDatabase).mode & 0o777).toString(8)).toBe("600");
+        expect(fileHash(backupDatabase)).toBe(before);
+        expect(output).toContain(`Backup: ${backup} (${bytes} bytes)`);
+        expect(output).toContain("This backup can be deleted once the merge has been confirmed.");
+    }, 30_000);
     it("different git directories refuse even with force", () => {
         const { path } = fixture();
+        const sourceDirectory = tempDir();
+        const targetDirectory = tempDir();
         const db = new Database(path);
         db.exec(`INSERT INTO project_state(project_path) VALUES ('git:source');
-            INSERT INTO workspaces VALUES (1,'shared',1,1,'[]');
-            INSERT INTO workspace_members VALUES (1,'git:source','source','/different/source',1),(1,'git:target','target','/different/target',1)`);
+            INSERT INTO workspaces VALUES (1,'shared',1,1,'[]')`);
+        db.prepare(
+            "INSERT INTO workspace_members VALUES (1,'git:source','source',?,1),(1,'git:target','target',?,1)",
+        ).run(sourceDirectory, targetDirectory);
         db.close();
         expect(() =>
             runMergeIdentityCli([

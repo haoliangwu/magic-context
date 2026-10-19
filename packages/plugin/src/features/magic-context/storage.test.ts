@@ -2,6 +2,11 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+    clearUnpublishedAutoSearchNoHints,
+    getUnpublishedAutoSearchNoHint,
+    rememberUnpublishedAutoSearchNoHint,
+} from "../../shared/auto-search-lifecycle";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
@@ -22,6 +27,7 @@ import {
     clearSession,
     closeDatabase,
     dismissNote,
+    flushAutoSearchHintDecisionRetirement,
     getAutoSearchHintDecisions,
     getNoteNudgeAnchors,
     getOrCreateSessionMeta,
@@ -329,9 +335,15 @@ describe("magic-context storage", () => {
             kind: "appended",
             decision: { messageId: "m2", decision: "no-hint", reason: "below-threshold" },
         });
-        expect(pruneAutoSearchHintDecisions(db, sessionId, new Set(["m1"]))).toBe(1);
-        expect(getAutoSearchHintDecisions(db, sessionId)).toEqual([first]);
+        expect(getAutoSearchHintDecisions(db, sessionId)).toEqual([
+            first,
+            { messageId: "m2", decision: "no-hint", reason: "below-threshold" },
+        ]);
         expect(removeAutoSearchHintDecisionByMessageId(db, sessionId, "m1")).toBe(true);
+        expect(getAutoSearchHintDecisions(db, sessionId)).toEqual([
+            { messageId: "m2", decision: "no-hint", reason: "below-threshold" },
+        ]);
+        expect(removeAutoSearchHintDecisionByMessageId(db, sessionId, "m2")).toBe(true);
         expect(getAutoSearchHintDecisions(db, sessionId)).toEqual([]);
         closeQuietly(db);
     });
@@ -347,6 +359,89 @@ describe("magic-context storage", () => {
         expect(getNoteNudgeAnchors(db, "ses-bad-json")).toEqual([]);
         expect(getAutoSearchHintDecisions(db, "ses-bad-json")).toEqual([]);
         closeQuietly(db);
+    });
+
+    it("prunes only proven retired auto-search ids and preserves hidden live decisions", () => {
+        const db = makeMemoryDatabase();
+        const sessionId = "ses-auto-retired";
+        const entries = ["compacted", "live", "hidden-branch"].map((messageId) => ({
+            messageId,
+            decision: "no-hint" as const,
+            reason: "error" as const,
+        }));
+        try {
+            for (const entry of entries) appendAutoSearchHintDecision(db, sessionId, entry);
+            expect(pruneAutoSearchHintDecisions(db, sessionId, new Set())).toBe(0);
+            expect(pruneAutoSearchHintDecisions(db, sessionId, new Set(["compacted"]))).toBe(1);
+            expect(getAutoSearchHintDecisions(db, sessionId)).toEqual(entries.slice(1));
+            expect(pruneAutoSearchHintDecisions(db, sessionId, new Set(["compacted"]))).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("session clear retires auto-search decisions without clearing another session", () => {
+        const db = makeMemoryDatabase();
+        const decision = { messageId: "served", decision: "hint" as const, text: "cached hint" };
+        try {
+            appendAutoSearchHintDecision(db, "cleared", decision);
+            appendAutoSearchHintDecision(db, "retained", decision);
+            rememberUnpublishedAutoSearchNoHint("cleared", "unpublished", "error");
+            rememberUnpublishedAutoSearchNoHint("retained", "unpublished", "error");
+            clearSession(db, "cleared");
+            expect(getUnpublishedAutoSearchNoHint("cleared", "unpublished")).toBeUndefined();
+            expect(getUnpublishedAutoSearchNoHint("retained", "unpublished")).toBe("error");
+            expect(getAutoSearchHintDecisions(db, "cleared")).toEqual([]);
+            expect(getAutoSearchHintDecisions(db, "retained")).toEqual([decision]);
+        } finally {
+            clearUnpublishedAutoSearchNoHints("cleared");
+            clearUnpublishedAutoSearchNoHints("retained");
+            closeQuietly(db);
+        }
+    });
+
+    it("busting cleanup caps only hidden omissions and preserves visible decisions", () => {
+        const db = makeMemoryDatabase();
+        const sessionId = "ses-hidden-omission-cap";
+        try {
+            const visibleHint = {
+                messageId: "visible-hint",
+                decision: "hint" as const,
+                text: "cached hint",
+            };
+            const visibleOmission = {
+                messageId: "visible-omission",
+                decision: "no-hint" as const,
+                reason: "error" as const,
+            };
+            const hiddenHint = {
+                messageId: "hidden-hint",
+                decision: "hint" as const,
+                text: "restorable hint",
+            };
+            for (const entry of [visibleHint, visibleOmission, hiddenHint])
+                appendAutoSearchHintDecision(db, sessionId, entry);
+            for (let index = 0; index < 2500; index++)
+                appendAutoSearchHintDecision(db, sessionId, {
+                    messageId: `hidden-${index}`,
+                    decision: "no-hint",
+                    reason: index % 2 ? "timeout" : "empty",
+                });
+            expect(
+                flushAutoSearchHintDecisionRetirement(
+                    db,
+                    sessionId,
+                    new Set(["visible-hint", "visible-omission"]),
+                ),
+            ).toBe(503);
+            const kept = getAutoSearchHintDecisions(db, sessionId);
+            expect(kept).toHaveLength(2000);
+            expect(kept.slice(0, 3)).toEqual([visibleHint, visibleOmission, hiddenHint]);
+            expect(kept[3]?.messageId).toBe("hidden-503");
+            expect(kept.at(-1)?.messageId).toBe("hidden-2499");
+        } finally {
+            closeQuietly(db);
+        }
     });
 
     it("stores smart notes in the unified notes table and filters by status", () => {

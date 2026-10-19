@@ -31,6 +31,7 @@ use crate::route_targets::{RegisteredRoute, RouteTargetConfig};
 /// legitimately needs five figures. The provider clamps to its own per-model limit, so a
 /// generous request costs nothing unless the model actually generates that much.
 pub(crate) const HISTORIAN_MAX_OUTPUT_TOKENS: u32 = 32_000;
+const HISTORIAN_SESSION_RETENTION_SECONDS: u64 = 86_400;
 
 #[derive(Serialize)]
 struct GenerationRequest {
@@ -52,15 +53,16 @@ struct SendModel<'a> {
     variant: Option<&'a str>,
 }
 
-/// `session.send` params, in Broca's golden field order (`prompt`, `send_id`, `model`)
-/// followed by the fields only this client adds. Magic Context never sends `delivery`,
-/// so every send is Broca's default queued delivery, which must name its variant
-/// explicitly: a queued send does not inherit one from the session.
+/// Serialize `prompt`, `send_id`, and nested `model` first, followed by optional
+/// retention seconds, then this client's `tools`, `generation`, and `system` fields.
+/// Omitting `delivery` selects queued mode; put any requested variant in `model`.
 #[derive(Serialize)]
 struct SendParams<'a> {
     prompt: &'a str,
     send_id: &'a str,
     model: SendModel<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retention: Option<u64>,
     tools: &'a [Value],
     generation: GenerationRequest,
     #[serde(skip_serializing_if = "str::is_empty")]
@@ -75,6 +77,7 @@ struct SendRequest<'a> {
 
 /// Build one `session.send` request. `model` is the canonical `provider/model` string,
 /// split at the FIRST slash so multi-slash model names keep their remainder intact.
+#[allow(clippy::too_many_arguments)] // Each argument corresponds to a separate wire value.
 fn session_send_request<'a>(
     send_id: &'a str,
     system: &'a str,
@@ -83,6 +86,7 @@ fn session_send_request<'a>(
     variant: Option<&'a str>,
     max_output_tokens: u32,
     temperature: Option<f64>,
+    retention: Option<u64>,
 ) -> Result<SendRequest<'a>, HistorianProducerError> {
     let (provider, model_name) = model.split_once('/').ok_or_else(|| {
         HistorianProducerError::Subc(ProducerErrorBody::untagged(
@@ -100,6 +104,7 @@ fn session_send_request<'a>(
                 model: model_name,
                 variant: variant.filter(|variant| !variant.is_empty()),
             },
+            retention,
             tools: &[],
             generation: GenerationRequest {
                 max_output_tokens,
@@ -625,6 +630,10 @@ impl HistorianProducerError {
         )
     }
 
+    pub(crate) fn is_expired(&self) -> bool {
+        matches!(self, HistorianProducerError::Subc(body) if body.code == "expired")
+    }
+
     /// Parse a route-open refusal while preserving the runner's code and message verbatim.
     pub fn runner_refusal(&self) -> Option<RunnerRefusal> {
         let HistorianProducerError::Subc(body) = self else {
@@ -819,6 +828,12 @@ pub struct HistorianProducer {
     session_id: Option<String>,
     command_route: Option<OpenedRoute>,
     subscribe_route: Option<OpenedRoute>,
+    /// `None` means this route has not been queried; `Some(None)` means it declared no
+    /// usable retention group. This cache belongs to a route and is cleared on close.
+    route_retention: Option<Option<u64>>,
+    /// Freeze the first send's policy for this session. In particular, a session that
+    /// began without retention must not opt in on a later send.
+    session_retention: Option<Option<u64>>,
 }
 
 impl HistorianProducer {
@@ -852,13 +867,19 @@ impl HistorianProducer {
             session_id: None,
             command_route: None,
             subscribe_route: None,
+            route_retention: None,
+            session_retention: None,
         })
     }
 
     /// Bind subsequent status/subscribe/cancel calls to an existing session. Reattach
     /// probes open the route with the persisted session id and must not call send again.
     pub fn bind_session(&mut self, session_id: impl Into<String>) {
-        self.session_id = Some(session_id.into());
+        let session_id = session_id.into();
+        if self.session_id.as_deref() != Some(session_id.as_str()) {
+            self.session_retention = None;
+        }
+        self.session_id = Some(session_id);
     }
 
     pub async fn start(
@@ -916,6 +937,11 @@ impl HistorianProducer {
     ) -> Result<RunHandle, HistorianProducerError> {
         self.bind_session(session_id.to_string());
         let route = self.ensure_command_route().await?;
+        // Check `role.describe` before building this send; include retention only when
+        // the runner advertises support. Its first accepted send fixes the session's
+        // lifetime, so repeat sends must keep that initial policy.
+        let declared_retention = self.retention_for_route(route).await;
+        let retention = select_session_retention(&mut self.session_retention, declared_retention);
         // The route identity is the session. Keeping `session` out of this body avoids
         // a second, diverging source of truth for the run lineage.
         //
@@ -943,6 +969,7 @@ impl HistorianProducer {
             variant,
             max_output_tokens,
             temperature,
+            retention,
         )?;
         let response = self.unary_json(route, body).await?;
         match send_outcome(&response) {
@@ -1056,6 +1083,29 @@ impl HistorianProducer {
         if let Some(route) = self.command_route.take() {
             let _ = self.send_goodbye(route).await;
         }
+        self.route_retention = None;
+    }
+
+    async fn retention_for_route(&mut self, route: OpenedRoute) -> Option<u64> {
+        if let Some(retention) = self.route_retention {
+            return retention;
+        }
+
+        let described = self
+            .unary_json(route, json!({ "method": "role.describe", "params": {} }))
+            .await;
+        let retention = match described {
+            Ok(answer) => retention_from_role_describe(&answer),
+            Err(_) => None,
+        };
+        if retention.is_none() {
+            static RETENTION_UNAVAILABLE_WARNING: std::sync::Once = std::sync::Once::new();
+            RETENTION_UNAVAILABLE_WARNING.call_once(|| {
+                tracing::warn!("[mc-module] Broca does not declare a usable retention capability; historian and dreamer sessions will use the runner's default lifetime");
+            });
+        }
+        self.route_retention = Some(retention);
+        retention
     }
 
     async fn subscribe_from_start(
@@ -1347,6 +1397,50 @@ impl HistorianProducer {
         self.next_corr = self.next_corr.saturating_add(1).max(1);
         corr
     }
+}
+
+/// Return a policy only when `role.describe` names `retention` and provides positive
+/// limits. Older runners may not support the field, so omitting it when the group is
+/// absent keeps their `session.send` requests valid.
+fn retention_from_role_describe(answer: &Value) -> Option<u64> {
+    let answer = answer.get("result").unwrap_or(answer);
+    let declares_retention = answer
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .is_some_and(|groups| {
+            groups
+                .iter()
+                .any(|group| group.as_str() == Some("retention"))
+        });
+    if !declares_retention {
+        return None;
+    }
+    let max_seconds = answer
+        .get("retention")
+        .and_then(|retention| retention.get("max_seconds"))
+        .and_then(Value::as_u64)
+        .filter(|max_seconds| *max_seconds > 0)?;
+    let delete_within_ms = answer
+        .get("retention")
+        .and_then(|retention| retention.get("delete_within_ms"))
+        .and_then(Value::as_u64)?;
+    if delete_within_ms == 0 {
+        return None;
+    }
+    Some(HISTORIAN_SESSION_RETENTION_SECONDS.min(max_seconds))
+}
+
+fn select_session_retention(
+    frozen: &mut Option<Option<u64>>,
+    declared: Option<u64>,
+) -> Option<u64> {
+    let original = *frozen.get_or_insert(declared);
+    let (Some(maximum), Some(original)) = (declared, original) else {
+        return None;
+    };
+    let selected = original.min(maximum);
+    *frozen = Some(Some(selected));
+    Some(selected)
 }
 
 impl Drop for HistorianProducer {
@@ -2033,6 +2127,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct ServerLog {
         route_sessions: Vec<String>,
+        role_describes: Vec<Value>,
         sends: Vec<Value>,
         subscribes: Vec<Value>,
         retracts: Vec<Value>,
@@ -2052,6 +2147,21 @@ mod tests {
     async fn fake_server_with_lost_send_reply(
         send_response: Value,
         stream_events: Vec<Value>,
+        lose_first_reply: bool,
+    ) -> FakeServer {
+        fake_server_with_role_describe(
+            send_response,
+            stream_events,
+            json!({"capabilities": [], "retention": {"max_seconds": 2_592_000, "delete_within_ms": 3_600_000}}),
+            lose_first_reply,
+        )
+        .await
+    }
+
+    async fn fake_server_with_role_describe(
+        send_response: Value,
+        stream_events: Vec<Value>,
+        role_describe_response: Value,
         mut lose_first_reply: bool,
     ) -> FakeServer {
         let temp = tempfile::tempdir().unwrap();
@@ -2126,6 +2236,17 @@ mod tests {
                         FrameType::Request => {
                             let req: Value = serde_json::from_slice(&frame.body).unwrap();
                             match req.get("method").and_then(Value::as_str) {
+                                Some("role.describe") => {
+                                    log_task.lock().await.role_describes.push(req.clone());
+                                    send_response_frame(
+                                        &mut stream,
+                                        frame.header.channel,
+                                        frame.header.epoch,
+                                        frame.header.corr,
+                                        serde_json::to_vec(&role_describe_response).unwrap(),
+                                    )
+                                    .await;
+                                }
                                 Some("session.send") => {
                                     log_task.lock().await.sends.push(req["params"].clone());
                                     if lose_first_reply {
@@ -2280,9 +2401,10 @@ mod tests {
 
     #[tokio::test]
     async fn lost_send_reply_retry_reuses_attempt_send_id_after_reconnect() {
-        let server = fake_server_with_lost_send_reply(
+        let server = fake_server_with_role_describe(
             json!({"state":"active","run_id":"run-1"}),
             Vec::new(),
+            json!({"capabilities":["retention"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
             true,
         )
         .await;
@@ -2309,6 +2431,72 @@ mod tests {
         assert_eq!(log.sends.len(), 2);
         assert_eq!(log.sends[0]["send_id"], json!(session));
         assert_eq!(log.sends[1]["send_id"], json!(session));
+        assert_eq!(log.sends[0]["retention"], json!(86_400));
+        assert_eq!(log.sends[1]["retention"], json!(86_400));
+        assert_eq!(
+            log.role_describes.len(),
+            2,
+            "each new route is queried once"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_send_includes_one_day_retention_when_role_declares_group() {
+        let server = fake_server_with_role_describe(
+            json!({"state":"active","run_id":"run-1"}),
+            Vec::new(),
+            json!({"capabilities":["retention"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
+            false,
+        )
+        .await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:1", "role", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        client.close().await;
+
+        let log = server.log.lock().await;
+        assert_eq!(log.role_describes.len(), 1);
+        assert_eq!(
+            log.role_describes[0],
+            json!({"method":"role.describe","params":{}})
+        );
+        assert_eq!(log.sends[0]["retention"], json!(86_400));
+    }
+
+    #[tokio::test]
+    async fn first_send_omits_retention_when_role_does_not_declare_group() {
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), Vec::new()).await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:1", "role", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        client.close().await;
+
+        let log = server.log.lock().await;
+        assert_eq!(log.sends.len(), 1);
+        assert!(log.sends[0].get("retention").is_none());
+    }
+
+    #[tokio::test]
+    async fn first_send_clamps_retention_to_role_maximum() {
+        let server = fake_server_with_role_describe(
+            json!({"state":"active","run_id":"run-1"}),
+            Vec::new(),
+            json!({"capabilities":["retention"],"retention":{"max_seconds":43_200,"delete_within_ms":3_600_000}}),
+            false,
+        )
+        .await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:1", "role", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        client.close().await;
+
+        assert_eq!(server.log.lock().await.sends[0]["retention"], json!(43_200));
     }
 
     #[tokio::test]
@@ -2543,8 +2731,14 @@ mod tests {
         include_str!("../testdata/broca/send_request.model_variant_queue.json");
     const BROCA_SEND_MODEL_VARIANT_STEER: &str =
         include_str!("../testdata/broca/send_request.model_variant_steer.json");
+    const SEND_WITH_RETENTION: &str =
+        include_str!("../testdata/broca/send_request.model_variant_retention.json");
 
     fn golden_send_params(variant: Option<&str>) -> String {
+        golden_send_params_with_retention(variant, None)
+    }
+
+    fn golden_send_params_with_retention(variant: Option<&str>, retention: Option<u64>) -> String {
         let request = session_send_request(
             "s-1",
             "",
@@ -2553,6 +2747,7 @@ mod tests {
             variant,
             HISTORIAN_MAX_OUTPUT_TOKENS,
             None,
+            retention,
         )
         .unwrap();
         assert_eq!(request.method, "session.send");
@@ -2572,6 +2767,73 @@ mod tests {
             format!(
                 "{golden_body},\"tools\":[],\"generation\":{{\"max_output_tokens\":{HISTORIAN_MAX_OUTPUT_TOKENS}}}}}"
             )
+        );
+    }
+
+    /// The retention fixture keeps the runner fields first: `prompt`, `send_id`, nested
+    /// `model`, and integer retention seconds. This producer appends `tools` and
+    /// `generation` afterward.
+    #[test]
+    fn session_send_retention_matches_runner_contract_field_order() {
+        let golden_body = SEND_WITH_RETENTION
+            .strip_suffix('}')
+            .expect("retention golden is one JSON object");
+        assert_eq!(
+            golden_send_params_with_retention(Some("high"), Some(86_400)),
+            format!(
+                "{golden_body},\"tools\":[],\"generation\":{{\"max_output_tokens\":{HISTORIAN_MAX_OUTPUT_TOKENS}}}}}"
+            )
+        );
+    }
+
+    #[test]
+    fn retention_requires_a_declared_group_and_clamps_to_its_maximum() {
+        assert_eq!(
+            retention_from_role_describe(
+                &json!({"capabilities": ["retention"], "retention": {"max_seconds": 2_592_000, "delete_within_ms": 3_600_000}})
+            ),
+            Some(86_400)
+        );
+        assert_eq!(
+            retention_from_role_describe(
+                &json!({"capabilities": [], "retention": {"max_seconds": 2_592_000, "delete_within_ms": 3_600_000}})
+            ),
+            None
+        );
+        assert_eq!(
+            retention_from_role_describe(
+                &json!({"capabilities": ["retention"], "retention": {"max_seconds": 43_200, "delete_within_ms": 3_600_000}})
+            ),
+            Some(43_200)
+        );
+    }
+
+    #[test]
+    fn a_session_without_first_send_retention_cannot_opt_in_later() {
+        let mut frozen = None;
+        assert_eq!(select_session_retention(&mut frozen, None), None);
+        assert_eq!(
+            select_session_retention(&mut frozen, Some(86_400)),
+            None,
+            "a later route cannot opt a session into retention"
+        );
+        assert_eq!(frozen, Some(None));
+    }
+
+    #[test]
+    fn a_reconnected_session_can_only_shorten_its_frozen_retention() {
+        let mut frozen = None;
+        assert_eq!(
+            select_session_retention(&mut frozen, Some(86_400)),
+            Some(86_400)
+        );
+        assert_eq!(
+            select_session_retention(&mut frozen, Some(43_200)),
+            Some(43_200)
+        );
+        assert_eq!(
+            select_session_retention(&mut frozen, Some(172_800)),
+            Some(43_200)
         );
     }
 

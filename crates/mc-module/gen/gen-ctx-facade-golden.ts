@@ -1,3 +1,4 @@
+import "./quiet-live-log";
 /**
  * Generate ctx_expand renderer fixtures from the TypeScript implementation.
  *

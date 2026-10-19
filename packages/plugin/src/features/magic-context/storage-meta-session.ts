@@ -1,5 +1,8 @@
 import { Buffer } from "node:buffer";
-import { cancelAutoSearchWork } from "../../shared/auto-search-lifecycle";
+import {
+    cancelAutoSearchWork,
+    clearUnpublishedAutoSearchNoHints,
+} from "../../shared/auto-search-lifecycle";
 import { getHarness } from "../../shared/harness";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import {
@@ -12,6 +15,11 @@ import {
     resolveIsSubagentFromOpenCode2Db,
     resolveIsSubagentFromOpenCodeDb,
 } from "./resolve-subagent-fallback";
+import {
+    getPendingPiCompactionMarkerState,
+    logPiCompactionMarkerClear,
+    type PendingPiCompactionMarker,
+} from "./storage-meta-persisted";
 import {
     BOOLEAN_META_KEYS,
     ensureSessionMetaRow,
@@ -84,14 +92,26 @@ function getSessionMetaSelectColumns(db: Database): string {
     return projection;
 }
 
-export function getOrCreateSessionMeta(db: Database, sessionId: string): SessionMeta {
+function findSessionMeta(db: Database, sessionId: string): SessionMeta | undefined {
     const result = db
         .prepare(`SELECT ${getSessionMetaSelectColumns(db)} FROM session_meta WHERE session_id = ?`)
         .get(sessionId);
 
-    if (isSessionMetaRow(result)) {
-        return toSessionMeta(result);
-    }
+    return isSessionMetaRow(result) ? toSessionMeta(result) : undefined;
+}
+
+/**
+ * Read session metadata, returning defaults instead of inserting a row. The
+ * history-head fallback that runs when another process holds the database write
+ * lock uses this: inserting would need that same lock, fail, and refuse the turn.
+ */
+export function readSessionMeta(db: Database, sessionId: string): SessionMeta {
+    return findSessionMeta(db, sessionId) ?? getDefaultSessionMeta(sessionId);
+}
+
+export function getOrCreateSessionMeta(db: Database, sessionId: string): SessionMeta {
+    const existing = findSessionMeta(db, sessionId);
+    if (existing) return existing;
 
     // Fresh row creation: bridge the race between OpenCode creating the
     // session (which writes `parent_id` synchronously) and the async
@@ -247,7 +267,7 @@ export function retryPendingSessionCleanups(
                     db.prepare(
                         "UPDATE pending_session_cleanup SET last_attempt_at = ? WHERE session_id = ?",
                     ).run(Date.now(), row.session_id);
-                    clearSession(db, row.session_id);
+                    clearSession(db, row.session_id, false, true);
                 }),
             );
             cleared += 1;
@@ -294,7 +314,7 @@ export async function retryPendingRustSessionCleanupsForProject(
                 ),
             );
             await deleteSession(row.session_id);
-            clearSession(db, row.session_id, true);
+            clearSession(db, row.session_id, true, true);
             cleared += 1;
         } catch {
             failedSessionIds.push(row.session_id);
@@ -307,20 +327,28 @@ export function clearSession(
     db: Database,
     sessionId: string,
     rustModuleCleanupAcknowledged = false,
+    // A deleted host session cannot resume; its retained tag-change counters can
+    // be removed. Administrative reset/reimport keeps them to invalidate live caches.
+    permanentlyDeleted = false,
 ): void {
     cancelAutoSearchWork(sessionId);
     let transactionStartedAt = 0;
+    let clearedMarker: PendingPiCompactionMarker | null = null;
     withoutSqliteTransformPass(() =>
         withSqliteBackgroundWriter(() =>
             db
                 .transaction(() => {
                     transactionStartedAt = performance.now();
+                    clearedMarker = getPendingPiCompactionMarkerState(db, sessionId);
                     deleteSessionScopedRows(db, [sessionId], undefined, {
                         rustModuleCleanupAcknowledged,
+                        preserveTagRevisionTombstones: !permanentlyDeleted,
                     });
                 })
                 .immediate(),
         ),
     );
+    if (clearedMarker) logPiCompactionMarkerClear(sessionId, clearedMarker, "session-reset");
+    clearUnpublishedAutoSearchNoHints(sessionId);
     logSlowWriteTransaction("clear-session", transactionStartedAt);
 }

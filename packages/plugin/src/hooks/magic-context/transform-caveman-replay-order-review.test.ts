@@ -18,6 +18,7 @@ import {
 } from "../../features/magic-context/storage";
 import { createTagger } from "../../features/magic-context/tagger";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { requestPendingMaterialization } from "./pending-materialization";
 import { createTransform } from "./transform";
 
 type TestMessage = {
@@ -107,6 +108,8 @@ function makeTransform(
     schedulerDecision: Scheduler["shouldExecute"],
     clearReasoningAge: number,
 ) {
+    const pending = new Set<string>();
+    requestPendingMaterialization(pending, sessionId, "user_flush");
     return createTransform({
         tagger: createTagger(),
         scheduler: { shouldExecute: schedulerDecision },
@@ -115,7 +118,7 @@ function makeTransform(
         ]),
         db,
         historyRefreshSessions: new Set(),
-        pendingMaterializationSessions: new Set([sessionId]),
+        pendingMaterializationSessions: pending,
         lastHeuristicsTurnId: new Map(),
         keepReasoningTokens: clearReasoningAge === 1 ? 0 : 100_000,
         protectedTokens: 1,

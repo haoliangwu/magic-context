@@ -172,9 +172,10 @@ export interface DreamTaskExecutorDeps {
     /** Resolved project transform mode; an explicit TS mode always stays on TS. */
     transformMode?: "ts" | "rust";
     /** Rust-mode module transport; classify uses it only after MODULE authority is confirmed. */
-    mural?: { enabled: boolean; model?: string };
+    mural?: { enabled: boolean };
     memoryInjectionBudgetTokens?: number;
     retinaHandoff?: boolean;
+    smartNotesEnabled?: boolean;
     /** Process-local progress callback for user-facing status displays; it never reads from or writes to the prompt/result cache. */
     onProgress?: (progress: DreamTaskProgress | null, completedTask?: DreamTaskName) => void;
     /** Pi's process runner reports usage after each child exits rather than through session.messages. */
@@ -774,9 +775,8 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 if (deps.mural?.enabled !== true) {
                     return skip("mural is not enabled");
                 }
-                // `config.model` is already resolved by task-config using the
-                // executing harness's task-specific, mural/project-level,
-                // then default model settings.
+                // `config.model` is already resolved by task-config from the
+                // executing harness's task-specific, then default model settings.
                 const result = await runCompressCues({
                     db,
                     client: deps.client,
@@ -855,9 +855,9 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 );
                 if (!result.complete) {
                     if (result.stopReason === "timeout-circuit-breaker") {
-                        // A repeated timeout is a model-capacity starvation signal, not
-                        // a normal deadline remainder. Keep its failed status loud so
-                        // /ctx-dream and dreamer history expose why it stopped.
+                        // The mapper stopped after two timed-out batches committed
+                        // nothing, rather than simply running out of overall time.
+                        // Record a failure so /ctx-dream and history show that distinction.
                         const error = `map-memories starvation: timeout circuit breaker stopped the run with ${result.remaining} remain`;
                         recordRun("failed", error);
                         return { status: "failed", transient: true, error };
@@ -1067,6 +1067,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     model: config.model,
                     fallbackModels: config.fallbackModels,
                     retinaHandoff: deps.retinaHandoff,
+                    smartNotesEnabled: deps.smartNotesEnabled,
                 });
                 recordRun("completed", null, {
                     smartNotesSurfaced: result.surfaced,

@@ -31,6 +31,8 @@ The wizard auto-detects OpenCode, Pi, and OMP. It then:
 
 Target one harness explicitly with `--harness opencode`, `--harness pi`, or `--harness omp`.
 
+When setup succeeds in an interactive terminal, it offers to install the Magic Context Dashboard desktop app, verified against its release signature; pass `--dashboard` to install it without asking or `--no-dashboard` to skip the offer.
+
 :::note
 **Why is compaction disabled?** Magic Context manages context itself. Host compaction would interfere with the historian and double-compress history. Setup turns it off automatically. OMP's automatic memory backend is also disabled because two memory injectors would duplicate context and writes. Existing OMP memory data is not deleted.
 :::

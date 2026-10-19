@@ -1,4 +1,5 @@
 import type { Database } from "../../shared/sqlite";
+import { capHistorianFailureReason } from "./historian-failure-reason";
 
 /**
  * Per historian-invocation telemetry.
@@ -82,6 +83,15 @@ export function countHistorianRuns(db: Database, sessionId: string): number {
 
 export function recordHistorianRun(db: Database, input: HistorianRunInput): number | null {
     try {
+        const failureReason =
+            input.failureReason == null
+                ? input.status === "failed"
+                    ? "provider_error"
+                    : null
+                : capHistorianFailureReason(
+                      input.failureReason,
+                      input.status === "failed" ? "provider_error" : "",
+                  );
         const result = db
             .prepare(
                 `INSERT INTO historian_runs (
@@ -99,7 +109,7 @@ export function recordHistorianRun(db: Database, input: HistorianRunInput): numb
                 input.subagentInvocationId ?? null,
                 input.runKind,
                 input.status,
-                input.failureReason ?? null,
+                failureReason,
                 input.chunkStartOrdinal ?? null,
                 input.chunkEndOrdinal ?? null,
                 input.unprocessedFrom ?? null,

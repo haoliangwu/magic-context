@@ -111,7 +111,12 @@ export function reconcilePiCompactionMode(args: {
 
 	let clearedSomething = false;
 	if (getPendingPiCompactionMarkerState(args.db, args.sessionId) !== null) {
-		setPendingPiCompactionMarkerState(args.db, args.sessionId, null);
+		setPendingPiCompactionMarkerState(
+			args.db,
+			args.sessionId,
+			null,
+			"compaction-disabled",
+		);
 		clearedSomething = true;
 	}
 	if (getOverflowState(args.db, args.sessionId).needsEmergencyRecovery) {

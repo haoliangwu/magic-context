@@ -221,7 +221,6 @@ This does not change the OpenCode 2 results above.
 | --- | --- |
 | Whole-system cache stability | OMP 18.2.6's request-body `cch` attestation changes `system[0]`; cache-stability and long-session phase 1 are declared host-imposed divergences, not relaxed assertions. [Evidence](packages/pi-plugin/PARITY.md#35-omp-provider-attestation-prevents-whole-system-byte-parity). |
 | Historian, todo, memory, compaction-off and pressure fixtures | OMP configuration filenames, shared config location, tool transport and macOS cwd spelling required harness corrections; real-host assertions remain enabled. [Adjudication](packages/pi-plugin/PARITY.md#36-omp-parity-fixtures-use-native-configuration-and-wire-conventions). |
-| Same-path window overlay | Pi/OMP product fix classifies the host model window as catalog metadata; observed overlay limits take precedence. Pi hot-reloads; OMP RPC restarts and resumes because its reload callback is a no-op. |
 
 ## Static tokenizer decision calibration
 
@@ -249,7 +248,7 @@ Calibration is curated by periodic measurement sweeps and has only `seed` and `f
 
 ### Calibration verification and remaining scope
 
-Pinned OpenCode captures compare master `7486664df07096385e3a5985427b335a221a2bd2` with runtime candidate `6eddf386937058ffcde18b88179c3bb987d517f0`. The neutral control preserves the complete captured messages at the same model-change HARD edge. Fable uses the independently supplied 38,173-local history allowance instead of 60,000. A common legacy cached history is then adopted on both revisions: a real tail-only execute preserves its bytes while dropping exactly two eligible tool tags on master and four on the calibrated candidate. Each path then observes four actual scheduler defers, including a restart; neutral messages/system/tools hashes match across revisions. No provider body is reconstructed by a second serializer. Hash evidence and limitations are in `docs/reports/tokenizer-calibration-phase-a-verification.md` and the adjacent gate JSON files.
+Pinned OpenCode captures compare master `7486664df07096385e3a5985427b335a221a2bd2` with runtime candidate `6eddf386937058ffcde18b88179c3bb987d517f0`. The neutral control preserves the complete captured messages at the same model-change HARD edge. Fable uses the independently supplied 38,173-local history allowance instead of 60,000. A common legacy cached history is then adopted on both revisions: a real tail-only execute preserves its bytes while dropping exactly two eligible tool tags on master and four on the calibrated candidate. Each path then observes four actual scheduler defers, including a restart; neutral messages/system/tools hashes match across revisions. No provider body is reconstructed by a second serializer.
 
 The fix round reran both full adapter suites under isolated HOME/XDG roots: plugin 5,254 pass / 1 skip / 0 fail; Pi 1,225 pass / 3 skip / 0 fail. Rust's locked `mc-module` suite passed with 1,217 library tests and 8 ignored plus all integration targets; clippy passed with warnings denied.
 

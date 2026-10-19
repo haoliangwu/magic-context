@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import {
+	copyFileSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -13,6 +14,11 @@ import { printGrowthTable, printLargestPhaseTable } from "./reporting";
 import type { PerfRunReport } from "./run";
 
 interface Options {
+	interleave?: boolean;
+	settledUsage?: boolean;
+	lane?: string;
+	reportDir?: string;
+	contextWindow?: number;
 	fixture?: string;
 	baseline: string;
 	messages: number;
@@ -94,6 +100,12 @@ async function main(): Promise<void> {
 		mkdirSync(baselineRoot, { recursive: true });
 		await run(["tar", "-xf", archive, "-C", baselineRoot], repoRoot);
 		linkDependencies(repoRoot, baselineRoot);
+		// Both revisions use the same measurement driver; only product modules
+		// come from the archive, keeping the measurement procedure identical.
+		copyFileSync(
+			join(repoRoot, "packages/pi-plugin/scripts/experiments/perf/run.ts"),
+			join(baselineRoot, "packages/pi-plugin/scripts/experiments/perf/run.ts"),
+		);
 
 		const commonArgs = [
 			"--messages",
@@ -106,13 +118,19 @@ async function main(): Promise<void> {
 		}
 		if (options.fixture) commonArgs.push("--fixture", resolve(options.fixture));
 		if (options.points) commonArgs.push("--points", options.points);
+		if (options.settledUsage) commonArgs.push("--settled-usage");
+		if (options.lane) commonArgs.push("--lane", options.lane);
+		if (options.contextWindow)
+			commonArgs.push("--context-window", String(options.contextWindow));
 
-		await runRunner(baselineRoot, [
-			...commonArgs,
-			"--output",
-			baselineReportPath,
-		]);
-		await runRunner(repoRoot, [...commonArgs, "--output", optimizedReportPath]);
+		const beforeArgs = [...commonArgs, "--output", baselineReportPath];
+		const afterArgs = [...commonArgs, "--output", optimizedReportPath];
+		if (options.interleave)
+			await runInterleaved(baselineRoot, beforeArgs, repoRoot, afterArgs);
+		else {
+			await runRunner(baselineRoot, beforeArgs);
+			await runRunner(repoRoot, afterArgs);
+		}
 
 		const baseline = (await Bun.file(
 			baselineReportPath,
@@ -121,13 +139,47 @@ async function main(): Promise<void> {
 			optimizedReportPath,
 		).json()) as PerfRunReport;
 		assertIdentical(baseline, optimized);
+		if (options.reportDir) {
+			mkdirSync(resolve(options.reportDir), { recursive: true });
+			copyFileSync(
+				baselineReportPath,
+				join(resolve(options.reportDir), "baseline.json"),
+			);
+			copyFileSync(
+				optimizedReportPath,
+				join(resolve(options.reportDir), "optimized.json"),
+			);
+		}
+		if (options.repeatFinal > 0) {
+			for (const [label, report] of [
+				["baseline", baseline],
+				["optimized", optimized],
+			] as const) {
+				const repeats = report.passes.slice(-options.repeatFinal);
+				const times = repeats
+					.map((pass) => pass.handlerMs)
+					.sort((a, b) => a - b);
+				const quantile = (q: number) => {
+					const index = q * (times.length - 1);
+					const low = Math.floor(index),
+						high = Math.ceil(index);
+					return (
+						(times[low] ?? 0) +
+						((times[high] ?? 0) - (times[low] ?? 0)) * (index - low)
+					);
+				};
+				console.log(
+					`${label}: ${times.length} warm handler passes p50=${quantile(0.5).toFixed(3)}ms p95=${quantile(0.95).toFixed(3)}ms p99=${quantile(0.99).toFixed(3)}ms full-array-clones=${repeats.reduce((sum, pass) => sum + pass.fullArrayClones, 0)} defer=${repeats.filter((pass) => pass.decision === "defer").length} envelope-reads=${repeats.reduce((sum, pass) => sum + pass.fitEnvelopeReads, 0)}`,
+				);
+			}
+		}
 		printGrowthTable(`baseline (${options.baseline})`, baseline);
 		printGrowthTable("optimized", optimized);
 		printLargestPhaseTable(`baseline (${options.baseline})`, baseline);
 		printLargestPhaseTable("optimized", optimized);
 
-		const before = baseline.passes.at(-1)?.phases.total ?? 0;
-		const after = optimized.passes.at(-1)?.phases.total ?? 0;
+		const before = baseline.passes.at(-1)?.handlerMs ?? 0;
+		const after = optimized.passes.at(-1)?.handlerMs ?? 0;
 		const speedup = after > 0 ? before / after : Number.POSITIVE_INFINITY;
 		console.log(
 			`\nbyte identity: ${optimized.passes.length} passes, zero output diffs, ` +
@@ -169,6 +221,7 @@ function assertIdentical(
 		}
 		if (
 			before.outputHash !== after.outputHash ||
+			before.wireHash !== after.wireHash ||
 			before.outputBytes !== after.outputBytes
 		) {
 			throw new Error(
@@ -198,6 +251,104 @@ async function runRunner(root: string, args: string[]): Promise<void> {
 		join(root, "packages/pi-plugin"),
 		{ ...process.env, NODE_ENV: "test" },
 	);
+}
+
+async function runInterleaved(
+	beforeRoot: string,
+	beforeArgs: string[],
+	afterRoot: string,
+	afterArgs: string[],
+): Promise<void> {
+	const start = (root: string, args: string[]) => {
+		const home = mkdtempSync(join(tmpdir(), "pi-perf-runner-"));
+		const env: Record<string, string | undefined> = {
+			...process.env,
+			NODE_ENV: "test",
+			HOME: home,
+		};
+		env.MAGIC_CONTEXT_LOG_PATH = join(home, "magic-context.log");
+		for (const key of [
+			"TMPDIR",
+			"XDG_CONFIG_HOME",
+			"XDG_DATA_HOME",
+			"XDG_STATE_HOME",
+			"XDG_CACHE_HOME",
+			"XDG_RUNTIME_DIR",
+			"MAGIC_CONTEXT_STORAGE_DIR",
+			"PI_CODING_AGENT_DIR",
+		] as const) {
+			const path = join(home, key);
+			env[key] = path;
+			mkdirSync(path, { recursive: true });
+		}
+		const child = Bun.spawn(
+			[
+				process.execPath,
+				join(root, "packages/pi-plugin/scripts/experiments/perf/run.ts"),
+				...args,
+				"--stepwise",
+			],
+			{
+				cwd: join(root, "packages/pi-plugin"),
+				env,
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "inherit",
+			},
+		);
+		const lines = (async function* () {
+			let text = "";
+			for await (const chunk of child.stdout) {
+				text += Buffer.from(chunk).toString();
+				let end = text.indexOf("\n");
+				while (end >= 0) {
+					yield text.slice(0, end);
+					text = text.slice(end + 1);
+					end = text.indexOf("\n");
+				}
+			}
+		})();
+		const until = async (marker: string) => {
+			for (;;) {
+				const line = await lines.next();
+				if (line.done) {
+					const code = await child.exited;
+					if (code !== 0 || marker !== "PERF_READY")
+						throw new Error(
+							`Stepwise runner stopped before ${marker} (exit ${code})`,
+						);
+					return false;
+				}
+				if (line.value === marker) return true;
+			}
+		};
+		return { child, until, home };
+	};
+	const before = start(beforeRoot, beforeArgs);
+	const after = start(afterRoot, afterArgs);
+	try {
+		for (let pass = 0; ; pass++) {
+			const ready = await Promise.all([
+				before.until("PERF_READY"),
+				after.until("PERF_READY"),
+			]);
+			if (!ready[0] && !ready[1]) break;
+			if (!ready[0] || !ready[1])
+				throw new Error("Interleaved pass-count mismatch");
+			// Alternating AB/BA pairs reduce drift; no two handlers run together.
+			for (const runner of pass % 2 ? [after, before] : [before, after]) {
+				runner.child.stdin.write("next\n");
+				await runner.child.stdin.flush();
+				await runner.until("PERF_DONE");
+			}
+		}
+	} finally {
+		before.child.kill();
+		after.child.kill();
+		await Promise.all([before.child.exited, after.child.exited]);
+		rmSync(before.home, { recursive: true, force: true });
+		rmSync(after.home, { recursive: true, force: true });
+	}
 }
 
 function linkDependencies(repoRoot: string, baselineRoot: string): void {
@@ -254,7 +405,20 @@ function parseOptions(args: readonly string[]): Options {
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index];
 		const value = args[index + 1];
-		if (arg === "--fixture" && value) {
+		if (arg === "--interleave") {
+			options.interleave = true;
+		} else if (arg === "--settled-usage") {
+			options.settledUsage = true;
+		} else if (arg === "--lane" && value) {
+			options.lane = value;
+			index++;
+		} else if (arg === "--report-dir" && value) {
+			options.reportDir = value;
+			index++;
+		} else if (arg === "--context-window" && value) {
+			options.contextWindow = positiveInteger(value, arg);
+			index++;
+		} else if (arg === "--fixture" && value) {
 			options.fixture = value;
 			index += 1;
 		} else if (arg === "--baseline" && value) {

@@ -10,9 +10,9 @@ import { builtInLightSurface } from "./prompt-surface-measurement";
 import { renderChecklist } from "./render-prompt-surface-checklist";
 
 const rootDir = resolve(import.meta.dir, "../../..");
-const fixturePath = resolve(rootDir, "docs/specs/prompt-surface/budget-fixture.json");
-const checklistPath = resolve(rootDir, "docs/specs/prompt-surface/checklist.json");
-const renderedChecklistPath = resolve(rootDir, "docs/specs/prompt-surface/load-bearing-rules-checklist.md");
+const fixturePath = resolve(rootDir, "packages/plugin/scripts/fixtures/prompt-surface/budget-fixture.json");
+const checklistPath = resolve(rootDir, "packages/plugin/scripts/fixtures/prompt-surface/checklist.json");
+const renderedChecklistPath = resolve(rootDir, "packages/plugin/scripts/fixtures/prompt-surface/load-bearing-rules-checklist.md");
 
 function withTempDir<T>(run: (directory: string) => T): T {
     const directory = mkdtempSync(join("/tmp", "prompt-surface-gate-"));

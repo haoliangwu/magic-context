@@ -7,6 +7,7 @@ export type CacheBustDivergenceClass =
     | "accounted_hard_pressure_refold"
     | "accounted_hard_marker_drain"
     | "accounted_hard_fold"
+    | "accounted_tag_identity_repair"
     | "accounted_execute_published_history"
     | "accounted_soft_m1_execute"
     | "accounted_ctx_reduce"
@@ -20,10 +21,15 @@ export type CacheBustDivergenceClass =
     | "tail_shrink_no_rewrite"
     | "self_inflicted_epoch"
     | "unfaulted_epoch"
+    | "accounted_lkg_frozen_release"
     | "unaccounted_defer_pass"
     | "unaccounted_double_bust"
     | "unaccounted_tail_rewrite"
-    | "unaccounted_rewrite";
+    | "unaccounted_rewrite"
+    | "provider_short_read_after_reclaim"
+    | "double_bust_after_reclaim"
+    | "idle_cache_expiry"
+    | "missing_breakpoint_after_read";
 
 export interface AnalyzedCacheRequest {
     session: string;
@@ -36,6 +42,12 @@ export interface AnalyzedCacheRequest {
     analyzerCmd: string;
     /** Render-identity components the matched pass reported as changed, when it logged them. */
     identityDelta?: string[];
+    /**
+     * The class the request would carry on its own, kept when a bust right after
+     * a reclaim bust was relabelled `double_bust_after_reclaim` or
+     * `provider_short_read_after_reclaim`, so the alert still names what happened.
+     */
+    cause?: CacheBustDivergenceClass;
 }
 
 export interface CacheBustSessionAnalysis {
@@ -57,6 +69,8 @@ export interface CacheBustDecisionAttribution {
      * scheduler decision alone does not say.
      */
     appliedRide?: string;
+    /** The reason a frozen last-known-good replay was no longer served. */
+    lkgFrozenReleaseReason?: string;
     materialized: boolean;
     materializeReason: string | null;
     emergency: boolean;
@@ -104,8 +118,24 @@ export interface CacheBustAttributionInput {
     currentModel?: string;
     /** The meter read short while the reusable byte prefix was unchanged. */
     providerShortReadWithIdenticalPrefix?: boolean;
+    /**
+     * Class of the request just before this one, when that request was also a
+     * bust. A bust right after a reclaim bust means one threshold crossing was
+     * paid twice; see classifyBustAfterReclaim.
+     */
+    previousBustClass?: CacheBustDivergenceClass;
     /** The only normalized wire change is a shorter tail, not a rewrite. */
     tailShrink?: boolean;
+    /**
+     * The short read came more than the cache TTL after the reusable prefix was
+     * last read in full or written; see isIdleCacheExpiry.
+     */
+    idleCacheExpiry?: boolean;
+    /**
+     * Explicit-breakpoint meter (Anthropic): the short read came with no cache
+     * write and a large uncached input; see isMissingBreakpointAfterRead.
+     */
+    missingBreakpointAfterRead?: boolean;
     /** Current raw OpenCode message count divided by the preceding pass count. */
     ocInputStepRatio?: number;
     decision?: CacheBustDecisionAttribution;
@@ -177,6 +207,11 @@ export const CACHE_BUST_RULE_TABLE: readonly CacheBustRule[] = [
         rule: "matched pass records another materialized HARD/m0 fold; tiny mid-history defer/first_render seams are excluded",
     },
     {
+        divergenceClass: "accounted_tag_identity_repair",
+        accounted: true,
+        rule: "matched pass records materialize_reason=tag_identity_repair (Pi kept the newest of two tag numbers for one call or message and rebuilt once)",
+    },
+    {
         divergenceClass: "accounted_ctx_reduce",
         accounted: true,
         rule: "matched pass applies drops at an agent ctx_reduce landing",
@@ -227,6 +262,11 @@ export const CACHE_BUST_RULE_TABLE: readonly CacheBustRule[] = [
         rule: "epoch_change has no restart/deploy/config epoch and the adapter log shows no module fault, full-array retry, fallback serve, or adapter restart in the preceding 60 s; the wake names identity_delta",
     },
     {
+        divergenceClass: "accounted_lkg_frozen_release",
+        accounted: true,
+        rule: "matched pass records why it stopped serving the frozen last-known-good request in materialize_reason",
+    },
+    {
         divergenceClass: "unaccounted_defer_pass",
         accounted: false,
         rule: "matched canonical defer pass, including a tiny mid-history first_render seam, diverges",
@@ -251,6 +291,26 @@ export const CACHE_BUST_RULE_TABLE: readonly CacheBustRule[] = [
         accounted: false,
         rule: "matched pass has no accounted attribution",
     },
+    {
+        divergenceClass: "provider_short_read_after_reclaim",
+        accounted: false,
+        rule: "overrides provider_short_read_identical_bytes on the request right after a reclaim bust: its bytes extend the reclaim request unchanged, yet the provider did not serve the prefix that request wrote, so one threshold crossing was billed twice; provider-side, not a Magic Context rewrite",
+    },
+    {
+        divergenceClass: "double_bust_after_reclaim",
+        accounted: false,
+        rule: "overrides any other accounted class on the request right after a reclaim bust; one threshold crossing must cost one bust, and the wake names the overridden class as its cause",
+    },
+    {
+        divergenceClass: "idle_cache_expiry",
+        accounted: true,
+        rule: "the short read came more than the cache TTL (default 5 min) after the reusable prefix was last read in full or written; the provider dropped it while idle",
+    },
+    {
+        divergenceClass: "missing_breakpoint_after_read",
+        accounted: false,
+        rule: "explicit-breakpoint meter: the read fell short of the previous cached prefix, nothing was written, and at least 1,024 tokens were billed as uncached input; the request carried no cache breakpoint past the read point",
+    },
 ] as const;
 
 const ACCOUNTED_CLASSES = new Set(
@@ -259,8 +319,128 @@ const ACCOUNTED_CLASSES = new Set(
 const EPOCH_REASONS = new Set(["project_memory_epoch", "epoch_change", "compartment_render_epoch"]);
 const TAIL_SHRINK_REWRITE_NOISE_TOKENS = 64;
 
+/**
+ * Tolerance below the previous cached prefix that still counts as a full read.
+ * Anthropic reports exact counts (a warm request reads the previous read plus
+ * write to the token), so this only absorbs small tail trims.
+ */
+export const CACHE_READ_EPSILON_TOKENS = 64;
+/**
+ * How long an idle provider prefix is assumed to survive: Anthropic's default
+ * ephemeral cache_control TTL, and Magic Context's own `cache_ttl` default.
+ */
+export const DEFAULT_CACHE_TTL_MS = 5 * 60_000;
+/**
+ * Smallest uncached input that, with no cache write, marks a missing breakpoint.
+ * A request whose last breakpoint sits on its newest message leaves only a few
+ * tokens uncached; 1,024 is Anthropic's smallest minimum cacheable length.
+ */
+export const MISSING_BREAKPOINT_MIN_UNCACHED_TOKENS = 1_024;
+
+/** One request's prompt meter: cached read, cache write, and uncached input. */
+export interface CacheMeterReading {
+    read: number;
+    write: number;
+    input: number;
+}
+
+/**
+ * Lowest cache read that still reuses everything the previous request left
+ * cached. Uncached input is deliberately absent: it was billed in full and
+ * cached nothing, so counting it as reuse hides a request that read only the
+ * head of the prompt.
+ */
+export function cachedPrefixFloor(previous: CacheMeterReading): number {
+    return previous.read + previous.write - CACHE_READ_EPSILON_TOKENS;
+}
+
+/**
+ * A short read on an explicit-breakpoint meter that wrote nothing while a large
+ * span went uncached. With a breakpoint after the read point the provider would
+ * have written that span; with none, it bills it as plain input every time.
+ */
+export function isMissingBreakpointAfterRead(
+    current: CacheMeterReading,
+    options: { shortRead: boolean; explicitBreakpoints: boolean },
+): boolean {
+    return (
+        options.shortRead &&
+        options.explicitBreakpoints &&
+        current.write === 0 &&
+        current.read > 0 &&
+        current.input >= MISSING_BREAKPOINT_MIN_UNCACHED_TOKENS
+    );
+}
+
+/**
+ * Does this request keep the cache clock running? A full read refreshes the
+ * provider's TTL and a write starts a new prefix. On an explicit-breakpoint
+ * meter a short read that wrote nothing touched only the head, so the rest of
+ * the prefix keeps ageing from the last request that did. Implicit-prefix
+ * caches (OpenAI, Gemini) store every prompt they serve, so every request
+ * refreshes them.
+ */
+export function refreshesCachedPrefix(
+    current: CacheMeterReading,
+    options: { shortRead: boolean; explicitBreakpoints: boolean },
+): boolean {
+    return !options.shortRead || current.write > 0 || !options.explicitBreakpoints;
+}
+
+/** A short read more than the TTL after the prefix was last refreshed. */
+export function isIdleCacheExpiry(
+    requestMs: number,
+    prefixRefreshedAtMs: number | undefined,
+    cacheTtlMs: number,
+): boolean {
+    return prefixRefreshedAtMs !== undefined && requestMs - prefixRefreshedAtMs > cacheTtlMs;
+}
+
+/** Parse a `--cache-ttl` value such as 5m, 1h, or 300s into milliseconds. */
+export function parseCacheTtl(value: string | undefined): number {
+    if (value === undefined) return DEFAULT_CACHE_TTL_MS;
+    const match = /^(\d+)(ms|s|m|h)$/.exec(value);
+    if (!match) throw new Error(`Invalid --cache-ttl ${value}; expected a duration such as 5m or 1h`);
+    const unitMs = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000 }[match[2] as "ms" | "s" | "m" | "h"];
+    return Number(match[1]) * unitMs;
+}
+
 export function isUnaccountedCacheBustClass(divergenceClass: string): boolean {
     return !ACCOUNTED_CLASSES.has(divergenceClass as CacheBustDivergenceClass);
+}
+
+/**
+ * Classes that are not a meaningful second rewrite: missing usage, a tail that
+ * only got shorter, or a small system-row shift (see the rule table).
+ */
+const NOT_A_SECOND_REWRITE = new Set<string>([
+    "usage_missing",
+    "tail_shrink_no_rewrite",
+    "system_row_shift",
+    "idle_cache_expiry",
+]);
+
+/** A bust Magic Context caused on purpose and accounted for: a reclaim, fold, or flush. */
+export function isReclaimBustClass(divergenceClass: string | undefined): boolean {
+    return divergenceClass?.startsWith("accounted_") === true;
+}
+
+/**
+ * Class for a bust that directly follows another bust. One threshold crossing
+ * must cost one bust, so a second bust right after a reclaim always alerts,
+ * even when its own class is accounted. A request whose bytes merely extend the
+ * reclaim request is named as the provider's doing; any other accounted class
+ * becomes `double_bust_after_reclaim`. Unaccounted classes already alert under
+ * their own name and are kept.
+ */
+export function classifyBustAfterReclaim(
+    previousBustClass: string | undefined,
+    own: CacheBustDivergenceClass,
+): CacheBustDivergenceClass {
+    if (!isReclaimBustClass(previousBustClass)) return own;
+    if (own === "provider_short_read_identical_bytes") return "provider_short_read_after_reclaim";
+    if (isUnaccountedCacheBustClass(own) || NOT_A_SECOND_REWRITE.has(own)) return own;
+    return "double_bust_after_reclaim";
 }
 
 export function nearestCacheBustDecision(
@@ -301,6 +481,18 @@ export function nearestCacheBustDecision(
 }
 
 export function classifyCacheBust(input: CacheBustAttributionInput): CacheBustDivergenceClass {
+    return classifyBustAfterReclaim(input.previousBustClass, classifyOwnCacheBust(input));
+}
+
+/** The request's class judged on its own, ignoring the request before it. */
+function classifyOwnCacheBust(input: CacheBustAttributionInput): CacheBustDivergenceClass {
+    // The provider drops an idle prefix whatever the request looks like, so an
+    // expiry outranks every request-shape class below.
+    if (input.idleCacheExpiry) return "idle_cache_expiry";
+    // A request that wrote nothing while most of its prompt went uncached had no
+    // breakpoint to write at. That is the request's own shape, so it outranks the
+    // identical-bytes provider class and any pass the request joins.
+    if (input.missingBreakpointAfterRead) return "missing_breakpoint_after_read";
     // No transform pass can explain a short provider read when the reusable bytes
     // are unchanged, so this case is settled before joining any pass row.
     if (input.providerShortReadWithIdenticalPrefix) return "provider_short_read_identical_bytes";
@@ -357,8 +549,11 @@ export function classifyCacheBust(input: CacheBustAttributionInput): CacheBustDi
         input.firstDivergenceSize !== undefined &&
         input.firstDivergenceSize <= 256 &&
         input.divergenceIndex < Math.max(0, input.previousMessageCount - 2);
-    if (decision.flush || materializeReason === "explicit_flush") return "accounted_ctx_flush";
+    if (decision.flush || materializeReason === "explicit_flush" || materializeReason === "user_flush") return "accounted_ctx_flush";
+    if (materializeReason === "fit_retry") return "accounted_force_band";
+    if (materializeReason === "system_hash") return "accounted_hard_system_hash";
     if (decision.emergency && decision.droppedCount > 0) return "accounted_force_band";
+    if (decision.lkgFrozenReleaseReason) return "accounted_lkg_frozen_release";
     if (isTinyFirstRenderDefer && (usageMissing || providerFullMiss)) {
         return usageMissing ? "usage_missing" : "provider_full_miss";
     }
@@ -391,6 +586,10 @@ export function classifyCacheBust(input: CacheBustAttributionInput): CacheBustDi
         return "accounted_hard_marker_drain";
     }
     if (usageMissing) return "usage_missing";
+    // A declared Pi tag-identity repair rebuilds the array whether or not m[0]
+    // was rematerialized; without this class an unmaterialized repair read as an
+    // m1 refresh and a materialized one as an unnamed fold.
+    if (materializeReason === "tag_identity_repair") return "accounted_tag_identity_repair";
     if (decision.materialized) {
         if (materializeReason === "model_change") return "accounted_hard_model_change";
         if (materializeReason === "system_hash") return "accounted_hard_system_hash";

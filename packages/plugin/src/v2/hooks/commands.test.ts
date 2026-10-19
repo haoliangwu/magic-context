@@ -118,7 +118,7 @@ test("command arguments reach the handler, with or without the typed command pre
     ]);
 });
 
-test("a bad argument is refused before any handler runs", async () => {
+test("a bad argument reports usage without running the RPC handler", async () => {
     const { domain, registered } = hostCommandDomain();
     const { rpc, calls } = rpcWithCalls({ embed: { ok: true, message: "unused" } });
     await registerV2Commands({
@@ -129,7 +129,7 @@ test("a bad argument is refused before any handler runs", async () => {
     });
 
     const embed = registered.find((command) => command.name === "ctx-embed");
-    await expect(embed?.execute(invocation("resume"))).rejects.toThrow("Usage: /ctx-embed");
+    await expect(embed?.execute(invocation("resume"))).resolves.toBeUndefined();
     expect(calls).toEqual([]);
 });
 

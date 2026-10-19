@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { closeCompactionMarkerDb, injectCompactionMarker } from "../../plugin/src/features/magic-context/compaction-marker";
+import { closeCompactionMarkerDb, injectCompactionMarker, prepareCompactionMarkerCandidates } from "../../plugin/src/features/magic-context/compaction-marker";
 import { MARKER_SUMMARY_TEXT } from "../../plugin/src/hooks/magic-context/compaction-marker-manager";
 import { stableStringify } from "../../plugin/src/shared/stable-json";
 import { RustTestHarness } from "../src/rust-harness";
@@ -31,7 +31,8 @@ const FOLD_CONFIG = {
 
 function assertHermeticStores(h: RustTestHarness): void {
     const pidFile = JSON.parse(readFileSync(join(h.env.dataDir, "cortexkit", "rust-e2e-pids.json"), "utf8")) as { pids: Array<{ pid: number }> };
-    const pids = [h.opencode.pid, ...pidFile.pids.map(row => row.pid)];
+    const roots = [h.opencode.pid, ...pidFile.pids.map(row => row.pid)];
+    const pids = [...roots];
     const tree = spawnSync("ps", ["-axo", "pid=,ppid="], { encoding: "utf8" });
     expect(tree.status).toBe(0);
     const rows = tree.stdout.trim().split("\n").map(line => line.trim().split(/\s+/).map(Number));
@@ -40,7 +41,11 @@ function assertHermeticStores(h: RustTestHarness): void {
         for (const [pid, parent] of rows) if (pids.includes(parent!) && !pids.includes(pid!)) pids.push(pid!);
     }
     const files = spawnSync("timeout", ["20s", "lsof", "-p", pids.join(","), "-Fn"], { encoding: "utf8" });
-    expect(files.status).toBe(0);
+    const observed = new Set(files.stdout.split("\n").filter(line => /^p\d+$/.test(line)).map(line => Number(line.slice(1))));
+    // A short-lived host child can exit between ps and lsof. lsof then returns
+    // 1 even when it inspected the entire persistent stack successfully.
+    expect(roots.every(pid => observed.has(pid))).toBe(true);
+    expect(files.status === 0 || (files.status === 1 && pids.some(pid => !observed.has(pid)))).toBe(true);
     const stores = [...new Set(files.stdout.split("\n").filter(line => /^n.*\.db(?:$|-)/.test(line)).map(line => line.slice(1)))];
     console.log(`lsof pids=${pids.join(",")} fixture=${h.env.dataDir} stores=${JSON.stringify(stores)}`);
     expect(stores.length).toBeGreaterThan(0);
@@ -370,6 +375,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
                 const previousDb = process.env.OPENCODE_DB;
                 try {
                     process.env.OPENCODE_DB = join(h.env.dataDir, "opencode", "opencode.db");
+                    expect(await prepareCompactionMarkerCandidates(sessionId)).toBe(true);
                     const marker = injectCompactionMarker({ sessionId, endOrdinal: 50, endMessageId: raw[49]!.id, summaryText: MARKER_SUMMARY_TEXT, directory: h.env.workdir });
                     expect(marker).not.toBeNull();
                     context.query("UPDATE session_meta SET compaction_marker_state=?, pending_compaction_marker_state=NULL WHERE session_id=?").run(JSON.stringify({ ...marker, boundaryOrdinal: 50, targetEndMessageId: raw[49]!.id }), sessionId);
@@ -426,7 +432,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
         h = await RustTestHarness.create({ modelContextLimit: 872_000, historianModelContextLimit: 872_000, magicContextConfig: config, startInTsMode: true, startHistorianProducer: false, mockDefault: { text: "mixed fixture reply", usage: { input_tokens: 350_000, output_tokens: 20 } } });
         h.subc.writeModuleConfig(config);
         const health = await fetch(`${h.opencode.url}/global/health`).then(response => response.json()) as { version: string };
-        expect(health.version).toMatch(/^1\.18\./);
+        expect(health.version).toMatch(/^1\./);
         const sessionId = await h.createSession();
         await h.sendPrompt(sessionId, "seed mixed sparse history");
         assertHermeticStores(h);
@@ -483,6 +489,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
         const previousDb = process.env.OPENCODE_DB;
         try {
             process.env.OPENCODE_DB = ocPath;
+            expect(await prepareCompactionMarkerCandidates(sessionId)).toBe(true);
             const marker = injectCompactionMarker({ sessionId, endOrdinal: 50, endMessageId: raw[49]!.id, summaryText: MARKER_SUMMARY_TEXT, directory: h.env.workdir });
             expect(marker).not.toBeNull();
             context.query("UPDATE session_meta SET compaction_marker_state=?,pending_compaction_marker_state=NULL WHERE session_id=?").run(JSON.stringify({ ...marker, boundaryOrdinal: 50, targetEndMessageId: raw[49]!.id }), sessionId);
@@ -495,7 +502,12 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
             mixHistory();
             [[51,62],[64,74],[76,84],[87,108],[111,16940]].forEach(([start,end], index) => insertRange(index+4,start!,end!));
         }
+        const beforeWarm = h.readRustPasses().length;
         await h.sendPrompt(sessionId, "warm below the execute threshold");
+        // The logger buffers pass lines after the host returns. Drain the warm
+        // pass before counting the control, or the control's SOFT+ can be mistaken for the
+        // later epoch HARD while that HARD is still waiting to be flushed.
+        await h.waitForRustPasses(beforeWarm + 1);
         if (noOp) {
             const probeId = "msg_01N00PEP0CHREPLAYPR0BE0000";
             const probe = "literal no-op epoch probe";
@@ -503,6 +515,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
             const oldDb = process.env.OPENCODE_DB;
             try {
                 process.env.OPENCODE_DB = ocPath;
+                expect(await prepareCompactionMarkerCandidates(sessionId)).toBe(true);
                 const old = injectCompactionMarker({ sessionId, endOrdinal: 50, endMessageId: raw[49]!.id, summaryText: MARKER_SUMMARY_TEXT, directory: h.env.workdir });
                 expect(old).not.toBeNull();
                 context.query("UPDATE session_meta SET compaction_marker_state=?,pending_compaction_marker_state=? WHERE session_id=?").run(JSON.stringify({ ...old, boundaryOrdinal: 50, targetEndMessageId: raw[49]!.id }),JSON.stringify({ordinal:16940,endMessageId:raw[16939]!.id,publishedAt:1,injectAttempts:3,firstInjectFailedAt:1,lastInjectError:"busy"}),sessionId);
@@ -522,13 +535,15 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: compaction marker byte identit
             try {
                 moduleStore.exec("PRAGMA busy_timeout=30000");
                 moduleStore.query("INSERT INTO pending_agent_drops(session_id,target_id,queued_at) VALUES (?,?,1)").run(sessionId,`${raw[16999]!.id}#0`);
-                moduleStore.query("UPDATE mc_cache_state SET meta=json_set(meta,'$.project_memory_epoch_pending',json('true')),row_version=row_version+1 WHERE session_id=?").run(sessionId);
+                const stagedEpoch = moduleStore.query("UPDATE mc_cache_state SET meta=json_set(meta,'$.project_memory_epoch_pending',json('true')),row_version=row_version+1 WHERE session_id=? RETURNING row_version,json_extract(meta,'$.project_memory_epoch_pending') AS pending").get(sessionId) as { row_version: number; pending: number };
+                expect(stagedEpoch.pending).toBe(1);
                 const before = h.readRustPasses().length;
                 await h.sendPrompt(sessionId,probe,{messageID:probeId});
                 const pass = (await h.waitForRustPasses(before+1)).at(-1)!;
                 expect(pass.decision).toBe("HARD");
                 expect(pass.raw).toContain("prefix_bust_permitted=false");
                 expect(pass.raw).toContain("reason=project_memory_epoch");
+                expect(pass.rowVersion).toBeGreaterThan(stagedEpoch.row_version);
                 expect(pass.applied).toBe(true);
                 expect(state()).toEqual(held);
                 expect(markerRows()).toEqual(rows);

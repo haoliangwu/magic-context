@@ -158,6 +158,37 @@ describe("doctor database collectors", () => {
         expect(existsSync(join(root, "missing", "context.db"))).toBe(false);
     });
 
+    it("labels legacy failed runs without a reason in doctor diagnostics", async () => {
+        const db = new Database(join(root, "populated", "context.db"));
+        try {
+            db.prepare("INSERT INTO historian_runs VALUES (?, ?, ?, ?)").run(
+                "ses_legacy_empty_reason",
+                "failed",
+                "",
+                4000,
+            );
+            db.prepare("INSERT INTO historian_runs VALUES (?, ?, ?, ?)").run(
+                "ses_success_only",
+                "success",
+                null,
+                5000,
+            );
+        } finally {
+            db.close();
+        }
+
+        const result = await collectHistorianRuns(join(root, "populated"));
+        expect(result.available).toBe(true);
+        if (!result.available) throw new Error(result.reason);
+        expect(
+            result.rows.find((row) => row.sessionId === "ses_legacy_empty_reason")
+                ?.lastFailureReason,
+        ).toBe("no reason recorded (older version)");
+        expect(
+            result.rows.find((row) => row.sessionId === "ses_success_only")?.lastFailureReason,
+        ).toBe("");
+    });
+
     it("reads populated, empty, missing, older and corrupt stores in a Node bundle", () => {
         const entry = join(root, "entry.ts");
         const bundle = join(root, "collector.mjs");

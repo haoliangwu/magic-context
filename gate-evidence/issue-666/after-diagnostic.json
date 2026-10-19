@@ -1,0 +1,19 @@
+{
+  "host": "opencode v2.0.27",
+  "databases": [
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-OMuWMt/XDG_DATA_HOME/opencode/opencode2.db-shm",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-OMuWMt/XDG_DATA_HOME/cortexkit/magic-context/context.db-shm",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-OMuWMt/XDG_DATA_HOME/opencode/opencode2.db",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-OMuWMt/XDG_DATA_HOME/opencode/opencode2.db-wal",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-OMuWMt/XDG_DATA_HOME/cortexkit/magic-context/context.db",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-OMuWMt/XDG_DATA_HOME/cortexkit/magic-context/context.db-wal"
+  ],
+  "lastIdOnlyCaptureSkip": "no-anchor",
+  "lastIdOnlyApplyExit": "none (stale first-step prefix applied)",
+  "wirePrefixEqual": true,
+  "wirePrefixBytes": 886,
+  "instructionsEqual": true,
+  "toolsEqual": true,
+  "runnerBytes": 37718,
+  "btwBytes": 37968
+}

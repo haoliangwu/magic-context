@@ -7,9 +7,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import todoRideGolden from "../../../../../crates/mc-module/testdata/todo-ride-only.json";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
+import * as embeddingModule from "../../features/magic-context/memory/embedding";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { isPrefixBoundThinkingModel } from "../../features/magic-context/overflow-detection";
-import { getProtectionWindowForSession } from "../../features/magic-context/protection-window";
+import {
+    computeProtectionWindow,
+    getProtectionWindowForSession,
+} from "../../features/magic-context/protection-window";
 import { protectedToolTagNumbers } from "../../features/magic-context/reclaim-protection";
 import {
     addNote,
@@ -65,7 +69,16 @@ import { createTagger } from "../../features/magic-context/tagger";
 import * as loggerModule from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { adaptPayload } from "../../v2/hooks/payload";
+import type { SessionContext } from "../../v2/hooks/types";
+import {
+    createAutoSearchReplayFixture,
+    replayHint,
+    replayPrompt,
+} from "./auto-search-replay.fixture";
 import * as autoSearchRunner from "./auto-search-runner";
+import { autoSearchTestSnapshot } from "./auto-search-snapshot.fixture";
+import * as searchModule from "./auto-search-worker-client";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { registerActiveCompartmentRun } from "./compartment-runner";
 import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
@@ -73,14 +86,20 @@ import { clearToolPermissionDenied } from "./ctx-reduce-availability";
 import type { Channel1State } from "./ctx-reduce-nudge";
 import * as staleReduce from "./drop-stale-reduce-calls";
 import { estimateMessageTokens } from "./final-wire-token-estimate";
+import * as heuristicCleanup from "./heuristic-cleanup";
 import * as compartmentInjection from "./inject-compartments";
 import {
     capturePrefixTrimSourceOrder,
     injectM0M1,
     type M0HardSignals,
+    materializeM0,
 } from "./inject-compartments";
 import * as noteNudger from "./note-nudger";
 import { createPassOutcome } from "./pass-outcome";
+import {
+    pendingMaterializationOrigin,
+    requestPendingMaterialization,
+} from "./pending-materialization";
 import * as readSessionFormatting from "./read-session-formatting";
 import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { stripStructuralNoise } from "./strip-structural-noise";
@@ -124,6 +143,10 @@ function createOpenCodeDbWithoutMessages(prefix: string): void {
     process.env.XDG_DATA_HOME = dir;
     mkdirSync(join(dir, "opencode"), { recursive: true });
     const opencodeDb = new Database(join(dir, "opencode", "opencode.db"));
+    // Create the fixture in WAL mode like OpenCode. Schema writes create the
+    // -wal/-shm files; without them, macOS SQLite can reject a readonly worker's
+    // first read after a late switch from rollback journaling to WAL.
+    opencodeDb.exec("PRAGMA journal_mode=WAL");
     opencodeDb.exec(
         "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
     );
@@ -265,6 +288,19 @@ function basePostTransformArgs(
     messages: MessageLike[],
     overrides: Partial<PostTransformArgs> = {},
 ): PostTransformArgs {
+    // Raw set membership in these fixtures represents a command request. Use
+    // the production API so admission can distinguish it from deferred work.
+    if (
+        overrides.pendingMaterializationSessions?.has(sessionId) &&
+        pendingMaterializationOrigin(overrides.pendingMaterializationSessions, sessionId) ===
+            "pending_materialization"
+    ) {
+        requestPendingMaterialization(
+            overrides.pendingMaterializationSessions,
+            sessionId,
+            "user_flush",
+        );
+    }
     return {
         sessionId,
         db,
@@ -316,6 +352,181 @@ function basePostTransformArgs(
 
 function cloneMessages(messages: MessageLike[]): MessageLike[] {
     return structuredClone(messages);
+}
+
+for (const host of ["opencode", "opencode2"] as const) {
+    describe(`${host} auto-search served decisions`, () => {
+        function setup(label: string) {
+            const fixture = createAutoSearchReplayFixture(host, label);
+            const snapshot = spyOn(embeddingModule, "getProjectEmbeddingSnapshot").mockReturnValue(
+                autoSearchTestSnapshot(fixture.projectPath),
+            );
+            const search = spyOn(searchModule, "searchAutoHint").mockResolvedValue([replayHint]);
+            return {
+                ...fixture,
+                search,
+                async invoke(id: string, busting = false) {
+                    const user = {
+                        info: { id, role: "user" },
+                        parts: [{ type: "text", text: replayPrompt }],
+                    } as MessageLike;
+                    const input = basePostTransformArgs(fixture.db, fixture.sessionId, [user], {
+                        currentTurnId: id,
+                        schedulerDecision: busting ? "execute" : "defer",
+                        projectPath: fixture.projectPath,
+                        autoSearch: { enabled: true, scoreThreshold: 0.6, minPromptChars: 12 },
+                        m0M1: fixture.renderOptions(
+                            busting ? "anthropic/other" : "anthropic/claude",
+                        ),
+                    });
+                    const result = await runPostTransformPhase(input);
+                    return { userBytes: JSON.stringify(user), result };
+                },
+                close() {
+                    search.mockRestore();
+                    snapshot.mockRestore();
+                    fixture.close();
+                },
+            };
+        }
+
+        it("full host processor cannot retry a served search exception", async () => {
+            const fixture = setup("host-exception");
+            fixture.search.mockImplementationOnce(async () => {
+                throw new Error("transient host-search failure");
+            });
+            try {
+                const first = await fixture.invoke("u1");
+                expect(first.userBytes).not.toContain("<ctx-search-hint>");
+                expect(fixture.search).toHaveBeenCalledTimes(1);
+                const second = await fixture.invoke("u1");
+                expect(second.userBytes).toBe(first.userBytes);
+                expect(fixture.search).toHaveBeenCalledTimes(1);
+            } finally {
+                fixture.close();
+            }
+        });
+
+        it("full host processor preserves a served hint when a truncated branch is restored", async () => {
+            const fixture = setup("host-restore");
+            try {
+                const first = await fixture.invoke("u1");
+                expect(first.userBytes).toContain("Independent search-only hint");
+                const truncated = await fixture.invoke("u2", true);
+                expect(truncated.result.materialized).toBe(true);
+                expect(truncated.result.bustedThisPass).toBe(true);
+                const retained = replayStorage.getAutoSearchHintDecisions(
+                    fixture.db,
+                    fixture.sessionId,
+                );
+                expect(retained.some((decision) => decision.messageId === "u1")).toBe(true);
+                fixture.search.mockResolvedValue([
+                    { ...replayHint, memoryId: 9001, content: "Recomputed changed hint" },
+                ]);
+                const restored = await fixture.invoke("u1");
+                expect(restored.userBytes).toBe(first.userBytes);
+                expect(restored.userBytes).not.toContain("Recomputed changed hint");
+                expect(fixture.search).toHaveBeenCalledTimes(2);
+            } finally {
+                fixture.close();
+            }
+        });
+
+        it("busting host flushes retirement staged by a prior cached cut", async () => {
+            const fixture = setup("staged-retirement");
+            try {
+                expect((await fixture.invoke("u1")).userBytes).toContain(
+                    "Independent search-only hint",
+                );
+                appendCompartments(fixture.db, fixture.sessionId, [
+                    {
+                        sequence: 0,
+                        startMessage: 0,
+                        endMessage: 0,
+                        startMessageId: "u1",
+                        endMessageId: "u1",
+                        title: "Covered",
+                        content: "Earlier question was answered.",
+                    },
+                ]);
+                materializeM0(fixture.renderOptions());
+                const live = ["u1", "u2"].map(
+                    (id) =>
+                        ({
+                            info: { id, role: "user" },
+                            parts: [{ type: "text", text: replayPrompt }],
+                        }) as MessageLike,
+                );
+                expect(
+                    injectM0M1({
+                        ...fixture.renderOptions(),
+                        messages: live,
+                        isCacheBustingPass: false,
+                    }).prefixTrimStatus,
+                ).toBe("applied");
+                expect(
+                    replayStorage
+                        .getAutoSearchHintDecisions(fixture.db, fixture.sessionId)
+                        .some((entry) => entry.messageId === "u1"),
+                ).toBe(true);
+                await fixture.invoke("u2", true);
+                expect(
+                    replayStorage
+                        .getAutoSearchHintDecisions(fixture.db, fixture.sessionId)
+                        .some((entry) => entry.messageId === "u1"),
+                ).toBe(false);
+            } finally {
+                fixture.close();
+            }
+        });
+
+        it("ordinary pass preserves visible user bytes at the omission cap boundary", async () => {
+            const fixture = setup("visible-cap-boundary");
+            const count = replayStorage.AUTO_SEARCH_DECISION_SOFT_LIMIT + 2;
+            const visibleIds = Array.from({ length: count }, (_, index) => `visible-${index}`);
+            const serve = async () => {
+                const messages = visibleIds.map(
+                    (id) =>
+                        ({
+                            info: { id, role: "user" },
+                            parts: [{ type: "text", text: replayPrompt }],
+                        }) as MessageLike,
+                );
+                await runPostTransformPhase(
+                    basePostTransformArgs(fixture.db, fixture.sessionId, messages),
+                );
+                return JSON.stringify(messages);
+            };
+            try {
+                for (const [index, messageId] of visibleIds.entries())
+                    replayStorage.appendAutoSearchHintDecision(
+                        fixture.db,
+                        fixture.sessionId,
+                        index === 0
+                            ? {
+                                  messageId,
+                                  decision: "hint",
+                                  text: "\n\n<ctx-search-hint>stable cap-boundary hint</ctx-search-hint>",
+                              }
+                            : { messageId, decision: "no-hint", reason: "error" },
+                    );
+                const first = await serve();
+                expect(first).toContain("stable cap-boundary hint");
+                const retired = replayStorage.flushAutoSearchHintDecisionRetirement(
+                    fixture.db,
+                    fixture.sessionId,
+                    new Set(visibleIds),
+                );
+                expect(await serve()).toBe(first);
+                expect(retired).toBe(0);
+                expect(
+                    replayStorage.getAutoSearchHintDecisions(fixture.db, fixture.sessionId),
+                ).toHaveLength(count);
+            } finally {
+                fixture.close();
+            }
+        });
+    });
 }
 
 describe("postprocess replay-or-refuse", () => {
@@ -459,7 +670,11 @@ describe("postprocess replay-or-refuse", () => {
                     case "reasoning-removal-persistence-failure":
                     case "reasoning-removal-committed-read-failure":
                         args.resolvedProviderID = "openai";
-                        args.pendingMaterializationSessions.add(sessionId);
+                        requestPendingMaterialization(
+                            args.pendingMaterializationSessions,
+                            sessionId,
+                            "user_flush",
+                        );
                         args.keepReasoningTokens = 0;
                         messages.forEach((message, index) => {
                             args.messageTagNumbers.set(message, index + 1);
@@ -492,7 +707,11 @@ describe("postprocess replay-or-refuse", () => {
                         break;
                     case "merged-reasoning-strip-persistence-failure":
                     case "merged-reasoning-strip-exception":
-                        args.pendingMaterializationSessions.add(sessionId);
+                        requestPendingMaterialization(
+                            args.pendingMaterializationSessions,
+                            sessionId,
+                            "user_flush",
+                        );
                         spies.push(
                             spyOn(
                                 replayStorage,
@@ -507,7 +726,11 @@ describe("postprocess replay-or-refuse", () => {
                         expect(addTrailingBlankDecisions(db, sessionId, [["a1", "keep:2"]])).toBe(
                             true,
                         );
-                        args.pendingMaterializationSessions.add(sessionId);
+                        requestPendingMaterialization(
+                            args.pendingMaterializationSessions,
+                            sessionId,
+                            "user_flush",
+                        );
                         args.trailingBlankSourceDecisions = new Map([["a1", "strip"]]);
                         spies.push(
                             spyOn(
@@ -529,7 +752,11 @@ describe("postprocess replay-or-refuse", () => {
                         );
                         break;
                     case "proactive-thinking-strip-persistence-failure":
-                        args.pendingMaterializationSessions.add(sessionId);
+                        requestPendingMaterialization(
+                            args.pendingMaterializationSessions,
+                            sessionId,
+                            "user_flush",
+                        );
                         args.thinkingBindingRecoveryEnabledForModel = true;
                         // Isolate the proactive lane from merged-run detection.
                         messages.splice(2, 0, {
@@ -605,6 +832,9 @@ describe("note nudge first-serve fence", () => {
         makeNoteDb();
         const sessionId = "synapse-rebuild-note";
         getOrCreateSessionMeta(db, sessionId);
+        // Serve the old user and assistant first, so the observer can prove the
+        // later channel notice is an unserved user message at the tail.
+        await runPostTransformPhase(basePostTransformArgs(db, sessionId, source().slice(0, 2)));
         addNote(db, "session", { sessionId, content: "Check deferred work" });
         noteNudger.onNoteTrigger(db, sessionId, "historian_complete");
         // The raw meaningful-user resolver skipped the newest channel notice.
@@ -664,8 +894,13 @@ describe("note nudge first-serve fence", () => {
         const path = join(root, "context.db");
         makeNoteDb(path);
         const sessionId = "note-restart";
-        const pass = async (bust = false) => {
+        const pass = async (bust = false, fresh = false) => {
             const messages = source();
+            if (fresh)
+                messages.push({
+                    info: { id: "after-restart", role: "user" },
+                    parts: [{ type: "text", text: "Next task" }],
+                } as MessageLike);
             await runPostTransformPhase(
                 basePostTransformArgs(db, sessionId, messages, {
                     currentTurnId: newestId,
@@ -684,20 +919,28 @@ describe("note nudge first-serve fence", () => {
             expect(await pass()).toEqual(served);
             expect(await pass()).toEqual(served);
             expect(getNoteNudgeAnchors(db, sessionId)).toEqual([]);
-            const hard = await pass(true);
-            expect(JSON.stringify(hard[2])).toContain("deferred_notes");
-            expect(await pass()).toEqual(hard);
+            // A requested materialization with no proven earlier wire edit is
+            // not permission to rewrite an already-served user message.
+            expect(await pass(true)).toEqual(served);
+            const fresh = await pass(false, true);
+            expect(JSON.stringify(fresh.at(-1))).toContain("deferred_notes");
+            expect(await pass(false, true)).toEqual(fresh);
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
     });
 
-    it("the Rust host postprocessor uses the same first-serve and bust fence", () => {
+    it("the Rust host requires a fresh tail when only bust permission is available", () => {
         makeNoteDb();
         const sessionId = "rust-note-first-serve";
         getOrCreateSessionMeta(db, sessionId);
-        const pass = (cacheBustingPass = false) => {
+        const pass = (cacheBustingPass = false, fresh = false) => {
             const messages = source();
+            if (fresh)
+                messages.push({
+                    info: { id: "rust-fresh", role: "user" },
+                    parts: [{ type: "text", text: "Next task" }],
+                } as MessageLike);
             runRustModePostprocess({
                 db,
                 sessionId,
@@ -713,9 +956,16 @@ describe("note nudge first-serve fence", () => {
         replayStorage.setPersistedNoteNudgeTriggerMessageId(db, sessionId, oldId);
         expect(pass()).toEqual(served);
         expect(getNoteNudgeAnchors(db, sessionId)).toEqual([]);
-        const hard = pass(true);
-        expect(JSON.stringify(hard[2])).toContain("deferred_notes");
-        expect(pass()).toEqual(hard);
+        expect(pass(true)).toEqual(served);
+        replayStorage.appendAutoSearchHintDecision(db, sessionId, {
+            messageId: "rust-fresh",
+            decision: "hint",
+            text: "\n\n<ctx-search-hint>saved hint</ctx-search-hint>",
+        });
+        const fresh = pass(false, true);
+        expect(JSON.stringify(fresh.at(-1))).toContain("deferred_notes");
+        expect(JSON.stringify(fresh.at(-1))).toContain("ctx-search-hint");
+        expect(pass(false, true)).toEqual(fresh);
     });
 });
 
@@ -1649,7 +1899,7 @@ describe("deferred compaction marker representation", () => {
         expect(rustMessages).toEqual(tsMessages);
     });
 
-    it("applies a Rust materialized boundary on its serving pass and replays identical bytes", () => {
+    it("applies a Rust materialized boundary on its serving pass and replays identical bytes", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-rust-marker-reverse-edge";
@@ -1686,6 +1936,7 @@ describe("deferred compaction marker representation", () => {
             },
         ] as unknown as MessageLike[];
         const first = structuredClone(source);
+        expect(await prepareCompactionMarkerCandidates(sessionId)).toBe(true);
         const applied = runRustModePostprocess({
             db,
             sessionId,
@@ -1724,7 +1975,7 @@ describe("deferred compaction marker representation", () => {
         expect(JSON.stringify(replay)).toBe(firstBytes);
     });
 
-    it("newer pending publication waits until consumed by the served response", () => {
+    it("newer pending publication waits until consumed by the served response", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-rust-consumed-coverage";
@@ -1789,6 +2040,7 @@ describe("deferred compaction marker representation", () => {
             expect(getCompactionMarkerHealth(db, sessionId).attempts).toBe(3);
         }
         // A noncommitting response can retry, but only with its own consumed coverage.
+        expect(await prepareCompactionMarkerCandidates(sessionId)).toBe(true);
         applyRustModeDeferredCompactionMarker({
             db,
             sessionId,
@@ -1955,7 +2207,7 @@ describe("deferred compaction marker representation", () => {
         expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
     });
 
-    it("an upgraded indexed pending waits through byte-identical defers and moves on the next bust", () => {
+    it("an upgraded indexed pending waits through byte-identical defers and moves on the next bust", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-upgraded-indexed-pending";
@@ -2044,6 +2296,7 @@ describe("deferred compaction marker representation", () => {
             expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
             expect(getCompactionMarkerHealth(db, sessionId).attempts).toBe(3);
         }
+        expect(await prepareCompactionMarkerCandidates(sessionId)).toBe(true);
         const bust = serve(true);
         expect(getPendingCompactionMarkerState(db, sessionId)).toBeNull();
         expect(getPersistedCompactionMarkerState(db, sessionId)?.boundaryMessageId).toBe(
@@ -2132,7 +2385,7 @@ describe("deferred compaction marker representation", () => {
         expect(JSON.stringify(messages)).toBe(served[0]);
     });
 
-    it("clears retry health when the next bust retries successfully, not on the intervening defer", () => {
+    it("clears retry health when the next bust retries successfully, not on the intervening defer", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-rust-marker-retry-heals";
@@ -2190,6 +2443,7 @@ describe("deferred compaction marker representation", () => {
 
         mkdirSync(join(dataHome, "opencode"), { recursive: true });
         const opencodeDb = new Database(join(dataHome, "opencode", "opencode.db"));
+        opencodeDb.exec("PRAGMA journal_mode=WAL");
         opencodeDb.exec(
             "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
         );
@@ -2205,6 +2459,7 @@ describe("deferred compaction marker representation", () => {
 
         expect(drain()).toBe(failedAttemptBytes);
         expect(getPendingCompactionMarkerState(db, sessionId)?.injectAttempts).toBe(1);
+        expect(await prepareCompactionMarkerCandidates(sessionId)).toBe(true);
         const healedAttemptBytes = drain(true);
         expect(healedAttemptBytes).toBe(failedAttemptBytes);
         expect(getPendingCompactionMarkerState(db, sessionId)).toBeNull();
@@ -2356,6 +2611,7 @@ describe("deferred compaction marker representation", () => {
         process.env.XDG_DATA_HOME = dataHome;
         mkdirSync(join(dataHome, "opencode"), { recursive: true });
         const opencodeDb = new Database(join(dataHome, "opencode", "opencode.db"));
+        opencodeDb.exec("PRAGMA journal_mode=WAL");
         opencodeDb.exec(
             "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
         );
@@ -2670,6 +2926,7 @@ describe("deferred compaction marker advance representation", () => {
         process.env.XDG_DATA_HOME = dataHome;
         mkdirSync(join(dataHome, "opencode"), { recursive: true });
         const opencodeDb = new Database(join(dataHome, "opencode", "opencode.db"));
+        opencodeDb.exec("PRAGMA journal_mode=WAL");
         opencodeDb.exec(
             "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
         );
@@ -2919,6 +3176,71 @@ describe("deferred compaction marker advance representation", () => {
 });
 
 describe("deferred compaction marker CAS drain", () => {
+    for (const unavailableAt of ["preparation", "replacement"] as const) {
+        it(`serves rebuilt history when marker candidates are unavailable at ${unavailableAt}`, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            createOpenCodeDbWithoutMessages("postprocess-deferred-candidates-");
+            const sessionId = `ses-marker-candidates-${unavailableAt}`;
+            const pending = { ordinal: 1, endMessageId: "u1", publishedAt: 1 };
+            setPendingCompactionMarkerState(db, sessionId, pending);
+            const messages = [
+                {
+                    info: { id: "fresh", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "fresh rebuilt turn" }],
+                },
+            ] as MessageLike[];
+            const deferredHistoryRefreshSessions = new Set([sessionId]);
+            const passOutcome = createPassOutcome();
+            const prepare = spyOn(
+                markerCandidates,
+                "prepareMarkerCandidateBasis",
+            ).mockResolvedValue(false);
+            let replacementCalls = 0;
+            try {
+                await runPostTransformPhase(
+                    basePostTransformArgs(db, sessionId, messages, {
+                        fullFeatureMode: false,
+                        passOutcome,
+                        historyRebuiltThisPass: true,
+                        canConsumeDeferredLate: true,
+                        deferredHistoryWasPendingAtPassStart: true,
+                        deferredHistoryRefreshSessions,
+                        pendingCompartmentInjection: {
+                            compartmentEndMessage: 1,
+                            compartmentEndMessageId: "u1",
+                            compartmentCount: 1,
+                            renderedText: "rebuilt history",
+                            skippedVisibleMessages: 0,
+                        } as PostTransformArgs["pendingCompartmentInjection"],
+                        ...(unavailableAt === "replacement"
+                            ? {
+                                  compactionMarkerStrategy: {
+                                      applyDeferred: () => {
+                                          replacementCalls++;
+                                          return {
+                                              kind: "deferred",
+                                              reason: "candidate-preparation",
+                                          };
+                                      },
+                                      reconcile: () => {},
+                                  } as PostTransformArgs["compactionMarkerStrategy"],
+                              }
+                            : {}),
+                    }),
+                );
+                expect(passOutcome.degradations).toEqual([]);
+                expect(JSON.stringify(messages)).toContain("fresh rebuilt turn");
+                expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+                expect(deferredHistoryRefreshSessions.has(sessionId)).toBe(true);
+                if (unavailableAt === "preparation") expect(prepare).toHaveBeenCalled();
+                else expect(replacementCalls).toBe(1);
+            } finally {
+                prepare.mockRestore();
+            }
+        });
+    }
+
     it("preserves the deferred-history signal when a newer pending blob exists", () => {
         db = new Database(":memory:");
         initializeDatabase(db);
@@ -3762,7 +4084,7 @@ describe("two-pass tool reclaim", () => {
         expect(tagStatuses(sessionId).get(1)).toBe("active");
     });
 
-    it("advances the watermark on a force-materialization bust even without execute", async () => {
+    it("does not age the current task on a force-materialization bust without distance", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-reclaim-force-defer";
@@ -3779,7 +4101,7 @@ describe("two-pass tool reclaim", () => {
             }),
         );
 
-        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(1);
+        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(0);
     });
 });
 
@@ -4405,6 +4727,63 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         });
     }
 
+    it("consumes an OpenCode flush on a hard fold and replays the next defer byte-identically", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "oc-fold-flush-defer";
+        materializeBaseline(sessionId);
+        insertTag(db, sessionId, "drop-call", "tool", 1000, 1, 0, "bash", 0, "drop-owner");
+        padRecentToolSkeletonWindow(sessionId, 1);
+        queuePendingOp(db, sessionId, 1, "drop");
+        const pendingMaterializationSessions = new Set([sessionId]);
+        const lines: string[] = [];
+        const log = spyOn(loggerModule, "sessionLog").mockImplementation((_id, ...values) => {
+            lines.push(values.join(" "));
+        });
+        const pass = async () => {
+            const message = makeToolMessage("drop-owner");
+            const messages = [
+                message,
+                {
+                    info: { id: "live-user", role: "user" },
+                    parts: [{ type: "text", text: "retained tail" }],
+                } as MessageLike,
+            ];
+            const targets = new Map([[1, makeDropTarget(message)]]);
+            applyFlushedStatuses(sessionId, db, targets, getTagsBySession(db, sessionId));
+            const result = await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    targets,
+                    pendingMaterializationSessions,
+                    resolvedProviderID: "anthropic",
+                    m0M1: {
+                        projectPath: FOLD_PROJECT,
+                        projectDirectory: FOLD_PROJECT,
+                        historyBudgetTokens: 98_000,
+                        hardSignals: { ...BASE_HARD, modelKey: "anthropic/sonnet" },
+                    },
+                }),
+            );
+            return { result, wire: JSON.stringify(messages) };
+        };
+        try {
+            const fold = await pass();
+            expect(fold.result.materialized).toBe(true);
+            expect(lines).toContain(
+                "heuristics WILL RUN — reason=pending_materialization origin=user_flush, context=20.0%, turn=null",
+            );
+            expect(getPendingOps(db, sessionId)).toHaveLength(0);
+            expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
+            lines.length = 0;
+            const defer = await pass();
+            expect(defer.result.materialized).toBe(false);
+            expect(lines).toContain("heuristics WILL NOT RUN — reason=scheduler_defer");
+            expect(defer.wire).toBe(fold.wire);
+        } finally {
+            log.mockRestore();
+        }
+    });
+
     it("review regression: executed fold must retire the held historian row it actually trims", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
@@ -4608,6 +4987,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         process.env.XDG_DATA_HOME = dataHome;
         mkdirSync(join(dataHome, "opencode"), { recursive: true });
         const opencodeDb = new Database(join(dataHome, "opencode", "opencode.db"));
+        opencodeDb.exec("PRAGMA journal_mode=WAL");
         opencodeDb.exec(
             "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
         );
@@ -5413,7 +5793,201 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         );
     });
 
-    it("drains pending ops and age reclaim on the same low-usage TTL fold", async () => {
+    it.each([
+        2, 3, 5,
+    ])("OpenCode 1/2 distance bookmark keeps the current task through %i TTL rebuilds and a model switch", async (rebuilds) => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = `ses-distance-idle-${rebuilds}`;
+        materializeBaseline(sessionId);
+        const tools = Array.from({ length: 8 }, (_, index) => makeToolMessage(`tool-${index + 1}`));
+        const messages: MessageLike[] = [
+            {
+                info: { id: "task", role: "user" },
+                parts: [{ type: "text", text: "implement the feature" }],
+            },
+            ...tools,
+        ];
+        const targets = new Map(
+            tools.map((message, index) => {
+                insertTag(db, sessionId, message.info.id, "tool", 4000, index + 1, 0, "bash");
+                return [
+                    index + 1,
+                    {
+                        ...makeDropTarget(message),
+                        mutationParts: [{ message, part: message.parts[0] }],
+                    },
+                ] as const;
+            }),
+        );
+        for (let pass = 0; pass <= rebuilds; pass++) {
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets,
+                    contextUsage: { percentage: 2, inputTokens: 4000 },
+                    usableWindow: 200_000,
+                    m0M1: {
+                        projectPath: FOLD_PROJECT,
+                        projectDirectory: FOLD_PROJECT,
+                        historyBudgetTokens: 98_000,
+                        hardSignals: {
+                            ...BASE_HARD,
+                            cacheExpired: pass < rebuilds,
+                            lastResponseTime: Number.MAX_SAFE_INTEGER,
+                            modelKey: pass === rebuilds ? "other/model" : BASE_HARD.modelKey,
+                        },
+                    },
+                }),
+            );
+            expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(0);
+            expect(
+                getTagsBySession(db, sessionId).filter((tag) => tag.status === "active"),
+            ).toHaveLength(8);
+        }
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                tags: getActiveTagsBySession(db, sessionId),
+                targets,
+                pendingMaterializationSessions: new Set([sessionId]),
+            }),
+        );
+        expect(
+            getTagsBySession(db, sessionId)
+                .filter((tag) => tag.status === "dropped")
+                .map((tag) => tag.tagNumber),
+        ).toEqual([1]);
+    });
+
+    it("OpenCode 1/2 single-user tool loop ages by a quarter-window of newer tokens", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-oc-token-distance";
+        const tools = Array.from({ length: 4 }, (_, index) => makeToolMessage(`loop-${index}`));
+        const targets = new Map<number, TagTarget>();
+        for (const [index, message] of tools.entries()) {
+            (message.parts[0] as { state: { output: string } }).state.output =
+                `unique ${index} ${"payload ".repeat(index === 0 ? 500 : 17_000)}`;
+            insertTag(db, sessionId, message.info.id, "tool", 4000, index + 1, 0, "bash");
+            targets.set(index + 1, {
+                ...makeDropTarget(message),
+                mutationParts: [{ message, part: message.parts[0] }],
+            });
+        }
+        const messages: MessageLike[] = [
+            {
+                info: { id: "task", role: "user" },
+                parts: [{ type: "text", text: "one coding task" }],
+            },
+            ...tools,
+        ];
+        const pass = () =>
+            runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets,
+                    usableWindow: 200_000,
+                    pendingMaterializationSessions: new Set([sessionId]),
+                }),
+            );
+        await pass();
+        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(1);
+        expect(getTagsBySession(db, sessionId).map((tag) => tag.status)).toEqual(
+            Array(4).fill("active"),
+        );
+        await pass();
+        expect(getTagsBySession(db, sessionId).map((tag) => tag.status)).toEqual([
+            "dropped",
+            "active",
+            "active",
+            "active",
+        ]);
+    });
+
+    it("OpenCode 1/2 distant outputs and edits survive one free rebuild, then reclaim at low usage", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-distance-edit";
+        materializeBaseline(sessionId);
+        const tools = [
+            makeToolMessage("old-edit"),
+            makeToolMessage("new-edit"),
+            makeToolMessage("old-bash"),
+        ];
+        const tail: MessageLike[] = Array.from({ length: 24 }, (_, index) => ({
+            info: { id: `tail-${index}`, role: index < 3 ? "user" : "assistant" },
+            parts: [
+                {
+                    type: "text",
+                    text:
+                        index < 3
+                            ? "<system-reminder>Background task finished.</system-reminder>"
+                            : `continuation ${index}`,
+                },
+            ],
+        }));
+        const messages = [...tools, ...tail];
+        const targets = new Map<number, TagTarget>();
+        for (const [index, message] of tools.entries()) {
+            const tag = index + 1;
+            if (index < 2)
+                (message.parts[0] as { state: { output: string } }).state.output = "edited";
+            insertTag(
+                db,
+                sessionId,
+                message.info.id,
+                "tool",
+                index < 2 ? 24 : 4000,
+                tag,
+                0,
+                index < 2 ? "edit" : "bash",
+                0,
+                message.info.id,
+                null,
+                { tokenCount: index < 2 ? 100 : 1000, inputTokenCount: 0, reasoningTokenCount: 0 },
+            );
+            const target = makeDropTarget(message);
+            targets.set(tag, {
+                ...target,
+                mutationParts: [{ message, part: message.parts[0] }],
+                readInput: () => ({ filePath: "/feature.ts", oldString: "a", newString: "b" }),
+                editMarker: target.truncate,
+            });
+        }
+        tail.forEach((message, index) => {
+            insertTag(db, sessionId, message.info.id, "message", 50, index + 4);
+        });
+        const pass = (bust: boolean) =>
+            runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets,
+                    contextUsage: { percentage: 2, inputTokens: 4000 },
+                    usableWindow: 200_000,
+                    pendingMaterializationSessions: new Set(bust ? [sessionId] : []),
+                }),
+            );
+        await pass(true);
+        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(3);
+        expect(
+            getTagsBySession(db, sessionId)
+                .slice(0, 3)
+                .map((tag) => tag.status),
+        ).toEqual(["active", "active", "active"]);
+        const replay = JSON.stringify(messages);
+        await pass(false);
+        expect(JSON.stringify(messages)).toBe(replay);
+        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(3);
+        await pass(true);
+        expect(
+            getTagsBySession(db, sessionId)
+                .slice(0, 3)
+                .map((tag) => tag.status),
+        ).toEqual(["dropped", "active", "dropped"]);
+    });
+
+    it("drains pending ops and previously bookmarked age reclaim on the same low-usage TTL fold", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-hardfold-reclaim-drain";
@@ -5460,7 +6034,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         expect(statuses.get(1)).toBe("dropped");
         expect(statuses.get(2)).toBe("dropped");
         expect(statuses.get(3)).toBe("active");
-        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(3);
+        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(2);
 
         const deferReplayBytes = JSON.stringify(messages);
         await runPostTransformPhase(
@@ -6440,7 +7014,7 @@ describe("postprocess empty-sentinel provider gate", () => {
         expect(oldMsg.parts).toEqual([{ type: "text", text: "" }]);
     });
 
-    it("leaves processed image file parts native for github-copilot", async () => {
+    it("leaves processed image file parts native for github-copilot on defer without frozen ids", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-copilot-processed-image";
@@ -6512,6 +7086,64 @@ describe("postprocess empty-sentinel provider gate", () => {
 
         expect(userMessage.parts).toEqual([{ type: "text", text: "" }]);
         expect([...getProcessedImageStrippedIds(db, sessionId)]).toEqual(["m-image"]);
+    });
+
+    it("keeps processed image bytes stable after failed freeze persistence and retries only on a bust", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-anthropic-processed-image-persistence-failure";
+        const nativeMessages: MessageLike[] = [
+            {
+                info: { id: "m-image", role: "user" },
+                parts: [
+                    {
+                        type: "file",
+                        mime: "image/png",
+                        url: `data:image/png;base64,${"a".repeat(220)}`,
+                    },
+                ],
+            },
+            {
+                info: { id: "m-assistant", role: "assistant" },
+                parts: [{ type: "text", text: "seen" }],
+            },
+        ] as unknown as MessageLike[];
+        const runPass = async (bust: boolean, turn: string) => {
+            const messages = cloneMessages(nativeMessages);
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    watermark: 1,
+                    messageTagNumbers: new Map([[messages[0], 1]]),
+                    resolvedProviderID: "anthropic",
+                    schedulerDecision: bust ? "execute" : "defer",
+                    pendingMaterializationSessions: new Set(bust ? [sessionId] : []),
+                    contextUsage: { percentage: 60, inputTokens: 6000 },
+                    currentTurnId: turn,
+                }),
+            );
+            return messages;
+        };
+
+        const persist = spyOn(replayStorage, "addProcessedImageStrippedIds").mockReturnValue(false);
+        let first: MessageLike[];
+        let deferred: MessageLike[];
+        try {
+            first = await runPass(true, "turn-img-failed");
+            expect(persist).toHaveBeenCalledTimes(1);
+            expect([...getProcessedImageStrippedIds(db, sessionId)]).toEqual([]);
+            deferred = await runPass(false, "turn-img-deferred");
+            expect(persist).toHaveBeenCalledTimes(1);
+        } finally {
+            persist.mockRestore();
+        }
+        expect(JSON.stringify(deferred[0].parts)).toBe(JSON.stringify(first[0].parts));
+        expect(first[0].parts).toEqual(nativeMessages[0].parts);
+
+        const retried = await runPass(true, "turn-img-retry");
+        expect(retried[0].parts).toEqual([{ type: "text", text: "" }]);
+        expect([...getProcessedImageStrippedIds(db, sessionId)]).toEqual(["m-image"]);
+        const replayed = await runPass(false, "turn-img-replay");
+        expect(JSON.stringify(replayed[0].parts)).toBe(JSON.stringify(retried[0].parts));
     });
 
     it("replays frozen processed image strips on defer passes even when the watermark is zero", async () => {
@@ -8983,6 +9615,7 @@ describe("marker-drain reasoning representation", () => {
                 ...first,
                 tagger,
                 resolvedProviderID: "anthropic",
+                readLastServedMessages: () => source(),
                 deferredMaterializationSessions: new Set([sessionId]),
                 hiddenMessagesAtCompactionSeam: [applyingRaw[1]],
                 deferredHistoryWasPendingAtPassStart: true,
@@ -10232,7 +10865,11 @@ describe("ride-only queued drops", () => {
                     await runPostTransformPhase({ ...args, schedulerDecision: "defer" });
                     expect(JSON.stringify(args.messages)).toBe(baseline);
                 }
-                args.pendingMaterializationSessions.add(sessionId);
+                requestPendingMaterialization(
+                    args.pendingMaterializationSessions,
+                    sessionId,
+                    "user_flush",
+                );
                 await runPostTransformPhase(args);
                 expect(getPendingOps(db, sessionId)).toHaveLength(0);
             } finally {
@@ -10279,7 +10916,7 @@ it("queued agent batches consume only one force episode", async () => {
     await runPostTransformPhase(args);
     expect(getPendingOps(db, sessionId)).toHaveLength(1);
     expect(JSON.stringify(args.messages)).toBe(frozen);
-    args.pendingMaterializationSessions.add(sessionId);
+    requestPendingMaterialization(args.pendingMaterializationSessions, sessionId, "user_flush");
     await runPostTransformPhase(args);
     expect(getPendingOps(db, sessionId)).toHaveLength(0);
 });
@@ -10447,6 +11084,9 @@ describe("pending-ops and heuristics permission labels", () => {
         initializeDatabase(db);
 
         const publishedHistory = await permissionLines("ses-ride-published-history", {
+            readLastServedMessages: () => [
+                { info: { role: "user" }, parts: [{ type: "text", text: "previous history" }] },
+            ],
             contextUsage: { percentage: 20, inputTokens: 1_000 },
             historyRebuiltThisPass: true,
             pendingCompartmentInjection: {
@@ -11295,7 +11935,7 @@ describe("issue 619 terminal first edits", () => {
     }
 });
 
-describe("prefix-bound oldest-prefix reasoning trim", () => {
+describe("prefix-bound all-or-none reasoning", () => {
     const PROVIDER = "google-vertex-anthropic";
     const sha256 = (value: unknown): string =>
         createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -11386,7 +12026,7 @@ describe("prefix-bound oldest-prefix reasoning trim", () => {
 
     for (const fullFeatureMode of [true, false]) {
         const who = fullFeatureMode ? "primary" : "subagent";
-        it(`${who}: "Remove \`thinking\` blocks from the start of the history" is valid, so a trim-only pass keeps every newer signed block byte-identical and defer passes replay it`, async () => {
+        it(`${who}: a pressure opportunity alone keeps every signed block byte-identical instead of trimming an older prefix`, async () => {
             openDb();
             const sessionId = `ses-bound-trim-only-${who}`;
             const served = boundLoop(sessionId, 8);
@@ -11395,8 +12035,8 @@ describe("prefix-bound oldest-prefix reasoning trim", () => {
 
             const trim = boundLoop(sessionId, 8);
             const result = await serve(sessionId, trim, { force: true, fullFeatureMode });
-            expect(getRemovedReasoningIds(db, sessionId)).toEqual(new Set(AGED));
-            for (const id of AGED) expect(reasoningCount(message(trim, id))).toBe(0);
+            expect(getRemovedReasoningIds(db, sessionId)).toEqual(new Set());
+            for (const id of AGED) expect(reasoningCount(message(trim, id))).toBe(1);
             // Nothing else changed, so no newer block is stripped.
             expect(result.proactiveThinkingStrip).toBeNull();
             expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
@@ -11429,7 +12069,7 @@ describe("prefix-bound oldest-prefix reasoning trim", () => {
             overrides: { targets: new Map([[8, makeDropTarget(dropped)]]) },
         });
         expect(getPendingOps(db, sessionId)).toHaveLength(0);
-        expect(getRemovedReasoningIds(db, sessionId)).toEqual(new Set(AGED));
+        expect(getRemovedReasoningIds(db, sessionId)).toEqual(new Set());
         expect(result.proactiveThinkingStrip?.messageIds).toEqual(
             expect.arrayContaining([...AGED, ...NEWER]),
         );
@@ -11442,37 +12082,35 @@ describe("prefix-bound oldest-prefix reasoning trim", () => {
         await serve(sessionId, boundLoop(sessionId, 8));
         const pass = boundLoop(sessionId, 8);
         const result = await serve(sessionId, pass, { flush: true });
-        expect(getRemovedReasoningIds(db, sessionId)).toEqual(new Set(AGED));
+        expect(getRemovedReasoningIds(db, sessionId)).toEqual(new Set());
         expect(result.proactiveThinkingStrip?.messageIds).toEqual(expect.arrayContaining(NEWER));
         for (const m of pass.messages.slice(1)) expect(reasoningCount(m)).toBe(0);
     });
 
-    it('"Remove a `thinking` block from the middle of the history and keep later ones" is invalid, so an ineligible message stops the trim and nothing after it is removed', async () => {
+    it("a missing tag cannot authorize partial stripping before kept signed thinking", async () => {
         openDb();
         const sessionId = "ses-bound-gap";
         await serve(sessionId, boundLoop(sessionId, 8, { untagged: 2 }));
         const pass = boundLoop(sessionId, 8, { untagged: 2 });
         const result = await serve(sessionId, pass, { force: true });
         expect(result.proactiveThinkingStrip).toBeNull();
-        expect(getRemovedReasoningIds(db, sessionId)).toEqual(
-            new Set(["assistant-0", "assistant-1"]),
-        );
-        for (const step of [2, 3, 4, 5, 6, 7]) {
+        expect(getRemovedReasoningIds(db, sessionId)).toEqual(new Set());
+        for (const step of [0, 1, 2, 3, 4, 5, 6, 7]) {
             expect(reasoningCount(message(pass, `assistant-${step}`))).toBe(1);
         }
     });
 
-    it('"Put back a `thinking` block you removed on an earlier request" is invalid, so removed and stripped blocks never return and the trim continues behind a strip', async () => {
+    it("full-bust omissions never return and newer blocks are not partially stripped", async () => {
         openDb();
         const sessionId = "ses-bound-never-restore";
         await serve(sessionId, boundLoop(sessionId, 8));
         await serve(sessionId, boundLoop(sessionId, 8), { force: true });
-        expect(getRemovedReasoningIds(db, sessionId)).toEqual(new Set(AGED));
+        expect(getRemovedReasoningIds(db, sessionId)).toEqual(new Set());
 
         // A later busting pass that selects nothing new still serves the removal.
         const quiet = boundLoop(sessionId, 8);
         await serve(sessionId, quiet, { force: true, clearReasoningAge: 999 });
-        for (const id of AGED) expect(reasoningCount(message(quiet, id))).toBe(0);
+        for (const id of AGED) expect(reasoningCount(message(quiet, id))).toBe(1);
 
         // A materializing pass strips everything; the strip set is replayed.
         const flush = boundLoop(sessionId, 8);
@@ -11484,15 +12122,13 @@ describe("prefix-bound oldest-prefix reasoning trim", () => {
         const grown = boundLoop(sessionId, 14);
         const result = await serve(sessionId, grown, { force: true });
         expect(result.proactiveThinkingStrip).toBeNull();
-        for (const step of [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
+        for (const step of [0, 1, 2, 3, 4, 5, 6, 7]) {
             expect(reasoningCount(message(grown, `assistant-${step}`))).toBe(0);
         }
-        for (const step of [11, 12, 13]) {
+        for (const step of [8, 9, 10, 11, 12, 13]) {
             expect(reasoningCount(message(grown, `assistant-${step}`))).toBe(1);
         }
-        expect(getRemovedReasoningIds(db, sessionId)).toEqual(
-            new Set([...AGED, ...[8, 9, 10].map((step) => `assistant-${step}`)]),
-        );
+        expect(getRemovedReasoningIds(db, sessionId)).toEqual(new Set());
     });
 
     it("timeout skips do not treat provisional hint rows as served prefix edits", async () => {
@@ -12057,5 +12693,1131 @@ it("fold preparation retries rather than overwriting a changed legacy tool tag",
         ).toEqual({ status: "active", drop_mode: "full" });
     } finally {
         inject.mockRestore();
+    }
+});
+
+// Observe each named edit's admission or persisted decision, plus served bytes.
+// An unfinished thinking tool loop must retain queued work until new user text
+// starts another turn, even when usage crosses the execute threshold.
+describe("active-thinking shared bust permission", () => {
+    for (const lane of [
+        "pending drain",
+        "heuristics",
+        "caveman",
+        "age sweep",
+        "synthetic todo",
+        "thinking strip",
+    ] as const) {
+        it(`held execute denies ${lane}`, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = `hold-${lane}`;
+            const source = [
+                {
+                    info: { id: "old-user", role: "user" },
+                    parts: [{ type: "text", text: "old task" }],
+                },
+                {
+                    info: { id: "old-answer", role: "assistant" },
+                    parts: [
+                        { type: "reasoning", text: "old signed thought" },
+                        {
+                            type: "text",
+                            text: "The project is in the directory and it is the important file.".repeat(
+                                20,
+                            ),
+                        },
+                    ],
+                },
+                {
+                    info: { id: "active-user", role: "user" },
+                    parts: [{ type: "text", text: "continue" }],
+                },
+                {
+                    info: { id: "active-answer", role: "assistant" },
+                    parts: [
+                        { type: "reasoning", text: "active signed thought" },
+                        {
+                            type: "text",
+                            text: "The current task is in the directory and it is the important file.".repeat(
+                                20,
+                            ),
+                        },
+                    ],
+                },
+            ] as MessageLike[];
+            const pending = new Set([sessionId]);
+            const pass = async (execute: boolean) => {
+                const messages = structuredClone(source);
+                const tagger = createTagger();
+                tagger.initFromDb(sessionId, db);
+                const tagged = tagMessages(sessionId, messages, tagger, db);
+                const result = await runPostTransformPhase(
+                    basePostTransformArgs(db, sessionId, messages, {
+                        tagger,
+                        ...tagged,
+                        tags: getActiveTagsBySession(db, sessionId),
+                        freezeM0M1: true,
+                        activeThinkingTurn: true,
+                        resolvedProviderID: "anthropic",
+                        resolvedModelID: "claude-opus-5-5",
+                        thinkingBindingRecoveryEnabledForModel: true,
+                        schedulerDecision: execute ? "execute" : "defer",
+                        contextUsage: { percentage: execute ? 66 : 20, inputTokens: 66_000 },
+                        pendingMaterializationSessions: execute ? pending : new Set(),
+                        cavemanTextCompression: { enabled: true, minChars: 10 },
+                        currentTurnId: "active-user",
+                    }),
+                );
+                return { messages, result };
+            };
+            const baseline = await pass(false);
+            const tag = getTagsBySession(db, sessionId).find((row) =>
+                row.messageId.startsWith("old-answer"),
+            )!;
+            expect(tag).toBeDefined();
+            queuePendingOp(db, sessionId, tag.tagNumber, "drop");
+            updateSessionMeta(db, sessionId, {
+                lastTodoState: JSON.stringify([
+                    {
+                        id: "held-todo",
+                        content: "deferred todo",
+                        status: "pending",
+                        priority: "medium",
+                    },
+                ]),
+            });
+            const drain = spyOn(operations, "applyPendingOperations");
+            const cleanup = spyOn(heuristicCleanup, "applyHeuristicCleanup");
+            try {
+                const held = await pass(true);
+                if (lane === "pending drain") expect(drain).not.toHaveBeenCalled();
+                if (lane === "heuristics" || lane === "caveman")
+                    expect(cleanup).not.toHaveBeenCalled();
+                if (lane === "age sweep")
+                    expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(0);
+                if (lane === "synthetic todo")
+                    expect(getPersistedTodoSyntheticAnchor(db, sessionId)).toBeNull();
+                if (lane === "thinking strip")
+                    expect(held.result.proactiveThinkingStrip).toBeNull();
+                expect(JSON.stringify(held.messages)).toBe(JSON.stringify(baseline.messages));
+                expect(getPendingOps(db, sessionId)).toHaveLength(1);
+                expect(pending.has(sessionId)).toBe(true);
+            } finally {
+                drain.mockRestore();
+                cleanup.mockRestore();
+            }
+        });
+    }
+});
+
+// Signed-prefix hold invariants: the hold must never outrank
+// pressure relief at the absolute 95% wall, and a whole randomized tool loop of
+// held passes must serve one byte sequence until the next real user turn.
+describe("signed-prefix hold review", () => {
+    const heldSource = (): MessageLike[] =>
+        [
+            { info: { id: "old-user", role: "user" }, parts: [{ type: "text", text: "old task" }] },
+            {
+                info: { id: "old-answer", role: "assistant" },
+                parts: [
+                    { type: "reasoning", text: "old signed thought" },
+                    { type: "text", text: "Old answer about the important file. ".repeat(40) },
+                ],
+            },
+            {
+                info: { id: "old-followup", role: "assistant" },
+                parts: [{ type: "text", text: "Old follow-up about the directory. ".repeat(40) }],
+            },
+            {
+                info: { id: "active-user", role: "user" },
+                parts: [{ type: "text", text: "continue" }],
+            },
+            {
+                info: { id: "active-answer", role: "assistant" },
+                parts: [
+                    { type: "reasoning", text: "active signed thought" },
+                    { type: "text", text: "Current answer about the important file. ".repeat(40) },
+                ],
+            },
+        ] as MessageLike[];
+
+    const runHeld = async (
+        sessionId: string,
+        options: {
+            held: boolean;
+            percentage: number;
+            execute: boolean;
+            flush: Set<string>;
+            deferred?: Set<string>;
+        },
+    ) => {
+        const messages = heldSource();
+        const tagger = createTagger();
+        tagger.initFromDb(sessionId, db);
+        const tagged = tagMessages(sessionId, messages, tagger, db);
+        const result = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                tagger,
+                ...tagged,
+                tags: getActiveTagsBySession(db, sessionId),
+                freezeM0M1: options.held,
+                activeThinkingTurn: options.held,
+                resolvedProviderID: "anthropic",
+                resolvedModelID: "claude-opus-5-5",
+                thinkingBindingRecoveryEnabledForModel: true,
+                schedulerDecision: options.execute ? "execute" : "defer",
+                contextUsage: {
+                    percentage: options.percentage,
+                    inputTokens: options.percentage * 1000,
+                },
+                emergencyCeilingTokens: 65_000,
+                pendingMaterializationSessions: options.flush,
+                deferredMaterializationSessions: options.deferred ?? new Set(),
+                canConsumeDeferredLate: options.execute,
+                currentTurnId: options.held ? "active-user" : "next-user",
+            }),
+        );
+        return { messages: JSON.stringify(messages), result };
+    };
+
+    const oldTags = (sessionId: string) =>
+        getTagsBySession(db, sessionId).filter(
+            (row) =>
+                row.messageId.startsWith("old-answer") || row.messageId.startsWith("old-followup"),
+        );
+
+    it("a held pass at the 95% wall still admits the shared drain", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "hold-review-wall";
+        await runHeld(sessionId, { held: true, percentage: 20, execute: false, flush: new Set() });
+        for (const tag of oldTags(sessionId)) queuePendingOp(db, sessionId, tag.tagNumber, "drop");
+        expect(getPendingOps(db, sessionId).length).toBeGreaterThan(0);
+        const drain = spyOn(operations, "applyPendingOperations");
+        try {
+            await runHeld(sessionId, {
+                held: true,
+                percentage: 96,
+                execute: true,
+                flush: new Set([sessionId]),
+            });
+            // At 95% or more the emergency ("force") reclaim permission lifts the
+            // hold, so the queued drain runs once. Individual drops may still be
+            // refused by per-target thinking protection, which is a separate gate.
+            expect(drain).toHaveBeenCalledTimes(1);
+        } finally {
+            drain.mockRestore();
+        }
+    });
+
+    it("a held pass at the 85% force band still admits the shared drain", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "hold-review-force-band";
+        await runHeld(sessionId, { held: true, percentage: 20, execute: false, flush: new Set() });
+        for (const tag of oldTags(sessionId)) queuePendingOp(db, sessionId, tag.tagNumber, "drop");
+        const drain = spyOn(operations, "applyPendingOperations");
+        try {
+            await runHeld(sessionId, {
+                held: true,
+                percentage: 85,
+                execute: true,
+                flush: new Set([sessionId]),
+            });
+            expect(drain).toHaveBeenCalledTimes(1);
+        } finally {
+            drain.mockRestore();
+        }
+    });
+
+    it("a randomized held tool loop serves one byte sequence, then one release applies the queue", async () => {
+        // Small deterministic generator so a failure names a reproducible seed.
+        let seed = 0x6650_0001;
+        const random = () => {
+            seed = (seed * 1_103_515_245 + 12_345) >>> 0;
+            return seed / 0x1_0000_0000;
+        };
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "hold-review-loop";
+        const flush = new Set<string>();
+        const deferred = new Set<string>();
+        const baseline = await runHeld(sessionId, {
+            held: true,
+            percentage: 20,
+            execute: false,
+            flush,
+        });
+        const queueable = oldTags(sessionId).map((tag) => tag.tagNumber);
+        expect(queueable.length).toBeGreaterThan(0);
+        let queued = 0;
+        for (let step = 0; step < 24; step++) {
+            const roll = random();
+            if (roll < 0.3 && queued < queueable.length) {
+                queuePendingOp(db, sessionId, queueable[queued++]!, "drop");
+            } else if (roll < 0.45) {
+                flush.add(sessionId);
+            } else if (roll < 0.55) {
+                deferred.add(sessionId);
+            }
+            // Usage 20-83%: always below the 85% force band set by
+            // forceMaterializationPercentage, randomly crossing the 65% execute threshold.
+            const percentage = 20 + Math.floor(random() * 64);
+            const held = await runHeld(sessionId, {
+                held: true,
+                percentage,
+                execute: percentage >= 65,
+                flush,
+                deferred,
+            });
+            expect({ step, seed, bytes: held.messages }).toEqual({
+                step,
+                seed,
+                bytes: baseline.messages,
+            });
+            expect(held.result.proactiveThinkingStrip).toBeNull();
+            expect(getPendingOps(db, sessionId)).toHaveLength(queued);
+        }
+        while (queued < queueable.length)
+            queuePendingOp(db, sessionId, queueable[queued++]!, "drop");
+        flush.add(sessionId);
+        const released = await runHeld(sessionId, {
+            held: false,
+            percentage: 61,
+            execute: false,
+            flush,
+        });
+        expect(released.messages).not.toBe(baseline.messages);
+        expect(getPendingOps(db, sessionId)).toHaveLength(0);
+    });
+});
+
+describe("signed-prefix riders on unavoidable busts", () => {
+    for (const cause of ["first render", "idle expiry"] as const) {
+        it(
+            cause === "first render"
+                ? "a rewriting first render strips every signed block and admits queued work"
+                : "idle expiry admits suffix work while keeping every signed block",
+            async () => {
+                db = new Database(":memory:");
+                initializeDatabase(db);
+                const sessionId = `held-priced-${cause}`;
+                const injection = {
+                    projectPath: "git:held-priced",
+                    projectDirectory: "/nonexistent",
+                    memoryEnabled: false,
+                    injectDocs: false,
+                    historyBudgetTokens: 1000,
+                };
+                if (cause === "idle expiry")
+                    injectM0M1({
+                        db,
+                        sessionId,
+                        state: getOrCreateSessionMeta(db, sessionId),
+                        ...injection,
+                        isCacheBustingPass: true,
+                    });
+                insertTag(db, sessionId, "late-call", "tool", 4000, 1, 0, "bash");
+                queuePendingOp(db, sessionId, 1, "drop");
+                const pass = async (cold: boolean) => {
+                    const late = makeToolMessage("late-tool");
+                    const source: MessageLike[] = [
+                        {
+                            info: { id: "old-user", role: "user" },
+                            parts: [{ type: "text", text: "old task" }],
+                        },
+                        {
+                            info: { id: "old-thought", role: "assistant" },
+                            parts: [
+                                { type: "reasoning", text: "old signed thought" },
+                                { type: "text", text: "old answer" },
+                            ],
+                        },
+                        {
+                            info: { id: "active-user", role: "user" },
+                            parts: [{ type: "text", text: "continue" }],
+                        },
+                        {
+                            info: { id: "active-thought", role: "assistant" },
+                            parts: [
+                                { type: "reasoning", text: "active signed thought" },
+                                { type: "text", text: "tool loop" },
+                            ],
+                        },
+                        late,
+                    ];
+                    const target = {
+                        ...makeDropTarget(late),
+                        mutationParts: [{ message: late, part: late.parts[0] }],
+                        dropReasoningParts: [],
+                    };
+                    const targets = new Map([[1, target]]);
+                    const replayed = applyFlushedStatuses(sessionId, db, targets);
+                    const result = await runPostTransformPhase(
+                        basePostTransformArgs(db, sessionId, source, {
+                            activeThinkingTurn: true,
+                            activeThinkingPrefixHold: true,
+                            freezeM0M1: true,
+                            resolvedProviderID: "anthropic",
+                            resolvedModelID: "claude-opus-5-5",
+                            thinkingBindingRecoveryEnabledForModel: true,
+                            contextUsage: { percentage: 66, inputTokens: 66_000 },
+                            schedulerDecision: cold ? "execute" : "defer",
+                            tags: getActiveTagsBySession(db, sessionId),
+                            targets,
+                            protectedTools: { bash: 0 },
+                            didMutateFromFlushedStatuses: replayed,
+                            m0M1: {
+                                ...injection,
+                                hardSignals: {
+                                    systemHash: "",
+                                    modelKey: "anthropic/claude-opus-5-5",
+                                    cacheExpired: cold && cause === "idle expiry",
+                                    lastResponseTime: Date.now(),
+                                },
+                            },
+                        }),
+                    );
+                    return { messages: source, result };
+                };
+                const priced = await pass(true);
+                expect(getPendingOps(db, sessionId)).toHaveLength(0);
+                expect(
+                    getTagsBySession(db, sessionId).find((tag) => tag.tagNumber === 1)?.status,
+                ).toBe("dropped");
+                expect(priced.result.proactiveThinkingStrip).toBeNull();
+                if (cause === "first render") {
+                    expect(getMergedReasoningStrippedIds(db, sessionId)).toContain(
+                        "binding_mismatch:old-thought",
+                    );
+                    expect(getMergedReasoningStrippedIds(db, sessionId)).toContain(
+                        "binding_mismatch:active-thought",
+                    );
+                    expect(
+                        priced.messages
+                            .flatMap((message) => message.parts)
+                            .filter((part) => (part as { type?: string }).type === "reasoning"),
+                    ).toHaveLength(0);
+                } else {
+                    expect(
+                        priced.messages.find((message) => message.info.id === "old-thought")
+                            ?.parts[0],
+                    ).toEqual({ type: "reasoning", text: "old signed thought" });
+                    expect(
+                        priced.messages.find((message) => message.info.id === "active-thought")
+                            ?.parts[0],
+                    ).toEqual({ type: "reasoning", text: "active signed thought" });
+                }
+                const replay = await pass(false);
+                expect(replay.result.proactiveThinkingStrip).toBeNull();
+                expect(replay.result.bustedThisPass).toBe(false);
+                expect(JSON.stringify(replay.messages)).toBe(JSON.stringify(priced.messages));
+            },
+        );
+    }
+});
+
+it("an already-cold held pass runs safe routine cleanup without stripping thinking before a kept block", async () => {
+    db = new Database(":memory:");
+    initializeDatabase(db);
+    const sessionId = "held-cold-protected-only";
+    const injection = {
+        projectPath: "git:held-cold",
+        projectDirectory: "/nonexistent",
+        memoryEnabled: false,
+        injectDocs: false,
+        historyBudgetTokens: 1000,
+    };
+    injectM0M1({
+        db,
+        sessionId,
+        state: getOrCreateSessionMeta(db, sessionId),
+        ...injection,
+        isCacheBustingPass: true,
+    });
+    const old = makeToolMessage("old-tool");
+    old.parts.unshift({ type: "reasoning", text: "old signed thought" });
+    const active: MessageLike = {
+        info: { id: "active-thought", role: "assistant" },
+        parts: [{ type: "reasoning", text: "active signed thought" }],
+    };
+    const messages: MessageLike[] = [
+        old,
+        { info: { id: "active-user", role: "user" }, parts: [{ type: "text", text: "continue" }] },
+        active,
+    ];
+    insertTag(db, sessionId, "old-call", "tool", 4000, 1, 0, "bash");
+    queuePendingOp(db, sessionId, 1, "drop");
+    const target = {
+        ...makeDropTarget(old),
+        mutationParts: [{ message: old, part: old.parts[1] }],
+        dropReasoningParts: [],
+    };
+    const cleanup = spyOn(heuristicCleanup, "applyHeuristicCleanup");
+    try {
+        const result = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                freezeM0M1: true,
+                activeThinkingPrefixHold: true,
+                activeThinkingTurn: true,
+                resolvedProviderID: "anthropic",
+                resolvedModelID: "claude-opus-5-5",
+                thinkingBindingRecoveryEnabledForModel: true,
+                contextUsage: { percentage: 66, inputTokens: 66000 },
+                schedulerDecision: "execute",
+                currentTurnId: "active-user",
+                lastHeuristicsTurnId: new Map([[sessionId, "active-user"]]),
+                targets: new Map([[1, target]]),
+                tags: getActiveTagsBySession(db, sessionId),
+                protectedTools: { bash: 0 },
+                messageTagNumbers: new Map([
+                    [old, 2],
+                    [active, 4],
+                ]),
+                keepReasoningTokens: 10000,
+                m0M1: {
+                    ...injection,
+                    hardSignals: {
+                        systemHash: "",
+                        modelKey: "",
+                        cacheExpired: true,
+                        lastResponseTime: 1,
+                    },
+                },
+            }),
+        );
+        expect(cleanup).toHaveBeenCalledTimes(1);
+        expect(cleanup.mock.calls[0]?.[4].routine).toBe(true);
+        expect(getPendingOps(db, sessionId)).toHaveLength(1);
+        expect(result.proactiveThinkingStrip).toBeNull();
+        expect(old.parts[0]).toEqual({ type: "reasoning", text: "old signed thought" });
+        expect(active.parts).toEqual([{ type: "reasoning", text: "active signed thought" }]);
+    } finally {
+        cleanup.mockRestore();
+    }
+});
+
+it("a first render reproducing the served pair keeps all signed thinking", async () => {
+    db = new Database(":memory:");
+    initializeDatabase(db);
+    const sessionId = "first-render-same-binding-prefix";
+    const injection = {
+        projectPath: "git:same-pair",
+        projectDirectory: "/nonexistent",
+        memoryEnabled: false,
+        injectDocs: false,
+        historyBudgetTokens: 1000,
+    };
+    const warm: MessageLike[] = [
+        { info: { id: "u0", role: "user" }, parts: [{ type: "text", text: "start" }] },
+    ];
+    await runPostTransformPhase(basePostTransformArgs(db, sessionId, warm, { m0M1: injection }));
+    const heads = structuredClone(warm.slice(0, 2));
+    updateSessionMeta(db, sessionId, { cachedM0Bytes: null, cachedM1Bytes: null });
+    const messages: MessageLike[] = [
+        { info: { id: "old-user", role: "user" }, parts: [{ type: "text", text: "old" }] },
+        {
+            info: { id: "old-thinking", role: "assistant" },
+            parts: [
+                { type: "reasoning", text: "old signed" },
+                { type: "text", text: "old answer" },
+            ],
+        },
+        { info: { id: "active-user", role: "user" }, parts: [{ type: "text", text: "new" }] },
+        {
+            info: { id: "active-thinking", role: "assistant" },
+            parts: [{ type: "reasoning", text: "active signed" }],
+        },
+    ];
+    const result = await runPostTransformPhase(
+        basePostTransformArgs(db, sessionId, messages, {
+            activeThinkingTurn: true,
+            activeThinkingPrefixHold: true,
+            freezeM0M1: true,
+            resolvedProviderID: "anthropic",
+            resolvedModelID: "claude-opus-5-5",
+            thinkingBindingRecoveryEnabledForModel: true,
+            m0M1: injection,
+            readLastServedMessages: () => heads,
+            schedulerDecision: "execute",
+            contextUsage: { percentage: 66, inputTokens: 66000 },
+        }),
+    );
+    expect(messages.slice(0, 2)).toEqual(heads);
+    expect(
+        messages
+            .flatMap((message) => message.parts)
+            .filter((part) => (part as { type?: string }).type === "reasoning"),
+    ).toHaveLength(2);
+    expect(result.proactiveThinkingStrip).toBeNull();
+});
+
+import { prepareCompactionMarkerCandidates } from "../../features/magic-context/compaction-marker";
+import * as markerCandidates from "../../features/magic-context/compaction-marker-candidates";
+
+describe("issue 699 processed-image provider replay", () => {
+    const image = () => ({
+        type: "file",
+        mime: "image/png",
+        url: `data:image/png;base64,${"a".repeat(300)}`,
+    });
+    const source = (): MessageLike[] =>
+        [
+            { info: { id: "old-image", role: "user" }, parts: [image()] },
+            {
+                info: { id: "tool-image", role: "assistant" },
+                parts: [
+                    {
+                        type: "tool",
+                        callID: "image-read",
+                        tool: "read",
+                        state: {
+                            status: "completed",
+                            input: {},
+                            output: "read",
+                            attachments: [image()],
+                        },
+                    },
+                ],
+            },
+            { info: { id: "answer", role: "assistant" }, parts: [{ type: "text", text: "seen" }] },
+            { info: { id: "recent-image", role: "user" }, parts: [image()] },
+        ] as unknown as MessageLike[];
+    const serve = async (
+        sessionId: string,
+        provider: string,
+        bust: boolean,
+        overrides: Partial<PostTransformArgs> = {},
+    ) => {
+        const messages = source();
+        if (overrides.activeThinkingPrefixHold)
+            messages[2].parts.unshift({
+                type: "reasoning",
+                text: "retained signed thinking",
+                metadata: { anthropic: { signature: "retained-signature" } },
+            });
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                watermark: 2,
+                messageTagNumbers: new Map(messages.map((msg, i) => [msg, i + 1])),
+                resolvedProviderID: provider,
+                schedulerDecision: bust ? "execute" : "defer",
+                pendingMaterializationSessions: new Set(bust ? [sessionId] : []),
+                contextUsage: { percentage: 60, inputTokens: 6000 },
+                currentTurnId: "image-turn",
+                ...overrides,
+            }),
+        );
+        return messages;
+    };
+    const open = () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+    };
+
+    it("issue 699 OpenAI rewrite strips answered aged images and defer only replays frozen bytes", async () => {
+        open();
+        const sessionId = "image-openai";
+        const deferFirst = await serve(sessionId, "openai", false);
+        expect(deferFirst[0].parts).toEqual(source()[0].parts);
+        expect(deferFirst[1].parts).toEqual(source()[1].parts);
+        expect([...getProcessedImageStrippedIds(db, sessionId)]).toEqual([]);
+        const rewritten = await serve(sessionId, "openai", true);
+        expect(rewritten[0].parts).toEqual([{ type: "text", text: "[image stripped]" }]);
+        expect(JSON.stringify(rewritten[1].parts)).not.toContain("data:image");
+        expect(JSON.stringify(rewritten[1].parts)).toContain("[image stripped]");
+        expect(rewritten[3].parts).toEqual(source()[3].parts);
+        const replayed = await serve(sessionId, "openai", false, { watermark: 100 });
+        expect(JSON.stringify(replayed.slice(0, 2))).toBe(JSON.stringify(rewritten.slice(0, 2)));
+        expect(replayed[3].parts).toEqual(source()[3].parts);
+    });
+
+    it("issue 699 provider switches retain each frozen marker form including legacy Anthropic ids", async () => {
+        open();
+        const sessionId = "image-switch";
+        const anthropic = await serve(sessionId, "anthropic", true);
+        expect(anthropic[0].parts).toEqual([{ type: "text", text: "" }]);
+        expect(JSON.stringify(anthropic[1].parts)).toContain("[image stripped]");
+        const openai = await serve(sessionId, "openai", false);
+        expect(JSON.stringify(openai.slice(0, 2))).toBe(JSON.stringify(anthropic.slice(0, 2)));
+        const other = await serve("image-switch-reverse", "openai", true);
+        const back = await serve("image-switch-reverse", "anthropic", false);
+        expect(JSON.stringify(back.slice(0, 2))).toBe(JSON.stringify(other.slice(0, 2)));
+        addProcessedImageStrippedIds(db, "legacy-switch", ["old-image"]);
+        const legacy = await serve("legacy-switch", "openai", false);
+        expect(legacy[0].parts).toEqual([{ type: "text", text: "" }]);
+    });
+
+    it("issue 699 a protected signed prefix prevents new user and tool image detection", async () => {
+        open();
+        const messages = await serve("image-signed", "anthropic", true, {
+            activeThinkingPrefixHold: true,
+        });
+        expect(messages[0].parts).toEqual(source()[0].parts);
+        expect(messages[1].parts).toEqual(source()[1].parts);
+        expect(messages[2].parts[0]).toEqual({
+            type: "reasoning",
+            text: "retained signed thinking",
+            metadata: { anthropic: { signature: "retained-signature" } },
+        });
+        expect([...getProcessedImageStrippedIds(db, "image-signed")]).toEqual([]);
+    });
+
+    it("issue 699 protected newest tags keep answered tool images despite a later dropped tag", async () => {
+        open();
+        const sessionId = "image-protected";
+        const window = computeProtectionWindow(
+            [{ tag_number: 2, type: "tool", token_count: 50 }],
+            4000,
+        );
+        expect(window.protectedTagNumbers.has(2)).toBe(true);
+        const messages = await serve(sessionId, "openai", true, {
+            watermark: 100,
+            protectedTagNumbers: window.protectedTagNumbers,
+            protectedCutoff: window.cutoff,
+        });
+        expect(messages[0].parts).toEqual([{ type: "text", text: "[image stripped]" }]);
+        expect(messages[1].parts).toEqual(source()[1].parts);
+        expect([...getProcessedImageStrippedIds(db, sessionId)]).toEqual(["old-image"]);
+    });
+
+    it("issue 699 emergency window bypass retains independent protected-tool images", async () => {
+        open();
+        const sessionId = "image-emergency-exemplar";
+        insertTag(db, sessionId, "image-read", "tool", 100, 2, 0, "read", 0, "tool-image");
+        const messages = await serve(sessionId, "openai", true, {
+            watermark: 100,
+            protectedCutoff: 1,
+            protectedTagNumbers: new Set([2]),
+            tags: getActiveTagsBySession(db, sessionId),
+            protectedTools: { read: 1 },
+            contextUsage: { percentage: 95, inputTokens: 1000 },
+        });
+        expect(messages[0].parts).toEqual([{ type: "text", text: "[image stripped]" }]);
+        expect(messages[1].parts).toEqual(source()[1].parts);
+    });
+
+    it("issue 699 compaction off disables detection and frozen replay", async () => {
+        open();
+        await serve("image-off", "openai", true);
+        const messages = await serve("image-off", "openai", true, { compactionOff: true });
+        expect(messages[0].parts).toEqual(source()[0].parts);
+        expect(messages[1].parts).toEqual(source()[1].parts);
+    });
+});
+
+describe("issue 699 post-drain image watermark", () => {
+    it("issue 699 uses newly drained drops for image discovery on the same admitted bust, never defer", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "image-post-drain";
+        insertTag(db, sessionId, "drop-tool", "tool", 4000, 5, 0, "bash");
+        queuePendingOp(db, sessionId, 5, "drop", 1);
+        const source = (): MessageLike[] =>
+            [
+                {
+                    info: { id: "aged-image", role: "user" },
+                    parts: [
+                        {
+                            type: "file",
+                            mime: "image/png",
+                            url: `data:image/png;base64,${"a".repeat(300)}`,
+                        },
+                    ],
+                },
+                makeToolMessage("drop-tool"),
+                {
+                    info: { id: "answer", role: "assistant" },
+                    parts: [{ type: "text", text: "seen" }],
+                },
+            ] as MessageLike[];
+        const pass = async (bust: boolean) => {
+            const messages = source();
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    resolvedProviderID: "openai",
+                    watermark: 0,
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets: new Map([[5, makeDropTarget(messages[1])]]),
+                    messageTagNumbers: new Map([
+                        [messages[0], 1],
+                        [messages[1], 5],
+                    ]),
+                    batch: { finalize: () => {} } as PostTransformArgs["batch"],
+                    pendingMaterializationSessions: new Set(bust ? [sessionId] : []),
+                    schedulerDecision: bust ? "execute" : "defer",
+                    contextUsage: { percentage: 60, inputTokens: 1000 },
+                }),
+            );
+            return messages;
+        };
+        const deferred = await pass(false);
+        expect(deferred[0].parts).toEqual(source()[0].parts);
+        expect(getTagsBySession(db, sessionId).find((tag) => tag.tagNumber === 5)?.status).toBe(
+            "active",
+        );
+        const rewritten = await pass(true);
+        expect(getTagsBySession(db, sessionId).find((tag) => tag.tagNumber === 5)?.status).toBe(
+            "dropped",
+        );
+        expect(rewritten[0].parts).toEqual([{ type: "text", text: "[image stripped]" }]);
+        const replay = await pass(false);
+        expect(replay[0].parts).toEqual(rewritten[0].parts);
+    });
+});
+
+describe("issue 699 position-based recent-image retention", () => {
+    const image = (native: boolean) =>
+        native
+            ? {
+                  type: "media",
+                  media: {
+                      mediaType: "image/png",
+                      source: { type: "base64", data: "a".repeat(300) },
+                  },
+              }
+            : { type: "file", mime: "image/png", url: `data:image/png;base64,${"a".repeat(300)}` };
+    const pass = async (
+        sessionId: string,
+        native: boolean,
+        options: { nextTag: number; watermark: number; percentage?: number; bust?: boolean },
+    ) => {
+        const messages = [
+            { info: { id: "position-image", role: "user" }, parts: [image(native)] },
+            {
+                info: { id: "position-answer", role: "assistant" },
+                parts: [{ type: "text", text: "seen" }],
+            },
+        ] as MessageLike[];
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                resolvedProviderID: "openai",
+                watermark: options.watermark,
+                messageTagNumbers: new Map([[messages[1], options.nextTag]]),
+                protectedCutoff: 5,
+                protectedTagNumbers: new Set([5, 6, 7, 8]),
+                pendingMaterializationSessions: new Set(options.bust === false ? [] : [sessionId]),
+                schedulerDecision: options.bust === false ? "defer" : "execute",
+                contextUsage: { percentage: options.percentage ?? 60, inputTokens: 1000 },
+            }),
+        );
+        return messages;
+    };
+    for (const native of [false, true]) {
+        it(`issue 699 answered image-only ${native ? "native media" : "file"} stays recent, ages outside the window, and yields only at emergency`, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const recent = await pass(`image-position-recent-${native}`, native, {
+                nextTag: 6,
+                watermark: 1,
+            });
+            expect(recent[0].parts).toEqual([image(native)]);
+            const crossed = await pass(`image-position-protected-${native}`, native, {
+                nextTag: 6,
+                watermark: 8,
+                percentage: 94.99,
+            });
+            expect(crossed[0].parts).toEqual([image(native)]);
+            const emergency = await pass(`image-position-emergency-${native}`, native, {
+                nextTag: 6,
+                watermark: 8,
+                percentage: 95,
+            });
+            expect(emergency[0].parts).toEqual([{ type: "text", text: "[image stripped]" }]);
+            const sessionId = `image-position-old-${native}`;
+            const deferred = await pass(sessionId, native, {
+                nextTag: 3,
+                watermark: 4,
+                bust: false,
+            });
+            expect(deferred[0].parts).toEqual([image(native)]);
+            const aged = await pass(sessionId, native, { nextTag: 3, watermark: 4 });
+            expect(aged[0].parts).toEqual([{ type: "text", text: "[image stripped]" }]);
+            const replay = await pass(sessionId, native, {
+                nextTag: 100,
+                watermark: 0,
+                bust: false,
+            });
+            expect(replay[0].parts).toEqual(aged[0].parts);
+        });
+    }
+});
+
+describe("independent image cache safety through both host projections", () => {
+    for (const host of ["oc1", "oc2-base64", "oc2-bytes"] as const) {
+        function project(provider: string, signed = false, precedingAssistant = false) {
+            const file = {
+                type: "file",
+                mime: "image/png",
+                url: `data:image/png;base64,${"a".repeat(300)}`,
+            };
+            const signature = {
+                type: "reasoning",
+                text: "kept signed thinking",
+                metadata: { anthropic: { signature: "sig-independent" } },
+            };
+            if (host === "oc1") {
+                const messages: MessageLike[] = [
+                    { info: { id: "independent-image", role: "user" }, parts: [file] },
+                    {
+                        info: { id: "independent-tool", role: "assistant" },
+                        parts: [
+                            {
+                                type: "tool",
+                                callID: "independent-read",
+                                tool: "read",
+                                state: {
+                                    status: "completed",
+                                    input: {},
+                                    output: "read",
+                                    attachments: [file],
+                                },
+                            },
+                        ],
+                    },
+                    {
+                        info: { id: "independent-answer", role: "assistant" },
+                        parts: [...(signed ? [signature] : []), { type: "text", text: "seen" }],
+                    },
+                ];
+                if (precedingAssistant)
+                    messages.unshift({
+                        info: { id: "before-image", role: "assistant" },
+                        parts: [{ type: "text", text: "before" }],
+                    });
+                return { messages, commit: () => {}, bytes: () => JSON.stringify(messages) };
+            }
+            class NativeAsset {
+                readonly mediaType = "image/png";
+                readonly source =
+                    host === "oc2-bytes"
+                        ? { type: "bytes", data: new Uint8Array(300) }
+                        : { type: "base64", data: "a".repeat(300) };
+            }
+            const draft: SessionContext = {
+                sessionID: "independent-host-projection",
+                model: { providerID: provider, id: "model" },
+                agent: "build",
+                system: [],
+                tools: {},
+                options: {},
+                messages: [
+                    {
+                        id: "independent-image",
+                        role: "user",
+                        content: [{ type: "media", media: new NativeAsset() }],
+                    },
+                    {
+                        id: "independent-tool",
+                        role: "assistant",
+                        content: [
+                            { type: "tool-call", id: "independent-read", name: "read", input: {} },
+                        ],
+                    },
+                    {
+                        role: "tool",
+                        content: [
+                            {
+                                type: "tool-result",
+                                id: "independent-read",
+                                name: "read",
+                                result: {
+                                    type: "content",
+                                    value: [
+                                        { type: "text", text: "read" },
+                                        { type: "file", mime: file.mime, uri: file.url },
+                                    ],
+                                },
+                            },
+                        ],
+                    },
+                    {
+                        id: "independent-answer",
+                        role: "assistant",
+                        content: [...(signed ? [signature] : []), { type: "text", text: "seen" }],
+                    },
+                ],
+            };
+            if (precedingAssistant)
+                draft.messages.unshift({
+                    id: "before-image",
+                    role: "assistant",
+                    content: [{ type: "text", text: "before" }],
+                });
+            return { ...adaptPayload(draft), bytes: () => JSON.stringify(draft.messages) };
+        }
+
+        async function serve(
+            sessionId: string,
+            bust: boolean,
+            provider = "openai",
+            signed = false,
+            precedingAssistant = false,
+        ) {
+            const projected = project(provider, signed, precedingAssistant);
+            const before = projected.bytes();
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, projected.messages, {
+                    resolvedProviderID: provider,
+                    resolvedModelID: "claude-opus-5-5",
+                    watermark: 5,
+                    messageTagNumbers: new Map(
+                        projected.messages.map((message, i) => [message, i + 1]),
+                    ),
+                    protectedCutoff: 4,
+                    pendingMaterializationSessions: new Set(bust ? [sessionId] : []),
+                    schedulerDecision: bust ? "execute" : "defer",
+                    activeThinkingPrefixHold: signed,
+                    contextUsage: { percentage: 60, inputTokens: 1000 },
+                }),
+            );
+            projected.commit();
+            return { ...projected, before };
+        }
+
+        it(`independent ${host}: signed hold preserves image-only and tool-result images before kept thinking`, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = `independent-signed-${host}`;
+            const result = await serve(sessionId, true, "anthropic", true);
+            expect(result.bytes()).toBe(result.before);
+            expect(result.bytes()).toContain("sig-independent");
+            expect([...getProcessedImageStrippedIds(db, sessionId)]).toEqual([]);
+        });
+
+        it(`independent ${host}: failed durable freeze leaves both image carriers native and defer cannot retry`, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = `independent-fault-${host}`;
+            getOrCreateSessionMeta(db, sessionId);
+            db.exec(
+                `CREATE TRIGGER fail_independent_image_freeze BEFORE UPDATE OF processed_image_stripped_ids ON session_meta BEGIN SELECT RAISE(ABORT, 'independent image persistence fault'); END`,
+            );
+            const projected = project("openai");
+            const before = projected.bytes();
+            await expect(
+                runPostTransformPhase(
+                    basePostTransformArgs(db, sessionId, projected.messages, {
+                        resolvedProviderID: "openai",
+                        watermark: 5,
+                        messageTagNumbers: new Map(
+                            projected.messages.map((message, i) => [message, i + 1]),
+                        ),
+                        pendingMaterializationSessions: new Set([sessionId]),
+                        schedulerDecision: "execute",
+                    }),
+                ),
+            ).rejects.toThrow();
+            projected.commit();
+            expect(projected.bytes()).toBe(before);
+            expect([...getProcessedImageStrippedIds(db, sessionId)]).toEqual([]);
+            db.exec("DROP TRIGGER fail_independent_image_freeze");
+            const deferred = await serve(sessionId, false);
+            expect(deferred.bytes()).toBe(deferred.before);
+            const retry = await serve(sessionId, true);
+            expect(retry.bytes()).not.toContain("data:image");
+            expect(retry.bytes()).not.toContain('"type":"media"');
+            expect([...getProcessedImageStrippedIds(db, sessionId)].sort()).toEqual([
+                "independent-image",
+                "independent-tool",
+            ]);
+        });
+
+        it(`independent ${host}: post-drain watermark admits both carriers on the same rewrite, never on defer`, async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = `independent-post-drain-${host}`;
+            insertTag(db, sessionId, "independent-drop", "tool", 4000, 8, 0, "bash");
+            queuePendingOp(db, sessionId, 8, "drop", 1);
+            const pass = async (bust: boolean) => {
+                const projected = project("openai");
+                const before = projected.bytes();
+                const drop = makeToolMessage("independent-drop");
+                projected.messages.push(drop);
+                await runPostTransformPhase(
+                    basePostTransformArgs(db, sessionId, projected.messages, {
+                        resolvedProviderID: "openai",
+                        watermark: 0,
+                        tags: getActiveTagsBySession(db, sessionId),
+                        targets: new Map([[8, makeDropTarget(drop)]]),
+                        messageTagNumbers: new Map(
+                            projected.messages.map((message, i) => [message, i === 3 ? 8 : i + 1]),
+                        ),
+                        batch: { finalize: () => {} } as PostTransformArgs["batch"],
+                        pendingMaterializationSessions: new Set(bust ? [sessionId] : []),
+                        schedulerDecision: bust ? "execute" : "defer",
+                        contextUsage: { percentage: 60, inputTokens: 1000 },
+                    }),
+                );
+                // Inspect only the original image carriers; the separate drop
+                // target is a fixture for advancing the persisted watermark.
+                projected.messages.splice(3);
+                projected.commit();
+                return { bytes: projected.bytes(), before };
+            };
+            const deferred = await pass(false);
+            expect(deferred.bytes).toBe(deferred.before);
+            expect(getTagsBySession(db, sessionId).find((tag) => tag.tagNumber === 8)?.status).toBe(
+                "active",
+            );
+            const rewritten = await pass(true);
+            expect(getTagsBySession(db, sessionId).find((tag) => tag.tagNumber === 8)?.status).toBe(
+                "dropped",
+            );
+            expect(rewritten.bytes).not.toContain("data:image");
+            expect(rewritten.bytes).not.toContain('"type":"media"');
+            expect([...getProcessedImageStrippedIds(db, sessionId)].sort()).toEqual([
+                "independent-image",
+                "independent-tool",
+            ]);
+            expect((await pass(false)).bytes).toBe(rewritten.bytes);
+        });
+
+        it(`independent ${host}: reopen reconstructs frozen output before and after both provider switches`, async () => {
+            const dir = createTestTempDirFromPath(
+                join(tmpdir(), `independent-image-restart-${host}-`),
+            );
+            tempDirs.push(dir);
+            const path = join(dir, "review.sqlite");
+            db = new Database(path);
+            initializeDatabase(db);
+            for (const initialProvider of ["openai", "anthropic"]) {
+                const sessionId = `independent-restart-${host}-${initialProvider}`;
+                const firstDefer = await serve(sessionId, false, initialProvider);
+                expect(firstDefer.bytes()).toBe(firstDefer.before);
+                const first = await serve(sessionId, true, initialProvider);
+                const bytes = first.bytes();
+                db.close();
+                db = new Database(path);
+                expect((await serve(sessionId, false, initialProvider)).bytes()).toBe(bytes);
+                const otherProvider = initialProvider === "openai" ? "anthropic" : "openai";
+                const switched = (await serve(sessionId, false, otherProvider)).bytes();
+                expect(switched).toBe(bytes);
+                expect((await serve(sessionId, false, initialProvider)).bytes()).toBe(bytes);
+            }
+        });
+
+        it(`independent ${host}: structural image marker persists across reopen and provider switch`, async () => {
+            const dir = createTestTempDirFromPath(join(tmpdir(), `image-separator-${host}-`));
+            tempDirs.push(dir);
+            const path = join(dir, "separator.sqlite");
+            db = new Database(path);
+            initializeDatabase(db);
+            const sessionId = `image-separator-${host}`;
+            const frozen = await serve(sessionId, true, "anthropic", false, true);
+            expect(frozen.messages[1].parts).toEqual([{ type: "text", text: "[image stripped]" }]);
+            expect(
+                replayStorage.getProcessedImageMarkers(db, sessionId).get("independent-image"),
+            ).toBe("[image stripped]");
+            const bytes = frozen.bytes();
+            db.close();
+            db = new Database(path);
+            expect((await serve(sessionId, false, "anthropic", false, true)).bytes()).toBe(bytes);
+            expect((await serve(sessionId, false, "openai", false, true)).bytes()).toBe(bytes);
+            expect(
+                replayStorage.getProcessedImageMarkers(db, sessionId).get("independent-image"),
+            ).toBe("[image stripped]");
+        });
     }
 });

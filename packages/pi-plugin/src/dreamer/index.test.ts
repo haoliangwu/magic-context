@@ -17,6 +17,7 @@ import { getDreamRuns } from "@magic-context/core/features/magic-context/dreamer
 import { getTaskScheduleState } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
 import { leaseKeyFor } from "@magic-context/core/features/magic-context/dreamer/task-registry";
 import { insertMemory } from "@magic-context/core/features/magic-context/memory";
+import { getMemoryVerifications } from "@magic-context/core/features/magic-context/memory/storage-memory-verifications";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import {
 	closeDatabase,
@@ -370,6 +371,32 @@ describe("Pi dreamer wiring", () => {
 		expect(tasks[0].modelChainUnavailable).toBe(true);
 	});
 
+	test("re-probes a model that becomes registered after an early miss", () => {
+		// OMP queues a dynamic-only extension provider (`litellm`) during extension
+		// loading and merges its catalogue in a fire-and-forget boot refresh, so a
+		// miss at registration normally means "not hydrated yet". Caching the miss
+		// kept the historian chain empty for the whole process even after the model
+		// appeared -- observed in the field as `registered historian trigger:
+		// DISABLED` in two of four OMP processes started within one minute.
+		let hydrated = false;
+		const registry = {
+			find: (_provider: string, model: string) =>
+				hydrated && model === "historian" ? {} : undefined,
+		};
+		const task = {
+			task: "classify-memories" as const,
+			schedule: "0 4 * * *",
+			timeoutMinutes: 20,
+			model: "litellm/historian",
+		};
+		expect(validatePiDreamerModels([task], registry)[0].model).toBeUndefined();
+		hydrated = true;
+		expect(validatePiDreamerModels([task], registry)[0]).toMatchObject({
+			model: "litellm/historian",
+			modelChainUnavailable: false,
+		});
+	});
+
 	test("does not register the filesystem root or home for dreaming", () => {
 		db = createDb();
 		let starts = 0;
@@ -459,19 +486,37 @@ describe("Pi dreamer wiring", () => {
 			"custody accounts exhausted",
 		);
 	});
-	test("disable=true config is a no-op", () => {
+	test("disabled dreamer registers maintenance once but cannot run dream tasks", async () => {
 		db = createDb();
-
-		registerPiDreamerProject(
-			dreamerOptions({
+		const starts: unknown[] = [];
+		__test.setStartDreamScheduleTimerFactory(async (args) => {
+			starts.push(args);
+			return mock(() => {});
+		});
+		const opts = {
+			...dreamerOptions({
 				database: db,
 				projectDir: "/tmp/pi-project-disabled",
 				projectIdentity: "git:pi-disabled",
 				config: disabledConfig(),
 			}),
-		);
-
-		expect(__test.registeredProjectCount()).toBe(0);
+			gitCommitIndexing: { enabled: true, since_days: 30, max_commits: 200 },
+		};
+		registerPiDreamerProject(opts);
+		registerPiDreamerProject(opts);
+		expect(__test.registeredProjectCount()).toBe(1);
+		expect(starts).toHaveLength(1);
+		expect(starts[0]).toMatchObject({
+			dreamerConfig: { disable: true },
+			gitCommitIndexing: { enabled: true },
+		});
+		await expect(
+			runPiDreamForProject(
+				opts.projectIdentity,
+				"verify",
+				opts.registrationOwner,
+			),
+		).rejects.toThrow("dreamer is disabled");
 	});
 
 	test("runnable config registers once for the same project", () => {
@@ -1877,6 +1922,149 @@ describe("Pi dreamer wiring", () => {
 				body: { system: "system", parts: [{ text: "run dreamer" }] },
 			}),
 		).rejects.toMatchObject({ transient: true });
+	});
+
+	test("mapping facade retains intermediate decisions after a step-limit failure", async () => {
+		db = createDb();
+		let capturedClient: CapturedDreamClient | null = null;
+		__test.setStartDreamScheduleTimerFactory(async (registration) => {
+			capturedClient = registration.client as unknown as CapturedDreamClient;
+			return mock(() => {});
+		});
+		const text = '<mappings><memory id="1" independent="true"/>';
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: async () => ({
+						ok: false,
+						reason: "step_limit",
+						error: "cap",
+						durationMs: 0,
+						meta: {
+							cap: 60,
+							mappingMessages: [
+								{ role: "assistant", content: [{ type: "text", text }] },
+							],
+						},
+					}),
+				}) as never,
+		);
+		const refresh = mock(() => {});
+		registerPiDreamerProject(
+			dreamerOptions({
+				database: db,
+				projectIdentity: "git:pi-map-partial",
+				onAdjunctsRefreshNeeded: refresh,
+			}),
+		);
+		const client = requireCapturedClient(capturedClient);
+		const created = (await client.session.create({
+			body: { title: "magic-context-dream-map-memories" },
+		})) as { id: string };
+		await expect(
+			client.session.prompt({
+				path: { id: created.id },
+				body: { agent: "dreamer-memory-mapper", parts: [{ text: "map" }] },
+			}),
+		).rejects.toThrow();
+		expect(
+			JSON.stringify(
+				await client.session.messages({ path: { id: created.id } }),
+			),
+		).toContain(JSON.stringify(text));
+		expect(refresh).not.toHaveBeenCalled();
+	});
+
+	test("Pi mapping stream commits an emitted decision after runner abort", async () => {
+		const dataDir = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-map-stream-"),
+		);
+		const previous = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+		process.env.MAGIC_CONTEXT_TEST_DATA_DIR = dataDir;
+		closeDatabase();
+		try {
+			db = openDatabase();
+			const projectIdentity = "git:pi-map-stream";
+			const first = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "External provider rejects an empty request.",
+			});
+			insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "External provider requires authentication.",
+			});
+			const controller = new AbortController();
+			const child = createEventStreamChild();
+			const spawned = deferred<void>();
+			const runner = new PiSubagentRunner({
+				invocation: {
+					command: "pi-fixture",
+					prefixArgs: [],
+					targetHarness: "pi",
+				},
+				spawnImpl: mock(() => {
+					spawned.resolve();
+					return child as never;
+				}) as never,
+			});
+			__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
+			__test.setPiSubagentRunnerFactory(
+				() =>
+					({
+						run: (args: Parameters<PiSubagentRunner["run"]>[0]) =>
+							runner.run({ ...args, signal: controller.signal }),
+					}) as never,
+			);
+			const opts = dreamerOptions({
+				database: db,
+				projectIdentity,
+				projectDir: dataDir,
+				config: DreamerConfigSchema.parse({
+					model: "test/model",
+					tasks: { "map-memories": { schedule: "0 4 * * *" } },
+				}),
+			});
+			registerPiDreamerProject(opts);
+			const run = runPiDreamForProject(
+				projectIdentity,
+				"map-memories",
+				opts.registrationOwner,
+			);
+			await spawned.promise;
+			child.writeStdoutLine({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					stopReason: "toolUse",
+					content: [
+						{
+							type: "text",
+							text: `<mappings><memory id="${first.id}" independent="true"/>`,
+						},
+						{
+							type: "toolCall",
+							id: "next",
+							name: "read",
+							arguments: { path: "next.ts" },
+						},
+					],
+				},
+			});
+			controller.abort();
+			expect((await run).ran).toEqual(["map-memories"]);
+			expect(
+				getMemoryVerifications(db, [first.id]).get(first.id)?.hasSentinel,
+			).toBe(true);
+		} finally {
+			closeDatabase();
+			db = null;
+			if (previous === undefined)
+				delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+			else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = previous;
+			rmSync(dataDir, { recursive: true, force: true });
+		}
 	});
 
 	test("unregister before timer promise resolves invokes timer cleanup when it eventually resolves", async () => {

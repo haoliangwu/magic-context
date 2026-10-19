@@ -743,7 +743,10 @@ describe("readSessionChunk", () => {
             const chunk = readSessionChunk("ses-noise-tail", 100_000, 1);
 
             //#then: filtered tail noise was scanned, so no semantic work remains.
-            expect(chunk.endIndex).toBe(2);
+            expect(chunk.endIndex).toBe(4);
+            expect(chunk.endMessageId).toBe("m-4");
+            expect(chunk.messageCount).toBe(4);
+            expect(chunk.lines.map((line) => line.ordinal)).toEqual([1, 2, 3, 4]);
             expect(chunk.text).toContain("eligible work");
             expect(chunk.text).not.toContain("Magic Status");
             expect(chunk.hasMore).toBe(false);

@@ -37,9 +37,9 @@ import {
 	buildChannel1Reminder,
 	buildChannel2Reminder,
 	CHANNEL1_SENTINEL,
+	currentReclaimableToolOutputCount,
 	decideChannel1,
 	evaluateChannel2,
-	reclaimableToolOutputCount,
 	type Channel1State as SharedChannel1State,
 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
 import { sessionLog } from "@magic-context/core/shared/logger";
@@ -185,7 +185,7 @@ export function maybeChannel1ReminderForToolResult(args: {
 		text: buildChannel1Reminder(
 			decision.level,
 			decision.undroppedTokens,
-			reclaimableToolOutputCount(state.baselineParts),
+			currentReclaimableToolOutputCount(state),
 			currentReclaimHints(db, sessionId, state.oldestReclaimableToolTags),
 			decision.sticky,
 		),
@@ -286,7 +286,7 @@ export function maybeDeliverChannel2Pi(
 			customType: CHANNEL2_NUDGE_CUSTOM_TYPE,
 			content: buildChannel2Reminder(
 				undropped,
-				reclaimableToolOutputCount(baseline.baselineParts),
+				currentReclaimableToolOutputCount(baseline),
 				currentReclaimHints(db, sessionId, baseline.oldestReclaimableToolTags),
 			),
 			display: false,

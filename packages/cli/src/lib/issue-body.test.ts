@@ -1,5 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { capBodyToGithubLimit, extractRecentErrors, MAX_GITHUB_BODY_BYTES } from "./issue-body";
+import {
+    capBodyToGithubLimit,
+    extractRecentErrors,
+    filterLogLinesBySession,
+    getLogSessionIds,
+    MAX_GITHUB_BODY_BYTES,
+} from "./issue-body";
 
 describe("extractRecentErrors", () => {
     it("matches the documented sessionLog error shapes", () => {
@@ -52,6 +58,16 @@ describe("extractRecentErrors", () => {
         ).toEqual([fleetWarn, fleetError, legacyError]);
     });
 
+    it("treats Magic Context turn refusals as recent errors", () => {
+        const refusalLines = [
+            "2026-05-20 12:00:01 could not safely prepare this turn: no safe plan",
+            "2026-05-20 12:00:02 MC-H403 refused (protected source)",
+            "2026-05-20 12:00:03 policy refused (unsafe operation)",
+        ];
+
+        expect(extractRecentErrors(refusalLines.join("\n"), 20)).toEqual(refusalLines);
+    });
+
     it("matches V8 stack-trace frames", () => {
         const log = [
             "Error: thing broke",
@@ -102,6 +118,20 @@ describe("extractRecentErrors", () => {
 
     it("handles empty input gracefully", () => {
         expect(extractRecentErrors("", 20)).toEqual([]);
+    });
+});
+
+describe("filterLogLinesBySession", () => {
+    it("keeps selected-session and unscoped lines while listing newest sessions first", () => {
+        const lines = [
+            "[2026-09-05T10:41:03.130Z] [magic-context][ses_old] old session",
+            "[2026-09-05T10:41:04.130Z] [magic-context][ses_keep] selected session",
+            "[2026-09-05T10:41:05.130Z] [magic-context][ses_old] newer other session",
+            "2026-09-05T10:41:06.130Z INFO  magic-context shared runtime line",
+        ];
+
+        expect(getLogSessionIds(lines)).toEqual(["ses_old", "ses_keep"]);
+        expect(filterLogLinesBySession(lines, "ses_keep")).toEqual([lines[1], lines[3]]);
     });
 });
 

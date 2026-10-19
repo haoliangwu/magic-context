@@ -98,13 +98,17 @@ export function createRustRefusalRecovery(options: RustRefusalRecoveryOptions) {
     };
 
     const schedule = (sessionId: string, watcher: RecoveryWatcher): void => {
-        watcher.timer = setTimeout(() => void poll(sessionId, watcher), pollIntervalMs);
+        watcher.timer = inRootAsyncContext(() =>
+            setTimeout(() => void poll(sessionId, watcher), pollIntervalMs),
+        );
     };
 
     const probe = async (watcher: RecoveryWatcher, sessionId: string): Promise<boolean> => {
         const controller = new AbortController();
         const timeoutError = new Error("rust refusal recovery probe timed out");
-        const timer = setTimeout(() => controller.abort(timeoutError), probeTimeoutMs);
+        const timer = inRootAsyncContext(() =>
+            setTimeout(() => controller.abort(timeoutError), probeTimeoutMs),
+        );
         try {
             await Promise.race([
                 options.moduleClient.call({
@@ -219,3 +223,5 @@ export function createRustRefusalRecovery(options: RustRefusalRecoveryOptions) {
 }
 
 export type RustRefusalRecovery = ReturnType<typeof createRustRefusalRecovery>;
+
+import { inRootAsyncContext } from "../../shared/sqlite";

@@ -1,0 +1,9 @@
+[
+  {"label":"one tag","stamped":1,"self_stamps":0,"expected":"1 tag stamped."},
+  {"label":"immediate and protected tags","stamped":3,"self_stamps":0,"expected":"3 tags stamped."},
+  {"label":"already queued tags","stamped":2,"self_stamps":0,"expected":"2 tags stamped."},
+  {"label":"protected-only tag","stamped":1,"self_stamps":0,"expected":"1 tag stamped."},
+  {"label":"one ctx_reduce call","stamped":0,"self_stamps":1,"expected":"1 was a ctx_reduce call; leave those alone, they are cleaned up automatically."},
+  {"label":"multiple ctx_reduce calls","stamped":0,"self_stamps":2,"expected":"2 were ctx_reduce calls; leave those alone, they are cleaned up automatically."},
+  {"label":"stamped tags and refused ctx_reduce call","stamped":2,"self_stamps":1,"expected":"2 tags stamped. 1 was a ctx_reduce call; leave those alone, they are cleaned up automatically."}
+]

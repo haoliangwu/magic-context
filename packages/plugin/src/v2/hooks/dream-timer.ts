@@ -2,7 +2,9 @@ import type { MagicContextPluginConfig } from "../../config";
 import { dreamerRunConfig } from "../../config/live-run-config";
 import type { DreamerConfig } from "../../config/schema/magic-context";
 import type { HiddenCompletionExecutor } from "../../hooks/magic-context/compartment-runner-types";
+import type { TransformDeps } from "../../hooks/magic-context/transform";
 import { startDreamScheduleTimer } from "../../plugin/dream-timer";
+import { createDreamTimerModuleClient } from "../../plugin/dream-timer-module-client";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embedding-bootstrap";
 import { log } from "../../shared/logger";
 import { V2RetrospectiveRawProvider } from "../retrospective-raw-provider";
@@ -56,7 +58,8 @@ export function registerV2DreamScheduleTimer(args: {
     directory: string;
     projectIdentity: string;
     config: MagicContextPluginConfig;
-    dreamer: DreamerConfig;
+    dreamer: DreamerConfig | undefined;
+    rustModeModuleClient?: TransformDeps["rustModeModuleClient"];
     /** The live configuration, re-read before each timer pass. */
     liveConfig: () => MagicContextPluginConfig;
     executor: HiddenCompletionExecutor;
@@ -77,7 +80,11 @@ export function registerV2DreamScheduleTimer(args: {
         dreamerConfig: dreamer,
         sampleDreamRun: () => {
             const current = dreamerRunConfig(config, args.liveConfig());
-            return { dreamerConfig: current.dreamer ?? dreamer, mural: current.mural };
+            return {
+                dreamerConfig: current.dreamer ?? dreamer,
+                mural: current.mural,
+                gitCommitIndexing: current.memory.git_commit_indexing,
+            };
         },
         // Scheduled and manual runs share one capability filter, so a host
         // without a tool loop never records tasks it cannot run as failed.
@@ -89,7 +96,10 @@ export function registerV2DreamScheduleTimer(args: {
         memoryEnabled: config.memory.enabled === true,
         memoryInjectionBudgetTokens: config.memory.injection_budget_tokens,
         retinaHandoff: config.smart_notes.retina_handoff,
+        smartNotesEnabled: config.smart_notes.enabled,
         embeddingConfig: config.embedding,
+        transformMode: config.transform_mode,
+        moduleClient: createDreamTimerModuleClient(args.rustModeModuleClient),
         gitCommitIndexing: gitCommitIndexing?.enabled
             ? {
                   enabled: true,

@@ -15,7 +15,11 @@ export interface RustLkgReplayParticipant {
      */
     lastPassStamp(sessionId: string): number | undefined;
     /** Enter or keep the freeze after an LKG replay served outside the adapter. */
-    enterFreezeFromExternalServe(sessionId: string, inputCount: number): void;
+    enterFreezeFromExternalServe(
+        sessionId: string,
+        inputMessages: MessageLike[],
+        servedMessages: MessageLike[],
+    ): void;
     /**
      * The adapter's own context-fit admission for an LKG replay of `messages`,
      * with the model resolved from the pass's `inputMessages` as the adapter does.
@@ -120,10 +124,11 @@ export function liveRustLkgReplayParticipantCountForTest(): number {
 export function noteExternalLkgReplay(
     participant: RustLkgReplayParticipant | undefined,
     sessionId: string,
-    inputCount: number,
+    inputMessages: MessageLike[],
+    servedMessages: MessageLike[],
 ): void {
     if (!participant) return;
-    participant.enterFreezeFromExternalServe(sessionId, inputCount);
+    participant.enterFreezeFromExternalServe(sessionId, inputMessages, servedMessages);
     sessionLog(sessionId, "lkg_external_replay_froze_rust_adapter");
 }
 

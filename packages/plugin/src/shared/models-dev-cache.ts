@@ -33,12 +33,7 @@ import { getHarness } from "./harness";
 import { modelRefLookupOrder } from "./harness-provider-map";
 import { sessionLog } from "./logger";
 import { writeStorageFileAtomicSync } from "./storage-permissions";
-import {
-    deriveWindowGeometry,
-    getWindowOverlay,
-    resolveWindowOverlayFacts,
-    type WindowGeometryResult,
-} from "./window-geometry";
+import { deriveWindowGeometry, type WindowGeometryResult } from "./window-geometry";
 
 interface OpencodeClientLike {
     config: {
@@ -515,7 +510,6 @@ export function getSdkWindowGeometry(
             output: metadata.outputLimit,
         },
         {
-            overlay: resolveWindowOverlayFacts(providerID, modelID, getWindowOverlay()),
             outputReserveOverride: resolveOutputReserve(providerID, modelID),
             harness: options?.harness ?? "opencode",
             contextCap:

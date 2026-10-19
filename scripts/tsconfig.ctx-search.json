@@ -1,0 +1,26 @@
+{
+	"extends": "../packages/plugin/tsconfig.json",
+	"compilerOptions": {
+		"rootDir": "..",
+		"noEmit": true,
+		"declaration": false,
+		"declarationMap": false,
+		"emitDeclarationOnly": false,
+		"typeRoots": [
+			"../packages/plugin/node_modules/@types",
+			"../packages/plugin/node_modules"
+		]
+	},
+	"include": [
+		"search-pool-benchmark.ts",
+		"../packages/plugin/src/features/magic-context/search-pool.test.ts",
+		"../packages/plugin/src/shared/chunk-vector-writer-guard.test.ts",
+		"ctx-search-benchmark.ts",
+		"ctx-search-rerank.ts",
+		"ctx-search-benchmark.test.ts",
+		"ctx-search-rerank-product.ts",
+		"../packages/plugin/src/features/magic-context/search-rerank.test.ts",
+		"lib/ctx-search-rerank.ts"
+	],
+	"exclude": ["../node_modules"]
+}

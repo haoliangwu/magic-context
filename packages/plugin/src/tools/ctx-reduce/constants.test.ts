@@ -1,10 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
-import {
-    CTX_REDUCE_DESCRIPTION,
-    CTX_REDUCE_SELF_STAMP_MESSAGE_TEMPLATE,
-    ctxReduceSelfStampMessage,
-} from "./constants";
+import { CTX_REDUCE_DESCRIPTION, formatCtxReduceReply } from "./constants";
+
+interface ReplyCase {
+    label: string;
+    stamped: number;
+    self_stamps: number;
+    expected: string;
+}
 
 describe("ctx-reduce constants", () => {
     //#given
@@ -26,12 +29,15 @@ describe("ctx-reduce constants", () => {
         });
     });
 
-    it("matches the shared TypeScript/Rust self-stamp message golden", () => {
-        const golden = readFileSync(
-            new URL("./self-stamp-message.golden", import.meta.url),
-            "utf8",
-        ).trimEnd();
-        expect(CTX_REDUCE_SELF_STAMP_MESSAGE_TEMPLATE).toBe(golden);
-        expect(ctxReduceSelfStampMessage(17)).toBe(golden.replace("§N§", "§17§"));
+    it("matches the shared cross-runtime ctx_reduce reply cases", () => {
+        const cases = JSON.parse(
+            readFileSync(new URL("./reply-cases.json", import.meta.url), "utf8"),
+        ) as ReplyCase[];
+        for (const replyCase of cases) {
+            expect(
+                formatCtxReduceReply(replyCase.stamped, replyCase.self_stamps),
+                replyCase.label,
+            ).toBe(replyCase.expected);
+        }
     });
 });

@@ -1,0 +1,11 @@
+{
+    "root": false,
+    "extends": ["../biome.json"],
+    "files": { "includes": ["**/*.ts", "**/*.json"] },
+    "overrides": [
+        {
+            "includes": ["**/*.ts"],
+            "linter": { "rules": { "style": { "noNonNullAssertion": "off" } } }
+        }
+    ]
+}

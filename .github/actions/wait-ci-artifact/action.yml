@@ -1,0 +1,36 @@
+name: Wait for same-attempt artifact
+description: Wait for a producer within its runtime and queue-wait allowance
+inputs:
+  artifact:
+    description: Same-commit artifact prefix, followed by its producer attempt
+    required: true
+  producer:
+    description: Producer job name reported by the Jobs API
+    required: true
+  timeout-minutes:
+    description: Producer job timeout in minutes
+    required: true
+  max-wait-minutes:
+    description: Optional total-wait override; must be at least the producer timeout
+    required: false
+outputs:
+  artifact-id:
+    description: Immutable artifact ID selected from the producer's attempt
+    value: ${{ steps.wait.outputs.artifact-id }}
+runs:
+  using: composite
+  steps:
+    - id: wait
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        WAIT_ARTIFACT: ${{ inputs.artifact }}
+        WAIT_PRODUCER: ${{ inputs.producer }}
+        WAIT_TIMEOUT: ${{ inputs.timeout-minutes }}
+        WAIT_MAX_WAIT: ${{ inputs.max-wait-minutes }}
+      run: |
+        args=(--artifact "$WAIT_ARTIFACT" --producer "$WAIT_PRODUCER" --timeout-minutes "$WAIT_TIMEOUT")
+        if [[ -n "$WAIT_MAX_WAIT" ]]; then
+          args+=(--max-wait-minutes "$WAIT_MAX_WAIT")
+        fi
+        python3 scripts/wait-ci-artifact.py "${args[@]}"

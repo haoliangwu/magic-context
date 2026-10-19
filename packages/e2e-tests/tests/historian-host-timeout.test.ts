@@ -6,7 +6,7 @@
  *
  * Some OpenCode 1 builds give plugins an SDK client whose fetch is plain
  * `globalThis.fetch`, so Bun's default request timer (300-360 s) applies to every
- * plugin request (docs/reports/dreamer-host-fetch-timeout.md). A historian that
+ * plugin request. A historian that
  * held one synchronous `session.prompt` open for its whole run therefore failed
  * with `TimeoutError: The operation timed out.` after about five minutes, however
  * long `historian_timeout_ms` was.

@@ -358,6 +358,8 @@ export function buildSidebarSnapshot(
     moduleStatus?: RustSessionStatus,
     compactionEnabled = true,
 ): SidebarSnapshot {
+    const smartNotesEnabled =
+        (config?.smart_notes as { enabled?: boolean } | undefined)?.enabled !== false;
     try {
         const projectIdentity = resolveProjectIdentityForSession(directory);
         if (projectIdentity === undefined)
@@ -511,7 +513,13 @@ export function buildSidebarSnapshot(
             : null;
         if (projectIdentity) {
             try {
-                dreamerBacklog = getDreamTaskBacklogs(db, projectIdentity, CANONICAL_DREAM_TASKS);
+                dreamerBacklog = getDreamTaskBacklogs(
+                    db,
+                    projectIdentity,
+                    CANONICAL_DREAM_TASKS.filter(
+                        (task) => smartNotesEnabled || task !== "evaluate-smart-notes",
+                    ),
+                );
             } catch {
                 // A pre-Dreamer-V2 database may not have all task tables yet.
             }
@@ -524,8 +532,12 @@ export function buildSidebarSnapshot(
                 lastDreamerRunAt = getMostRecentTaskRunAt(db, projectIdentity);
                 // A scheduled task can fail on every slot for weeks. Without this the
                 // only in-session trace is a backlog count that never falls.
-                dreamerFailures = getFailingDreamTasks(db, projectIdentity);
-                dreamerSkipped = getSkippedDreamTasks(db, projectIdentity);
+                dreamerFailures = getFailingDreamTasks(db, projectIdentity).filter(
+                    (state) => smartNotesEnabled || state.task !== "evaluate-smart-notes",
+                );
+                dreamerSkipped = getSkippedDreamTasks(db, projectIdentity).filter(
+                    (task) => smartNotesEnabled || task !== "evaluate-smart-notes",
+                );
             } catch {
                 // task_schedule_state may not exist on a pre-V2 DB
             }
@@ -971,6 +983,7 @@ export function buildStatusDetail(
             // pending_ops may not exist
         }
 
+        modelKey ??= persistedModelKey ?? undefined;
         const modelSlash = modelKey?.indexOf("/") ?? -1;
         if (modelKey && modelSlash > 0) {
             detail.windowGeometry = resolveContextWindowGeometry(
@@ -1455,6 +1468,8 @@ export function registerRpcHandlers(
         compactionMarkerStrategy?: ManagedRecompContext["compactionMarkerStrategy"];
         /** Install the host's history source even before a reopened session's first pass. */
         prepareHistorySession?: (sessionId: string) => void;
+        /** Read the session's current host directory, not the plugin's pre-move cached directory. */
+        readSessionDirectory?: (sessionId: string) => Promise<string | null>;
         storageDir?: string;
         getDebugMemoryHolders?: () => RuntimeDebugMemoryHolders | undefined;
         getDatabase?: () => Database | null;
@@ -1524,9 +1539,10 @@ export function registerRpcHandlers(
     rpcServer.handle("session-owner", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { owner: false };
-        const sessionDirectory =
-            liveSessionState.sessionDirectoryBySession.get(sessionId) ??
-            (await readHostSessionDirectory(args.client, sessionId));
+        const sessionDirectory = args.readSessionDirectory
+            ? await args.readSessionDirectory(sessionId)
+            : ((await readHostSessionDirectory(args.client, sessionId)) ??
+              liveSessionState.sessionDirectoryBySession.get(sessionId));
         if (!sessionDirectory) return { owner: false };
         return {
             owner:
@@ -1629,9 +1645,8 @@ export function registerRpcHandlers(
         const { resolveHistorianModel } = await importPluginModule(
             () => import("../shared/model-resolution"),
         );
-        const { userMemoryCollectionEnabled } = await importPluginModule(
-            () => import("../features/magic-context/dreamer/task-config"),
-        );
+        const { userObservationCollectionEnabled, userObservationsRequested } =
+            await importPluginModule(() => import("../features/magic-context/dreamer/task-config"));
         const DEFAULT_HISTORIAN_TIMEOUT_MS = 10 * 60 * 1000;
         const runConfig = historianRunConfig(
             config,
@@ -1649,11 +1664,13 @@ export function registerRpcHandlers(
                 resolveHistorianContextLimit(historianModel.primary?.model),
             ),
             historianTimeoutMs: runConfig.historian_timeout_ms ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
+            historianMaxOutputTokens: runConfig.historian?.maxTokens,
             memoryEnabled: config.memory?.enabled ?? true,
             autoPromote: runConfig.memory?.auto_promote ?? true,
             historianModel: historianModel.primary,
             fallbackModels: historianModel.fallbacks,
-            userMemoriesEnabled: userMemoryCollectionEnabled(runConfig.dreamer),
+            userMemoriesEnabled: userObservationCollectionEnabled(runConfig.dreamer),
+            userObservationsRequested: userObservationsRequested(runConfig.dreamer),
             historianTwoPass: runConfig.historian?.two_pass === true,
             historianExpandTools: runConfig.historian?.expand_tools,
             getNotificationParams: (sessionId) =>
@@ -1670,6 +1687,19 @@ export function registerRpcHandlers(
     rpcServer.handle("recomp", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
+        const readDirectory = args.readSessionDirectory;
+        if (readDirectory) {
+            const { handoffHistoryWork } = await import("../shared/history-owner");
+            const handed = await handoffHistoryWork({
+                storageDir: args.storageDir ?? getMagicContextStorageDir(),
+                directory,
+                sessionId,
+                method: "recomp",
+                params,
+                readDirectory: () => readDirectory(sessionId),
+            });
+            if (handed) return handed;
+        }
         const dir = String(params.directory ?? directory);
         if (config.transform_mode === "rust") {
             return executeRustRecompRpc(rustModeModuleClient, sessionId, dir);
@@ -1718,11 +1748,9 @@ export function registerRpcHandlers(
         return { ok: true };
     });
 
-    // The three handlers below exist for a host whose only command seam is the
-    // TUI (OpenCode 2 registers /ctx-* through its keymap layer, and its lane
-    // never runs the OpenCode 1 `command.execute.before` hook). Each performs the
-    // same server-side work as the matching command branch and returns its text,
-    // so the caller can render it in a dialog or toast instead of a chat row.
+    // OpenCode 2 server command callbacks dispatch to these RPC handlers. The
+    // command API has no response-text channel, so callbacks send handler replies
+    // to a connected TUI as notifications instead of adding them to chat history.
     const compactionOffRefusal = (command: string): string =>
         `Magic Context compaction is disabled (${COMPACTION_ENABLED_PATH}: false) — /${command} manages compacted history and has no effect in this mode.`;
 
@@ -1764,11 +1792,29 @@ export function registerRpcHandlers(
         // pass instead of leaving the flush invisible until one happens anyway.
         liveSessionState.historyRefreshSessions.add(sessionId);
         liveSessionState.systemPromptRefreshSessions.add(sessionId);
-        liveSessionState.pendingMaterializationSessions.add(sessionId);
+        requestPendingMaterialization(
+            liveSessionState.pendingMaterializationSessions,
+            sessionId,
+            "user_flush",
+        );
         return { ok: true, message };
     });
 
     rpcServer.handle("wrapup", async (params) => {
+        const readDirectory = args.readSessionDirectory;
+        if (readDirectory && params.sessionId) {
+            const { handoffHistoryWork } = await import("../shared/history-owner");
+            const sessionId = String(params.sessionId);
+            const handed = await handoffHistoryWork({
+                storageDir: args.storageDir ?? getMagicContextStorageDir(),
+                directory,
+                sessionId,
+                method: "wrapup",
+                params,
+                readDirectory: () => readDirectory(sessionId),
+            });
+            if (handed) return handed;
+        }
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
         if (!compactionEnabled) return { ok: true, message: compactionOffRefusal("ctx-wrapup") };
@@ -1897,3 +1943,5 @@ export function registerRpcHandlers(
         return { ok: true } as unknown as Record<string, unknown>;
     });
 }
+
+import { requestPendingMaterialization } from "../hooks/magic-context/pending-materialization";

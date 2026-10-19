@@ -16,6 +16,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
+use crate::writer_diagnostics::WriterTransaction;
 use crate::McStoreError;
 
 /// The `context.db` connections `McStore` reads and writes domain rows through.
@@ -38,6 +39,19 @@ pub trait ContextDomain: Send + Sync {
         tables: &[&str],
         write: &mut dyn FnMut(&Transaction<'_>) -> rusqlite::Result<()>,
     ) -> Result<(), McStoreError>;
+
+    /// Attempt telemetry without waiting for a writer lock. Implementations that do not
+    /// support nonblocking writes refuse rather than delaying the caller's publication.
+    fn try_write(
+        &self,
+        _tables: &[&str],
+        _write: &mut dyn FnMut(&Transaction<'_>) -> rusqlite::Result<()>,
+    ) -> Result<(), McStoreError> {
+        Err(context_error(
+            "telemetry_unavailable",
+            "nonblocking writes unsupported",
+        ))
+    }
 
     /// What the domain reports on the status surface: where it is and what its schema
     /// fence found. Null when it has nothing to report.
@@ -130,6 +144,34 @@ impl SqliteContextDomain {
 }
 
 impl ContextDomain for SqliteContextDomain {
+    fn try_write(
+        &self,
+        tables: &[&str],
+        write: &mut dyn FnMut(&Transaction<'_>) -> rusqlite::Result<()>,
+    ) -> Result<(), McStoreError> {
+        let mut conn = self
+            .writer
+            .try_lock()
+            .map_err(|_| context_error("context_busy", "telemetry writer is occupied"))?;
+        conn.busy_timeout(std::time::Duration::ZERO)
+            .map_err(context_sql_error)?;
+        let outcome = (|| {
+            let tx = WriterTransaction::immediate(
+                &mut conn,
+                "context_telemetry",
+                "mc-store",
+                "background",
+                emit_writer,
+            )?
+            .with_tables(tables);
+            write(&tx)?;
+            tx.commit()
+        })();
+        conn.busy_timeout(std::time::Duration::from_millis(5_000))
+            .map_err(context_sql_error)?;
+        outcome.map_err(context_sql_error)
+    }
+
     fn read(
         &self,
         read: &mut dyn FnMut(&Connection) -> rusqlite::Result<()>,
@@ -147,19 +189,29 @@ impl ContextDomain for SqliteContextDomain {
 
     fn write(
         &self,
-        _tables: &[&str],
+        tables: &[&str],
         write: &mut dyn FnMut(&Transaction<'_>) -> rusqlite::Result<()>,
     ) -> Result<(), McStoreError> {
         let mut conn = self
             .writer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let transaction = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(context_sql_error)?;
+        let transaction = WriterTransaction::immediate(
+            &mut conn,
+            "context_domain",
+            "mc-store",
+            "domain",
+            emit_writer,
+        )
+        .map_err(context_sql_error)?
+        .with_tables(tables);
         write(&transaction).map_err(context_sql_error)?;
         transaction.commit().map_err(context_sql_error)
     }
+}
+
+fn emit_writer(line: &str) {
+    tracing::info!("{line}");
 }
 
 /// The `context.db` schema the plugin creates, as the module's tests pin it.
@@ -189,6 +241,38 @@ pub fn create_test_context_db(path: &Path) -> Result<(), McStoreError> {
 #[cfg(test)]
 mod durability_tests {
     use super::*;
+
+    #[test]
+    fn telemetry_refuses_busy_writers_without_spending_the_publication_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("context.db");
+        let domain = SqliteContextDomain::open(&path).unwrap();
+        let mut blocker = Connection::open(&path).unwrap();
+        let tx = blocker
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(domain
+            .try_write(&[], &mut |_| panic!("busy write must not enter callback"))
+            .is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let timeout: i64 = domain
+            .writer
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "busy_timeout", |r| r.get(0))
+            .unwrap();
+        assert_eq!(timeout, 5_000, "publication keeps its original busy budget");
+        drop(tx);
+        let held = domain.writer.lock().unwrap();
+        assert!(domain
+            .try_write(&[], &mut |_| panic!(
+                "occupied writer must not enter callback"
+            ))
+            .is_err());
+        drop(held);
+        domain.try_write(&[], &mut |_| Ok(())).unwrap();
+    }
 
     #[test]
     fn freshly_opened_context_connections_use_wal_normal() {

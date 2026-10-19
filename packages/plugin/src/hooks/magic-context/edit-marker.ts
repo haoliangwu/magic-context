@@ -38,6 +38,19 @@ export function isEditTool(name: string | null | undefined): boolean {
     return name === "edit" || name === "write";
 }
 
+/** Check before copying an input: only long, unmarked diff strings are rewritten. */
+export function needsEditMarker(input: Record<string, unknown>): boolean {
+    return Object.keys(input).some((key) => {
+        const value = input[key];
+        return (
+            DIFF_KEYS.has(key) &&
+            typeof value === "string" &&
+            value.length > EDIT_REGION_HINT_LEN &&
+            !value.endsWith(TRUNCATION_SENTINEL)
+        );
+    });
+}
+
 /**
  * Mutate a tool input object in place into its edit-marker form: preserve
  * path-like keys verbatim, clamp the diff keys to a region-hint prefix, leave

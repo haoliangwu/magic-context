@@ -1,0 +1,20 @@
+[
+    { "name": "own maximum wins over a later smaller tag", "tags": [[2, 10, 4], [3]], "target": 0, "watermark": 8, "cutoff": null, "percentage": 60, "age": 10, "eligible": false },
+    { "name": "own maximum at watermark", "tags": [[2, 10, 4], [30]], "target": 0, "watermark": 10, "cutoff": null, "percentage": 60, "age": 10, "eligible": true },
+    { "name": "first later tag not largest later tag", "tags": [[], [3], [20]], "target": 0, "watermark": 3, "cutoff": null, "percentage": 60, "age": 3, "eligible": true },
+    { "name": "first later message contributes its own maximum", "tags": [[], [2, 9], [3]], "target": 0, "watermark": 5, "cutoff": null, "percentage": 60, "age": 9, "eligible": false },
+    { "name": "skip empty and zero tags when looking forward", "tags": [[1], [], [0], [4]], "target": 1, "watermark": 4, "cutoff": null, "percentage": 60, "age": 4, "eligible": true },
+    { "name": "zero own tag inherits later positive", "tags": [[0], [7]], "target": 0, "watermark": 6, "cutoff": null, "percentage": 60, "age": 7, "eligible": false },
+    { "name": "preceding tag cannot age live tail", "tags": [[1], [], []], "target": 1, "watermark": 100, "cutoff": null, "percentage": 60, "age": null, "eligible": false },
+    { "name": "all untagged is ineligible", "tags": [[], []], "target": 0, "watermark": 100, "cutoff": null, "percentage": 60, "age": null, "eligible": false },
+    { "name": "watermark zero even with emergency", "tags": [[], [1]], "target": 0, "watermark": 0, "cutoff": 1, "percentage": 95, "age": 1, "eligible": false },
+    { "name": "age above watermark even with emergency", "tags": [[], [7]], "target": 0, "watermark": 6, "cutoff": 1, "percentage": 100, "age": 7, "eligible": false },
+    { "name": "cutoff inclusive at 94.99 percent", "tags": [[5], [8]], "target": 0, "watermark": 9, "cutoff": 5, "percentage": 94.99, "age": 5, "eligible": false },
+    { "name": "inside cutoff is a range not set membership", "tags": [[], [6]], "target": 0, "watermark": 9, "cutoff": 5, "percentage": 60, "age": 6, "eligible": false },
+    { "name": "below cutoff is eligible", "tags": [[4], [8]], "target": 0, "watermark": 9, "cutoff": 5, "percentage": 94.99, "age": 4, "eligible": true },
+    { "name": "exactly 95 waives cutoff", "tags": [[], [6]], "target": 0, "watermark": 9, "cutoff": 5, "percentage": 95, "age": 6, "eligible": true },
+    { "name": "above 95 waives cutoff", "tags": [[5], [8]], "target": 0, "watermark": 9, "cutoff": 5, "percentage": 95.01, "age": 5, "eligible": true },
+    { "name": "emergency cannot invent tail age", "tags": [[1], []], "target": 1, "watermark": 100, "cutoff": 1, "percentage": 100, "age": null, "eligible": false },
+    { "name": "own positive tag overrides later greater tag", "tags": [[2], [20]], "target": 0, "watermark": 2, "cutoff": 3, "percentage": 60, "age": 2, "eligible": true },
+    { "name": "last message with own tag is aged", "tags": [[1], [4]], "target": 1, "watermark": 4, "cutoff": null, "percentage": 60, "age": 4, "eligible": true }
+]

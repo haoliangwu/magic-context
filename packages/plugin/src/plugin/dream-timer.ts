@@ -48,7 +48,7 @@ import {
     getProjectEmbeddingSnapshot,
 } from "../features/magic-context/memory/embedding";
 import { isUsableProjectIdentity } from "../features/magic-context/memory/project-identity";
-import { sweepOrphanedOpenCodeMessageIndexes } from "../features/magic-context/message-index";
+import { sweepOrphanedOpenCodeMessageIndexesOffThread } from "../features/magic-context/message-index-async";
 import {
     drainCommitBacklogForProject,
     drainProjectEmbeddingIdentityMaintenance,
@@ -91,6 +91,7 @@ const BOOT_PROJECT_JITTER_SLOT_MS = 1_000;
  * its dream schedule checked, and its config respected.
  */
 interface ProjectRegistration {
+    smartNotesEnabled?: boolean;
     directory: string;
     projectIdentity: string;
     /** The runtime selecting models for this registration. */
@@ -135,7 +136,7 @@ interface ProjectRegistration {
         fallbackModelCount: number;
         keepSubagents: boolean;
     };
-    mural?: { enabled: boolean; model?: string };
+    mural?: { enabled: boolean };
     retinaHandoff?: boolean;
     embeddingConfig?: { provider?: string };
     ensureRegistered: (directory: string, db: Database) => Promise<void>;
@@ -317,7 +318,9 @@ export async function startDreamScheduleTimer(
             runTick("startup");
         });
 
-        const timer = setInterval(() => runTick("interval"), DREAM_TIMER_INTERVAL_MS);
+        const timer = inRootAsyncContext(() =>
+            setInterval(() => runTick("interval"), DREAM_TIMER_INTERVAL_MS),
+        );
         if (typeof timer === "object" && "unref" in timer) {
             timer.unref();
         }
@@ -479,7 +482,7 @@ async function runMessageHistoryMaintenance(db: Database): Promise<void> {
         }
     }
 
-    const sweep = sweepOrphanedOpenCodeMessageIndexes(db, openOpenCodeDb);
+    const sweep = await sweepOrphanedOpenCodeMessageIndexesOffThread(db, openOpenCodeDb);
     if (sweep.reason) log(`[message-index] orphan sweep parked: ${sweep.reason}`);
     if (sweep.deleted > 0) {
         log(
@@ -535,7 +538,7 @@ async function runProjectMaintenance(
     const projectMaintenanceEnabled =
         Boolean(current.dreamerConfig && current.dreamerConfig.disable !== true) ||
         reg.memoryEnabled === true ||
-        reg.gitCommitIndexing?.enabled === true ||
+        current.gitCommitIndexing?.enabled === true ||
         reg.historianChildSweep !== undefined;
     if (!projectMaintenanceEnabled) return;
 
@@ -551,7 +554,9 @@ async function runProjectMaintenance(
         // Compartment-chunk backfill remains demand-driven to avoid bursty
         // requests to local embedding endpoints.
     }
-    await sweepProject(current, origin, db);
+    // Indexing commit text does not require an embedding provider. Only the
+    // optional vector backfill depends on the embedding snapshot.
+    await sweepProject(current, origin, db, current.gitCommitIndexing?.enabled === true);
 }
 
 /**
@@ -624,7 +629,7 @@ async function sweepProject(
                   dreamerConfig,
                   reg.harness,
                   reg.language,
-                  reg.mural?.model,
+                  reg.smartNotesEnabled,
               )
             : [];
     const runtimeConfigs = reg.validateTaskModels?.(configuredTasks) ?? configuredTasks;
@@ -683,6 +688,7 @@ async function sweepProject(
             mural: reg.mural,
             memoryInjectionBudgetTokens: reg.memoryInjectionBudgetTokens,
             retinaHandoff: reg.retinaHandoff,
+            smartNotesEnabled: reg.smartNotesEnabled,
             transformMode: reg.transformMode,
             moduleClient: reg.moduleClient,
             onProgress: (progress, completedTask) =>
@@ -694,6 +700,7 @@ async function sweepProject(
             tasks: runtimeConfigs,
             executor,
             projectMemoryEnabled: reg.memoryEnabled !== false,
+            smartNotesEnabled: reg.smartNotesEnabled,
         });
         if (ran > 0) {
             log(`[dreamer] timer tick (${origin}) ${reg.projectIdentity} — ran ${ran} task(s)`);
@@ -761,6 +768,7 @@ export function _resetDreamTimerForTests(): void {
 }
 
 async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database): Promise<void> {
+    if (reg.smartNotesEnabled === false) return;
     if (projectNeedsSingleStoreMigration(db, reg.projectIdentity)) {
         logDreamerNotOwnerOnce(reg.projectIdentity);
         return;
@@ -797,17 +805,19 @@ function startGitSweepLeaseRenewal(
     projectIdentity: string,
     holderId: string,
 ): () => void {
-    const timer = setInterval(() => {
-        try {
-            if (!renewGitSweepLease(db, projectIdentity, holderId)) {
-                log(`[git-commits] sweep lease renewal failed for ${projectIdentity}`);
+    const timer = inRootAsyncContext(() =>
+        setInterval(() => {
+            try {
+                if (!renewGitSweepLease(db, projectIdentity, holderId)) {
+                    log(`[git-commits] sweep lease renewal failed for ${projectIdentity}`);
+                }
+            } catch (error) {
+                log(
+                    `[git-commits] sweep lease renewal errored for ${projectIdentity}: ${error instanceof Error ? error.message : String(error)}`,
+                );
             }
-        } catch (error) {
-            log(
-                `[git-commits] sweep lease renewal errored for ${projectIdentity}: ${error instanceof Error ? error.message : String(error)}`,
-            );
-        }
-    }, GIT_SWEEP_LEASE_RENEWAL_MS);
+        }, GIT_SWEEP_LEASE_RENEWAL_MS),
+    );
     (timer as { unref?: () => void }).unref?.();
     return () => clearInterval(timer);
 }
@@ -891,3 +901,5 @@ async function sweepGitCommits(args: {
         stopRenewal();
     }
 }
+
+import { inRootAsyncContext } from "../shared/sqlite";

@@ -2,6 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as sqlite from "@magic-context/core/shared/sqlite";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import {
@@ -43,7 +44,26 @@ function install(db: ReturnType<typeof createTestDb>) {
 	registerPiContextHandler(fake.pi as never, { db });
 	const handler = fake.handlers.get("context");
 	if (!handler) throw new Error("Context handler not installed");
-	return handler;
+	return handler as unknown as (
+		event: { messages: ReturnType<typeof userMessage>[] },
+		ctx: unknown,
+	) => Promise<unknown>;
+}
+
+function observeWriterWait(onWait: () => void) {
+	const writer = sqlite.withAsyncPrivilegedWriter;
+	return spyOn(sqlite, "withAsyncPrivilegedWriter").mockImplementation(
+		(db, operation, options) =>
+			writer(db, operation, {
+				...options,
+				beforeRetry: (error) => {
+					options?.beforeRetry?.(error);
+					// Serving a saved request throws from beforeRetry; only a writer
+					// that must wait for the lock reaches this callback.
+					onWait();
+				},
+			}),
+	);
 }
 
 test("a usable Pi LKG is replayed before any backed-off writer wait", async () => {
@@ -63,11 +83,20 @@ test("a usable Pi LKG is replayed before any backed-off writer wait", async () =
 		const first = await handler({ messages: structuredClone(raw) }, ctx);
 		await new Promise((done) => setImmediate(done));
 		locker.exec("BEGIN IMMEDIATE");
-		const started = performance.now();
-		const replay = await handler({ messages: structuredClone(raw) }, ctx);
-		expect(replay).toEqual(first);
-		expect(performance.now() - started).toBeLessThan(350);
-		expect(locker.inTransaction).toBe(true);
+		let backoffs = 0;
+		const wait = observeWriterWait(() => {
+			backoffs++;
+			throw new Error("LKG replay entered a backed-off writer wait");
+		});
+		try {
+			const replay = await handler({ messages: structuredClone(raw) }, ctx);
+			expect(replay).toEqual(first);
+			expect(wait).toHaveBeenCalledTimes(1);
+			expect(backoffs).toBe(0);
+			expect(locker.inTransaction).toBe(true);
+		} finally {
+			wait.mockRestore();
+		}
 	});
 });
 
@@ -101,17 +130,25 @@ test("Pi writer wait yields and performs the actual managed write after release"
 	await underWriter(async (db, locker, dir) => {
 		const handler = install(db);
 		const raw = [userMessage("new turn", 1)];
-		let ticked = false;
-		const release = setTimeout(() => {
-			ticked = true;
-			locker.exec("ROLLBACK");
-		}, 200);
+		const entered = Promise.withResolvers<void>();
+		const wait = observeWriterWait(() => entered.resolve());
 		try {
-			const result = await handler(
+			const pending = handler(
 				{ messages: raw },
 				fakeContext("waiter", dir, ["u"], raw),
 			);
-			expect(ticked).toBe(true);
+			await Promise.race([
+				entered.promise,
+				pending.then(() => {
+					throw new Error(
+						"Pi request completed without entering the writer wait",
+					);
+				}),
+			]);
+			expect(locker.inTransaction).toBe(true);
+			await new Promise<void>((done) => setImmediate(done));
+			locker.exec("ROLLBACK");
+			const result = await pending;
 			expect(JSON.stringify(result)).toContain("§");
 			expect(
 				db
@@ -121,7 +158,7 @@ test("Pi writer wait yields and performs the actual managed write after release"
 					.get(),
 			).toBeDefined();
 		} finally {
-			clearTimeout(release);
+			wait.mockRestore();
 		}
 	});
 });
@@ -134,19 +171,17 @@ test("Pi writer wait honours a supplied host abort signal before writes", async 
 		const ctx = Object.assign(fakeContext("waiter", dir, ["u"], raw), {
 			signal: controller.signal,
 		});
-		const abort = setTimeout(
-			() => controller.abort(new Error("host cancelled")),
-			100,
-		);
-		const started = performance.now();
+		const entered = Promise.withResolvers<void>();
+		const wait = observeWriterWait(() => entered.resolve());
 		try {
-			await expect(handler({ messages: raw }, ctx)).rejects.toThrow(
-				"host cancelled",
-			);
+			const pending = handler({ messages: raw }, ctx);
+			void pending.catch(() => {});
+			await entered.promise;
+			controller.abort(new Error("host cancelled"));
+			expect(await pending).toBeUndefined();
 		} finally {
-			clearTimeout(abort);
+			wait.mockRestore();
 		}
-		expect(performance.now() - started).toBeLessThan(350);
 		expect(
 			db.prepare("SELECT * FROM session_meta WHERE session_id='waiter'").get(),
 		).toBeNull();
@@ -163,19 +198,33 @@ test("a superseded Pi waiter never writes or aborts the newer pass", async () =>
 				oldAborts++;
 			},
 		});
+		const oldEntered = Promise.withResolvers<void>();
+		const newEntered = Promise.withResolvers<void>();
+		let attempts = 0;
+		const wait = observeWriterWait(() => {
+			(attempts++ === 0 ? oldEntered : newEntered).resolve();
+		});
 		const old = handler({ messages: older }, oldCtx).then(
 			() => "unexpected success",
 			(error: Error) => error.message,
 		);
-		await new Promise((done) => setTimeout(done, 100));
+		await oldEntered.promise;
 		const newer = [userMessage("replacement input", 2)];
 		const current = handler(
 			{ messages: newer },
 			fakeContext("waiter", dir, ["new"], newer),
 		);
-		const release = setTimeout(() => locker.exec("ROLLBACK"), 200);
 		try {
+			await Promise.race([
+				newEntered.promise,
+				current.then(() => {
+					throw new Error(
+						"Replacement request completed without entering the writer wait",
+					);
+				}),
+			]);
 			expect(await old).toContain("superseded");
+			locker.exec("ROLLBACK");
 			const result = await current;
 			expect(oldAborts).toBe(0);
 			expect(JSON.stringify(result)).toContain("replacement input");
@@ -190,7 +239,7 @@ test("a superseded Pi waiter never writes or aborts the newer pass", async () =>
 					),
 			).toBe(true);
 		} finally {
-			clearTimeout(release);
+			wait.mockRestore();
 		}
 	});
 });

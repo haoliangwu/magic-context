@@ -1,16 +1,18 @@
 use std::fs;
+use std::path::Path;
 use std::process::Command;
+
+#[path = "support/executable.rs"]
+mod executable_staging;
 
 #[test]
 fn module_start_writes_dated_segment_under_resolved_data_dir() {
     let scratch_parent = std::env::temp_dir().join("magic-context/mc-module-fleet-logging");
     fs::create_dir_all(&scratch_parent).expect("create isolated temp parent");
     let root = tempfile::tempdir_in(scratch_parent).expect("temp data home");
-    let module = root.path().join("ckdev-mc");
     let cargo_module = env!("CARGO_BIN_EXE_ck-mc");
-    // A copy, never a hard link: on macOS a binary exec'd through a hard link to
-    // cargo's output was occasionally SIGKILLed at startup, while a copy never was.
-    fs::copy(cargo_module, &module).expect("stage ck-mc with a dev process name");
+    let module = executable_staging::stage_executable(Path::new(cargo_module), "ckdev-mc", "ck-mc")
+        .expect("stage ck-mc with a dev process name");
     let output = Command::new(&module)
         .env("XDG_DATA_HOME", root.path())
         .env("SUBC_MODULE_ID", "magic-context")

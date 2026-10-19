@@ -2,6 +2,9 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { hash, parseDraft, prompt, type Memory, type TrialBatch } from "./core";
 
+const reportPath = process.argv[2];
+const sourceRepo = process.argv[3];
+if (!reportPath || !sourceRepo) throw new Error("Usage: verify.ts <report-path> <recorded-source-root>; both offline inputs are required");
 const repo = resolve(import.meta.dir, "../../../.."), root = join(repo, ".curate-trial");
 const pool: Memory[] = JSON.parse(readFileSync(join(root, "pool.json"), "utf8"));
 const retained = JSON.parse(readFileSync(join(root, "sanitized-evidence.json"), "utf8"));
@@ -36,7 +39,7 @@ const checks: [string, () => void][] = [
             const refs = retained.suppliedEvidence[id].map((index: number) => retained.excerptCatalog[index]);
             if (JSON.stringify(refs) !== JSON.stringify(rows.map(e => ({ path: e.path, line: e.line, excerptHash: hash(e.text) })))) throw new Error(`Evidence mismatch: ${id}`);
             for (const row of rows) {
-                if (!files.has(row.path)) files.set(row.path, readFileSync(join(repo, row.path), "utf8").split("\n"));
+                if (!files.has(row.path)) files.set(row.path, readFileSync(join(sourceRepo, row.path), "utf8").split("\n"));
                 if (files.get(row.path)![row.line - 1]?.slice(0, 1600) !== row.text) throw new Error(`Source mismatch: ${row.path}:${row.line}`);
             }
         }
@@ -50,7 +53,7 @@ const checks: [string, () => void][] = [
         }
     }],
     ["privacy export contains no full active memory content", () => {
-        const paths = [...readdirSync(import.meta.dir).map(f => join(import.meta.dir, f)), join(repo, "docs/reports/curate-stale-retirement-trial.md")];
+        const paths = [...readdirSync(import.meta.dir).map(f => join(import.meta.dir, f)), reportPath];
         for (const path of paths) {
             const text = readFileSync(path, "utf8");
             for (const m of pool) {

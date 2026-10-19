@@ -1,4 +1,4 @@
-import { TASKS } from "./DreamerTasksField";
+import { TASKS } from "./dreamer-task-data";
 
 // Single source of truth for which magic-context config fields the dashboard
 // ConfigEditor surfaces. Enforced by config-parity.test.ts against the
@@ -19,13 +19,14 @@ import { TASKS } from "./DreamerTasksField";
  * derived instead of hand-maintained.
  */
 export const RENDERED_PREFIXES: readonly string[] = [
+  "smart_notes.enabled",
   // General
   "enabled",
   "allow_home_project",
   "language",
   "toast_duration_ms",
   // Memory & search
-  "mural",
+  "mural.enabled",
   // Context window (defaults and compact PerModelTable)
   "cache_ttl",
   "output_reserve",
@@ -145,14 +146,11 @@ export const OMITTED_BY_DESIGN: Readonly<Record<string, string>> = {
     "user-only inoperability policy; raw JSONC because project configs cannot change it",
   "smart_notes.retina_handoff":
     "external-events plane flip; stays raw JSONC until the retina consumer ships and the flag has a user-facing meaning",
-  // Listed as the exact leaf rather than omitting the whole `models` subtree, so
-  // a future sibling field still trips this gate instead of being absorbed by a
-  // prefix match.
-  "models.window_overlay_path":
-    "user-only Fusiform overlay path; raw JSONC because it is a filesystem location with a computed default (<dataDir>/fusiform/window-overlay.json), not a value worth a form widget",
   protected_tags:
     "deprecated and ignored by every runtime; retained only so existing files receive a migration warning",
   smart_drops: "deprecated and ignored; supersession is always on and old configs remain loadable",
+  "mural.model":
+    "deprecated and ignored; compress-cues uses each harness's dreamer model, set per task in the dreamer task list",
   debug_rpc:
     "developer-only diagnostics toggle (memory/heap endpoints on the local RPC); never a dashboard knob",
 };

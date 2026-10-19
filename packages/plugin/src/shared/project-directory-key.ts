@@ -20,6 +20,26 @@ export function projectDirectoryKey(directory: string): string {
     return path.resolve(directory);
 }
 
+/**
+ * Whether two spellings name the same directory, judged by spelling alone.
+ *
+ * Hosts and the plugin do not agree on how to write a directory: OpenCode 2 on
+ * Windows stores a session's directory as `D:/work/app` while the plugin's own
+ * location is `D:\work\app`, and a drive letter can arrive in either case.
+ * Both sides go through `projectDirectoryKey`, so separators, Windows case,
+ * `\\?\` prefixes, trailing separators and `.`/`..` segments cannot make one
+ * directory look like two. POSIX paths keep their case. Symlinks are not
+ * resolved here; callers that must follow them use `canonicalProjectDirectory`.
+ *
+ * An empty spelling never matches anything: `path.resolve("")` is the process's
+ * working directory, and a session with no recorded directory must not be
+ * taken for one in the directory the process happens to run in.
+ */
+export function sameProjectDirectory(a: string, b: string): boolean {
+    if (a.length === 0 || b.length === 0) return false;
+    return projectDirectoryKey(a) === projectDirectoryKey(b);
+}
+
 let realpathForCanonicalDirectory: (directory: string) => string = (directory) =>
     realpathSync.native(directory);
 

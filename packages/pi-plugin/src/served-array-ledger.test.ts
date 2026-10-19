@@ -1,14 +1,19 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import {
+	appendFileSync,
+	mkdirSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	statSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import * as storagePermissions from "@magic-context/core/shared/storage-permissions";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import {
 	__test,
@@ -48,6 +53,103 @@ function message(index: number): Record<string, unknown> {
 }
 
 describe("Pi served-array digest ledger", () => {
+	test("validates a warm legacy cache and reloads a peer append", () => {
+		const storageDir = temporaryDirectory();
+		capturePiServedArray("cache", [], { storageDir, servedTagNumbers: [3] });
+		const first = getPiServedTagNumbers("cache", storageDir);
+		expect([...first]).toEqual([3]);
+		expect(getPiServedTagNumbers("cache", storageDir)).toBe(first);
+		appendFileSync(
+			getPiServedTagNumbersPath("cache", storageDir),
+			`${JSON.stringify({ version: 1, session_id: "cache", tag_numbers: [99] })}\n`,
+		);
+		expect([...getPiServedTagNumbers("cache", storageDir)]).toEqual([3, 99]);
+	});
+
+	test("reloads a same-size legacy rewrite when its mtime changes", () => {
+		const storageDir = temporaryDirectory();
+		capturePiServedArray("mtime", [], { storageDir, servedTagNumbers: [3] });
+		const file = getPiServedTagNumbersPath("mtime", storageDir);
+		const beforeTime = new Date("2020-01-01T00:00:00Z");
+		utimesSync(file, beforeTime, beforeTime);
+		expect([...getPiServedTagNumbers("mtime", storageDir)]).toEqual([3]);
+		const before = statSync(file);
+		writeFileSync(
+			file,
+			`${JSON.stringify({ version: 1, session_id: "mtime", tag_numbers: [8] })}\n`,
+		);
+		utimesSync(file, beforeTime, new Date(beforeTime.getTime() + 1000));
+		expect(statSync(file).size).toBe(before.size);
+		expect(statSync(file).ino).toBe(before.ino);
+		expect([...getPiServedTagNumbers("mtime", storageDir)]).toEqual([8]);
+	});
+
+	test.skipIf(process.platform === "win32")(
+		"reloads an inode replacement with unchanged size and mtime",
+		() => {
+			const storageDir = temporaryDirectory();
+			capturePiServedArray("inode", [], { storageDir, servedTagNumbers: [3] });
+			const file = getPiServedTagNumbersPath("inode", storageDir);
+			const time = new Date("2020-01-01T00:00:00Z");
+			utimesSync(file, time, time);
+			expect([...getPiServedTagNumbers("inode", storageDir)]).toEqual([3]);
+			const before = statSync(file);
+			writeFileSync(
+				`${file}.replacement`,
+				`${JSON.stringify({ version: 1, session_id: "inode", tag_numbers: [8] })}\n`,
+			);
+			utimesSync(`${file}.replacement`, time, time);
+			renameSync(`${file}.replacement`, file);
+			expect(statSync(file).size).toBe(before.size);
+			expect(statSync(file).mtimeMs).toBe(before.mtimeMs);
+			expect(statSync(file).ino).not.toBe(before.ino);
+			expect([...getPiServedTagNumbers("inode", storageDir)]).toEqual([8]);
+		},
+	);
+
+	test("does not trust warm cached evidence after legacy file corruption", () => {
+		const storageDir = temporaryDirectory();
+		capturePiServedArray("warm-corrupt", [], {
+			storageDir,
+			servedTagNumbers: [3],
+		});
+		expect([...getPiServedTagNumbers("warm-corrupt", storageDir)]).toEqual([3]);
+		writeFileSync(
+			getPiServedTagNumbersPath("warm-corrupt", storageDir),
+			"not a served record\n",
+		);
+		expect(() => getPiServedTagNumbers("warm-corrupt", storageDir)).toThrow();
+	});
+
+	test("a peer append racing the local mirror remains visible to the next reader", () => {
+		const storageDir = temporaryDirectory();
+		const file = getPiServedTagNumbersPath("race", storageDir);
+		expect(getPiServedTagNumbers("race", storageDir).size).toBe(0);
+		const write = storagePermissions.writeStorageFileSync;
+		let reached = 0;
+		const writer = spyOn(
+			storagePermissions,
+			"writeStorageFileSync",
+		).mockImplementation((path, ...args) => {
+			if (path === file) {
+				reached++;
+				// Execute a peer's actual append after our read, before our own append.
+				appendFileSync(
+					file,
+					`${JSON.stringify({ version: 1, session_id: "race", tag_numbers: [99] })}\n`,
+				);
+			}
+			write(path, ...args);
+		});
+		try {
+			capturePiServedArray("race", [], { storageDir, servedTagNumbers: [3] });
+			expect(reached).toBe(1);
+			expect([...getPiServedTagNumbers("race", storageDir)]).toEqual([99, 3]);
+		} finally {
+			writer.mockRestore();
+		}
+	});
+
 	test("unreadable identity storage refuses instead of forgetting served numbers", () => {
 		const storageDir = temporaryDirectory();
 		capturePiServedArray("corrupt", ["§1§ served"], {
@@ -101,6 +203,34 @@ console.log(JSON.stringify([...getPiServedTagNumbers("restart", ${JSON.stringify
 			servedTagNumbers: [1],
 		});
 		expect([...getPiServedTagNumbers("literal", storageDir)]).toEqual([1]);
+	});
+	test("busy recovery records bytes without reading or writing tag identity state", () => {
+		const storageDir = temporaryDirectory();
+		const identityPath = getPiServedTagNumbersPath("busy", storageDir);
+		mkdirSync(dirname(identityPath), { recursive: true });
+		writeFileSync(identityPath, "unreadable identity state");
+		const db = new Proxy(
+			{},
+			{
+				get: () => {
+					throw new Error("Recovery consulted SQLite identity state");
+				},
+			},
+		);
+		const record = capturePiServedArray(
+			"busy",
+			["§1§ old prefix", "raw tail"],
+			{
+				storageDir,
+				db: db as never,
+				servedTagNumbers: [99],
+				recoveryWithoutTagState: true,
+			},
+		);
+		expect(record?.message_count).toBe(2);
+		expect(readFileSync(identityPath, "utf8")).toBe(
+			"unreadable identity state",
+		);
 	});
 	test("records served numbers across normal and detached LKG arrays after cleanup", () => {
 		const storageDir = temporaryDirectory();

@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as embedding from "@magic-context/core/features/magic-context/memory/embedding";
 import { getAutoSearchHintDecisions } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import {
+	deadlineClock,
+	nextLoopTurn,
+} from "@magic-context/core/hooks/magic-context/auto-search-clock.test";
 import { persistAutoSearchSkip } from "@magic-context/core/hooks/magic-context/auto-search-deadline";
 import { autoSearchTestSnapshot } from "@magic-context/core/hooks/magic-context/auto-search-snapshot.fixture";
 import * as search from "@magic-context/core/hooks/magic-context/auto-search-worker-client";
@@ -19,6 +23,7 @@ const db = createTestDb(
 );
 const options = {
 	enabled: true,
+	scoreThreshold: 0.6,
 	projectPath: "git:pi-deadline",
 	minPromptChars: 1,
 };
@@ -34,6 +39,8 @@ afterEach(() => snapshotSpy.mockRestore());
 afterAll(() => db.close());
 
 test("Pi aborts slow embeddings at the deadline and replays byte-identical skip on retry", async () => {
+	const clock = deadlineClock();
+	const entered = Promise.withResolvers<void>();
 	let signal: AbortSignal | undefined;
 	let release: ((value: null) => void) | undefined;
 	const spy = spyOn(embedding, "embedTextForProject").mockImplementation(
@@ -41,21 +48,24 @@ test("Pi aborts slow embeddings at the deadline and replays byte-identical skip 
 			signal = current;
 			return new Promise<null>((resolve) => {
 				release = resolve;
+				entered.resolve();
 			});
 		},
 	);
 	try {
 		const messages = [userMessage("explain historian cache wiring", 1)];
 		const before = JSON.stringify(messages);
-		const start = performance.now();
-		await runAutoSearchHintForPi({
+		const pending = runAutoSearchHintForPi({
 			db,
 			sessionId: "pi-slow",
 			messages,
 			entryIds: ["user"],
 			options,
 		});
-		expect(performance.now() - start).toBeLessThan(3150);
+		await entered.promise;
+		expect(signal?.aborted).toBe(false);
+		clock.expire();
+		await pending;
 		expect(signal?.aborted).toBe(true);
 		expect(JSON.stringify(messages)).toBe(before);
 		release?.(null);
@@ -83,14 +93,19 @@ test("Pi aborts slow embeddings at the deadline and replays byte-identical skip 
 	} finally {
 		release?.(null);
 		spy.mockRestore();
+		clock.restore();
 	}
 }, 6000);
 
 test("Pi bounds a synchronous SQLite search worker by the same turn deadline", async () => {
+	const clock = deadlineClock();
+	let searchSignal: AbortSignal | undefined;
+	const workerEntered = Promise.withResolvers<void>();
 	const realSearch = searchAutoHint;
 	const spy = spyOn(search, "searchAutoHint").mockImplementation(
-		(db, session, project, query, options) =>
-			realSearch(
+		(db, session, project, query, options) => {
+			searchSignal = options.signal;
+			return realSearch(
 				db,
 				session,
 				project,
@@ -100,35 +115,49 @@ test("Pi bounds a synchronous SQLite search worker by the same turn deadline", a
 					"../../plugin/src/hooks/magic-context/auto-search-blocking.fixture.ts",
 					import.meta.url,
 				),
-			),
+			);
+		},
 	);
-	const embed = spyOn(embedding, "embedTextForProject").mockResolvedValue(null);
+	const embed = spyOn(embedding, "embedTextForProject").mockImplementation(
+		async (_project, text) => {
+			if (text === "synchronous-fixture-entered") workerEntered.resolve();
+			return null;
+		},
+	);
 	try {
 		const messages = [userMessage("explain historian cache wiring", 1)];
 		const before = JSON.stringify(messages);
-		const start = performance.now();
-		await runAutoSearchHintForPi({
+		let served = false;
+		const pending = runAutoSearchHintForPi({
 			db,
 			sessionId: "pi-sync",
 			messages,
 			entryIds: ["user"],
 			options,
+		}).then(() => {
+			served = true;
 		});
-		expect(performance.now() - start).toBeLessThan(3150);
+		await workerEntered.promise;
+		await nextLoopTurn();
+		expect(served).toBe(false);
+		clock.expire();
+		expect(searchSignal?.aborted).toBe(true);
+		await pending;
 		expect(embed).toHaveBeenCalledTimes(1);
 		expect(JSON.stringify(messages)).toBe(before);
 	} finally {
 		spy.mockRestore();
 		embed.mockRestore();
+		clock.restore();
 	}
 }, 6000);
 
 test("Pi defers cold synchronous preparation without holding the served stage", async () => {
 	snapshotSpy.mockReturnValue(null);
 	let prepared = false;
+	const preparation = Promise.withResolvers<void>();
 	const messages = [userMessage("explain historian cache wiring", 1)];
 	const before = JSON.stringify(messages);
-	const start = performance.now();
 	await runAutoSearchHintForPi({
 		db,
 		sessionId: "pi-cold-preparation",
@@ -136,13 +165,12 @@ test("Pi defers cold synchronous preparation without holding the served stage", 
 		entryIds: ["cold-user"],
 		options,
 		ensureProjectRegistered: async () => {
-			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3600);
 			prepared = true;
+			preparation.resolve();
 		},
 	});
-	expect(performance.now() - start).toBeLessThan(3150);
 	expect(prepared).toBe(false);
 	expect(JSON.stringify(messages)).toBe(before);
-	await new Promise((resolve) => setTimeout(resolve, 0));
+	await preparation.promise;
 	expect(prepared).toBe(true);
 }, 7000);

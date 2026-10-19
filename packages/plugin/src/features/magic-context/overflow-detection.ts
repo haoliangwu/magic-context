@@ -206,8 +206,7 @@ function extractExplicitHttpStatus(error: unknown): number | undefined {
 /**
  * Classify Anthropic's thinking-prefix binding rejection (Claude Fable 5.1 and
  * Claude Opus 5.5). Only the stable phrase is matched; the surrounding prose
- * and SDK wrappers vary. The live 400 (captured in
- * docs/reports/anthropic-thinking-binding.md) carries no message id, only
+ * and SDK wrappers vary. The provider's 400 carries no message id, only
  * provider request-array paths, so the result never names a host message.
  * Source: https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
  */

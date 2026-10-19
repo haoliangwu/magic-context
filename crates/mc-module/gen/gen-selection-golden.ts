@@ -1,3 +1,4 @@
+import "./quiet-live-log";
 /**
  * Generate the differential SELECTION golden for the Rust mc-module port.
  *
@@ -300,7 +301,7 @@ function runTsSelector(spec: CaseSpec): Record<string, string> {
                 if (arc) expected[arc] = "drop";
             }
         } else if (spec.selector === "edit") {
-            const res = supersession.buildEditSupersessionReclaim({ db, sessionId: SES, targets });
+            const res = supersession.buildEditSupersessionReclaim({ watermark: spec.lastExecuteOrdinal ?? 0, db, sessionId: SES, targets });
             for (const op of res.ops) {
                 const arc = tagNumberToArc.get(op.tagId);
                 if (arc) expected[arc] = "edit_marker";
@@ -537,6 +538,17 @@ const cases: CaseSpec[] = [
         tags: [{ id: "c1", toolName: "bash", n: 1, byteSize: 8000 }],
     },
 ];
+
+// Marker fixtures model edits already distant at an earlier rebuild. Counts
+// below 250 tokens keep payload assertions on compression, not full removal.
+for (const spec of cases) {
+    if (spec.selector !== "edit") continue;
+    spec.lastExecuteOrdinal = Math.max(0, ...spec.tags.map((tag) => tag.n));
+    for (const tag of spec.tags) {
+        tag.tokenCount = 100;
+        tag.inputTokenCount = 0;
+    }
+}
 
 const golden: GoldenCase[] = cases.map((spec) => {
     const legacyExpected = runTsSelector(spec);

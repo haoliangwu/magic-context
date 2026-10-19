@@ -1,3 +1,4 @@
+import "./quiet-live-log";
 /**
  * DG-1..8 reference generator.
  *

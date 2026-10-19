@@ -8,6 +8,7 @@ import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getAutoSearchHintDecisions } from "../../features/magic-context/storage-meta-persisted";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { deadlineClock, nextLoopTurn } from "./auto-search-clock.test";
 import { persistAutoSearchSkip } from "./auto-search-deadline";
 import { runAutoSearchHint } from "./auto-search-runner";
 import { autoSearchTestSnapshot } from "./auto-search-snapshot.fixture";
@@ -43,6 +44,8 @@ afterEach(() => snapshotSpy.mockRestore());
 afterAll(() => db.close());
 
 test("slow embedding aborts at the deadline, freezes skip bytes, and cannot land late", async () => {
+    const clock = deadlineClock();
+    const entered = Promise.withResolvers<void>();
     let signal: AbortSignal | undefined;
     let release: ((value: null) => void) | undefined;
     const spy = spyOn(embedding, "embedTextForProject").mockImplementation(
@@ -50,15 +53,18 @@ test("slow embedding aborts at the deadline, freezes skip bytes, and cannot land
             signal = currentSignal;
             return new Promise<null>((resolve) => {
                 release = resolve;
+                entered.resolve();
             });
         },
     );
     try {
         const wire = messages();
         const before = JSON.stringify(wire);
-        const start = performance.now();
-        await runAutoSearchHint({ sessionId: "embedding", db, messages: wire, options });
-        expect(performance.now() - start).toBeLessThan(3150);
+        const pending = runAutoSearchHint({ sessionId: "embedding", db, messages: wire, options });
+        await entered.promise;
+        expect(signal?.aborted).toBe(false);
+        clock.expire();
+        await pending;
         expect(signal?.aborted).toBe(true);
         expect(JSON.stringify(wire)).toBe(before);
         await persistAutoSearchSkip(db, "embedding", "user");
@@ -66,7 +72,7 @@ test("slow embedding aborts at the deadline, freezes skip bytes, and cannot land
             { messageId: "user", decision: "no-hint", reason: "timeout" },
         ]);
         release?.(null);
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        await nextLoopTurn();
         const retry = messages();
         await runAutoSearchHint({ sessionId: "embedding", db, messages: retry, options });
         expect(JSON.stringify(retry)).toBe(before);
@@ -74,34 +80,55 @@ test("slow embedding aborts at the deadline, freezes skip bytes, and cannot land
     } finally {
         release?.(null);
         spy.mockRestore();
+        clock.restore();
     }
 }, 6000);
 
-test("slow synchronous search returns the stage within deadline plus 150ms", async () => {
-    const embed = spyOn(embedding, "embedTextForProject").mockResolvedValue(null);
+test("a blocked synchronous search worker yields the owner and is aborted at its deadline", async () => {
+    const clock = deadlineClock();
+    let searchSignal: AbortSignal | undefined;
+    const workerEntered = Promise.withResolvers<void>();
+    const embed = spyOn(embedding, "embedTextForProject").mockImplementation(
+        async (_project, text) => {
+            if (text === "synchronous-fixture-entered") workerEntered.resolve();
+            return null;
+        },
+    );
     const realSearch = searchAutoHint;
     const spy = spyOn(search, "searchAutoHint").mockImplementation(
-        (db, sessionId, projectPath, query, options) =>
-            realSearch(
+        (db, sessionId, projectPath, query, options) => {
+            searchSignal = options.signal;
+            return realSearch(
                 db,
                 sessionId,
                 projectPath,
                 query,
                 options,
                 new URL("./auto-search-blocking.fixture.ts", import.meta.url),
-            ),
+            );
+        },
     );
     try {
         const wire = messages();
         const before = JSON.stringify(wire);
-        const start = performance.now();
-        await runAutoSearchHint({ sessionId: "sync", db, messages: wire, options });
-        expect(performance.now() - start).toBeLessThan(3150);
+        let served = false;
+        const pending = runAutoSearchHint({ sessionId: "sync", db, messages: wire, options }).then(
+            () => {
+                served = true;
+            },
+        );
+        await workerEntered.promise;
+        await nextLoopTurn();
+        expect(served).toBe(false);
+        clock.expire();
+        expect(searchSignal?.aborted).toBe(true);
+        await pending;
         expect(embed).toHaveBeenCalledTimes(1);
         expect(JSON.stringify(wire)).toBe(before);
     } finally {
         spy.mockRestore();
         embed.mockRestore();
+        clock.restore();
     }
 }, 6000);
 
@@ -141,6 +168,8 @@ test("worker hint bytes match the original search and the pre-change golden payl
 });
 
 test("late search results cannot mutate this turn or a later pass's bytes", async () => {
+    const clock = deadlineClock();
+    const entered = Promise.withResolvers<void>();
     let release:
         | ((results: import("../../features/magic-context/search").UnifiedSearchResult[]) => void)
         | undefined;
@@ -148,12 +177,16 @@ test("late search results cannot mutate this turn or a later pass's bytes", asyn
         () =>
             new Promise((resolve) => {
                 release = resolve;
+                entered.resolve();
             }),
     );
     try {
         const wire = messages();
         const before = JSON.stringify(wire);
-        await runAutoSearchHint({ sessionId: "late", db, messages: wire, options });
+        const pending = runAutoSearchHint({ sessionId: "late", db, messages: wire, options });
+        await entered.promise;
+        clock.expire();
+        await pending;
         release?.([
             {
                 source: "memory",
@@ -164,25 +197,24 @@ test("late search results cannot mutate this turn or a later pass's bytes", asyn
                 matchType: "fts",
             },
         ]);
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        await nextLoopTurn();
         expect(JSON.stringify(wire)).toBe(before);
         const replay = messages();
-        const start = performance.now();
         await runAutoSearchHint({ sessionId: "late", db, messages: replay, options });
-        expect(performance.now() - start).toBeLessThan(100);
         expect(JSON.stringify(replay)).toBe(before);
         expect(spy).toHaveBeenCalledTimes(1);
     } finally {
         spy.mockRestore();
+        clock.restore();
     }
 }, 6000);
 
 test("cold synchronous preparation is deferred beyond the served stage", async () => {
     const snapshot = snapshotSpy.mockReturnValue(null);
     let prepared = false;
+    const preparation = Promise.withResolvers<void>();
     const wire = messages();
     const before = JSON.stringify(wire);
-    const start = performance.now();
     try {
         await runAutoSearchHint({
             db,
@@ -192,15 +224,14 @@ test("cold synchronous preparation is deferred beyond the served stage", async (
                 ...options,
                 directory: "/synthetic-project",
                 ensureProjectRegistered: async () => {
-                    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3600);
                     prepared = true;
+                    preparation.resolve();
                 },
             },
         });
-        expect(performance.now() - start).toBeLessThan(3150);
         expect(prepared).toBe(false);
         expect(JSON.stringify(wire)).toBe(before);
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await preparation.promise;
         expect(prepared).toBe(true);
     } finally {
         snapshot.mockRestore();
@@ -263,6 +294,7 @@ test("worker preserves the owner's busy-host backfill gate and hint bytes", asyn
 });
 
 test("concurrent passes join one read and replay the owner's decision", async () => {
+    const entered = Promise.withResolvers<void>();
     let release:
         | ((results: import("../../features/magic-context/search").UnifiedSearchResult[]) => void)
         | undefined;
@@ -270,6 +302,7 @@ test("concurrent passes join one read and replay the owner's decision", async ()
         () =>
             new Promise((resolve) => {
                 release = resolve;
+                entered.resolve();
             }),
     );
     const firstWire = messages();
@@ -287,7 +320,7 @@ test("concurrent passes join one read and replay the owner's decision", async ()
         options,
     });
     try {
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await entered.promise;
         expect(getAutoSearchHintDecisions(db, "concurrent-read")).toEqual([]);
         release?.([
             {
@@ -318,17 +351,19 @@ test("session cleanup discards a pending search result without recreating its de
     let release!: (
         results: import("../../features/magic-context/search").UnifiedSearchResult[],
     ) => void;
+    const entered = Promise.withResolvers<void>();
     const results = spyOn(search, "searchAutoHint").mockImplementation(
         () =>
             new Promise((resolve) => {
                 release = resolve;
+                entered.resolve();
             }),
     );
     try {
         const wire = messages();
         const before = JSON.stringify(wire);
         const pending = runAutoSearchHint({ db, sessionId, messages: wire, options });
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await entered.promise;
         clearSession(db, sessionId);
         clearAutoSearchForSession(sessionId);
         release([

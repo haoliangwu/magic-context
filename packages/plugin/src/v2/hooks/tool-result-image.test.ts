@@ -7,6 +7,7 @@ import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getTailHygieneTags } from "../../features/magic-context/storage-tags";
 import { createTagger } from "../../features/magic-context/tagger";
 import { estimateMessageTokens } from "../../hooks/magic-context/final-wire-token-estimate";
+import { stripProcessedImages } from "../../hooks/magic-context/strip-content";
 import { type MessageLike, tagMessages } from "../../hooks/magic-context/tag-messages";
 import { measureTailHygiene } from "../../hooks/magic-context/tail-hygiene-walk";
 import { Database } from "../../shared/sqlite";
@@ -131,7 +132,10 @@ describe("a tool result carrying an image, through the tagging pass", () => {
             ],
         });
         expect((result?.result as { value: unknown[] }).value[1]).toBe(fileEntry);
-        for (const message of draft.messages) expect(() => Message.make(message)).not.toThrow();
+        for (const message of draft.messages)
+            expect(() =>
+                Message.make(message as unknown as Parameters<typeof Message.make>[0]),
+            ).not.toThrow();
     });
 
     it("OpenCode 1: tags the text output, leaves the attachment untouched, and bills it by pixels", () => {
@@ -168,4 +172,68 @@ describe("a tool result carrying an image, through the tagging pass", () => {
         expect(state.attachments[0]).toBe(attachment);
         expect(tag.token_count).toBe(textOnlyTokens() + IMAGE_TOKENS);
     });
+});
+
+it("issue 699 OpenCode 2 commits processed-image strips and replays the same non-empty result", () => {
+    const file = { type: "file", uri: DATA_URL, mime: "image/png" };
+    const pdf = { type: "file", uri: "data:application/pdf;base64,abc", mime: "application/pdf" };
+    const source: V2Message[] = [
+        {
+            id: "tool-owner",
+            role: "assistant",
+            content: [{ type: "tool-call", id: "read", name: "read", input: {} }],
+        },
+        {
+            role: "tool",
+            content: [
+                {
+                    type: "tool-result",
+                    id: "read",
+                    name: "read",
+                    result: { type: "content", value: [file, pdf] },
+                },
+            ],
+        },
+        { id: "answer", role: "assistant", content: [{ type: "text", text: "seen" }] },
+    ];
+    const frozen = new Set<string>();
+    const serve = (detect: boolean) => {
+        const draft: SessionContext = {
+            sessionID: SESSION,
+            model: { providerID: "openai", id: "model" },
+            agent: "build",
+            messages: structuredClone(source),
+            system: [],
+            tools: {},
+            options: {},
+        };
+        const payload = adaptPayload(draft);
+        stripProcessedImages(payload.messages, frozen, {
+            detect,
+            watermark: 1,
+            messageTagNumbers: new Map([[payload.messages[0], 1]]),
+            persistNewIds: (ids) => {
+                for (const id of ids) frozen.add(id);
+                return true;
+            },
+        });
+        payload.commit();
+        return draft.messages;
+    };
+    const untouched = serve(false);
+    expect(JSON.stringify(untouched)).toContain(DATA_URL);
+    const rewritten = serve(true);
+    expect(JSON.stringify(rewritten)).not.toContain(DATA_URL);
+    const result = rewritten
+        .flatMap((msg) => msg.content)
+        .find((part) => part.type === "tool-result");
+    expect(result?.result).toEqual({
+        type: "content",
+        value: [{ type: "text", text: "[image stripped]" }, pdf],
+    });
+    expect(JSON.stringify(serve(false))).toBe(JSON.stringify(rewritten));
+    for (const msg of rewritten)
+        expect(() =>
+            Message.make(msg as unknown as Parameters<typeof Message.make>[0]),
+        ).not.toThrow();
 });

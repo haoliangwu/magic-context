@@ -3,8 +3,12 @@ import golden from "../../../../../crates/mc-module/testdata/processed-image-tri
 import { stripProcessedImages } from "./strip-content";
 import type { MessageLike } from "./tag-messages";
 
-it("processed images match Rust's dropped-watermark golden, independent of reasoning retention", () => {
+it("processed images preserve dropped-watermark golden cases except superseded age-zero eligibility", () => {
     for (const scenario of golden.cases) {
+        // This historical case assigned untagged images age zero. Their next
+        // tagged message is 200, so a dropped watermark of 1 must now retain them.
+        const changedAgeCase =
+            scenario.name === "an untagged answered image retires when a drop watermark exists";
         const messages = scenario.steps.map((step) => ({
             info: { id: step.id, role: step.role },
             parts: step.image
@@ -27,7 +31,7 @@ it("processed images match Rust's dropped-watermark golden, independent of reaso
         });
         expect({ name: scenario.name, selected: outcome.newlyStrippedIds }).toEqual({
             name: scenario.name,
-            selected: scenario.selected,
+            selected: changedAgeCase ? [] : scenario.selected,
         });
         const after = messages
             .filter(
@@ -38,7 +42,7 @@ it("processed images match Rust's dropped-watermark golden, independent of reaso
             .map((message) => message.info.id);
         expect({ name: scenario.name, after }).toEqual({
             name: scenario.name,
-            after: scenario.removed_after,
+            after: changedAgeCase ? [] : scenario.removed_after,
         });
     }
 });

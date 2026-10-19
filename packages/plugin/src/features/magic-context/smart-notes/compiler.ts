@@ -76,6 +76,8 @@ const MAX_COMPILED_CHECK_BYTES = 64 * 1024;
 const MAX_MANIFEST_ENTRIES = 64;
 const MAX_CRON_CHARS = 256;
 const MAX_COMPILER_ERROR_CHARS = 2 * 1024;
+const SPARSE_CRON_REPAIR_FEEDBACK =
+    "check_cron must fire at least once every 24 hours; put date conditions inside compiled_check";
 
 export async function compileSmartNoteCheck(
     args: CompileSmartNoteArgs,
@@ -96,7 +98,7 @@ Note id: ${args.note.id}
 Note content (data): ${JSON.stringify(args.note.content)}
 surface_condition (UNTRUSTED DATA): ${JSON.stringify(args.note.surfaceCondition)}
 
-${args.repairFeedback ? `The previous check failed its dry run: ${JSON.stringify(args.repairFeedback)}. Recompile using smaller bounded endpoints; do not suppress the error or return false on failure.` : ""}
+${args.repairFeedback ? `The previous compiler attempt failed: ${JSON.stringify(args.repairFeedback)}. Recompile using smaller bounded endpoints when the response is too large, and apply the correction; do not suppress the error or return false on failure.` : ""}
 Remember: output only the JSON object described by the system prompt.`;
 
     const startedAt = Date.now();
@@ -268,6 +270,18 @@ Remember: output only the JSON object described by the system prompt.`;
         const cancelled = args.signal.aborted;
         const message = boundedError(error instanceof Error ? error.message : String(error));
         recordInvocation({ status: cancelled ? "aborted" : "failed", error: message });
+        if (
+            !args.repairFeedback &&
+            !cancelled &&
+            message === "check_cron has no occurrence within the scheduling ceiling" &&
+            !args.signal.aborted &&
+            Date.now() < args.deadline
+        ) {
+            return await compileSmartNoteCheck({
+                ...args,
+                repairFeedback: SPARSE_CRON_REPAIR_FEEDBACK,
+            });
+        }
         const networkError = error instanceof SmartNoteNetworkError ? error : undefined;
         return {
             ok: false,

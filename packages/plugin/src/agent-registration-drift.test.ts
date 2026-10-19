@@ -15,6 +15,7 @@ import {
 import {
     buildHiddenAgentConfig,
     buildHiddenAgentRegistrations,
+    buildZenReadAgentRegistrations,
     HIDDEN_AGENT_DESCRIPTION_MARKER,
 } from "./agents/hidden-agent-registrations";
 import {
@@ -80,6 +81,41 @@ describe("hidden-agent registration drift guard", () => {
                 HISTORIAN_RECOMP_AGENT,
             ].sort(),
         );
+    });
+
+    test("Zen compatibility carriers remain hidden primary agents with Task routing denied", () => {
+        const carriers = buildZenReadAgentRegistrations(regs);
+        expect(carriers.map((carrier) => carrier.id).sort()).toEqual(
+            [
+                "dreamer-classifier-zen-blocked-read",
+                "dreamer-reviewer-zen-blocked-read",
+                "smart-note-compiler-zen-blocked-read",
+                "historian-zen-blocked-read",
+                "historian-recomp-zen-blocked-read",
+                "historian-editor-zen-blocked-read",
+            ].sort(),
+        );
+        for (const carrier of carriers) {
+            expect(carrier.mode).toBe("primary");
+            expect(carrier.hidden).toBe(true);
+            const config = buildHiddenAgentConfig(
+                carrier.prompt ?? "prompt",
+                carrier.allowedTools,
+                carrier.maxSteps,
+                carrier.overrides,
+                carrier.id,
+                true,
+                carrier.description,
+            );
+            expect(config.mode).toBe("primary");
+            expect(config.hidden).toBe(true);
+            const routed = denyTaskRoutingToCallerAgents(
+                { [carrier.id]: config },
+                carriers.map((item) => item.id),
+            );
+            const task = (routed.build.permission as { task: Record<string, string> }).task;
+            expect(task[carrier.id]).toBe("deny");
+        }
     });
 
     test("registers opt-in historian temperature on every historian agent", () => {

@@ -449,9 +449,10 @@ describe("path fence", () => {
         const danglingLink = join(home, "dangling-link");
         await mkdir(join(missingTarget, ".."), { recursive: true });
         await symlink(missingTarget, danglingLink);
+        // Reject dangling links as unreadable before checking whether their targets are fenced.
         await expect(
             poll({ kind: "path_exists", path: danglingLink, gone: true }, null, home),
-        ).rejects.toMatchObject({ code: "fenced_path" });
+        ).rejects.toMatchObject({ code: "unreadable_path" });
     });
 
     test("admits every documented file-granular carve-in", async () => {

@@ -102,6 +102,7 @@ export {
 export {
     type AcquireWrapupResult,
     type AppendAutoSearchHintOutcome,
+    AUTO_SEARCH_DECISION_SOFT_LIMIT,
     type AutoSearchHintDecision,
     acquireWrapupInProgress,
     addProcessedImageStrippedIds,
@@ -133,6 +134,7 @@ export {
     DRAIN_WINDOW_MS,
     deliverNoteNudgeAtomic,
     describeProtectedTailDrainBudgetSkip,
+    flushAutoSearchHintDecisionRetirement,
     getAutoSearchHintDecisions,
     getChannel1NudgeState,
     getChannel2NudgeClaim,
@@ -184,6 +186,7 @@ export {
     protectedTailWindowBudget,
     pruneAutoSearchHintDecisions,
     pruneNoteNudgeAnchors,
+    queueAutoSearchHintDecisionRetirement,
     recordDetectedContextLimit,
     recordHistorianDrainFailure,
     recordOverflowDetected,

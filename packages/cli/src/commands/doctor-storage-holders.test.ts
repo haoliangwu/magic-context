@@ -77,7 +77,17 @@ test.skipIf(process.platform === "win32")(
                 child.once("spawn", resolve);
                 child.once("error", reject);
             });
-            expect(processReferencesStorage(child.pid as number, target)).toBe(true);
+            // "spawn" can fire before the child has exec'd; until then the
+            // process still shows the parent's environment. Poll briefly for the
+            // child's own environment instead of reading it once.
+            const pid = child.pid as number;
+            const deadline = Date.now() + 5_000;
+            let seen = processReferencesStorage(pid, target);
+            while (!seen && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                seen = processReferencesStorage(pid, target);
+            }
+            expect(seen).toBe(true);
             expect(processReferencesStorage(child.pid as number, `${target}-other`)).toBe(false);
         } finally {
             child.kill();

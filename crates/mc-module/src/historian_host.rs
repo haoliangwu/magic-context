@@ -26,6 +26,37 @@ pub enum HostRunReport {
     /// (`chain_exhausted`, `no_models`, …) and lands in the failure taxonomy the
     /// same way a producer error does.
     Failed { code: String, message: String },
+    /// Attempts travel with the report so a duplicate or expired report cannot record spend twice.
+    WithInvocations {
+        report: Box<HostRunReport>,
+        invocations: Vec<mc_store::HistorianInvocation>,
+    },
+}
+
+impl HostRunReport {
+    pub(crate) fn record_invocations(
+        self,
+        store: &mc_store::McStore,
+        session_id: &str,
+        harness: &str,
+    ) -> Self {
+        match self {
+            Self::WithInvocations {
+                report,
+                invocations,
+            } => {
+                store.record_historian_invocations(
+                    session_id,
+                    harness,
+                    "historian",
+                    &invocations,
+                    None,
+                );
+                *report
+            }
+            report => report,
+        }
+    }
 }
 
 /// Where one queued run stands, as far as its in-process waiter is concerned.

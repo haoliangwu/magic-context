@@ -1,3 +1,4 @@
+import "./quiet-live-log";
 import { computeProtectionWindow } from "../../../packages/plugin/src/features/magic-context/protection-window.ts"
 
 // Mirror the canonical fixtures in protection-window.test.ts, retaining their labels and identities.

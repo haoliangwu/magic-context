@@ -1,7 +1,4 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import {
 	getOrCreateSessionMeta,
 	getTagsBySession,
@@ -10,11 +7,7 @@ import {
 import * as loggerModule from "@magic-context/core/shared/logger";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
-import {
-	clearWindowOverlayCacheForTest,
-	setWindowOverlayPath,
-} from "@magic-context/core/shared/window-geometry";
-import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
+import { clearWindowGeometryLogForTest } from "@magic-context/core/shared/window-geometry";
 
 import {
 	awaitInFlightHistorians,
@@ -132,7 +125,7 @@ function setup(sessionId: string) {
 			sessionId,
 			message,
 			piContextWindow: MODEL.contextWindow,
-			piContextWindowSource: "catalog",
+			piContextWindowSource: "observed",
 			piModel: MODEL,
 			piTokens,
 			piTokensIsRawBranchEstimate: retried,
@@ -216,6 +209,7 @@ function codexUsage(promptTokens: number) {
 describe("Pi usage readings above the model window (issue 534 replay)", () => {
 	afterEach(() => {
 		mock.restore();
+		clearWindowGeometryLogForTest();
 	});
 
 	it("ignores Pi's 425K estimate on a 272K window: no emergency, drops, or historian force", async () => {
@@ -459,49 +453,13 @@ describe("isPiLiveUsageRawBranchEstimate", () => {
 	});
 });
 
-// A measured overlay cell for the model: the strongest configured window the
-// resolver knows, and the one a provider report above 272K contradicts.
-function use272kOverlay(): () => void {
-	const dir = createTestTempDirFromPath(join(tmpdir(), "pi-534-overlay-"));
-	const overlayPath = join(dir, "window-overlay.json");
-	writeFileSync(
-		overlayPath,
-		JSON.stringify({
-			schema: "fusiform-window-overlay/v1",
-			generated_at: "2026-09-11T00:00:00Z",
-			minted_provider_ids: [],
-			cells: [
-				{
-					provider_id: MODEL.provider,
-					model_id: MODEL.id,
-					facts: {
-						"window.enforced": {
-							value: { kind: "stated", value: MODEL.contextWindow },
-							grade: "measured",
-							units: "provider",
-							boundary: "Observed",
-							source_ref: "issue 534 follow-up fixture",
-							observed_at: "2026-09-11T00:00:00Z",
-						},
-					},
-				},
-			],
-		}),
-	);
-	setWindowOverlayPath(overlayPath);
-	return () => {
-		setWindowOverlayPath(undefined);
-		clearWindowOverlayCacheForTest();
-		rmSync(dir, { recursive: true, force: true });
-	};
-}
-
 describe("Pi provider usage above the configured window", () => {
 	afterEach(() => {
 		mock.restore();
+		clearWindowGeometryLogForTest();
 	});
 
-	it("rejects provider-reported input above the 272K overlay on every pass", async () => {
+	it("rejects provider-reported input above the configured 272K window on every pass", async () => {
 		const sessionId = "ses-issue-534-provider-above-window";
 		const logs: string[] = [];
 		spyOn(loggerModule, "sessionLog").mockImplementation(
@@ -509,7 +467,6 @@ describe("Pi provider usage above the configured window", () => {
 				logs.push(parts.map(String).join(" "));
 			},
 		);
-		const restoreOverlay = use272kOverlay();
 		const { db, runPass, messageEnd, droppedToolCount } = setup(sessionId);
 		const emergencyPasses = () =>
 			logs.filter((line) => line.includes("EMERGENCY=true")).length;
@@ -527,13 +484,13 @@ describe("Pi provider usage above the configured window", () => {
 			expect(emergencyPasses()).toBe(0);
 
 			// Even a successful reply can carry aggregate billing usage. It does
-			// not measure a single request when it exceeds the overlay window.
+			// not measure a single request when it exceeds the configured window.
 			await messageEnd(
 				assistantMessage("ok", 92, codexUsage(300_000)),
 				300_000,
 			);
 			expect(getOrCreateSessionMeta(db, sessionId).lastInputTokens).toBe(0);
-			await runPass(300_000);
+			await runPass(147_839);
 			await awaitInFlightHistorians();
 			expect(emergencyPasses()).toBe(0);
 			expect(droppedToolCount()).toBe(0);
@@ -544,11 +501,10 @@ describe("Pi provider usage above the configured window", () => {
 				310_000,
 			);
 			expect(getOrCreateSessionMeta(db, sessionId).lastInputTokens).toBe(0);
-			await runPass(310_000);
+			await runPass(147_839);
 			await awaitInFlightHistorians();
 			expect(emergencyPasses()).toBe(0);
 		} finally {
-			restoreOverlay();
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
 		}

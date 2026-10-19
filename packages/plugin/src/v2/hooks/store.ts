@@ -110,6 +110,7 @@ export interface V2RawMessageReader {
     findPartsById(sessionID: string, messageID: string): RawMessageParts | null;
     hasById(sessionID: string, messageID: string): boolean;
     ordinalOf(sessionID: string, messageID: string): number | null;
+    orderOf?(sessionID: string, messageID: string): number | null;
     ordinalMapForRange(
         sessionID: string,
         fromOrdinal: number,
@@ -280,6 +281,14 @@ export function createV2RawMessageReader(openReader: () => V2StoreReader): V2Raw
                 reader.close();
             }
         },
+        orderOf: (sessionID: string, messageID: string) => {
+            const reader = openReader();
+            try {
+                return reader.sequenceForId(sessionID, messageID) ?? null;
+            } finally {
+                reader.close();
+            }
+        },
         ordinalMapForRange: (sessionID: string, fromOrdinal: number, toOrdinal: number) => {
             const reader = openReader();
             try {
@@ -346,6 +355,12 @@ export function createV2RawMessageProvider(
         readMessagePartsById: (messageID) => reader.findPartsById(sessionID, messageID),
         hasMessageById: (messageID) => reader.hasById(sessionID, messageID),
         readMessageOrdinalById: (messageID) => reader.ordinalOf(sessionID, messageID),
+        ...(reader.orderOf
+            ? {
+                  readMessageOrderById: (messageID: string) =>
+                      reader.orderOf?.(sessionID, messageID) ?? null,
+              }
+            : {}),
         readMessageIdOrdinalsForRange: (fromOrdinal, toOrdinal) =>
             reader.ordinalMapForRange(sessionID, fromOrdinal, toOrdinal),
         readMessageOrdinalPage: (after, limit) => reader.readOrdinalPage(sessionID, after, limit),

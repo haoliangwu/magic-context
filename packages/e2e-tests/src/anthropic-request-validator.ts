@@ -1,6 +1,7 @@
 /**
  * Anthropic-style request checks for mock-provider drives: tool_use/tool_result
- * pairing and the no-prefill rule (a request may not end on an assistant turn).
+ * pairing, the no-prefill rule (a request may not end on an assistant turn),
+ * non-empty text blocks, and the placement of in-conversation system messages.
  * A drive installs `anthropicViolation` as its first mock matcher and answers a
  * violating request with a 400, the way the real API does.
  */
@@ -21,15 +22,62 @@ export function blocks(message: WireMessage | undefined): Block[] {
         : [{ type: "text", text: String(message.content) }];
 }
 
+/**
+ * Where a text block with empty text sits in the request, or null. The real
+ * API answers any such block, in the top-level system array, in any message
+ * (including an in-conversation `system` message) or inside a tool_result,
+ * with HTTP 400 `messages: text content blocks must be non-empty`.
+ */
+export function emptyTextBlock(body: Record<string, unknown>): string | null {
+    const isEmptyText = (block: unknown) =>
+        !!block &&
+        typeof block === "object" &&
+        (block as Block).type === "text" &&
+        (block as Block).text === "";
+    if (Array.isArray(body.system)) {
+        const index = body.system.findIndex(isEmptyText);
+        if (index >= 0) return `system.${index}`;
+    }
+    const messages = Array.isArray(body.messages) ? (body.messages as WireMessage[]) : [];
+    for (let index = 0; index < messages.length; index += 1) {
+        const content = messages[index]!.content;
+        if (content === "") return `messages.${index}.content`;
+        if (!Array.isArray(content)) continue;
+        for (let blockIndex = 0; blockIndex < content.length; blockIndex += 1) {
+            const block = content[blockIndex] as Block;
+            if (isEmptyText(block)) return `messages.${index}.content.${blockIndex}`;
+            if (block?.type === "tool_result" && Array.isArray(block.content)) {
+                const inner = (block.content as unknown[]).findIndex(isEmptyText);
+                if (inner >= 0)
+                    return `messages.${index}.content.${blockIndex}.content.${inner}`;
+            }
+        }
+    }
+    return null;
+}
+
 /** Anthropic-style request validation: returns the first violation, if any. */
 export function anthropicViolation(body: Record<string, unknown>): string | null {
     const messages = body.messages as WireMessage[] | undefined;
     if (!Array.isArray(messages) || messages.length === 0) return null;
+    const empty = emptyTextBlock(body);
+    if (empty) return `${empty}: text content blocks must be non-empty`;
     if (messages.at(-1)?.role === "assistant") {
         return "This model does not support assistant message prefill";
     }
     for (let index = 0; index < messages.length; index += 1) {
         const message = messages[index]!;
+        if (message.role === "system") {
+            // OpenCode 2 sends an in-conversation system update this way for Claude
+            // models that accept one; the API takes it only after a user turn
+            // (tool results count), never first or after an assistant turn. The
+            // host may send several updates in a row after that user turn.
+            const before = messages.slice(0, index).findLast((m) => m.role !== "system");
+            if (before?.role !== "user") {
+                return `messages.${index}: a system message must follow a user turn`;
+            }
+            continue;
+        }
         if (message.role === "assistant") {
             const next = messages[index + 1];
             const answered = new Set(

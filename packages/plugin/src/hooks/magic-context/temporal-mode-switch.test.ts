@@ -20,6 +20,7 @@ import { createTestTempDir } from "../../shared/test-temp-dir";
 import { resetLkgSlotsForTest } from "./lkg-slot";
 import { buildModuleStateSyncPayload } from "./module-state-sync";
 import { encodeOpenCodeMessagesToCk } from "./module-wire";
+import { requestPendingMaterialization } from "./pending-materialization";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import { createTransform } from "./transform";
 
@@ -76,7 +77,8 @@ it("TS mode-switch rebuild retains its own frozen choice and subsequent defers a
     resetLkgSlotsForTest();
     const id = mode.request.session_id;
     try {
-        const pending = new Set([id]);
+        const pending = new Set<string>();
+        requestPendingMaterialization(pending, id, "user_flush");
         const transform = createTransform({
             db,
             tagger: createTagger(),
@@ -114,7 +116,7 @@ it("TS mode-switch rebuild retains its own frozen choice and subsequent defers a
         expect(encodeOpenCodeMessagesToCk(raw)).toEqual(mode.request.messages);
         // Returning to TS is explicitly priced, not a claim of equality with
         // what the cold Rust engine chose on its own rebuilding pass.
-        pending.add(id);
+        requestPendingMaterialization(pending, id, "user_flush");
         const switched = structuredClone(raw);
         await transform({}, { messages: switched });
         expect(users(switched)).toEqual(mode.ts_users);

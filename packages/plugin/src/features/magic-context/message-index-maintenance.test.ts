@@ -18,7 +18,13 @@ import {
 import { runMigrations } from "./migrations";
 import { advanceSessionActivity, readSessionActivity } from "./session-activity";
 import { initializeDatabase } from "./storage-db";
+import { clearSession } from "./storage-meta-session";
 import { deleteSessionScopedRows } from "./storage-session-tables";
+import {
+    tagIdentityRevisionKey,
+    tagRevisionKey,
+    tagTombstoneOwnerRange,
+} from "./storage-tag-identity-revision";
 
 const tempDirectories: string[] = [];
 
@@ -524,4 +530,76 @@ describe("message history orphan sweep on OpenCode 2", () => {
             closeQuietly(db);
         }
     });
+});
+
+test("orphan sweep discovers tombstone-only sessions and preserves live-host and Pi epochs", () => {
+    const previous = getHarness();
+    const db = createStoreDb();
+    const epochs = (id: string) =>
+        db
+            .prepare(
+                "SELECT key FROM schema_migrations_meta WHERE key IN (?, ?) OR (key >= ? AND key < ?)",
+            )
+            .all(tagIdentityRevisionKey(id), tagRevisionKey(id), ...tagTombstoneOwnerRange(id));
+    try {
+        setHarness("opencode");
+        for (const [id, harness] of [
+            ["deleted-tombstone", "opencode"],
+            ["live-tombstone", "opencode"],
+            ["pi-tombstone", "pi"],
+        ]) {
+            db.prepare(
+                "INSERT INTO tags(session_id,message_id,type,status,tag_number,byte_size,harness) VALUES (?, 'm','message','active',1,1,?)",
+            ).run(id, harness);
+            clearSession(db, id);
+            expect(epochs(id).length).toBeGreaterThan(0);
+        }
+        const source = createOpenCodeDb(["live-tombstone"]);
+        const result = sweepOrphanedOpenCodeMessageIndexes(db, () => new Database(source), {
+            now: 10000,
+            safetyAgeMs: 0,
+            cooldownMs: 0,
+        });
+        expect(result).toMatchObject({ status: "swept", scanned: 2, deleted: 1 });
+        expect(epochs("deleted-tombstone")).toEqual([]);
+        expect(epochs("live-tombstone").length).toBeGreaterThan(0);
+        expect(epochs("pi-tombstone").length).toBeGreaterThan(0);
+    } finally {
+        db.close();
+        _resetHarnessForTesting();
+        setHarness(previous);
+    }
+});
+
+test("harness-scoped orphan retirement keeps another harness's tombstone-only epoch", () => {
+    const previous = getHarness();
+    const db = createStoreDb();
+    const epochs = () =>
+        db
+            .prepare("SELECT key FROM schema_migrations_meta WHERE key IN (?, ?)")
+            .all(tagIdentityRevisionKey("shared-tombstone"), tagRevisionKey("shared-tombstone"));
+    try {
+        setHarness("opencode");
+        for (const harness of ["opencode", "pi"]) {
+            db.prepare(
+                "INSERT INTO tags(session_id,message_id,type,status,tag_number,byte_size,harness) VALUES ('shared-tombstone','m','message','active',1,1,?)",
+            ).run(harness);
+            clearSession(db, "shared-tombstone");
+        }
+        const source = createOpenCodeDb([]);
+        expect(
+            sweepOrphanedOpenCodeMessageIndexes(db, () => new Database(source), {
+                now: 10000,
+                safetyAgeMs: 0,
+                cooldownMs: 0,
+            }),
+        ).toMatchObject({ status: "swept", deleted: 1 });
+        expect(epochs().length).toBe(2);
+        clearSession(db, "shared-tombstone", false, true);
+        expect(epochs()).toEqual([]);
+    } finally {
+        db.close();
+        _resetHarnessForTesting();
+        setHarness(previous);
+    }
 });

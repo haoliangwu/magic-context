@@ -19,7 +19,12 @@ function sourceFiles(directory: string): string[] {
         const path = join(directory, entry.name);
         if (entry.isDirectory()) {
             result.push(...sourceFiles(path));
-        } else if (/\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name)) {
+        } else if (
+            /\.tsx?$/.test(entry.name) &&
+            // Tests and their shared helpers build migrated throwaway databases.
+            // `.fixture.ts` and `.test-support.ts` files are only imported by tests.
+            !/\.(test|fixture|test-support)\.tsx?$/.test(entry.name)
+        ) {
             result.push(path);
         }
     }

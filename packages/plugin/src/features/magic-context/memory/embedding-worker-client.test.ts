@@ -1,9 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { getHarness } from "../../../shared/harness";
 import {
     __resetStoragePrivatePermissionEnforcementForTests,
     setStoragePrivatePermissionEnforcement,
 } from "../../../shared/storage-permissions";
+import { cleanupTestTempDir, createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import {
     __resetLocalEmbeddingForTests,
     __setLocalEmbeddingTestHooks,
@@ -20,6 +25,71 @@ afterEach(() => {
 const entry = new URL("./embedding-worker.fixture.ts", import.meta.url);
 
 describe("embedding worker transport", () => {
+    test("concurrent startup prepares telemetry once and disposal prevents a late worker", async () => {
+        let ready!: (value: boolean) => void;
+        let preparations = 0;
+        const preparation = new Promise<boolean>((resolve) => {
+            ready = resolve;
+        });
+        const client = new EmbeddingWorkerClient({}, entry, undefined, () => {
+            preparations++;
+            return preparation;
+        });
+        const requests = Promise.allSettled([client.request(), client.request()]);
+        const disposed = client.dispose();
+        ready(true);
+        const results = await requests;
+        await disposed;
+        expect(preparations).toBe(1);
+        expect(results.every((result) => result.status === "rejected")).toBe(true);
+        expect(client.isRunning()).toBe(false);
+    });
+    test.skipIf(process.platform !== "linux" || !existsSync("/usr/include/node/node_api.h"))(
+        "native getenv sees telemetry disabled before the model worker initializes",
+        async () => {
+            const dir = createTestTempDirFromPath(join(tmpdir(), "ort-getenv-"));
+            const addon = join(dir, "probe.node");
+            const build = spawnSync(
+                "cc",
+                [
+                    "-shared",
+                    "-fPIC",
+                    "-I/usr/include/node",
+                    new URL(
+                        "../../../../../../scripts/fixtures/onnx-telemetry-probe.c",
+                        import.meta.url,
+                    ).pathname,
+                    "-ldl",
+                    "-o",
+                    addon,
+                ],
+                { windowsHide: true },
+            );
+            try {
+                expect(build.status, build.stderr.toString()).toBe(0);
+                const script = `import { EmbeddingWorkerClient } from ${JSON.stringify(new URL("./embedding-worker-client.ts", import.meta.url).pathname)};
+                    const client = new EmbeddingWorkerClient({probeAddon:${JSON.stringify(addon)}}, new URL(${JSON.stringify(entry.href)}));
+                    try {
+                        const reply = await client.request(["native-env", "pid"]);
+                        console.log(JSON.stringify({native:reply.vectors?.[0]?.[0], workerPid:reply.vectors?.[1]?.[0], hostPid:process.pid}));
+                    } finally { await client.dispose(); }`;
+                const child = Bun.spawn([process.execPath, "-e", script], {
+                    windowsHide: true,
+                    env: { ...process.env, ORT_DISABLE_TELEMETRY: "0" },
+                    stdout: "pipe",
+                    stderr: "pipe",
+                });
+                const stdout = await new Response(child.stdout).text();
+                const stderr = await new Response(child.stderr).text();
+                expect(await child.exited, stderr).toBe(0);
+                const result = JSON.parse(stdout);
+                expect(result.native).toBe(1);
+                expect(result.workerPid).toBe(result.hostPid);
+            } finally {
+                cleanupTestTempDir(dir);
+            }
+        },
+    );
     test("worker inherits the resolved model cache, harness and trusted-group permission policy", async () => {
         let captured: Record<string, unknown> | undefined;
         setStoragePrivatePermissionEnforcement(false);
@@ -105,6 +175,11 @@ describe("embedding worker transport", () => {
                 [6, 0.125, -0.25],
             ]);
             expect(result.vectors?.[0]).toBeInstanceOf(Float32Array);
+            const special = (await client.request(["special-floats"])).vectors?.[0];
+            expect(Object.is(special?.[0], -0)).toBe(true);
+            expect(Number.isNaN(special?.[1])).toBe(true);
+            expect(special?.[2]).toBe(Infinity);
+            expect(special?.[3]).toBe(-Infinity);
         } finally {
             await client.dispose();
         }
@@ -114,6 +189,26 @@ describe("embedding worker transport", () => {
         const client = new EmbeddingWorkerClient({}, entry);
         try {
             await expect(client.request(["crash"])).rejects.toThrow("embedding worker exited (7)");
+            expect((await client.request(["recovered"])).vectors?.[0]?.[0]).toBe(9);
+        } finally {
+            await client.dispose();
+        }
+    });
+
+    test("killed subprocess rejects every in-flight request and restarts lazily", async () => {
+        const client = new EmbeddingWorkerClient({}, entry, undefined, async () => false);
+        try {
+            const pid = (await client.request(["pid"])).vectors?.[0]?.[0];
+            expect(pid).toBeDefined();
+            const requests = [client.request(["hang-a"]), client.request(["hang-b"])];
+            const settled = Promise.allSettled(requests);
+            process.kill(pid!, "SIGKILL");
+            for (const result of await settled) {
+                expect(result.status).toBe("rejected");
+                if (result.status === "rejected") {
+                    expect(String(result.reason)).toContain("embedding worker exited (SIGKILL)");
+                }
+            }
             expect((await client.request(["recovered"])).vectors?.[0]?.[0]).toBe(9);
         } finally {
             await client.dispose();

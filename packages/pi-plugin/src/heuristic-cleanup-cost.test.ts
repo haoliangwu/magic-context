@@ -47,7 +47,9 @@ describe("heuristic cleanup cost", () => {
 		expect(fixture.steps.measureReclaim?.calls).toBe(130);
 		expect(fixture.steps.dropTargets?.calls).toBe(48);
 		expect(fixture.autocommitDocumentWrites).toBe(0);
-		expect(fixture.transactions).toBe(3);
+		// Each of the 48 tool decisions commits before touching the transcript;
+		// native-marker preparation and injection cleanup each commit once.
+		expect(fixture.transactions).toBe(50);
 		// The full snapshot is shared with Channel-1 accounting. Heuristics do
 		// not re-read it for each tool or perform any per-drop tag query.
 		expect(fixture.steps.tagQueries?.calls).toBe(1);

@@ -84,6 +84,18 @@ impl ModuleContextDomain {
 }
 
 impl ContextDomain for ModuleContextDomain {
+    fn try_write(
+        &self,
+        tables: &[&str],
+        write: &mut dyn FnMut(&Transaction<'_>) -> rusqlite::Result<()>,
+    ) -> Result<(), McStoreError> {
+        self.writer
+            .try_lock()
+            .map_err(|_| context_error("context_busy", "telemetry writer is occupied"))?
+            .try_domain_transaction(tables, write)
+            .map_err(host_error)
+    }
+
     fn read(
         &self,
         read: &mut dyn FnMut(&Connection) -> rusqlite::Result<()>,

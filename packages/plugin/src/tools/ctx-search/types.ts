@@ -29,6 +29,7 @@ export interface CtxSearchToolDeps {
     embeddingEnabled?: boolean;
     /** When true, ctx_search surfaces indexed git commits as a 3rd source. */
     gitCommitsEnabled?: boolean;
+    rerankConnectionFile?: string;
     /** Override message reader for testing (avoids opening OpenCode DB in CI). */
     readMessages?: (sessionId: string) => Array<{
         ordinal: number;

@@ -173,7 +173,7 @@ describe("host stall profiler switch", () => {
         host.advanceAndTick(10_000);
 
         expect(host.calls).toEqual({ loadJsc: 0, start: 0, profile: 0, drain: 0 });
-        // Only the 30 s enable-file poll exists: no watchdog was ever created.
+        // Only the enable-file poll exists: no watchdog was ever created.
         expect(host.intervalDelays()).toEqual([SWITCH_POLL_MS]);
         expect(handle.isActive()).toBe(false);
         // Not even the profiler directory is created.

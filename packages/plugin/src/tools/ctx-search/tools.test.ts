@@ -26,7 +26,7 @@ import { createCtxSearchTools } from "./tools";
 const toolContext = (sessionID = "ses-search", directory?: string) =>
     ({ sessionID, directory }) as never;
 const EXPAND_HINT =
-    "Use ctx_expand(start, end) with the range from any message result above to read the full conversation context.";
+    "Use ctx_expand(start, end) with the range from any message result above to read the conversation context. If the host no longer holds those messages, ctx_expand returns indexed text from the search archive only, with no surrounding messages or tool output.";
 const NOTE_EXPAND_HINT =
     "Use ctx_expand(start=N-10, end=N) around any note @msg anchor above to read the surrounding conversation context.";
 

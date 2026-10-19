@@ -9,7 +9,10 @@ import {
 } from "../../../plugin/src/features/magic-context/storage";
 import { createTagger } from "../../../plugin/src/features/magic-context/tagger";
 import { resolveOpenCodeProtectedTailBoundary } from "../../../plugin/src/hooks/magic-context/protected-tail-boundary";
-import { readRawSessionMessages } from "../../../plugin/src/hooks/magic-context/read-session-chunk";
+import {
+	prepareRawSessionOrdinals,
+	readRawSessionMessages,
+} from "../../../plugin/src/hooks/magic-context/read-session-chunk";
 import { findLastAssistantModelFromOpenCodeDb } from "../../../plugin/src/hooks/magic-context/read-session-db";
 import {
 	createTransform,
@@ -43,11 +46,12 @@ const sha = (value: unknown) =>
 	createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const root = resolve(import.meta.dir, "../../../..");
 
-test("I14 sdk_renames: v2 supplies every host seam, v1 defaults retain function identity", () => {
+test("I14 sdk_renames: v2 supplies every host seam, v1 defaults retain function identity", async () => {
 	const defaults = resolveTransformHostSeams({});
 	expect(defaults).toEqual({
 		hostRawMessages: readRawSessionMessages,
 		hostMessageReconciliationSource: readRawSessionMessages,
+		hostPrepareRawOrdinals: prepareRawSessionOrdinals,
 		hostProtectedTailBoundary: resolveOpenCodeProtectedTailBoundary,
 		hostModelFallback: findLastAssistantModelFromOpenCodeDb,
 		hostRefusalNotice: sendEmergencyRefusalNotice,
@@ -65,6 +69,8 @@ test("I14 sdk_renames: v2 supplies every host seam, v1 defaults retain function 
 	}
 	expect(supplied.hostRawMessages).toBe(read);
 	expect(supplied.hostRawMessages).not.toBe(defaults.hostRawMessages);
+	expect(supplied.hostPrepareRawOrdinals).not.toBe(defaults.hostPrepareRawOrdinals);
+	expect(await supplied.hostPrepareRawOrdinals("v2-session")).toBe(true);
 	expect(supplied.hostRefusalNotice).not.toBe(defaults.hostRefusalNotice);
 	expect(supplied.hostRefuse).not.toBe(defaults.hostRefuse);
 	expect(supplied.hostProtectedTailBoundary).not.toBe(

@@ -316,7 +316,7 @@ export function startLeaseHeartbeat(
 
     const timer = lost
         ? undefined
-        : setInterval(() => withSqliteBackgroundWriter(beat), intervalMs);
+        : inRootAsyncContext(() => setInterval(() => withSqliteBackgroundWriter(beat), intervalMs));
     return {
         stop: () => {
             if (timer) clearInterval(timer);
@@ -346,3 +346,5 @@ export function releaseLease(
         deleteDreamState(db, keys.expiry);
     });
 }
+
+import { inRootAsyncContext } from "../../../shared/sqlite";

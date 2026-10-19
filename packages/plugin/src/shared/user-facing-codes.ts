@@ -17,8 +17,8 @@ export const USER_FACING_FAILURES = {
     history_boundary_unresolved: {
         code: "MC-H04",
         sentence:
-            "This request was not sent: the message that marks where this session's history summary ends is missing from the OpenCode store, and without it the request is larger than the model's context window.",
-        action: "Run /ctx-recomp to rebuild the history summary.",
+            "This request was not sent: Magic Context could not safely place the history summary boundary in the loaded conversation, and the untrimmed request is larger than the model's context window.",
+        action: "Reopen this session in its current project directory, then run /ctx-recomp to rebuild the history summary. A model with a larger context window can also help.",
     },
     history_over_window_unmanaged: {
         code: "MC-H06",
@@ -245,12 +245,8 @@ export const USER_FACING_FAILURES = {
         sentence: "Magic Context has no context.db.",
         action: "Run `npx @cortexkit/magic-context doctor store init`, then restart ck-mc.",
     },
-    checkout_claim_held_elsewhere: {
-        code: "MC-C16",
-        sentence:
-            "This request was not sent: this agent is checked out on another machine, so Magic Context will not work on its sessions here.",
-        action: "Move the agent back to this machine, then send your message again.",
-    },
+    // MC-C16 is retired: released builds showed it when a turn was refused because
+    // another machine held the session's agent. Do not reuse it for a new failure.
     single_store_migration_required: {
         code: "MC-C14",
         sentence: "Magic Context's Rust mode needs a one-time migration of its store.",

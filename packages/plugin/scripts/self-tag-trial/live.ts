@@ -12,7 +12,7 @@ const stagedAuth = join(tmpdir(), "magic-context", "self-tag-trial", "creds", "a
 const hostBinary = join(tmpdir(), "magic-context", "self-tag-trial", "host", "node_modules", ".bin", "opencode");
 const liveHome = homedir();
 if (!existsSync(stagedAuth) || (statSync(stagedAuth).mode & 0o777) !== 0o600) throw new Error("Staged credential absent or not mode 600");
-const out = resolve(process.argv[2] ?? "docs/reports/issue-582-self-tag-live");
+const out = resolve(process.argv[2] ?? ".cortexkit/internal-docs/investigations/reports/issue-582-self-tag-live");
 const resumeVariant = process.argv[4]?.startsWith("resume-") ? process.argv[4].slice(7) : null;
 const resume = ["A", "B", "C", "D"].includes(resumeVariant ?? "");
 const selected = process.env.SELF_TAG_VARIANTS?.split(",") as Variant[] | undefined;

@@ -14,6 +14,7 @@ Capability API available to check(cap):
 - cap.httpGet(httpsUrl): { status: number, body: string } (external HTTPS only; internal/metadata blocked)
 
 Authoring constraints:
+- Use a five-field check_cron that fires at least once every 24 hours. Never encode a future date in the cron; put date conditions inside check(cap) and poll them on a frequent schedule such as "0 * * * *".
 - Plain JavaScript only; no TypeScript types, imports, require, eval, Function, dynamic code, timers, Date.now randomness, or ambient globals.
 - Define exactly function check(cap) { ... }. Do not use async/await; host capabilities are synchronous inside the sandbox.
 - Return exactly { met: boolean }. Do not include a reason string.

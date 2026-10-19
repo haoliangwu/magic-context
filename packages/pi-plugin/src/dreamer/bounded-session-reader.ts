@@ -1,5 +1,7 @@
 import { closeSync, opendirSync, openSync, readSync } from "node:fs";
+import { open, opendir } from "node:fs/promises";
 import { join } from "node:path";
+import { setImmediate as yieldToHost } from "node:timers/promises";
 
 // A single JSONL line longer than this is never buffered whole. Pi stores
 // pasted images inline as base64, so such lines do occur in real sessions.
@@ -82,44 +84,77 @@ function lastMatch(text: string, pattern: RegExp): string | undefined {
 	return last;
 }
 
+class LineDecoder {
+	private pending = Buffer.alloc(0);
+	private oversized: OversizedLine | null = null;
+
+	*append(buffer: Buffer): Generator<string> {
+		const bytes = buffer.length;
+		let start = 0;
+		for (let i = 0; i < bytes; i++) {
+			if (buffer[i] !== 10) continue;
+			const piece = buffer.subarray(start, i);
+			if (this.oversized) {
+				yield this.oversized.append(piece).stub();
+				this.oversized = null;
+			} else if (this.pending.length + piece.length > MAX_ENTRY_BYTES) {
+				yield new OversizedLine().append(this.pending).append(piece).stub();
+			} else {
+				yield Buffer.concat([this.pending, piece]).toString("utf8");
+			}
+			this.pending = Buffer.alloc(0);
+			start = i + 1;
+		}
+		const rest = buffer.subarray(start, bytes);
+		if (this.oversized) {
+			this.oversized.append(rest);
+		} else if (this.pending.length + rest.length > MAX_ENTRY_BYTES) {
+			this.oversized = new OversizedLine().append(this.pending).append(rest);
+			this.pending = Buffer.alloc(0);
+		} else {
+			this.pending = Buffer.concat([this.pending, rest]);
+		}
+	}
+
+	*finish(): Generator<string> {
+		if (this.oversized) yield this.oversized.stub();
+		else if (this.pending.length) yield this.pending.toString("utf8");
+	}
+}
+
 export function* lines(path: string): Generator<string> {
 	const fd = openSync(path, "r");
 	const buffer = Buffer.alloc(64 * 1024);
-	let pending = Buffer.alloc(0);
-	let oversized: OversizedLine | null = null;
+	const decoder = new LineDecoder();
 	try {
 		while (true) {
 			const bytes = readSync(fd, buffer, 0, buffer.length, null);
 			if (bytes === 0) break;
-			let start = 0;
-			for (let i = 0; i < bytes; i++) {
-				if (buffer[i] !== 10) continue;
-				const piece = buffer.subarray(start, i);
-				if (oversized) {
-					yield oversized.append(piece).stub();
-					oversized = null;
-				} else if (pending.length + piece.length > MAX_ENTRY_BYTES) {
-					yield new OversizedLine().append(pending).append(piece).stub();
-				} else {
-					yield Buffer.concat([pending, piece]).toString("utf8");
-				}
-				pending = Buffer.alloc(0);
-				start = i + 1;
-			}
-			const rest = buffer.subarray(start, bytes);
-			if (oversized) {
-				oversized.append(rest);
-			} else if (pending.length + rest.length > MAX_ENTRY_BYTES) {
-				oversized = new OversizedLine().append(pending).append(rest);
-				pending = Buffer.alloc(0);
-			} else {
-				pending = Buffer.concat([pending, rest]);
-			}
+			yield* decoder.append(buffer.subarray(0, bytes));
 		}
-		if (oversized) yield oversized.stub();
-		else if (pending.length) yield pending.toString("utf8");
+		yield* decoder.finish();
 	} finally {
 		closeSync(fd);
+	}
+}
+
+/** Background readers yield after every 64 KiB, even when the file is cached. */
+export async function* asyncLines(path: string): AsyncGenerator<string> {
+	const file = await open(path, "r");
+	const buffer = Buffer.alloc(64 * 1024);
+	const decoder = new LineDecoder();
+	try {
+		while (true) {
+			const { bytesRead } = await file.read(buffer, 0, buffer.length, null);
+			if (bytesRead === 0) break;
+			yield* decoder.append(buffer.subarray(0, bytesRead));
+			// Awaiting an already-ready read alone need not give timers or host input
+			// a turn. Bound parsing work too, not just the size of each I/O request.
+			await yieldToHost();
+		}
+		yield* decoder.finish();
+	} finally {
+		await file.close();
 	}
 }
 
@@ -186,7 +221,54 @@ export function* sessionEntries(path: string): Generator<unknown> {
 		try {
 			yield JSON.parse(line);
 		} catch {
-			/* Match Pi's tolerant JSONL parser. */
+			/* Like Pi, ignore malformed lines without assigning them an entry ordinal. */
+		}
+	}
+}
+
+export async function* asyncSessionEntries(
+	path: string,
+): AsyncGenerator<unknown> {
+	for await (const line of asyncLines(path)) {
+		try {
+			yield JSON.parse(line);
+		} catch {
+			/* Like Pi, ignore malformed lines without assigning them an entry ordinal. */
+		}
+	}
+}
+
+async function* asyncSessionFiles(
+	directory: string,
+	nested: boolean,
+): AsyncGenerator<string> {
+	let dir: Awaited<ReturnType<typeof opendir>>;
+	try {
+		dir = await opendir(directory);
+	} catch {
+		return;
+	}
+	for await (const entry of dir) {
+		const path = join(directory, entry.name);
+		if (entry.isFile() && entry.name.endsWith(".jsonl")) yield path;
+		else if (nested && entry.isDirectory())
+			yield* asyncSessionFiles(path, false);
+	}
+}
+
+export async function* asyncSessionHeaders(
+	directory: string,
+	nested: boolean,
+): AsyncGenerator<Record<string, unknown> & { path: string }> {
+	for await (const path of asyncSessionFiles(directory, nested)) {
+		try {
+			for await (const line of asyncLines(path)) {
+				const header = record(JSON.parse(line));
+				if (header.type === "session") yield { ...header, path };
+				break;
+			}
+		} catch {
+			/* Skip files whose session headers cannot be read or parsed. */
 		}
 	}
 }

@@ -116,14 +116,16 @@ export function buildSupersessionReclaimOps(input: {
 /**
  * Select superseded edit/write tool calls for COMPRESSION (not full drop).
  * Among active edit/write tags grouped by their `filePath`, the newest stays
- * full; every older edit to the same file is an edit_marker target. Like the
- * control-plane selector, supersession is age-independent so the watermark is
- * ignored, but the caller only acts inside the gated pass.
+ * full; an older edit to the same file is an edit_marker target only below the
+ * previous bookmark: its output had three newer user turns or a quarter-window
+ * of newer content at an earlier cache rebuild. Replaced todowrite/ctx_reduce
+ * outputs do not need that delay; an edit's body does.
  *
  * Returns both the drop ops AND the set of tag ids that must be compressed as
  * edit_marker (the caller passes the set to applyPendingOperations).
  */
 export function buildEditSupersessionReclaim(input: {
+    watermark: number;
     db: ContextDatabase;
     sessionId: string;
     targets: Map<number, TagTarget>;
@@ -167,8 +169,10 @@ export function buildEditSupersessionReclaim(input: {
         // Older edit to an already-seen file → compress, except within the
         // owner-message recency floor where the call may still guide continuation.
         if (
-            input.recentMessageIds &&
-            (tag.toolOwnerMessageId === null || input.recentMessageIds.has(tag.toolOwnerMessageId))
+            tag.tagNumber > input.watermark ||
+            (input.recentMessageIds &&
+                (tag.toolOwnerMessageId === null ||
+                    input.recentMessageIds.has(tag.toolOwnerMessageId)))
         ) {
             continue;
         }

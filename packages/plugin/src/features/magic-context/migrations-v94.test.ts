@@ -222,7 +222,7 @@ describe("migration v94: LKG prefixes as slices", () => {
             expect(loadPersistedLkgSlot(before, "ses")?.jsonPrefix).toBe(first.jsonPrefix);
 
             const start = totalChanges(before);
-            expect(saveLkgSlotToDb(before, "ses", second)).toBe(true);
+            expect(saveLkgSlotToDb(before, "ses", second, undefined, { rebuild: true })).toBe(true);
             // Two row changes: the last slice and the metadata row. The first two
             // slices are not rewritten.
             expect(totalChanges(before) - start).toBe(2);

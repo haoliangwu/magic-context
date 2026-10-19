@@ -22,7 +22,7 @@ import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
 import { failedInvocationStatus, recordChildInvocation } from "../subagent-token-capture";
 import { runHiddenSingleShotPrompt } from "./hidden-single-shot";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
-import { buildPrimerSeed, selectPrimerOriginCandidate } from "./primer-seed";
+import { buildPrimerSeed, buildPrimerSeedAsync, selectPrimerOriginCandidate } from "./primer-seed";
 import { PRIMER_INVESTIGATOR_SYSTEM_PROMPT } from "./task-prompts";
 
 const REFRESH_PRIMERS_PER_RUN = 5;
@@ -49,8 +49,8 @@ export interface RefreshPrimersArgs {
      * (JSONL), so the orientation seed read works on Pi-only installs where there
      * is no opencode.db. OpenCode leaves this undefined — the seed read falls to
      * the read-only opencode.db path. Returning null → closed-book fallback.
-     * May be async (Pi JSONL discovery is async); the returned provider serves
-     * synchronous summary pages without retaining the historical transcript.
+     * May be async (Pi JSONL discovery is async); background seed assembly prefers
+     * its async range reader without retaining the historical transcript.
      */
     rawProviderFactory?: (
         sessionId: string,
@@ -213,7 +213,7 @@ async function refreshOnePrimer(
     signal: AbortSignal,
 ): Promise<boolean> {
     // Build the orientation seed. On Pi, resolve a raw provider for the origin
-    // session (async JSONL discovery) BEFORE the synchronous seed scope; on
+    // session before rendering, and await its yielding traversal; on
     // OpenCode, the read falls to the read-only opencode.db path.
     const originSessionId = originSessionIdForPrimer(args, primer);
     let provider: RawMessageProvider | null = null;
@@ -224,15 +224,17 @@ async function refreshOnePrimer(
             provider = null; // → closed-book fallback inside buildPrimerSeed
         }
     }
-    const seed = withRawSessionMessageCache(() => {
+    const seed = await (async () => {
         const unregister =
             provider && originSessionId ? setRawMessageProvider(originSessionId, provider) : null;
         try {
-            return buildPrimerSeed(args.db, primer);
+            return provider?.iterateMessageRangeAsync
+                ? await buildPrimerSeedAsync(args.db, primer)
+                : withRawSessionMessageCache(() => buildPrimerSeed(args.db, primer));
         } finally {
             unregister?.();
         }
-    });
+    })();
 
     let agentSessionId: string | null = null;
     let promptSettled = false;
@@ -249,7 +251,10 @@ async function refreshOnePrimer(
                 prompt,
                 title: "magic-context-dream-refresh-primers",
                 callContext: "dreamer:refresh-primers",
-                metadata: { tokenBudget: args.tokenBudget, onBudgetUpdate: args.onBudgetUpdate },
+                metadata: {
+                    tokenBudget: args.tokenBudget,
+                    onBudgetUpdate: args.onBudgetUpdate,
+                },
                 model: args.model,
                 fallbackModels: args.fallbackModels,
                 language: args.language,
@@ -331,7 +336,10 @@ async function refreshOnePrimer(
         );
         promptSettled = true;
 
-        recordInvocation(args, startedAt, { status: "completed", messages: run.output });
+        recordInvocation(args, startedAt, {
+            status: "completed",
+            messages: run.output,
+        });
 
         const answer = run.validated.trim();
         if (!answer) return false;
@@ -355,7 +363,10 @@ async function refreshOnePrimer(
             `[dreamer] refresh-primers failed (primer #${primer.id}): ${desc.brief}`,
             desc.stackHead ? { stackHead: desc.stackHead } : undefined,
         );
-        recordInvocation(args, startedAt, { status: failedInvocationStatus(error), error });
+        recordInvocation(args, startedAt, {
+            status: failedInvocationStatus(error),
+            error,
+        });
         throw error;
     } finally {
         if (agentSessionId && args.client)
@@ -379,7 +390,11 @@ function originSessionIdForPrimer(args: RefreshPrimersArgs, primer: Primer): str
 function recordInvocation(
     args: RefreshPrimersArgs,
     startedAt: number,
-    params: { status: SubagentInvocationStatus; messages?: unknown[]; error?: unknown },
+    params: {
+        status: SubagentInvocationStatus;
+        messages?: unknown[];
+        error?: unknown;
+    },
 ): void {
     if (!args.parentSessionId) return;
     recordChildInvocation({

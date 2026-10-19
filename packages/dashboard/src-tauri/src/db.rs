@@ -1,6 +1,4 @@
-use rusqlite::{
-    params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
-};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -10,6 +8,9 @@ use crate::broca_wal;
 use crate::external_cache_sessions;
 use crate::pi_sessions;
 use crate::project_identity::{basename, normalize_stored_project_path};
+#[path = "historian_telemetry.rs"]
+mod historian_telemetry;
+pub use historian_telemetry::{count_historian_runs, get_subagent_invocations, SubagentInvocation};
 
 pub fn resolve_db_path() -> Option<PathBuf> {
     // Keep the dashboard on the same harness-side database as the plugin. An
@@ -738,10 +739,12 @@ fn ensure_context_store_uuid(conn: &Connection) -> Result<(), rusqlite::Error> {
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
     );
-    conn.execute(
+    crate::writer_diagnostics::statement("context_store_uuid", || {
+        conn.execute(
         "INSERT INTO context_store_meta(key, value) VALUES ('store_uuid', ?1) ON CONFLICT(key) DO NOTHING",
         [&uuid],
-    )?;
+    )
+    })?;
     Ok(())
 }
 
@@ -903,6 +906,12 @@ impl Harness {
             self,
             Self::Opencode | Self::Opencode2 | Self::Pi | Self::Omp
         )
+    }
+
+    /// Hosts whose Magic Context state lives only in the Rust module's
+    /// store.db, keyed by the host's session id.
+    fn mc_state_lives_in_store(self) -> bool {
+        matches!(self, Self::ClaudeCode | Self::Codex | Self::Broca)
     }
 
     /// OpenCode 1.x and 2.x are two store generations of the same product: a
@@ -1128,9 +1137,11 @@ pub struct Compartment {
     pub title: String,
     pub content: String,
     pub created_at: i64,
-    /// Resolved from OpenCode DB using start_message_id
+    /// Epoch milliseconds from the OpenCode message table or Pi/OMP JSONL entry
+    /// matched by start_message_id.
     pub start_time: Option<i64>,
-    /// Resolved from OpenCode DB using end_message_id
+    /// Epoch milliseconds from the OpenCode message table or Pi/OMP JSONL entry
+    /// matched by end_message_id.
     pub end_time: Option<i64>,
     /// v2 decay-rate score (1–100). Higher = decays into lower render tiers
     /// more slowly. Default 50.
@@ -1192,26 +1203,6 @@ pub struct SessionMetaRow {
     pub memory_block_count: i64,
     pub new_work_tokens: i64,
     pub total_input_tokens: i64,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub struct SubagentInvocation {
-    pub id: i64,
-    pub session_id: String,
-    pub harness: String,
-    pub subagent: String,
-    pub task: Option<String>,
-    pub provider_id: Option<String>,
-    pub model_id: Option<String>,
-    pub started_at: i64,
-    pub ended_at: Option<i64>,
-    pub status: String,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub error: Option<String>,
-    pub parent_invocation_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1348,10 +1339,26 @@ pub struct DbCacheEvent {
     // to a single stable per-session value before scaling/segmenting, or the
     // timeline fragments into one box per step.
     pub context_limit_estimated: bool,
-    // True when the prompt shrank meaningfully vs the previous step — i.e. Magic
-    // Context reclaimed context (execute-pass drops, comparting). The `cause`
-    // field carries the reason pulled from the plugin logs for these steps.
+    // True when the prompt shrank meaningfully vs the previous step. In a
+    // session whose context Magic Context manages (`context_reduced_by_mc`)
+    // that is Magic Context reclaiming context (execute-pass drops,
+    // comparting), and `cause` carries the reason it recorded. Elsewhere the
+    // shrink is not Magic Context's and no Magic Context cause is attached.
     pub is_drop: bool,
+    // True when Magic Context manages this session's context, so a drop here
+    // is Magic Context's own reclaim. This differs from
+    // `SessionCacheStats::managed`, which only decides whether the Cache list
+    // shows the session by default (every Broca session is "managed" in that
+    // sense, though Magic Context does not manage a Broca run's context unless
+    // store.db holds state for it).
+    pub context_reduced_by_mc: bool,
+    // On a drop, whether the request actually sent got smaller than the
+    // previous step's. `None` unless the source records the request size for
+    // both steps (today only Broca, from `model_attempt_finished`).
+    pub drop_request_size: Option<DropRequestSize>,
+    // Bytes of the request body sent for this step, when the source records it.
+    #[serde(skip)]
+    request_body_len: Option<i64>,
     // True when the row sums several provider requests (a whole Broca run)
     // instead of describing one request. `hit_ratio` is then the run's total
     // cached share and `severity` is "aggregate", never a cache-health verdict.
@@ -1367,6 +1374,18 @@ pub struct DbCacheEvent {
     // them. The timeline header shows the session's latest model from these.
     pub provider: Option<String>,
     pub model: Option<String>,
+}
+
+/// How a dropped step's sent request compared in size with the previous
+/// step's. A token drop on a request that did not get smaller came from how
+/// the provider counted tokens, not from anything removed from the request.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DropRequestSize {
+    /// The request was the same size or larger.
+    NotSmaller,
+    /// The request got smaller.
+    Smaller,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1434,6 +1453,10 @@ struct BrocaRow {
     /// store on 2026-09-25: only Anthropic facts carried it), which is
     /// different from a reported zero.
     cache_write_reported: bool,
+    /// Bytes of the request body sent for this step's last provider attempt,
+    /// from the WAL's `model_attempt_finished.request_body_len`. `None` for a
+    /// run total and for a step whose attempt size was not recorded.
+    request_body_len: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1700,8 +1723,77 @@ fn transform_decision_reason_label(reason: &str) -> Option<&'static str> {
         "epoch_change" => Some("Epoch change"),
         "coverage_fold" => Some("Coverage fold"),
         "profile_transition" => Some("Profile transition"),
+        "tag_identity_repair" => Some("Tag identity repair"),
         _ => None,
     }
+}
+
+/// Every reason the plugin records when Magic Context rebuilds the prompt
+/// (`canonicalReasons` in
+/// `packages/plugin/src/features/magic-context/transform-decision-log.ts`).
+/// TypeScript passes are normalized to this list before they are written;
+/// Rust passes write the module's own reason as-is.
+const MAGIC_CONTEXT_REBUILD_REASONS: &[&str] = &[
+    "system_hash",
+    "model_change",
+    "project_memory_epoch",
+    "ttl_idle",
+    "explicit_flush",
+    "user_flush",
+    "fit_retry",
+    "pending_materialization",
+    "variant_change",
+    "recomp",
+    "boundary_repair",
+    "host_history_change",
+    "thinking_hold",
+    "mutation_drift",
+    "max_mutation_id",
+    "first_render",
+    "pressure_refold",
+    "upgrade_state",
+    "cached_m1_missing",
+    "project_change",
+    "compartment_render_epoch",
+    "m1_delta",
+    "ttl_expiry",
+    "epoch_change",
+    "coverage_fold",
+    "profile_transition",
+    "host_compaction",
+    "tag_identity_repair",
+];
+
+/// Prefix the plugin writes when the host stops replaying its frozen
+/// last-known-good request and serves new bytes instead. The rest of the value
+/// names why, and `first_changed=` names the first block that differs.
+const LKG_FROZEN_RELEASE_PREFIX: &str = "lkg_frozen_release:";
+
+/// Whether a recorded pass changed what the provider was sent, so that its
+/// reason can explain a cache loss on the same request.
+///
+/// Every Rust-mode pass writes a row, including passes that served the bytes
+/// the provider already had: a SOFT+ replay (recorded as `defer` with no
+/// reason), a raw pass-through (`passthrough`, reason `pending_rewrite`), or
+/// a full-sync request. Those rows explain nothing. A row explains a loss when
+/// the pass rebuilt the prompt (`execute`), when it names one of Magic
+/// Context's rebuild reasons (a TypeScript pass writes a row only when it
+/// changed the prompt, and a `system_hash` row marks a system prompt change
+/// whatever the pass served), or when the host released its frozen replay and
+/// a block actually changed.
+fn transform_decision_changed_prompt(decision: &TransformDecisionCause) -> bool {
+    if decision.decision == "execute" {
+        return true;
+    }
+    let Some(reason) = decision.materialize_reason.as_deref() else {
+        return false;
+    };
+    if let Some(release) = reason.strip_prefix(LKG_FROZEN_RELEASE_PREFIX) {
+        return !release
+            .split(';')
+            .any(|field| field == "first_changed=none");
+    }
+    MAGIC_CONTEXT_REBUILD_REASONS.contains(&reason)
 }
 
 fn transform_decision_cause(decision: Option<&TransformDecisionCause>) -> Option<String> {
@@ -1712,6 +1804,9 @@ fn transform_decision_cause(decision: Option<&TransformDecisionCause>) -> Option
     if decision.emergency {
         return Some("Compaction pressure".to_string());
     }
+    if !transform_decision_changed_prompt(decision) {
+        return None;
+    }
     if let Some(reason) = decision.materialize_reason.as_deref() {
         return Some(
             transform_decision_reason_label(reason)
@@ -1721,6 +1816,160 @@ fn transform_decision_cause(decision: Option<&TransformDecisionCause>) -> Option
     }
     if decision.decision == "execute" {
         return Some("Execute pass (reclaimed tool output)".to_string());
+    }
+    None
+}
+
+/// A cache loss right after a warm read, on a request whose prompt did not
+/// shrink and that Magic Context recorded no change to. The label states that
+/// evidence; it does not claim Magic Context could not have been involved.
+const PROVIDER_CACHE_MISS_CAUSE: &str = "Provider cache miss (no change recorded by Magic Context)";
+
+const MINUTE_MS: i64 = 60_000;
+
+/// How long a provider keeps a cached prompt prefix after its last use, as the
+/// shortest and longest lifetime the evidence allows. A known TTL has both
+/// ends equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheLifetime {
+    shortest_ms: i64,
+    longest_ms: i64,
+}
+
+/// Prompt-cache lifetimes stated in provider documentation, used when the
+/// session records no TTL of its own. A provider has a row only when its
+/// documentation states both the shortest and the longest lifetime; without a
+/// row, a session with no recorded TTL gets no provider-side label.
+const DOCUMENTED_CACHE_LIFETIMES: &[(&str, CacheLifetime)] = &[(
+    // "By default, the cache has a 5-minute lifetime" and the "1-hour cache
+    // duration" is the longer option:
+    // https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    "anthropic",
+    CacheLifetime {
+        shortest_ms: 5 * MINUTE_MS,
+        longest_ms: 60 * MINUTE_MS,
+    },
+)];
+
+/// Parse the TTL Magic Context recorded for a session (`session_meta.cache_ttl`)
+/// the way the plugin's `parseCacheTtl` does (`scheduler.ts`): `<n>s`, `<n>m`,
+/// `<n>h`, or bare milliseconds. `never` means a keep-warm setup that Magic
+/// Context does not time, so like an unreadable value it gives no TTL.
+fn parse_recorded_cache_ttl_ms(ttl: &str) -> Option<i64> {
+    let ttl = ttl.trim();
+    let digits_end = ttl.find(|c: char| !c.is_ascii_digit()).unwrap_or(ttl.len());
+    let value: i64 = ttl[..digits_end].parse().ok()?;
+    let unit_ms = match &ttl[digits_end..] {
+        "" => 1,
+        "s" => 1_000,
+        "m" => MINUTE_MS,
+        "h" => 60 * MINUTE_MS,
+        _ => return None,
+    };
+    value.checked_mul(unit_ms).filter(|ms| *ms > 0)
+}
+
+/// The cache lifetime a request could rely on: the TTL Magic Context recorded
+/// for the session when it is a duration, otherwise the serving provider's
+/// documented range, otherwise unknown.
+fn cache_lifetime(recorded_ttl: Option<&str>, provider: Option<&str>) -> Option<CacheLifetime> {
+    if let Some(ttl_ms) = recorded_ttl.and_then(parse_recorded_cache_ttl_ms) {
+        return Some(CacheLifetime {
+            shortest_ms: ttl_ms,
+            longest_ms: ttl_ms,
+        });
+    }
+    let provider = provider?;
+    DOCUMENTED_CACHE_LIFETIMES
+        .iter()
+        .find(|(name, _)| *name == provider)
+        .map(|(_, lifetime)| *lifetime)
+}
+
+/// Smallest read shortfall that counts, from the meter rule in
+/// `packages/plugin/scripts/analyze-cache-busts.ts` (`epsilon`).
+const METER_EPSILON_MIN_TOKENS: i64 = 64;
+
+/// The provider read far less than the previous request's prompt, by the meter
+/// rule `analyze-cache-busts.ts` applies: the comparable read is below the
+/// previous prompt total minus `max(64, previous uncached input)`. A provider
+/// with explicit cache writes (Anthropic) counts the request's uncached input
+/// as comparable; an implicit-prefix cache (OpenAI, Gemini) counts only the
+/// cached read, because its uncached input includes the rewritten prefix.
+fn meter_reports_short_read(
+    previous: &DbCacheEvent,
+    current: &DbCacheEvent,
+    explicit_cache_writes: bool,
+) -> bool {
+    let comparable_read = if explicit_cache_writes {
+        current.cache_read + current.input_tokens
+    } else {
+        current.cache_read
+    };
+    comparable_read < meter_floor(previous)
+}
+
+/// The previous request's prompt total minus the meter's allowance
+/// `max(64, previous uncached input)`.
+fn meter_floor(previous: &DbCacheEvent) -> i64 {
+    let previous_total = previous.input_tokens + previous.cache_read + previous.cache_write;
+    previous_total - METER_EPSILON_MIN_TOKENS.max(previous.input_tokens)
+}
+
+/// The request's whole prompt is no smaller than the previous one, within the
+/// same allowance the meter uses. A prompt that shrank proves the request
+/// itself changed (Magic Context or the host removed something), so its cache
+/// loss cannot be put on the provider alone.
+fn prompt_did_not_shrink(previous: &DbCacheEvent, current: &DbCacheEvent) -> bool {
+    current.input_tokens + current.cache_read + current.cache_write >= meter_floor(previous)
+}
+
+/// "N min" below two hours, "H h M min" above, rounded down to the minute.
+fn format_idle_gap(gap_ms: i64) -> String {
+    let minutes = gap_ms / MINUTE_MS;
+    if minutes < 120 {
+        return format!("{minutes} min");
+    }
+    let (hours, rest) = (minutes / 60, minutes % 60);
+    if rest == 0 {
+        format!("{hours} h")
+    } else {
+        format!("{hours} h {rest} min")
+    }
+}
+
+/// Name a cache loss that happened on the provider's side, for a request whose
+/// prompt Magic Context recorded no change to. Callers check recorded Magic
+/// Context causes first; this only fills the gap they leave.
+///
+/// - The gap since the previous request is longer than the longest lifetime:
+///   the cache expired while the session sat idle.
+/// - The gap is shorter than the shortest lifetime, the previous request read
+///   from the cache, this one read far less, and its prompt did not shrink:
+///   the provider did not reuse a cache that was still alive. A prompt that
+///   shrank changed the request, so it gets no provider-side label.
+/// - Between the two, either is possible, so no label is given.
+fn provider_side_cause(
+    previous: &DbCacheEvent,
+    current: &DbCacheEvent,
+    lifetime: Option<CacheLifetime>,
+    explicit_cache_writes: bool,
+) -> Option<String> {
+    let lifetime = lifetime?;
+    let gap_ms = current.timestamp - previous.timestamp;
+    if gap_ms > lifetime.longest_ms {
+        return Some(format!(
+            "Cache expired after {} idle",
+            format_idle_gap(gap_ms)
+        ));
+    }
+    if gap_ms >= 0
+        && gap_ms < lifetime.shortest_ms
+        && previous.cache_read > 0
+        && meter_reports_short_read(previous, current, explicit_cache_writes)
+        && prompt_did_not_shrink(previous, current)
+    {
+        return Some(PROVIDER_CACHE_MISS_CAUSE.to_string());
     }
     None
 }
@@ -2322,12 +2571,88 @@ fn load_transform_failure_sessions_from_conn(
     out
 }
 
+/// The TTL Magic Context recorded for each session (`session_meta.cache_ttl`),
+/// as written: `5m`, `1h`, `never`, ...
+fn load_session_cache_ttls(
+    keys: &HashSet<(Harness, String)>,
+) -> HashMap<(Harness, String), String> {
+    if keys.is_empty() {
+        return HashMap::new();
+    }
+    let Some(db_path) = resolve_db_path() else {
+        return HashMap::new();
+    };
+    let Ok(conn) = open_readonly(&db_path) else {
+        return HashMap::new();
+    };
+    load_session_cache_ttls_from_conn(&conn, keys)
+}
+
+fn load_session_cache_ttls_from_conn(
+    conn: &Connection,
+    keys: &HashSet<(Harness, String)>,
+) -> HashMap<(Harness, String), String> {
+    let mut out = HashMap::new();
+    let session_ids: HashSet<String> = keys.iter().map(|(_, sid)| sid.clone()).collect();
+    if session_ids.is_empty() {
+        return out;
+    }
+    let placeholders = vec!["?"; session_ids.len()].join(",");
+    let sql = format!(
+        "SELECT session_id, harness, cache_ttl
+         FROM session_meta
+         WHERE session_id IN ({})",
+        placeholders
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return out;
+    };
+    let rows = stmt.query_map(params_from_iter(session_ids.iter()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    });
+    // Index by session id so a converted OpenCode session whose timeline
+    // label (`opencode2`) differs from the recorded label (`opencode`) still
+    // sees its TTL; see resolve_session_context_limits_from_conn.
+    let mut by_session_id: HashMap<String, Vec<(Harness, String)>> = HashMap::new();
+    if let Ok(rows) = rows {
+        for (session_id, harness, ttl) in rows.flatten() {
+            let (Ok(harness), Some(ttl)) = (harness.parse::<Harness>(), ttl) else {
+                continue;
+            };
+            by_session_id
+                .entry(session_id)
+                .or_default()
+                .push((harness, ttl));
+        }
+    }
+    for (req_harness, session_id) in keys {
+        let Some(rows) = by_session_id.get(session_id) else {
+            continue;
+        };
+        let ttl = rows
+            .iter()
+            .find(|(harness, _)| harness == req_harness)
+            .or_else(|| {
+                rows.iter()
+                    .find(|(harness, _)| req_harness.shares_session_ids_with(*harness))
+            });
+        if let Some((_, ttl)) = ttl {
+            out.insert((*req_harness, session_id.clone()), ttl.clone());
+        }
+    }
+    out
+}
+
 fn finish_continues_turn(finish: &str) -> bool {
     matches!(finish, "tool-calls" | "toolUse" | "tool_use")
 }
 
 fn build_db_cache_events(rows: Vec<RawDbCacheEvent>, enrich_causes: bool) -> Vec<DbCacheEvent> {
-    build_db_cache_events_with_attribution(rows, enrich_causes, None, None)
+    build_db_cache_events_with_overrides(rows, enrich_causes, None, None, None, None)
 }
 
 #[cfg(test)]
@@ -2338,9 +2663,16 @@ fn build_db_cache_events_with_decisions(
         HashMap<(Harness, String, String), TransformDecisionCause>,
     >,
 ) -> Vec<DbCacheEvent> {
-    build_db_cache_events_with_attribution(rows, enrich_causes, transform_decisions_override, None)
+    build_db_cache_events_with_attribution(
+        rows,
+        enrich_causes,
+        transform_decisions_override,
+        None,
+        Some(HashMap::new()),
+    )
 }
 
+#[cfg(test)]
 fn build_db_cache_events_with_attribution(
     rows: Vec<RawDbCacheEvent>,
     enrich_causes: bool,
@@ -2348,6 +2680,29 @@ fn build_db_cache_events_with_attribution(
         HashMap<(Harness, String, String), TransformDecisionCause>,
     >,
     transform_failure_sessions_override: Option<HashSet<(Harness, String)>>,
+    session_cache_ttls_override: Option<HashMap<(Harness, String), String>>,
+) -> Vec<DbCacheEvent> {
+    build_db_cache_events_with_overrides(
+        rows,
+        enrich_causes,
+        transform_decisions_override,
+        transform_failure_sessions_override,
+        session_cache_ttls_override,
+        None,
+    )
+}
+
+/// Each `*_override` replaces what would otherwise be read from the stores on
+/// disk, so tests can supply it; `None` reads the store.
+fn build_db_cache_events_with_overrides(
+    rows: Vec<RawDbCacheEvent>,
+    enrich_causes: bool,
+    transform_decisions_override: Option<
+        HashMap<(Harness, String, String), TransformDecisionCause>,
+    >,
+    transform_failure_sessions_override: Option<HashSet<(Harness, String)>>,
+    session_cache_ttls_override: Option<HashMap<(Harness, String), String>>,
+    mc_state_sessions_override: Option<HashSet<(Harness, String)>>,
 ) -> Vec<DbCacheEvent> {
     // Build a map of earliest timestamp per session in our window so we can
     // detect whether an event is truly the session's first message vs just
@@ -2538,6 +2893,9 @@ fn build_db_cache_events_with_attribution(
             context_limit: row.context_limit.unwrap_or(0),
             context_limit_estimated: false, // set with context_limit below
             is_drop: false,                 // computed in pass 2
+            context_reduced_by_mc: false,   // set per session in pass 2
+            drop_request_size: None,        // computed in pass 2
+            request_body_len: row.broca.and_then(|broca| broca.request_body_len),
             aggregate: row.broca.is_some_and(|broca| broca.aggregate),
             cold_start: row.broca.is_some_and(|broca| broca.first_in_session),
             cache_write_reported: row.broca.map_or(true, |broca| broca.cache_write_reported),
@@ -2554,12 +2912,19 @@ fn build_db_cache_events_with_attribution(
     // accounting at all (e.g. ollama-cloud reports cache_read=0 everywhere). We
     // can't judge its cache health, so every row is UNKNOWN, never a false bust.
     let mut session_has_cache: HashMap<(Harness, String), bool> = HashMap::new();
+    // Providers with an explicit cache (Anthropic) report cache writes; an
+    // implicit-prefix cache (OpenAI, Gemini) never does. The meter rule for a
+    // provider-side miss counts uncached input differently for the two.
+    let mut session_reports_cache_writes: HashSet<(Harness, String)> = HashSet::new();
     for e in &chronological {
         let entry = session_has_cache
             .entry((e.harness, e.session_id.clone()))
             .or_insert(false);
         if e.cache_read > 0 {
             *entry = true;
+        }
+        if e.cache_write > 0 {
+            session_reports_cache_writes.insert((e.harness, e.session_id.clone()));
         }
     }
     let session_keys: HashSet<(Harness, String)> = chronological
@@ -2580,6 +2945,17 @@ fn build_db_cache_events_with_attribution(
             HashSet::new()
         }
     });
+    let session_cache_ttls = session_cache_ttls_override.unwrap_or_else(|| {
+        if enrich_causes {
+            load_session_cache_ttls(&session_keys)
+        } else {
+            HashMap::new()
+        }
+    });
+    // Read whether or not causes are enriched: the drop label depends on it,
+    // and the Claude Code, Codex and Broca timelines never enrich causes.
+    let mc_state_sessions =
+        mc_state_sessions_override.unwrap_or_else(|| load_mc_state_sessions(&session_keys));
 
     // ── Pass 2: turn grouping + cross-step retention severity ──
     // Expected next cache_read = prev.cache_read + growth, where growth is the
@@ -2587,8 +2963,7 @@ fn build_db_cache_events_with_attribution(
     //   - Anthropic reports it directly as cache_write (cache_creation tokens).
     //   - When cache_write is absent, use only the previous uncached input.
     //     Generated output (including reasoning) is not automatically part of
-    //     the next step's cached input; measured comparisons support this rule
-    //     (docs/reports/pi-openai-cache-busts-2026-09-28.md).
+    //     the next step's cached input: the host may not resend those bytes.
     // retention = current.cache_read / expected (only when prev had a cache):
     //   >= 0.95 stable · 0.80..0.95 warning · < 0.80 bust · ==0 full_bust
     // (Verified empirically: on a stable step retention is 0.97-1.00+ across
@@ -2647,22 +3022,44 @@ fn build_db_cache_events_with_attribution(
             cur_session.clone(),
             chronological[i].message_id.clone(),
         );
-        let decision_row = transform_decisions.get(&decision_key);
+        let context_reduced_by_mc = session_context_reduced_by_mc(
+            chronological[i].harness,
+            &cur_session,
+            &mc_state_sessions,
+        );
+        chronological[i].context_reduced_by_mc = context_reduced_by_mc;
+        // A Magic Context decision explains only a session whose context Magic
+        // Context manages; in any other session it must not become the cause.
+        let decision_row = transform_decisions
+            .get(&decision_key)
+            .filter(|_| context_reduced_by_mc);
         let has_transform_failure = transform_failure_sessions.contains(&session_key);
         // A missing decision is normal for routine passes that do not invalidate
         // the cache: the plugin persists decisions only when they bust the cache.
-        // Attribute a transform failure only when a recorded error proves it;
-        // otherwise report the cache loss as having an unknown origin.
+        // Order of attribution for a bust:
+        //   1. the cause Magic Context recorded for this request's pass (a pass
+        //      that changed nothing records none, see
+        //      transform_decision_changed_prompt);
+        //   2. a transform error Magic Context recorded for the session;
+        //   3. a provider-side loss the timing and usage show (idle expiry, or a
+        //      miss right after a warm read), see provider_side_cause;
+        //   4. otherwise the origin is unknown.
+        // So an expired cache on a request Magic Context also folded is still
+        // labelled with the fold.
         let cause_from_decision = || transform_decision_cause(decision_row);
-        let cause_from_bust = || {
-            cause_from_decision().or_else(|| {
-                if has_transform_failure {
-                    Some(MC_TRANSFORM_FAILED_OPEN_CAUSE.to_string())
-                } else {
-                    Some(UNATTRIBUTED_CACHE_BUST_CAUSE.to_string())
-                }
-            })
+        let cause_from_bust = |provider_side: Option<String>| {
+            cause_from_decision()
+                .or_else(|| {
+                    has_transform_failure.then(|| MC_TRANSFORM_FAILED_OPEN_CAUSE.to_string())
+                })
+                .or(provider_side)
+                .or_else(|| Some(UNATTRIBUTED_CACHE_BUST_CAUSE.to_string()))
         };
+        let lifetime = cache_lifetime(
+            session_cache_ttls.get(&session_key).map(String::as_str),
+            chronological[i].provider.as_deref(),
+        );
+        let explicit_cache_writes = session_reports_cache_writes.contains(&session_key);
 
         let (severity, cause, retention): (String, Option<String>, Option<f64>) =
             if chronological[i].aggregate {
@@ -2735,11 +3132,19 @@ fn build_db_cache_events_with_attribution(
                         prev_input
                     };
                     let expected = prev_read + growth; // > 0 since prev_read > 0
+                    let provider_side = || {
+                        provider_side_cause(
+                            &chronological[prev_idx],
+                            &chronological[i],
+                            lifetime,
+                            explicit_cache_writes,
+                        )
+                    };
                     if cur_read == 0 {
                         (
                             "full_bust".to_string(),
                             if enrich_causes {
-                                cause_from_bust()
+                                cause_from_bust(provider_side())
                             } else {
                                 None
                             },
@@ -2763,7 +3168,7 @@ fn build_db_cache_events_with_attribution(
                             (
                                 "bust".to_string(),
                                 if enrich_causes {
-                                    cause_from_bust()
+                                    cause_from_bust(provider_side())
                                 } else {
                                     None
                                 },
@@ -2776,33 +3181,49 @@ fn build_db_cache_events_with_attribution(
                 ("stable".to_string(), None, None)
             };
 
-        // Drop detection: a meaningful prompt shrink vs the previous step means
-        // MC reclaimed context this step. Mark it and (if not already) attach the
-        // DB-recorded transform decision so the timeline explains WHY it dropped.
+        // Drop detection: a meaningful prompt shrink vs the previous step. In a
+        // session Magic Context manages that is its reclaim, so (if not already)
+        // attach the DB-recorded transform decision to explain WHY it dropped.
+        // Elsewhere no decision is consulted; when the source records request
+        // sizes, note whether the request itself got smaller.
         let mut is_drop = false;
+        let mut drop_request_size = None;
         let mut cause = cause;
         if let Some(&prev_idx) = prev_event_idx_by_session
             .get(&session_key)
             .filter(|_| !chronological[i].aggregate)
         {
-            let prev_prompt = {
+            let (prev_prompt, prev_request_len) = {
                 let prev = &chronological[prev_idx];
-                prev.input_tokens + prev.cache_read + prev.cache_write
+                (
+                    prev.input_tokens + prev.cache_read + prev.cache_write,
+                    prev.request_body_len,
+                )
             };
             let cur_prompt = chronological[i].input_tokens
                 + chronological[i].cache_read
                 + chronological[i].cache_write;
             if prev_prompt - cur_prompt >= DROP_MARKER_MIN_TOKENS {
                 is_drop = true;
-                if cause.is_none() && enrich_causes {
+                if cause.is_none() && enrich_causes && context_reduced_by_mc {
                     cause = cause_from_decision();
                 }
+                drop_request_size = prev_request_len.zip(chronological[i].request_body_len).map(
+                    |(prev_len, cur_len)| {
+                        if cur_len < prev_len {
+                            DropRequestSize::Smaller
+                        } else {
+                            DropRequestSize::NotSmaller
+                        }
+                    },
+                );
             }
         }
 
         chronological[i].severity = severity;
         chronological[i].cause = cause;
         chronological[i].is_drop = is_drop;
+        chronological[i].drop_request_size = drop_request_size;
         if chronological[i].severity == "info" {
             chronological[i].cold_start = true;
         }
@@ -3271,6 +3692,7 @@ fn load_broca_run_totals(
                 aggregate: true,
                 cache_write_reported: row.get::<_, i64>(9)? != 0,
                 first_in_session: false,
+                request_body_len: None,
             }),
         })
     })?;
@@ -3339,6 +3761,7 @@ fn broca_wal_step_rows(
                 aggregate: false,
                 first_in_session: false,
                 cache_write_reported: usage.cache_write_tokens.is_some(),
+                request_body_len: step.request_body_len,
             }),
         });
     }
@@ -3753,30 +4176,41 @@ fn resolve_store_db_path() -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-fn load_managed_cache_sessions(keys: &HashSet<(Harness, String)>) -> HashSet<(Harness, String)> {
+/// The Claude Code, Codex and Broca sessions among `keys` that Magic Context
+/// holds state for in its store.db. Those hosts have no Magic Context plugin
+/// state of their own, so this is how the dashboard knows Magic Context runs
+/// in one of their sessions.
+fn load_mc_state_sessions(keys: &HashSet<(Harness, String)>) -> HashSet<(Harness, String)> {
+    // Most timelines (OpenCode, Pi) have no such session; skip the store then.
+    if !keys
+        .iter()
+        .any(|(harness, _)| harness.mc_state_lives_in_store())
+    {
+        return HashSet::new();
+    }
     let Some(path) = resolve_store_db_path() else {
         return HashSet::new();
     };
-    load_managed_cache_sessions_from_path(&path, keys)
+    load_mc_state_sessions_from_path(&path, keys)
 }
 
-fn load_managed_cache_sessions_from_path(
+fn load_mc_state_sessions_from_path(
     path: &Path,
     keys: &HashSet<(Harness, String)>,
 ) -> HashSet<(Harness, String)> {
     let Ok(conn) = open_readonly(&path.to_path_buf()) else {
         return HashSet::new();
     };
-    load_managed_cache_sessions_from_conn(&conn, keys)
+    load_mc_state_sessions_from_conn(&conn, keys)
 }
 
-fn load_managed_cache_sessions_from_conn(
+fn load_mc_state_sessions_from_conn(
     conn: &Connection,
     keys: &HashSet<(Harness, String)>,
 ) -> HashSet<(Harness, String)> {
     let external_session_ids: Vec<String> = keys
         .iter()
-        .filter(|(harness, _)| matches!(harness, Harness::ClaudeCode | Harness::Codex))
+        .filter(|(harness, _)| harness.mc_state_lives_in_store())
         .map(|(_, session_id)| session_id.clone())
         .collect::<HashSet<_>>()
         .into_iter()
@@ -3807,13 +4241,16 @@ fn load_managed_cache_sessions_from_conn(
     let managed_ids: HashSet<String> = rows.flatten().collect();
     keys.iter()
         .filter(|(harness, session_id)| {
-            matches!(harness, Harness::ClaudeCode | Harness::Codex)
-                && managed_ids.contains(session_id)
+            harness.mc_state_lives_in_store() && managed_ids.contains(session_id)
         })
         .cloned()
         .collect()
 }
 
+/// Whether the Cache list shows this session by default. "Managed" here means
+/// one of our own systems runs the session (every Broca run) or Magic Context
+/// runs in it; it does not mean Magic Context manages the session's context.
+/// See `session_context_reduced_by_mc` for that.
 fn is_managed_cache_session(
     harness: Harness,
     session_id: &str,
@@ -3822,6 +4259,22 @@ fn is_managed_cache_session(
     harness.has_magic_context_plugin_state()
         || harness == Harness::Broca
         || detected.contains(&(harness, session_id.to_string()))
+}
+
+/// Whether Magic Context manages this session's context, so a prompt drop in
+/// it is Magic Context's reclaim. True on hosts with Magic Context plugin
+/// state, and on Claude Code, Codex and Broca only when store.db holds Magic
+/// Context state for the session (`mc_state` from `load_mc_state_sessions`).
+/// Unlike `is_managed_cache_session`, a Broca session is not counted by
+/// default.
+fn session_context_reduced_by_mc(
+    harness: Harness,
+    session_id: &str,
+    mc_state: &HashSet<(Harness, String)>,
+) -> bool {
+    harness.has_magic_context_plugin_state()
+        || (harness.mc_state_lives_in_store()
+            && mc_state.contains(&(harness, session_id.to_string())))
 }
 
 pub fn load_cache_session_titles(
@@ -4051,7 +4504,7 @@ pub fn get_session_cache_stats_from_db(
         .iter()
         .map(|row| (row.harness, row.session_id.clone()))
         .collect();
-    let detected_managed = load_managed_cache_sessions(&candidate_keys);
+    let detected_managed = load_mc_state_sessions(&candidate_keys);
     if !show_unmanaged {
         sessions.retain(|row| {
             is_managed_cache_session(row.harness, &row.session_id, &detected_managed)
@@ -5199,6 +5652,34 @@ fn like_contains_pattern(raw: &str) -> String {
     escaped
 }
 
+/// Parse a search box value that is exactly a memory ID: digits, optionally
+/// prefixed with `#` (the form agents use when citing a memory, e.g. `#831`),
+/// with surrounding whitespace ignored. Anything else, including an ID that
+/// does not fit in an i64, returns None and is searched as ordinary text.
+fn parse_memory_id_query(search_query: Option<&str>) -> Option<i64> {
+    let trimmed = search_query?.trim();
+    let digits = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Restricts a memory list query to one memory ID, or excludes one.
+#[derive(Clone, Copy)]
+enum MemoryIdCondition {
+    Only(i64),
+    Exclude(i64),
+}
+
+/// List memories for the Memories view.
+///
+/// When the search text is exactly a memory ID (`1234` or `#1234`) and that
+/// memory passes the project/workspace/status/category filters, the result is
+/// that memory followed by the normal text-search results with it removed.
+/// `limit`/`offset` page through that combined list, so the exact match only
+/// appears on the first page. An ID that does not exist or is filtered out
+/// leaves the ordinary text search unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn get_memories(
     conn: &Connection,
@@ -5207,6 +5688,63 @@ pub fn get_memories(
     status_filter: Option<&str>,
     category_filter: Option<&str>,
     search_query: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Memory>, rusqlite::Error> {
+    let run =
+        |search: Option<&str>, id_condition: Option<MemoryIdCondition>, limit: i64, offset: i64| {
+            query_memories(
+                conn,
+                project_filter,
+                workspace_filter,
+                status_filter,
+                category_filter,
+                search,
+                id_condition,
+                limit,
+                offset,
+            )
+        };
+
+    // A zero limit asks for no rows; skip the ID lookup so it cannot add one.
+    if let Some(id) = parse_memory_id_query(search_query).filter(|_| limit != 0) {
+        // The exact lookup runs without the search text but with every view
+        // filter, so an ID outside the current filters is not surfaced.
+        let exact = run(None, Some(MemoryIdCondition::Only(id)), 1, 0)?
+            .into_iter()
+            .next();
+        if let Some(exact) = exact {
+            // The combined list is [exact match, text results without it...].
+            // The first page holds the exact match plus one fewer text row;
+            // later pages read the text results shifted back by one. A negative
+            // limit means "no limit" to SQLite and is passed through as-is.
+            let text_condition = Some(MemoryIdCondition::Exclude(id));
+            if offset > 0 {
+                return run(search_query, text_condition, limit, offset - 1);
+            }
+            let text_limit = if limit > 0 { limit - 1 } else { limit };
+            let mut rows = vec![exact];
+            if text_limit != 0 {
+                rows.extend(run(search_query, text_condition, text_limit, 0)?);
+            }
+            return Ok(rows);
+        }
+    }
+
+    run(search_query, None, limit, offset)
+}
+
+/// The filtered FTS/LIKE/unfiltered memory list behind `get_memories`, with an
+/// optional condition that keeps or drops a single memory ID.
+#[allow(clippy::too_many_arguments)]
+fn query_memories(
+    conn: &Connection,
+    project_filter: Option<&str>,
+    workspace_filter: Option<i64>,
+    status_filter: Option<&str>,
+    category_filter: Option<&str>,
+    search_query: Option<&str>,
+    id_condition: Option<MemoryIdCondition>,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<Memory>, rusqlite::Error> {
@@ -5298,6 +5836,22 @@ pub fn get_memories(
         params.push(Box::new(c.to_string()));
         conditions.push(format!("m.category = ?{}", params.len()));
     }
+    // Position in `params` of an excluded ID. The FTS fallback check below
+    // binds NULL there instead: `m.id IS NOT NULL` keeps every row, so that
+    // check sees the same matches as the search without the exclusion.
+    let mut exclude_param_pos = None;
+    match id_condition {
+        Some(MemoryIdCondition::Only(id)) => {
+            params.push(Box::new(id));
+            conditions.push(format!("m.id = ?{}", params.len()));
+        }
+        Some(MemoryIdCondition::Exclude(id)) => {
+            exclude_param_pos = Some(params.len());
+            params.push(Box::new(id));
+            conditions.push(format!("m.id IS NOT ?{}", params.len()));
+        }
+        None => {}
+    }
 
     let where_extra = if conditions.is_empty() {
         String::new()
@@ -5387,22 +5941,32 @@ pub fn get_memories(
             enrich_memories_workspace_source(conn, workspace_filter, &mut memories)?;
             Ok(memories)
         }
-        Ok(empty) if use_fts && !use_like_fallback && offset > 0 && {
-            // An empty page past the first one only falls back to LIKE when FTS
-            // matches nothing at all. Otherwise it is just the end of the FTS
-            // results, and a LIKE page at the same offset would splice a
-            // different result set onto the pages already shown.
-            let mut probe: Vec<&dyn rusqlite::types::ToSql> = params[..params.len() - 2]
-                .iter()
-                .map(|p| p.as_ref())
-                .collect();
-            probe.push(&1i64);
-            probe.push(&0i64);
-            conn.prepare(&sql)?
-                .query(probe.as_slice())?
-                .next()?
-                .is_some()
-        } =>
+        Ok(empty)
+            if use_fts
+                && !use_like_fallback
+                && (offset > 0 || exclude_param_pos.is_some())
+                && {
+                    // An empty page past the first one only falls back to LIKE when FTS
+                    // matches nothing at all. Otherwise it is just the end of the FTS
+                    // results, and a LIKE page at the same offset would splice a
+                    // different result set onto the pages already shown. The same holds
+                    // for a first page that is empty only because the excluded ID was
+                    // the sole FTS match: the caller already shows that memory, and the
+                    // search without the exclusion would have stayed on FTS.
+                    let mut probe: Vec<&dyn rusqlite::types::ToSql> = params[..params.len() - 2]
+                        .iter()
+                        .map(|p| p.as_ref())
+                        .collect();
+                    if let Some(pos) = exclude_param_pos {
+                        probe[pos] = &rusqlite::types::Null;
+                    }
+                    probe.push(&1i64);
+                    probe.push(&0i64);
+                    conn.prepare(&sql)?
+                        .query(probe.as_slice())?
+                        .next()?
+                        .is_some()
+                } =>
         {
             Ok(empty)
         }
@@ -5441,6 +6005,10 @@ pub fn get_memories(
             }
             if let Some(c) = category_filter {
                 like_params.push(Box::new(c.to_string()));
+            }
+            if let Some(MemoryIdCondition::Only(id) | MemoryIdCondition::Exclude(id)) = id_condition
+            {
+                like_params.push(Box::new(id));
             }
             like_params.push(Box::new(limit));
             like_params.push(Box::new(offset));
@@ -5484,6 +6052,10 @@ pub fn get_memories(
             }
             if let Some(c) = category_filter {
                 like_params.push(Box::new(c.to_string()));
+            }
+            if let Some(MemoryIdCondition::Only(id) | MemoryIdCondition::Exclude(id)) = id_condition
+            {
+                like_params.push(Box::new(id));
             }
             like_params.push(Box::new(limit));
             like_params.push(Box::new(offset));
@@ -5632,39 +6204,6 @@ fn table_exists(conn: &Connection, table: &str) -> bool {
     )
     .map(|n| n > 0)
     .unwrap_or(false)
-}
-
-fn count_historian_runs(conn: &Connection, session_id: &str) -> i64 {
-    if !table_exists(conn, "historian_runs") {
-        return 0;
-    }
-    conn.query_row(
-        "SELECT COUNT(*) FROM historian_runs WHERE session_id = ?1",
-        [session_id],
-        |row| row.get(0),
-    )
-    .unwrap_or(0)
-}
-
-#[cfg(test)]
-mod historian_runs_reader_tests {
-    use super::*;
-
-    #[test]
-    fn counts_recorded_runs_for_only_the_requested_session() {
-        let conn = Connection::open_in_memory().expect("open test database");
-        assert_eq!(count_historian_runs(&conn, "session-a"), 0);
-
-        conn.execute_batch(
-            "CREATE TABLE historian_runs (session_id TEXT NOT NULL);
-             INSERT INTO historian_runs (session_id) VALUES ('session-a'), ('session-b'), ('session-a');",
-        )
-        .expect("create historian run fixture");
-
-        assert_eq!(count_historian_runs(&conn, "session-a"), 2);
-        assert_eq!(count_historian_runs(&conn, "session-b"), 1);
-        assert_eq!(count_historian_runs(&conn, "session-c"), 0);
-    }
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
@@ -6107,8 +6646,9 @@ fn bump_session_facts_version_for_session(
 /// Exception-only cache invalidation for schema/cache-format upgrades and explicit clear-all UI.
 /// Routine memory, user-memory, and fact mutations must use scoped version counters instead.
 pub fn invalidate_all_memory_block_caches(conn: &Connection) -> Result<usize, rusqlite::Error> {
-    conn.execute(
-        "UPDATE session_meta
+    crate::writer_diagnostics::statement("invalidate_memory_caches", || {
+        conn.execute(
+            "UPDATE session_meta
          SET memory_block_cache = '',
              memory_block_ids = '',
              cached_m0_bytes = NULL,
@@ -6119,8 +6659,9 @@ pub fn invalidate_all_memory_block_caches(conn: &Connection) -> Result<usize, ru
             OR cached_m0_bytes IS NOT NULL
             OR cached_m1_bytes IS NOT NULL
             OR cached_m0_max_memory_mutation_id IS NOT NULL",
-        [],
-    )
+            [],
+        )
+    })
 }
 
 pub fn update_memory_status(
@@ -6160,7 +6701,7 @@ pub fn update_memory_status(
     let is_archive = new_status == "archived" && prior_status != Some("archived");
 
     // Phase B: re-check the target row, mutate, and queue/bump in one tx.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
     verify_memory_project_path_unchanged(&tx, memory_id, &target.project_path)?;
     tx.execute(
         "UPDATE memories SET status = ?1, updated_at = ?2 WHERE id = ?3",
@@ -6203,7 +6744,7 @@ pub fn update_memory_content(
     let new_hash = normalize_hash(new_content);
 
     // Phase B: re-check the target row, mutate, clear stale embeddings, and queue once.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
     verify_memory_project_path_unchanged(&tx, memory_id, &target.project_path)?;
 
     // Pre-check the UNIQUE(project_path, category, normalized_hash) constraint
@@ -6300,7 +6841,7 @@ pub fn update_memory_category(
     }
 
     // Phase B: re-check the target row, mutate, and bump epochs once.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
     verify_memory_project_path_unchanged(&tx, memory_id, &target.project_path)?;
 
     let normalized_hash: String = tx.query_row(
@@ -6360,7 +6901,7 @@ pub fn delete_memory(conn: &mut Connection, memory_id: i64) -> Result<(), rusqli
     let target = lookup_memory_mutation_target(conn, memory_id)?;
 
     // Phase B: re-check, queue before delete, then delete.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
     verify_memory_project_path_unchanged(&tx, memory_id, &target.project_path)?;
     queue_memory_mutation(
         &tx,
@@ -6423,7 +6964,7 @@ pub fn bulk_update_memory_status(
     let now = now_millis();
 
     // Phase B: bulk re-verify, bulk update, then queue per archive or bump per restore.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
     verify_bulk_memory_project_paths_unchanged(&tx, &phase_a_paths)?;
     let affected = {
         let status_value = new_status.to_string();
@@ -6485,7 +7026,7 @@ pub fn bulk_delete_memory(
     let placeholders = memory_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
     // Phase B: bulk re-verify, queue one delete per memory, then delete.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
     verify_bulk_memory_project_paths_unchanged(&tx, &phase_a_paths)?;
     for id in memory_ids {
         if let Some(target) = phase_a_targets.get(id) {
@@ -7272,9 +7813,32 @@ pub fn get_pi_session_detail(
         .filter(|m| m.usage.as_ref().is_some_and(|u| u.total > 0))
         .count() as i64;
 
-    let compartments = conn
+    let mut compartments = conn
         .and_then(|c| get_compartments(c, session_id).ok())
         .unwrap_or_default();
+    let boundary_ids: Vec<String> = compartments
+        .iter()
+        .flat_map(|compartment| {
+            [
+                compartment.start_message_id.as_deref(),
+                compartment.end_message_id.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(str::to_owned)
+        })
+        .collect();
+    let entry_times = pi_sessions::read_pi_entry_times(&path, &boundary_ids);
+    for compartment in &mut compartments {
+        compartment.start_time = compartment
+            .start_message_id
+            .as_ref()
+            .and_then(|id| entry_times.get(id).copied());
+        compartment.end_time = compartment
+            .end_message_id
+            .as_ref()
+            .and_then(|id| entry_times.get(id).copied());
+    }
     let facts = conn
         .and_then(|c| get_session_facts(c, session_id).ok())
         .unwrap_or_default();
@@ -7572,7 +8136,7 @@ pub fn update_session_fact(
     let session_id = lookup_session_fact_session_id(conn, fact_id)?;
 
     // Phase B: re-check the owner, mutate, and bump session_facts_version together.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
     verify_session_fact_session_unchanged(&tx, fact_id, &session_id)?;
     let affected = tx.execute(
         "UPDATE session_facts SET content = ?1, updated_at = ?2 WHERE id = ?3",
@@ -7590,7 +8154,7 @@ pub fn delete_session_fact(conn: &mut Connection, fact_id: i64) -> Result<usize,
     let session_id = lookup_session_fact_session_id(conn, fact_id)?;
 
     // Phase B: re-check, bump before delete, then delete.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
     verify_session_fact_session_unchanged(&tx, fact_id, &session_id)?;
     bump_session_facts_version_for_session(&tx, &session_id)?;
     let affected = tx.execute("DELETE FROM session_facts WHERE id = ?1", params![fact_id])?;
@@ -7603,24 +8167,30 @@ pub fn update_note(
     note_id: i64,
     content: &str,
 ) -> Result<usize, rusqlite::Error> {
-    conn.execute(
-        "UPDATE notes SET content = ?1, updated_at = ?2 WHERE id = ?3",
-        rusqlite::params![content, chrono::Utc::now().timestamp_millis(), note_id],
-    )
+    crate::writer_diagnostics::statement("update_note", || {
+        conn.execute(
+            "UPDATE notes SET content = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![content, chrono::Utc::now().timestamp_millis(), note_id],
+        )
+    })
 }
 
 pub fn delete_note(conn: &Connection, note_id: i64) -> Result<usize, rusqlite::Error> {
-    conn.execute(
-        "DELETE FROM notes WHERE id = ?1",
-        rusqlite::params![note_id],
-    )
+    crate::writer_diagnostics::statement("delete_note", || {
+        conn.execute(
+            "DELETE FROM notes WHERE id = ?1",
+            rusqlite::params![note_id],
+        )
+    })
 }
 
 pub fn dismiss_note(conn: &Connection, note_id: i64) -> Result<usize, rusqlite::Error> {
-    conn.execute(
-        "UPDATE notes SET status = 'dismissed', updated_at = ?1 WHERE id = ?2",
-        rusqlite::params![chrono::Utc::now().timestamp_millis(), note_id],
-    )
+    crate::writer_diagnostics::statement("dismiss_note", || {
+        conn.execute(
+            "UPDATE notes SET status = 'dismissed', updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![chrono::Utc::now().timestamp_millis(), note_id],
+        )
+    })
 }
 
 pub fn get_smart_notes(
@@ -7682,41 +8252,6 @@ pub fn get_session_meta(
         Some(Err(e)) => Err(e),
         None => Ok(None),
     }
-}
-
-pub fn get_subagent_invocations(
-    conn: &Connection,
-    session_id: &str,
-) -> Result<Vec<SubagentInvocation>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT id, session_id, harness, subagent, task, provider_id, model_id,
-                started_at, ended_at, status, input_tokens, output_tokens,
-                cache_read_tokens, cache_write_tokens, error, parent_invocation_id
-         FROM subagent_invocations
-         WHERE session_id = ?1
-         ORDER BY started_at DESC",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
-        Ok(SubagentInvocation {
-            id: row.get(0)?,
-            session_id: row.get(1)?,
-            harness: row.get(2)?,
-            subagent: row.get(3)?,
-            task: row.get(4)?,
-            provider_id: row.get(5)?,
-            model_id: row.get(6)?,
-            started_at: row.get(7)?,
-            ended_at: row.get(8)?,
-            status: row.get(9)?,
-            input_tokens: row.get(10)?,
-            output_tokens: row.get(11)?,
-            cache_read_tokens: row.get(12)?,
-            cache_write_tokens: row.get(13)?,
-            error: row.get(14)?,
-            parent_invocation_id: row.get(15)?,
-        })
-    })?;
-    rows.collect()
 }
 
 pub fn get_subagent_totals_by_subagent(
@@ -7893,6 +8428,9 @@ pub fn get_dreamer_projects(conn: &Connection) -> Result<Vec<DreamerProject>, ru
             // built-in default. Identical for every project that only inherits.
             let tasks = crate::config::CANONICAL_DREAM_TASKS
                 .iter()
+                .filter(|&&task| {
+                    crate::jsonc::startup_smart_notes_enabled() || task != "evaluate-smart-notes"
+                })
                 .map(|&task| {
                     let effective = project_schedules
                         .get(task)
@@ -8449,7 +8987,7 @@ pub fn get_user_memory_candidates(
 }
 
 pub fn dismiss_user_memory(conn: &mut Connection, id: i64) -> Result<(), rusqlite::Error> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
     let affected = tx.execute(
         "UPDATE user_memories SET status = 'dismissed', updated_at = ?1 WHERE id = ?2",
         params![now_millis(), id],
@@ -8461,8 +8999,27 @@ pub fn dismiss_user_memory(conn: &mut Connection, id: i64) -> Result<(), rusqlit
     Ok(())
 }
 
+pub fn restore_user_memory(conn: &mut Connection, id: i64) -> Result<(), rusqlite::Error> {
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
+    let affected = tx.execute(
+        "UPDATE user_memories SET status = 'active', updated_at = ?1 WHERE id = ?2 AND status = 'dismissed'",
+        params![now_millis(), id],
+    )?;
+    // Same invariant as dismiss/delete: user_memories render into the cached
+    // m[0] <user-profile> block, so a restore must bump the global
+    // user-profile version or running sessions keep serving the profile
+    // without the restored entry. The status predicate keeps affected at 0
+    // for a row that is already active, so a no-op restore cannot
+    // invalidate every running session's cached profile.
+    if affected > 0 {
+        bump_project_user_profile_version(&tx)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn delete_user_memory(conn: &mut Connection, id: i64) -> Result<(), rusqlite::Error> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
     let affected = tx.execute("DELETE FROM user_memories WHERE id = ?1", params![id])?;
     if affected > 0 {
         bump_project_user_profile_version(&tx)?;
@@ -8476,7 +9033,7 @@ pub fn update_user_memory_content(
     id: i64,
     content: &str,
 ) -> Result<(), rusqlite::Error> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
     let affected = tx.execute(
         "UPDATE user_memories SET content = ?1, updated_at = ?2 WHERE id = ?3",
         params![content, now_millis(), id],
@@ -8492,10 +9049,12 @@ pub fn update_user_memory_content(
 }
 
 pub fn delete_user_memory_candidate(conn: &Connection, id: i64) -> Result<(), rusqlite::Error> {
-    conn.execute(
-        "DELETE FROM user_memory_candidates WHERE id = ?1",
-        params![id],
-    )?;
+    crate::writer_diagnostics::statement("delete_user_memory_candidate", || {
+        conn.execute(
+            "DELETE FROM user_memory_candidates WHERE id = ?1",
+            params![id],
+        )
+    })?;
     Ok(())
 }
 
@@ -8504,7 +9063,7 @@ pub fn promote_user_memory_candidate(
     id: i64,
 ) -> Result<(), rusqlite::Error> {
     let now = now_millis();
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::writer_diagnostics::begin(conn, concat!(file!(), ":", line!()))?;
 
     let content: String = tx.query_row(
         "SELECT content FROM user_memory_candidates WHERE id = ?1",
@@ -10796,6 +11355,7 @@ mod cache_turn_tests {
             ("epoch_change", "Epoch change"),
             ("coverage_fold", "Coverage fold"),
             ("profile_transition", "Profile transition"),
+            ("tag_identity_repair", "Tag identity repair"),
         ] {
             let cause = TransformDecisionCause {
                 decision: "execute".to_string(),
@@ -11013,11 +11573,503 @@ mod cache_turn_tests {
             true,
             Some(HashMap::new()),
             Some(failures),
+            Some(HashMap::new()),
         );
         assert_eq!(events[1].severity, "full_bust");
         assert_eq!(
             events[1].cause.as_deref(),
             Some(MC_TRANSFORM_FAILED_OPEN_CAUSE)
+        );
+    }
+
+    // ── Provider-side cache losses (idle expiry, provider cache miss) ──
+    //
+    // Fixtures model an Anthropic OpenCode session with a large cached prompt:
+    // the warm request read 682k from the cache (prompt total 695,053, so the
+    // short-read floor is 694,989), and the busting request read 0 cached + 4
+    // uncached tokens and rewrote its whole prompt, which grew to 695,104.
+
+    const T0: i64 = 1_760_000_000_000;
+    const SECOND: i64 = 1_000;
+
+    fn anthropic_step(
+        message_id: &str,
+        timestamp: i64,
+        input: i64,
+        read: i64,
+        write: i64,
+    ) -> RawDbCacheEvent {
+        let mut event = raw(
+            Harness::Opencode,
+            message_id,
+            "s1",
+            timestamp,
+            input,
+            read,
+            write,
+            input + read + write,
+            Some("stop"),
+        );
+        event.provider = Some("anthropic".to_string());
+        event
+    }
+
+    /// A warm Anthropic request, then one `gap_ms` later that read nothing and
+    /// rewrote a prompt no smaller than the previous one.
+    fn warm_then_cold(gap_ms: i64) -> Vec<RawDbCacheEvent> {
+        warm_then_cold_rewriting(gap_ms, 695_100)
+    }
+
+    /// Like `warm_then_cold`, with the busting request writing `rewritten`
+    /// tokens (its prompt total is `rewritten + 4`).
+    fn warm_then_cold_rewriting(gap_ms: i64, rewritten: i64) -> Vec<RawDbCacheEvent> {
+        vec![
+            anthropic_step("m1", T0, 3, 682_000, 13_050),
+            anthropic_step("m2", T0 + gap_ms, 4, 0, rewritten),
+        ]
+    }
+
+    fn decision(decision: &str, reason: Option<&str>) -> TransformDecisionCause {
+        TransformDecisionCause {
+            decision: decision.to_string(),
+            materialize_reason: reason.map(str::to_string),
+            emergency: false,
+        }
+    }
+
+    /// Attribute `rows` (session `s1`) with an optional decision on `m2` and the
+    /// session's recorded `cache_ttl`, without reading any store.
+    fn attribute(
+        rows: Vec<RawDbCacheEvent>,
+        m2_decision: Option<TransformDecisionCause>,
+        recorded_ttl: Option<&str>,
+    ) -> Vec<DbCacheEvent> {
+        let decisions = m2_decision
+            .map(|row| {
+                HashMap::from([((Harness::Opencode, "s1".to_string(), "m2".to_string()), row)])
+            })
+            .unwrap_or_default();
+        let ttls = recorded_ttl
+            .map(|ttl| HashMap::from([((Harness::Opencode, "s1".to_string()), ttl.to_string())]))
+            .unwrap_or_default();
+        build_db_cache_events_with_attribution(
+            rows,
+            true,
+            Some(decisions),
+            Some(HashSet::new()),
+            Some(ttls),
+        )
+    }
+
+    fn m2_cause(events: &[DbCacheEvent]) -> Option<&str> {
+        let m2 = events
+            .iter()
+            .find(|event| event.message_id == "m2")
+            .expect("m2 event");
+        m2.cause.as_deref()
+    }
+
+    #[test]
+    fn passes_that_changed_nothing_are_not_a_cause() {
+        // Rust SOFT+ replay, raw pass-through, full-sync, and a frozen-replay
+        // release that changed no block all served the bytes the provider had.
+        for row in [
+            decision("defer", None),
+            decision("passthrough", Some("pending_rewrite")),
+            decision("need_full_sync", None),
+            decision("unknown", Some("marker_admission_failed")),
+            decision(
+                "passthrough",
+                Some("lkg_frozen_release:raw_replay_gap;first_changed=none"),
+            ),
+        ] {
+            assert_eq!(transform_decision_cause(Some(&row)), None, "{row:?}");
+        }
+        // A frozen-replay release that changed a block, and every rebuild
+        // reason, still explain the loss.
+        let release = "lkg_frozen_release:raw_replay_gap;first_changed=msg_9#0";
+        assert_eq!(
+            transform_decision_cause(Some(&decision("passthrough", Some(release)))).as_deref(),
+            Some(release)
+        );
+        assert_eq!(
+            transform_decision_cause(Some(&decision("defer", Some("explicit_flush")))).as_deref(),
+            Some("Manual flush")
+        );
+        assert_eq!(
+            transform_decision_cause(Some(&decision("execute", Some("m1_delta")))).as_deref(),
+            Some("M1 delta")
+        );
+    }
+
+    #[test]
+    fn system_hash_is_a_system_prompt_change_whatever_the_pass_did() {
+        // The plugin records system_hash on deferred, pass-through and
+        // placeholder rows too: the changed prompt rewrites the provider cache.
+        for kind in ["defer", "passthrough", "unknown", "execute"] {
+            assert_eq!(
+                transform_decision_cause(Some(&decision(kind, Some("system_hash")))).as_deref(),
+                Some("System prompt change"),
+                "{kind}"
+            );
+        }
+        // Ten seconds after a warm read, the recorded cause wins over the
+        // provider-miss label.
+        let events = attribute(
+            warm_then_cold(10 * SECOND),
+            Some(decision("passthrough", Some("system_hash"))),
+            Some("never"),
+        );
+        assert_eq!(m2_cause(&events), Some("System prompt change"));
+    }
+
+    #[test]
+    fn no_change_pass_is_never_shown_as_the_bust_cause() {
+        // Reported: 248 and 183 min idle, `passthrough`/`pending_rewrite`.
+        let row = decision("passthrough", Some("pending_rewrite"));
+        let events = attribute(
+            warm_then_cold(248 * MINUTE_MS),
+            Some(row.clone()),
+            Some("never"),
+        );
+        assert_eq!(events[1].severity, "full_bust");
+        assert_eq!(
+            m2_cause(&events),
+            Some("Cache expired after 4 h 8 min idle")
+        );
+        let events = attribute(
+            warm_then_cold(183 * MINUTE_MS),
+            Some(row.clone()),
+            Some("never"),
+        );
+        assert_eq!(
+            m2_cause(&events),
+            Some("Cache expired after 3 h 3 min idle")
+        );
+        // Reported: 6 min after a host restart. Neither bound applies, and the
+        // pass-through's reason is not a cause either.
+        let events = attribute(warm_then_cold(6 * MINUTE_MS), Some(row), Some("never"));
+        assert_eq!(m2_cause(&events), Some(UNATTRIBUTED_CACHE_BUST_CAUSE));
+        // A SOFT+ replay ten seconds after a warm read.
+        let events = attribute(
+            warm_then_cold(10 * SECOND),
+            Some(decision("defer", None)),
+            Some("never"),
+        );
+        assert_eq!(m2_cause(&events), Some(PROVIDER_CACHE_MISS_CAUSE));
+    }
+
+    #[test]
+    fn unknown_ttl_uses_the_documented_bounds_and_is_silent_between_them() {
+        // Reported: 0.1 min after a 380k warm read, no decision row.
+        let events = attribute(warm_then_cold(6 * SECOND), None, Some("never"));
+        assert_eq!(m2_cause(&events), Some(PROVIDER_CACHE_MISS_CAUSE));
+        // Reported: 11.3 and 17.1 min, no decision row. Past Anthropic's 5 min
+        // default but within its 1 h maximum: either cause is possible.
+        for gap in [678 * SECOND, 1_026 * SECOND] {
+            let events = attribute(warm_then_cold(gap), None, Some("never"));
+            assert_eq!(m2_cause(&events), Some(UNATTRIBUTED_CACHE_BUST_CAUSE));
+        }
+        // No recorded TTL at all behaves the same.
+        let events = attribute(warm_then_cold(6 * SECOND), None, None);
+        assert_eq!(m2_cause(&events), Some(PROVIDER_CACHE_MISS_CAUSE));
+        let events = attribute(warm_then_cold(61 * MINUTE_MS), None, None);
+        assert_eq!(m2_cause(&events), Some("Cache expired after 61 min idle"));
+    }
+
+    #[test]
+    fn documented_bounds_are_exclusive() {
+        let cause_at =
+            |gap| m2_cause(&attribute(warm_then_cold(gap), None, None)).map(str::to_string);
+        let five = 5 * MINUTE_MS;
+        let hour = 60 * MINUTE_MS;
+        assert_eq!(
+            cause_at(five - 1).as_deref(),
+            Some(PROVIDER_CACHE_MISS_CAUSE)
+        );
+        assert_eq!(
+            cause_at(five).as_deref(),
+            Some(UNATTRIBUTED_CACHE_BUST_CAUSE)
+        );
+        assert_eq!(
+            cause_at(hour).as_deref(),
+            Some(UNATTRIBUTED_CACHE_BUST_CAUSE)
+        );
+        assert_eq!(
+            cause_at(hour + 1).as_deref(),
+            Some("Cache expired after 60 min idle")
+        );
+    }
+
+    #[test]
+    fn known_ttl_session_labels_against_its_own_ttl() {
+        // MC recorded 5m: 6 min idle expired it, 4 min did not.
+        let events = attribute(warm_then_cold(6 * MINUTE_MS), None, Some("5m"));
+        assert_eq!(m2_cause(&events), Some("Cache expired after 6 min idle"));
+        let events = attribute(warm_then_cold(4 * MINUTE_MS), None, Some("5m"));
+        assert_eq!(m2_cause(&events), Some(PROVIDER_CACHE_MISS_CAUSE));
+        // MC recorded 1h: 11 min is well inside it, so the loss is a miss.
+        let events = attribute(warm_then_cold(11 * MINUTE_MS), None, Some("1h"));
+        assert_eq!(m2_cause(&events), Some(PROVIDER_CACHE_MISS_CAUSE));
+        // A recorded TTL applies even to a provider with no documented row.
+        let mut rows = warm_then_cold(31 * MINUTE_MS);
+        for row in &mut rows {
+            row.provider = Some("openai".to_string());
+        }
+        let events = attribute(rows, None, Some("30m"));
+        assert_eq!(m2_cause(&events), Some("Cache expired after 31 min idle"));
+    }
+
+    #[test]
+    fn provider_without_documented_bounds_gets_no_label() {
+        for gap in [6 * SECOND, 248 * MINUTE_MS] {
+            let mut rows = warm_then_cold(gap);
+            for row in &mut rows {
+                row.provider = Some("openrouter".to_string());
+            }
+            let events = attribute(rows, None, Some("never"));
+            assert_eq!(m2_cause(&events), Some(UNATTRIBUTED_CACHE_BUST_CAUSE));
+        }
+    }
+
+    #[test]
+    fn recorded_magic_context_causes_win_over_provider_side_labels() {
+        // A fold Magic Context recorded on this request is its cause, even when
+        // the gap alone would also have expired the cache.
+        let events = attribute(
+            warm_then_cold(248 * MINUTE_MS),
+            Some(decision("execute", Some("pressure_refold"))),
+            Some("never"),
+        );
+        assert_eq!(m2_cause(&events), Some("Compaction pressure"));
+        let events = attribute(
+            warm_then_cold(6 * MINUTE_MS),
+            Some(decision("execute", Some("ttl_idle"))),
+            Some("5m"),
+        );
+        assert_eq!(m2_cause(&events), Some("Idle cache refresh"));
+        // Seconds after a warm read, a recorded fold is the fold, not a miss.
+        let events = attribute(
+            warm_then_cold(10 * SECOND),
+            Some(decision("execute", None)),
+            Some("5m"),
+        );
+        assert_eq!(
+            m2_cause(&events),
+            Some("Execute pass (reclaimed tool output)")
+        );
+        // A transform error recorded for the session wins too.
+        let events = build_db_cache_events_with_attribution(
+            warm_then_cold(10 * SECOND),
+            true,
+            Some(HashMap::new()),
+            Some(HashSet::from([(Harness::Opencode, "s1".to_string())])),
+            Some(HashMap::new()),
+        );
+        assert_eq!(m2_cause(&events), Some(MC_TRANSFORM_FAILED_OPEN_CAUSE));
+    }
+
+    #[test]
+    fn warm_sequence_gets_no_label() {
+        // Each request reads the previous prefix plus what it wrote: seconds
+        // apart, after 30 min, and after 2 h (a setup that re-sends requests to
+        // keep the provider cache alive can read warm after any gap). Stable
+        // rows carry no cause, whatever the gap.
+        let rows = vec![
+            anthropic_step("m1", T0, 3, 682_000, 13_050),
+            anthropic_step("m2", T0 + 4 * SECOND, 2, 695_050, 1_200),
+            anthropic_step("m3", T0 + 9 * SECOND, 5, 696_250, 900),
+            anthropic_step("m4", T0 + 30 * MINUTE_MS, 1, 697_150, 300),
+            anthropic_step("m5", T0 + 150 * MINUTE_MS, 2, 697_450, 700),
+        ];
+        let events = attribute(rows, None, Some("never"));
+        for event in &events[1..] {
+            assert_eq!(event.severity, "stable", "{}", event.message_id);
+            assert_eq!(event.cause, None, "{}", event.message_id);
+        }
+    }
+
+    #[test]
+    fn bust_the_meter_does_not_call_short_is_not_a_provider_miss() {
+        // The cached read fell (retention 0.66, a bust), but Anthropic's meter
+        // counts the uncached input too: 460k read + 236k input is not below
+        // the 694,989 floor, so nothing says the provider dropped its cache.
+        let rows = vec![
+            anthropic_step("m1", T0, 3, 682_000, 13_050),
+            anthropic_step("m2", T0 + 10 * SECOND, 236_000, 460_000, 0),
+        ];
+        let events = attribute(rows, None, Some("never"));
+        assert_eq!(events[1].severity, "bust");
+        assert_eq!(m2_cause(&events), Some(UNATTRIBUTED_CACHE_BUST_CAUSE));
+    }
+
+    #[test]
+    fn fast_cold_read_with_a_shrunk_prompt_gets_no_provider_label() {
+        // 10 s after a warm read the prompt shrank by 13,143 tokens (below the
+        // 15k drop marker): the request changed, so the loss is not put on the
+        // provider.
+        let events = attribute(
+            warm_then_cold_rewriting(10 * SECOND, 681_906),
+            None,
+            Some("never"),
+        );
+        assert_eq!(events[1].severity, "full_bust");
+        assert!(!events[1].is_drop);
+        assert_eq!(m2_cause(&events), Some(UNATTRIBUTED_CACHE_BUST_CAUSE));
+        // A prompt total 55k smaller than the previous one is also marked as a
+        // context drop (is_drop, 15k or more). The step still gets the single
+        // Unattributed cause, never the provider-miss label next to the drop.
+        let events = attribute(
+            warm_then_cold_rewriting(10 * SECOND, 640_000),
+            None,
+            Some("never"),
+        );
+        assert!(events[1].is_drop);
+        assert_eq!(m2_cause(&events), Some(UNATTRIBUTED_CACHE_BUST_CAUSE));
+        // The shrink check uses the same floor as the short-read meter rule
+        // (previous prompt total 695,053 minus max(64, 3) = 694,989): a prompt
+        // total of exactly 694,989 did not shrink, one token less did.
+        let events = attribute(
+            warm_then_cold_rewriting(10 * SECOND, 694_985),
+            None,
+            Some("never"),
+        );
+        assert_eq!(m2_cause(&events), Some(PROVIDER_CACHE_MISS_CAUSE));
+        let events = attribute(
+            warm_then_cold_rewriting(10 * SECOND, 694_984),
+            None,
+            Some("never"),
+        );
+        assert_eq!(m2_cause(&events), Some(UNATTRIBUTED_CACHE_BUST_CAUSE));
+    }
+
+    #[test]
+    fn meter_rule_matches_the_analyzer_floor() {
+        let step = |input, read, write| DbCacheEvent {
+            harness: Harness::Opencode,
+            message_id: String::new(),
+            session_id: String::new(),
+            timestamp: 0,
+            input_tokens: input,
+            cache_read: read,
+            cache_write: write,
+            cache_reported: true,
+            total_tokens: 0,
+            hit_ratio: 0.0,
+            severity: String::new(),
+            cause: None,
+            agent: None,
+            finish: None,
+            native_turn_id: None,
+            turn_id: String::new(),
+            is_turn_start: false,
+            context_limit: 0,
+            context_limit_estimated: false,
+            is_drop: false,
+            context_reduced_by_mc: true,
+            drop_request_size: None,
+            request_body_len: None,
+            aggregate: false,
+            cold_start: false,
+            cache_write_reported: true,
+            provider: None,
+            model: None,
+        };
+        // Previous total 695,053 and epsilon max(64, 3) = 64, so a comparable
+        // read below 694,989 is short.
+        let previous = step(3, 682_000, 13_050);
+        assert!(meter_reports_short_read(
+            &previous,
+            &step(4, 0, 681_906),
+            true
+        ));
+        assert!(meter_reports_short_read(
+            &previous,
+            &step(0, 694_988, 0),
+            true
+        ));
+        assert!(!meter_reports_short_read(
+            &previous,
+            &step(0, 694_989, 0),
+            true
+        ));
+        // A larger previous uncached input widens the short-read allowance,
+        // because epsilon is then that input (1,000), not 64.
+        let previous = step(1_000, 600_000, 0);
+        assert!(!meter_reports_short_read(
+            &previous,
+            &step(0, 600_000, 0),
+            true
+        ));
+        assert!(meter_reports_short_read(
+            &previous,
+            &step(0, 599_999, 0),
+            true
+        ));
+        // An implicit-prefix cache counts only the cached read.
+        assert!(meter_reports_short_read(
+            &previous,
+            &step(50_000, 551_000, 0),
+            false
+        ));
+        assert!(!meter_reports_short_read(
+            &previous,
+            &step(50_000, 551_000, 0),
+            true
+        ));
+    }
+
+    #[test]
+    fn recorded_cache_ttl_parses_like_the_plugin() {
+        assert_eq!(parse_recorded_cache_ttl_ms("5m"), Some(5 * MINUTE_MS));
+        assert_eq!(parse_recorded_cache_ttl_ms(" 1h "), Some(60 * MINUTE_MS));
+        assert_eq!(parse_recorded_cache_ttl_ms("30s"), Some(30 * SECOND));
+        assert_eq!(parse_recorded_cache_ttl_ms("300000"), Some(5 * MINUTE_MS));
+        for unknown in ["never", "NEVER", "", "5 m", "5d", "0m", "m"] {
+            assert_eq!(parse_recorded_cache_ttl_ms(unknown), None, "{unknown}");
+        }
+    }
+
+    #[test]
+    fn session_cache_ttl_loader_reads_session_meta() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_meta (
+                session_id TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                cache_ttl TEXT
+            );
+            INSERT INTO session_meta (session_id, harness, cache_ttl) VALUES
+                ('ses_known', 'opencode', '1h'),
+                ('ses_converted', 'opencode', '5m'),
+                ('ses_never', 'opencode', 'never'),
+                ('ses_null', 'opencode', NULL);",
+        )
+        .unwrap();
+        let keys = HashSet::from([
+            (Harness::Opencode, "ses_known".to_string()),
+            (Harness::Opencode2, "ses_converted".to_string()),
+            (Harness::Opencode, "ses_never".to_string()),
+            (Harness::Opencode, "ses_null".to_string()),
+            (Harness::Pi, "ses_known".to_string()),
+        ]);
+        let ttls = load_session_cache_ttls_from_conn(&conn, &keys);
+        assert_eq!(
+            ttls,
+            HashMap::from([
+                (
+                    (Harness::Opencode, "ses_known".to_string()),
+                    "1h".to_string()
+                ),
+                (
+                    (Harness::Opencode2, "ses_converted".to_string()),
+                    "5m".to_string()
+                ),
+                (
+                    (Harness::Opencode, "ses_never".to_string()),
+                    "never".to_string()
+                ),
+            ])
         );
     }
 
@@ -11457,12 +12509,13 @@ mod managed_cache_tests {
             // U+241F and subagent/epoch parts. Matching by this prefix folds those
             // rows back onto the visible Claude Code session.
             conn.execute(
-                "INSERT INTO mc_cache_state (session_id) VALUES (?1), (?2), (?3), (?4)",
+                "INSERT INTO mc_cache_state (session_id) VALUES (?1), (?2), (?3), (?4), (?5)",
                 params![
                     "cc-exact",
                     "cc-composite␟agent␟1",
                     "cc-other-suffix",
                     "codex-exact",
+                    "broca-with-state",
                 ],
             )
             .unwrap();
@@ -11474,13 +12527,38 @@ mod managed_cache_tests {
             (Harness::ClaudeCode, "cc-other".to_string()),
             (Harness::Codex, "codex-exact".to_string()),
             (Harness::Opencode, "oc-session".to_string()),
+            (Harness::Broca, "broca-with-state".to_string()),
+            (Harness::Broca, "broca-without-state".to_string()),
         ]);
-        let managed = load_managed_cache_sessions_from_path(&path, &keys);
+        let managed = load_mc_state_sessions_from_path(&path, &keys);
         assert!(managed.contains(&(Harness::ClaudeCode, "cc-exact".to_string())));
         assert!(managed.contains(&(Harness::ClaudeCode, "cc-composite".to_string())));
         assert!(!managed.contains(&(Harness::ClaudeCode, "cc-other".to_string())));
         assert!(managed.contains(&(Harness::Codex, "codex-exact".to_string())));
         assert!(!managed.contains(&(Harness::Opencode, "oc-session".to_string())));
+        // Broca sessions are detected the same way. The Cache list shows every
+        // Broca session regardless, but only one with state counts as having
+        // its context managed by Magic Context.
+        assert!(managed.contains(&(Harness::Broca, "broca-with-state".to_string())));
+        assert!(!managed.contains(&(Harness::Broca, "broca-without-state".to_string())));
+        for id in ["broca-with-state", "broca-without-state"] {
+            assert!(is_managed_cache_session(Harness::Broca, id, &managed));
+        }
+        assert!(session_context_reduced_by_mc(
+            Harness::Broca,
+            "broca-with-state",
+            &managed
+        ));
+        assert!(!session_context_reduced_by_mc(
+            Harness::Broca,
+            "broca-without-state",
+            &managed
+        ));
+        assert!(session_context_reduced_by_mc(
+            Harness::Opencode,
+            "oc-session",
+            &managed
+        ));
     }
 
     #[test]
@@ -11488,7 +12566,7 @@ mod managed_cache_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing-store.db");
         let keys = HashSet::from([(Harness::ClaudeCode, "cc-session".to_string())]);
-        assert!(load_managed_cache_sessions_from_path(&path, &keys).is_empty());
+        assert!(load_mc_state_sessions_from_path(&path, &keys).is_empty());
     }
 }
 
@@ -11523,6 +12601,9 @@ mod get_session_cache_events_by_turn_count_tests {
             context_limit: 0,
             context_limit_estimated: false,
             is_drop: false,
+            context_reduced_by_mc: true,
+            drop_request_size: None,
+            request_body_len: None,
             aggregate: false,
             cold_start: false,
             cache_write_reported: true,
@@ -12115,6 +13196,352 @@ mod memory_project_filter_tests {
         assert_eq!((like_page(0), like_page(2), like_page(4)), (2, 1, 0));
     }
 
+    /// Insert a memory with an explicit ID, indexed in FTS like the plugin does.
+    fn insert_memory_row(
+        conn: &Connection,
+        id: i64,
+        project_path: &str,
+        category: &str,
+        status: &str,
+        content: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO memories
+                (id, project_path, category, content, normalized_hash,
+                 source_type, seen_count, retrieval_count,
+                 first_seen_at, last_seen_at, verification_status,
+                 status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5,
+                     'historian', 1, 0,
+                     1000, 1000, 'unverified',
+                     ?6, 1000, ?7)",
+            (
+                id,
+                project_path,
+                category,
+                content,
+                format!("{:x}", md5::compute(content)),
+                status,
+                1000 + id,
+            ),
+        )
+        .expect("insert memory");
+        conn.execute(
+            "INSERT INTO memories_fts(rowid, content, category) VALUES (?1, ?2, ?3)",
+            (id, content, category),
+        )
+        .expect("index memory");
+    }
+
+    fn search_ids(
+        conn: &Connection,
+        project: Option<&str>,
+        status: Option<&str>,
+        category: Option<&str>,
+        search: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Vec<i64> {
+        get_memories(
+            conn,
+            project,
+            None,
+            status,
+            category,
+            Some(search),
+            limit,
+            offset,
+        )
+        .expect("get_memories")
+        .into_iter()
+        .map(|m| m.id)
+        .collect()
+    }
+
+    #[test]
+    fn parse_memory_id_query_accepts_only_a_bare_or_hashed_id() {
+        assert_eq!(parse_memory_id_query(Some("1451")), Some(1451));
+        assert_eq!(parse_memory_id_query(Some("#1451")), Some(1451));
+        assert_eq!(parse_memory_id_query(Some("  #1451 \t")), Some(1451));
+        for text in [
+            "",
+            "#",
+            "# 1451",
+            "1451a",
+            "#14 51",
+            "-5",
+            "+5",
+            "##5",
+            "memory 5",
+            "99999999999999999999",
+        ] {
+            assert_eq!(parse_memory_id_query(Some(text)), None, "{text:?}");
+        }
+        assert_eq!(parse_memory_id_query(None), None);
+    }
+
+    #[test]
+    fn memory_id_search_returns_exact_memory_with_or_without_hash() {
+        let conn = make_memory_db();
+        insert_memory_row(
+            &conn,
+            1451,
+            "/tmp/ids",
+            "CONSTRAINTS",
+            "active",
+            "alpha fact",
+        );
+        insert_memory_row(
+            &conn,
+            1526,
+            "/tmp/ids",
+            "CONSTRAINTS",
+            "active",
+            "beta fact",
+        );
+        // A two-digit ID takes the LIKE text path rather than FTS.
+        insert_memory_row(&conn, 42, "/tmp/ids", "CONSTRAINTS", "active", "gamma fact");
+
+        for search in ["1451", "#1451", "  #1451  "] {
+            assert_eq!(
+                search_ids(&conn, None, None, None, search, 200, 0),
+                vec![1451],
+                "{search:?}"
+            );
+        }
+        for search in ["42", "#42"] {
+            assert_eq!(
+                search_ids(&conn, None, None, None, search, 200, 0),
+                vec![42],
+                "{search:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_id_search_puts_exact_match_first_without_duplicating_text_hits() {
+        let conn = make_memory_db();
+        // The memory's own text also contains its ID, so the text search
+        // returns it too; it must appear exactly once, in first place. Its
+        // text is long so FTS ranks it below the short hits: without the ID
+        // lookup it would not come first.
+        insert_memory_row(
+            &conn,
+            1451,
+            "/tmp/ids",
+            "WORKFLOW",
+            "active",
+            "decision kept after a long discussion about release timing, review load, \
+             and several unrelated follow-ups, recorded as 1451",
+        );
+        insert_memory_row(
+            &conn,
+            1526,
+            "/tmp/ids",
+            "CONSTRAINTS",
+            "active",
+            "1451 1451",
+        );
+        insert_memory_row(
+            &conn,
+            1600,
+            "/tmp/ids",
+            "CONSTRAINTS",
+            "active",
+            "1451 again",
+        );
+        insert_memory_row(
+            &conn,
+            1700,
+            "/tmp/ids",
+            "CONSTRAINTS",
+            "active",
+            "unrelated",
+        );
+
+        for search in ["1451", "#1451"] {
+            // Pin the premise: text ranking alone puts 1451 last.
+            let text_only: Vec<i64> =
+                query_memories(&conn, None, None, None, None, Some(search), None, 200, 0)
+                    .expect("text search")
+                    .into_iter()
+                    .map(|m| m.id)
+                    .collect();
+            assert_eq!(text_only.len(), 3, "{search:?}: {text_only:?}");
+            assert_eq!(text_only.last(), Some(&1451), "{search:?}: {text_only:?}");
+
+            let all = search_ids(&conn, None, None, None, search, 200, 0);
+            assert_eq!(all[0], 1451, "{search:?}: {all:?}");
+            let mut rest = all[1..].to_vec();
+            rest.sort_unstable();
+            assert_eq!(rest, vec![1526, 1600], "{search:?}: {all:?}");
+
+            // Pages walk the same combined list: the exact match is on the
+            // first page only, and no row is repeated or skipped.
+            let mut paged = search_ids(&conn, None, None, None, search, 2, 0);
+            assert_eq!(paged.len(), 2);
+            paged.extend(search_ids(&conn, None, None, None, search, 2, 2));
+            assert_eq!(paged, all, "{search:?}");
+            assert!(search_ids(&conn, None, None, None, search, 2, 4).is_empty());
+            assert_eq!(
+                search_ids(&conn, None, None, None, search, 1, 0),
+                vec![1451]
+            );
+        }
+    }
+
+    #[test]
+    fn memory_id_search_stays_on_fts_when_the_exact_match_is_the_only_hit() {
+        // FTS matches only memory 1451 itself. Showing it as the exact match
+        // must not leave the text part empty and trigger the LIKE fallback,
+        // which would add the substring-only hit on "14510".
+        let conn = make_memory_db();
+        insert_memory_row(
+            &conn,
+            1451,
+            "/tmp/ids",
+            "CONSTRAINTS",
+            "active",
+            "note 1451 here",
+        );
+        insert_memory_row(
+            &conn,
+            1460,
+            "/tmp/ids",
+            "CONSTRAINTS",
+            "active",
+            "ticket 14510",
+        );
+
+        assert_eq!(
+            search_ids(&conn, None, None, None, "1451", 200, 0),
+            vec![1451]
+        );
+        assert!(search_ids(&conn, None, None, None, "1451", 1, 1).is_empty());
+    }
+
+    #[test]
+    fn memory_id_search_does_not_override_view_filters() {
+        let conn = make_memory_db();
+        insert_memory_row(
+            &conn,
+            1451,
+            "/tmp/ids-a",
+            "WORKFLOW",
+            "archived",
+            "old rule",
+        );
+        insert_memory_row(
+            &conn,
+            1526,
+            "/tmp/ids-a",
+            "CONSTRAINTS",
+            "active",
+            "see 1451",
+        );
+        insert_memory_row(&conn, 2000, "/tmp/ids-b", "CONSTRAINTS", "active", "other");
+        insert_memory_row(
+            &conn,
+            2001,
+            "/tmp/ids-a",
+            "CONSTRAINTS",
+            "active",
+            "cites 2000",
+        );
+
+        // Status: 1451 is archived, so an active-only view shows text hits only.
+        assert_eq!(
+            search_ids(&conn, None, Some("active"), None, "#1451", 200, 0),
+            vec![1526]
+        );
+        // Category: 1451 is WORKFLOW, so a CONSTRAINTS view shows text hits only.
+        assert_eq!(
+            search_ids(&conn, None, None, Some("CONSTRAINTS"), "1451", 200, 0),
+            vec![1526]
+        );
+        // Project: 2000 lives in another project.
+        let project_a = stable_dir_identity("/tmp/ids-a");
+        assert_eq!(
+            search_ids(&conn, Some(&project_a), None, None, "#2000", 200, 0),
+            vec![2001]
+        );
+        // Matching filters still surface the exact match first.
+        assert_eq!(
+            search_ids(
+                &conn,
+                Some(&project_a),
+                Some("archived"),
+                None,
+                "1451",
+                200,
+                0
+            ),
+            vec![1451]
+        );
+        let project_b = stable_dir_identity("/tmp/ids-b");
+        assert_eq!(
+            search_ids(
+                &conn,
+                Some(&project_b),
+                None,
+                Some("CONSTRAINTS"),
+                "#2000",
+                200,
+                0
+            ),
+            vec![2000]
+        );
+    }
+
+    #[test]
+    fn memory_id_search_for_a_missing_id_returns_text_results_only() {
+        let conn = make_memory_db();
+        insert_memory_row(
+            &conn,
+            10,
+            "/tmp/ids",
+            "CONSTRAINTS",
+            "active",
+            "see 9999 later",
+        );
+        insert_memory_row(&conn, 11, "/tmp/ids", "CONSTRAINTS", "active", "unrelated");
+
+        assert_eq!(
+            search_ids(&conn, None, None, None, "9999", 200, 0),
+            vec![10]
+        );
+        assert_eq!(
+            search_ids(&conn, None, None, None, "#9999", 200, 0),
+            vec![10]
+        );
+        assert!(search_ids(&conn, None, None, None, "#8888", 200, 0).is_empty());
+    }
+
+    #[test]
+    fn ordinary_text_search_is_unaffected_by_id_lookup() {
+        let conn = make_memory_db();
+        insert_memory_row(&conn, 1, "/tmp/ids", "CONSTRAINTS", "active", "alpha fact");
+        insert_memory_row(
+            &conn,
+            2,
+            "/tmp/ids",
+            "CONSTRAINTS",
+            "active",
+            "memory 1 alpha",
+        );
+        insert_memory_row(&conn, 3, "/tmp/ids", "CONSTRAINTS", "active", "beta");
+
+        let mut alpha = search_ids(&conn, None, None, None, "alpha", 200, 0);
+        alpha.sort_unstable();
+        assert_eq!(alpha, vec![1, 2]);
+        // Text that merely contains a number is not an ID lookup: memory 1 is
+        // not pulled in ahead of the text match.
+        assert_eq!(
+            search_ids(&conn, None, None, None, "memory 1", 200, 0),
+            vec![2]
+        );
+    }
+
     #[test]
     fn enumerate_memory_projects_empty_db_returns_empty() {
         let conn = make_memory_db();
@@ -12700,6 +14127,7 @@ mod broca_cache_tests {
             finish_reason: Some("tool_calls".to_string()),
             provider: Some("anthropic".to_string()),
             model: Some(model.to_string()),
+            request_body_len: None,
         }
     }
 
@@ -13550,6 +14978,137 @@ mod broca_cache_tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    /// A Broca run in progress whose second step reports about 36k fewer
+    /// prompt tokens than its first (DeepSeek drops its retained thinking
+    /// from `prompt_tokens` when a new turn starts). Neither step reads the
+    /// cache, so the drop is the only thing that can attach a cause. Each
+    /// step's sent request size is `request_lens`.
+    fn broca_drop_session(
+        name: &str,
+        request_lens: (Option<i64>, Option<i64>),
+    ) -> (Connection, String, Vec<broca_wal::WalRun>) {
+        let conn = store();
+        let session = identity(name).to_string();
+        let mut first = wal_step(
+            1,
+            Some(2_010),
+            "deepseek-flash",
+            step_usage(138_083, Some(0), None),
+        );
+        first.request_body_len = request_lens.0;
+        let mut second = wal_step(
+            2,
+            Some(2_020),
+            "deepseek-flash",
+            step_usage(102_299, Some(0), None),
+        );
+        second.request_body_len = request_lens.1;
+        let mut run = wal_run("r1", 2_000, vec![first, second]);
+        run.finished = false;
+        (conn, session, vec![run])
+    }
+
+    /// Events for the session with causes enriched and a recorded Magic
+    /// Context decision on the dropped step, and `mc_state` standing in for
+    /// store.db.
+    fn broca_drop_events(
+        conn: &Connection,
+        session: &str,
+        runs: &[broca_wal::WalRun],
+        mc_state: HashSet<(Harness, String)>,
+    ) -> Vec<DbCacheEvent> {
+        let rows =
+            load_broca_cache_events_from_conn(conn, session, Some(runs), None, None).unwrap();
+        let decisions = HashMap::from([(
+            (Harness::Broca, session.to_string(), "r1#2".to_string()),
+            TransformDecisionCause {
+                decision: "execute".to_string(),
+                materialize_reason: Some("m1_delta".to_string()),
+                emergency: false,
+            },
+        )]);
+        build_db_cache_events_with_overrides(
+            rows,
+            true,
+            Some(decisions),
+            Some(HashSet::new()),
+            Some(HashMap::new()),
+            Some(mc_state),
+        )
+    }
+
+    #[test]
+    fn broca_drop_without_mc_state_gets_no_magic_context_cause() {
+        let (conn, session, runs) = broca_drop_session("alfonso:bg_mason", (None, None));
+        let events = broca_drop_events(&conn, &session, &runs, HashSet::new());
+        assert_eq!(ids(&events), ["r1#1", "r1#2"]);
+        let dropped = &events[1];
+        assert!(dropped.is_drop);
+        assert!(!dropped.context_reduced_by_mc);
+        assert_eq!(dropped.cause, None);
+        assert_eq!(dropped.drop_request_size, None);
+        // The Cache list still shows the session by default.
+        assert!(is_managed_cache_session(
+            Harness::Broca,
+            &session,
+            &HashSet::new()
+        ));
+    }
+
+    #[test]
+    fn broca_drop_with_mc_state_keeps_the_magic_context_cause() {
+        let (conn, session, runs) = broca_drop_session("alfonso:bg_mason", (None, None));
+        let mc_state = HashSet::from([(Harness::Broca, session.clone())]);
+        let events = broca_drop_events(&conn, &session, &runs, mc_state.clone());
+        let dropped = &events[1];
+        assert!(dropped.is_drop);
+        assert!(dropped.context_reduced_by_mc);
+        assert_eq!(dropped.cause.as_deref(), Some("M1 delta"));
+        assert!(is_managed_cache_session(
+            Harness::Broca,
+            &session,
+            &mc_state
+        ));
+    }
+
+    #[test]
+    fn broca_drop_compares_the_sent_request_sizes() {
+        // Request bytes from the real case: the request grew while the
+        // provider counted 36k fewer prompt tokens.
+        for (lens, expected) in [
+            (
+                (Some(378_960), Some(382_956)),
+                Some(DropRequestSize::NotSmaller),
+            ),
+            (
+                (Some(382_956), Some(382_956)),
+                Some(DropRequestSize::NotSmaller),
+            ),
+            (
+                (Some(382_956), Some(250_000)),
+                Some(DropRequestSize::Smaller),
+            ),
+            ((None, Some(382_956)), None),
+            ((Some(378_960), None), None),
+        ] {
+            let (conn, session, runs) = broca_drop_session("alfonso:bg_mason", lens);
+            let events = broca_drop_events(&conn, &session, &runs, HashSet::new());
+            assert!(events[1].is_drop, "{lens:?}");
+            assert_eq!(events[1].drop_request_size, expected, "{lens:?}");
+            let json = serde_json::to_value(&events[1]).unwrap();
+            assert!(json.get("request_body_len").is_none());
+        }
+        // Steps that did not drop say nothing about the request size.
+        let (conn, session, runs) =
+            broca_drop_session("alfonso:bg_mason", (Some(378_960), Some(382_956)));
+        let events = broca_drop_events(&conn, &session, &runs, HashSet::new());
+        assert_eq!(events[0].drop_request_size, None);
+        assert_eq!(
+            serde_json::to_value(&events[1]).unwrap()["drop_request_size"],
+            "not_smaller"
         );
     }
 }

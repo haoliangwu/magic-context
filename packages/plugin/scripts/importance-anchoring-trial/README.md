@@ -1,6 +1,6 @@
 # Historian importance anchoring trial
 
-Investigative harness only; it does not modify historian behavior. Results and limitations are in `docs/reports/historian-importance-anchoring.md`. `evidence.json` retains input identities, prompt/system SHA-256s, reference selections, response titles, score/range arrays, P1 SHA-256s and provider usage. It contains no full prompts, transcripts, project-memory blocks, P1 bodies, reasoning or credentials.
+Investigative harness only; it does not modify historian behavior. `evidence.json` retains input identities, prompt/system SHA-256s, reference selections, response titles, score/range arrays, P1 SHA-256s and provider usage. It contains no full prompts, transcripts, project-memory blocks, P1 bodies, reasoning or credentials.
 
 ## Reproduction
 

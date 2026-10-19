@@ -47,6 +47,10 @@ import {
 	getCompartments,
 } from "@magic-context/core/features/magic-context/compartment-storage";
 import {
+	externalHistorianFailureReason,
+	subprocessExitHistorianFailureReason,
+} from "@magic-context/core/features/magic-context/historian-failure-reason";
+import {
 	embedPromotedFacts,
 	promoteSessionFactsDurable,
 } from "@magic-context/core/features/magic-context/memory";
@@ -150,9 +154,14 @@ import type {
 } from "@magic-context/core/shared/subagent-runner";
 import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child-stderr";
 import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transaction-timing";
-
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { resolvePiHarnessKind } from "./pi-harness-kind";
+import { acknowledgePiHistoryRetirement } from "./pi-history-retirement";
+import {
+	isPiOrdinalAlignmentUnanchored,
+	resolvePiOrdinalAlignment,
+} from "./pi-ordinal-alignment";
+import { ZEN_FREE_TIER_FAILURE } from "./pi-zen-free-tier";
 import {
 	iterateEntriesToRawMessageRange,
 	SYNTH_USER_ID_PREFIX,
@@ -286,7 +295,9 @@ async function runHistorianSubagentWithTransientRetriesGuarded(args: {
 			result = {
 				ok: false,
 				reason: "model_failed",
-				error: desc.brief,
+				error: PRODUCER_PROMPT_FIT_FAILURE_PATTERN.test(desc.message)
+					? desc.message
+					: desc.brief,
 				durationMs: Date.now() - attemptStart,
 			};
 		}
@@ -451,6 +462,9 @@ export interface PiHistorianDeps {
 	/** User-memory feature gate (`dreamer.user_memories.enabled`). Gates whether
 	 *  historian-extracted user observations are persisted as candidates. */
 	userMemoriesEnabled?: boolean;
+	/** False when the dreamer is not runnable, so the historian prompt asks it to
+	 *  skip user observations nothing could review. Undefined counts as true. */
+	userObservationsRequested?: boolean;
 	language?: string;
 	/** Optional callback invoked on successful publication for cache-bust signaling. */
 	onPublished?: () => void;
@@ -505,6 +519,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		allowHomeProject,
 		autoPromote,
 		userMemoriesEnabled,
+		userObservationsRequested,
 		onPublished,
 		compartmentLeaseHolderId,
 		readBranchEntries,
@@ -617,6 +632,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			const existingValidationError =
 				validateStoredCompartments(priorCompartments);
 			if (existingValidationError) {
+				telemetry.failureReason = existingValidationError;
 				sessionLog(
 					sessionId,
 					`historian failure: source=existing-validation reason="${existingValidationError}"`,
@@ -646,6 +662,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					? createDefaultBoundarySnapshotForTests(sessionId)
 					: null);
 			if (!boundarySnapshot) {
+				telemetry.status = "noop";
+				telemetry.failureReason = "missing protected-tail boundary snapshot";
 				sessionLog(
 					sessionId,
 					"historian no-op: missing protected-tail boundary snapshot from Pi trigger decision",
@@ -691,6 +709,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				}
 			}
 			if (!validation.ok) {
+				telemetry.status = "noop";
+				telemetry.failureReason = "stale protected-tail boundary snapshot";
 				sessionLog(
 					sessionId,
 					`historian no-op: stale protected-tail snapshot (${validation.detail ?? validation.reason ?? "unknown"})`,
@@ -703,6 +723,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				protectedTailStart,
 			);
 			if (protectedTailStart <= offset || eligibleEndOrdinal <= offset) {
+				telemetry.status = "noop";
+				telemetry.failureReason = "nothing to compact before protected tail";
 				sessionLog(
 					sessionId,
 					`historian no-op: protectedTailStart=${protectedTailStart} eligibleEnd=${eligibleEndOrdinal} <= offset=${offset} — nothing to compact; ${describeBoundaryDiagnostics(boundarySnapshot)}`,
@@ -726,13 +748,33 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				directory,
 				allowHomeProject,
 			);
-			const memories = projectPath
-				? getMemoriesByProject(db, projectPath, ["active", "permanent"])
-				: [];
 			const fitModelKey = piModelRefToCanonical(historianModel ?? "");
 			const fitContext = fitModelKey
 				? resolveProducerContextLimit(fitModelKey)
 				: undefined;
+			// Every attempt in the chain (configured fallbacks, then the session
+			// model as the last resort) sends this same prompt, so size it for each
+			// of their windows too, resolved as the dispatch guard resolves them.
+			const fallbackWindows = [
+				...(fallbackModels ?? []).map((entry) =>
+					typeof entry === "string" ? entry : entry.model,
+				),
+				fallbackModelId,
+			]
+				.map((model) => (model ? piModelRefToCanonical(model) : ""))
+				.filter((key) => key.length > 0 && key !== fitModelKey)
+				.map((key) => {
+					const context = resolveProducerContextLimit(key);
+					return {
+						modelKey: key,
+						contextLimitTokens: context,
+						maxOutputTokens: historianProducerReserve(
+							context,
+							maxOutputTokens,
+							deps.resolveHostOutputLimit?.(key),
+						),
+					};
+				});
 			const promptFit = fitHistorianPrompt({
 				window: {
 					modelKey: fitModelKey || undefined,
@@ -743,14 +785,19 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						deps.resolveHostOutputLimit?.(fitModelKey),
 					),
 				},
+				fallbackWindows,
 				systemPrompt: historianSystemPrompt,
 				requestedChunkTokens: historianChunkTokens,
 				sessionId,
 				chunkStart: Math.max(1, offset),
 				lastOrdinal: eligibleEndOrdinal - 1,
 				sessionCompartments: priorCompartments,
-				memories,
+				memories: () =>
+					projectPath
+						? getMemoriesByProject(db, projectPath, ["active", "permanent"])
+						: [],
 				memoryEnabled: memoryEnabled !== false,
+				userObservationsRequested,
 			});
 			if (!promptFit.ok) {
 				telemetry.failureReason = promptFit.reason;
@@ -852,6 +899,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 
 			const chunkCoverageError = validateChunkCoverage(chunk);
 			if (chunkCoverageError) {
+				telemetry.failureReason = chunkCoverageError;
 				sessionLog(
 					sessionId,
 					`historian failure: source=chunk-coverage reason="${chunkCoverageError}" chunkRange=${chunk.startIndex}-${chunk.endIndex}`,
@@ -871,6 +919,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			}
 
 			if (!projectPath) {
+				telemetry.status = "noop";
+				telemetry.failureReason = "project path unavailable";
 				rollbackDrainReservation();
 				return;
 			}
@@ -937,6 +987,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				projectMemory: promptFit.projectMemory,
 				inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunkText}`,
 				memoryEnabled: memoryEnabled !== false,
+				userObservationsRequested,
 			});
 
 			// Defensive: use MAX(sequence) + 1 over .length to survive any old
@@ -1161,6 +1212,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 							onProgress: buildProgressLogger("fallback"),
 							accountingSessionId: sessionId,
 							accountingSubagent: "historian",
+							accountingTask:
+								candidate.kind === "session" ? "fallback-session" : "fallback",
 						},
 					});
 					const fbPass = await validateHistorianResult(
@@ -1189,6 +1242,12 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						: validatedPass.kind === "spawn-failed"
 							? `subagent run failed (${validatedPass.reason}): ${validatedPass.error}`
 							: "historian returned no usable text";
+				telemetry.failureReason =
+					validatedPass.kind === "validation-failed"
+						? validatedPass.error
+						: validatedPass.kind === "no-output"
+							? "empty_output"
+							: piSubagentFailureReason(validatedPass);
 				// A window refusal here comes from a fallback model (the primary was
 				// fitted above). Treat it like any other failed pass: count it, notify,
 				// and keep the reserved drain budget spent even though nothing was
@@ -1309,6 +1368,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				newCompartments[newCompartments.length - 1]?.endMessage ?? 0;
 			if (lastNewEnd + 1 <= offset) {
 				const errorMsg = `historian returned compartments that did not advance past raw message ${offset - 1}`;
+				telemetry.failureReason = errorMsg;
 				sessionLog(
 					sessionId,
 					`historian failure: source=no-progress newCompartmentCount=${newCompartments.length} lastNewEnd=${lastNewEnd} priorEnd=${offset - 1}`,
@@ -1327,10 +1387,17 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			let firstKeptEntryId: string | null = null;
 			if (readBranchEntries) {
 				try {
-					firstKeptEntryId = findFirstKeptEntryId(
-						readBranchEntries(),
-						lastNewEnd,
+					const branchEntries = readBranchEntries();
+					const alignment = resolvePiOrdinalAlignment(
+						db,
+						sessionId,
+						branchEntries,
 					);
+					// Leave the marker unresolved (pending) while stored ordinals
+					// cannot be placed on the branch; a later drain resolves it.
+					firstKeptEntryId = isPiOrdinalAlignmentUnanchored(alignment)
+						? null
+						: findFirstKeptEntryId(branchEntries, lastNewEnd, alignment.offset);
 					if (!firstKeptEntryId) {
 						sessionLog(
 							sessionId,
@@ -1398,6 +1465,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			// marker for the deferred materializing drain. BEGIN IMMEDIATE keeps the
 			// holder check and writes on one fresh write-locked snapshot.
 			if (!compartmentLeaseHolderId) {
+				telemetry.status = "noop";
+				telemetry.failureReason = "missing compartment lease holder";
 				sessionLog(
 					sessionId,
 					"historian publish skipped: missing compartment lease holder",
@@ -1422,6 +1491,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			try {
 				if (!isCompartmentLeaseHeld(db, sessionId, compartmentLeaseHolderId)) {
 					db.exec("ROLLBACK");
+					telemetry.status = "noop";
+					telemetry.failureReason = "compartment lease no longer held";
 					sessionLog(
 						sessionId,
 						"historian publish skipped: compartment lease no longer held",
@@ -1480,6 +1551,14 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				// reaches the keep watermark.
 				clearHistorianDrainFailure(db, sessionId);
 				recordProtectedTailPublicationFloor(db, sessionId, lastNewEnd + 1);
+				acknowledgePiHistoryRetirement(
+					db,
+					sessionId,
+					lastNewEnd,
+					(id) =>
+						provider.readMessages().find((message) => message.id === id)
+							?.ordinal,
+				);
 				if (!isWrapupInProgress(db, sessionId))
 					clearEmergencyRecovery(db, sessionId);
 				// userObservations are inserted POST-COMMIT
@@ -1712,7 +1791,11 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		});
 	} catch (error) {
 		const desc = describeError(error);
-		telemetry.failureReason = `exception: ${desc.brief}`;
+		telemetry.failureReason = PRODUCER_PROMPT_FIT_FAILURE_PATTERN.test(
+			desc.message,
+		)
+			? desc.message
+			: externalHistorianFailureReason(error, "exception");
 		sessionLog(
 			sessionId,
 			`historian failure: source=exception ${desc.brief}${desc.stackHead ? ` stackHead="${desc.stackHead}"` : ""}`,
@@ -1748,7 +1831,11 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				subagentInvocationId: invocationId,
 				runKind: telemetry.runKind ?? "incremental",
 				status: telemetry.status ?? "failed",
-				failureReason: telemetry.failureReason ?? null,
+				failureReason:
+					telemetry.failureReason ??
+					((telemetry.status ?? "failed") === "failed"
+						? "provider_error"
+						: null),
 				chunkStartOrdinal: telemetry.chunkStartOrdinal ?? null,
 				chunkEndOrdinal: telemetry.chunkEndOrdinal ?? null,
 				unprocessedFrom: telemetry.unprocessedFrom ?? null,
@@ -1800,8 +1887,48 @@ type ValidationOutcome =
 				: never;
 	  }
 	| { kind: "validation-failed"; error: string; rawText: string }
-	| { kind: "spawn-failed"; reason: string; error: string }
+	| {
+			kind: "spawn-failed";
+			reason: string;
+			error: string;
+			meta?: Record<string, unknown>;
+	  }
 	| { kind: "no-output" };
+
+function piSubagentFailureReason(
+	failure: Extract<ValidationOutcome, { kind: "spawn-failed" }>,
+): string {
+	if (failure.meta?.failureClass === ZEN_FREE_TIER_FAILURE)
+		return ZEN_FREE_TIER_FAILURE;
+	if (PRODUCER_PROMPT_FIT_FAILURE_PATTERN.test(failure.error))
+		return failure.error;
+	if (
+		["step_limit", "token_budget", "invalid_prompt"].includes(failure.reason)
+	) {
+		return failure.error;
+	}
+	if (failure.reason === "abort") return "aborted";
+	if (failure.reason === "timeout") {
+		return externalHistorianFailureReason(failure.error, "timeout");
+	}
+	if (failure.reason === "parse_failed") return "parse_failed";
+	if (failure.reason === "non_zero_exit") {
+		const exitCode =
+			failure.meta?.exitCode ??
+			/\bcode\s*=\s*(-?\d+|null)\b/i.exec(failure.error)?.[1];
+		return subprocessExitHistorianFailureReason(exitCode, failure.meta?.stderr);
+	}
+	if (failure.reason === "no_assistant") {
+		const providerReason = externalHistorianFailureReason(failure.error);
+		return providerReason === "provider_error"
+			? "empty_output"
+			: providerReason;
+	}
+	return externalHistorianFailureReason(
+		failure.error,
+		failure.reason === "spawn_failed" ? "exception" : "provider_error",
+	);
+}
 
 async function validateHistorianResult(
 	result: SubagentRunResult,
@@ -1815,6 +1942,7 @@ async function validateHistorianResult(
 			kind: "spawn-failed",
 			reason: result.reason,
 			error: result.error,
+			...(result.meta ? { meta: result.meta } : {}),
 		};
 	}
 	if (result.assistantText.trim().length === 0) {
@@ -1886,28 +2014,62 @@ export function buildPiCompactionSummary(
  * Empty-id slots cannot anchor Pi's native compaction marker, but may be followed
  * by a real entry that can. Folded tool-result slots are different: their
  * synthesized id represents kept-tail content, so advancing past one would drop
- * that content; leave the marker pending until a safe boundary is available.
+ * that content. resolvePiFirstKeptEntry distinguishes a trailing result group that
+ * can merge into a future user entry from an interior group that needs a newer
+ * summary boundary before a native marker can be placed.
  * System slots keep their ordinals but cannot anchor the kept conversation tail;
  * Pi's compaction snapshot preserves their effective state instead.
+ *
+ * `ordinalOffset` places the stored ordinal on this branch when the walk no
+ * longer starts where the stored coordinates were written (see
+ * pi-ordinal-alignment.ts).
  */
 export function findFirstKeptEntryId(
 	entries: readonly unknown[],
 	lastCompactedOrdinal: number,
+	ordinalOffset = 0,
 ): string | null {
+	const boundary = resolvePiFirstKeptEntry(
+		entries,
+		lastCompactedOrdinal,
+		ordinalOffset,
+	);
+	return boundary.kind === "resolved" ? boundary.entryId : null;
+}
+
+export function resolvePiFirstKeptEntry(
+	entries: readonly unknown[],
+	lastCompactedOrdinal: number,
+	ordinalOffset = 0,
+):
+	| { kind: "resolved"; entryId: string }
+	| { kind: "waiting" }
+	| { kind: "unplaceable"; rawId: string } {
 	const target = lastCompactedOrdinal + 1;
 	const afterOrdinal = Number.isNaN(lastCompactedOrdinal)
 		? 0
 		: Math.max(0, lastCompactedOrdinal);
+	let syntheticKeptId: string | undefined;
 	for (const message of iterateEntriesToRawMessageRange(
 		entries,
 		afterOrdinal,
 		Number.MAX_SAFE_INTEGER,
 		Number.MAX_SAFE_INTEGER,
+		ordinalOffset,
 	)) {
 		if (message.ordinal < target || isPiSystemEntry(message)) continue;
-		if (message.id.startsWith(SYNTH_USER_ID_PREFIX)) return null;
+		// iterateEntriesToRawMessageRange groups consecutive tool results into a
+		// generated user message without a real SessionEntry id. A real user appended
+		// at the session tail can carry those results instead. Once another chat
+		// message follows the group, appends cannot change it. Skipping the group
+		// would discard tool results outside the summary.
+		if (syntheticKeptId) return { kind: "unplaceable", rawId: syntheticKeptId };
+		if (message.id.startsWith(SYNTH_USER_ID_PREFIX)) {
+			syntheticKeptId = message.id;
+			continue;
+		}
 		if (message.id.length === 0) continue;
-		return message.id;
+		return { kind: "resolved", entryId: message.id };
 	}
-	return null;
+	return { kind: "waiting" };
 }

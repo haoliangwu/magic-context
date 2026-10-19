@@ -175,6 +175,9 @@ export interface CompartmentRunnerDeps<
     getNotificationParams?: () => NotificationParams;
     /** When true, extract user behavior observations from historian output */
     experimentalUserMemories?: boolean;
+    /** False when the dreamer is not runnable, so the historian prompt asks it
+     *  to skip user observations nothing could review. Undefined counts as true. */
+    userObservationsRequested?: boolean;
     /** When true, inject wall-clock dates on compartments in <session-history>. */
     experimentalTemporalAwareness?: boolean;
     /** When true, run an editor pass after successful historian output to clean
@@ -265,6 +268,8 @@ export interface HistorianRunResult {
     ok: boolean;
     result?: string;
     error?: string;
+    /** Select a failure reason suitable for durable storage where the source is known. */
+    failureReason?: string;
     dumpPath?: string;
     invocationId?: number;
 }
@@ -294,7 +299,12 @@ export type ValidatedHistorianPassResult =
            */
           invocationId?: number | null;
       }
-    | { ok: false; error: string; invocationId?: number | null };
+    | {
+          ok: false;
+          error: string;
+          failureReason?: string;
+          invocationId?: number | null;
+      };
 
 export interface StoredCompartmentRange {
     startMessage: number;

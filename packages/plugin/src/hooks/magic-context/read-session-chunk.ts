@@ -5,9 +5,11 @@ import {
 import { expandToolPart } from "../../shared/historian-tool-expansions";
 import type { ToolExpansionMap } from "../../shared/historian-tool-template";
 import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker";
+import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { isSystemDirective } from "../../shared/system-directive";
 import { isHostUnservedRow, markHostUnservedRow } from "./host-served-rows";
+import { prewarmRawSessionOrdinalsForDb } from "./raw-ordinal-warmup";
 import {
     getMessageTimesFromOpenCodeDb,
     getRawSessionMessageCountFromDb,
@@ -32,11 +34,13 @@ import {
     countRawSessionMessageOrdinalsFromDb,
     countStoredRawSessionMessagesFromDb,
     hasRawSessionMessageByIdFromDb,
+    type RawBoundaryEndpoint,
     type RawMessage,
     type RawMessageOrdinalAnchor,
     type RawMessageOrdinalEntry,
     type RawMessageParts,
     readRawSeedTailFromDb,
+    readRawSessionBoundaryEndpointsFromDb,
     readRawSessionMessageByIdFromDb,
     readRawSessionMessageIdOrdinalsForRangeFromDb,
     readRawSessionMessageOrdinalByIdFromDb,
@@ -138,10 +142,17 @@ export interface RawMessageProvider {
     ) => RawMessage[];
     /** A single source traversal; iterator cleanup must release resources on early exit. */
     iterateMessageRange?: (fromOrdinal: number, toOrdinal: number) => Iterable<RawMessage>;
+    /** Background consumers use async iteration so scans can yield between reads to process host input. */
+    iterateMessageRangeAsync?: (
+        fromOrdinal: number,
+        toOrdinal: number,
+    ) => AsyncIterable<RawMessage>;
     readMessageById?: (messageId: string) => RawMessage | null;
     readMessagePartsById?: (messageId: string) => RawMessageParts | null;
     hasMessageById?: (messageId: string) => boolean;
     readMessageOrdinalById?: (messageId: string) => number | null;
+    /** Persisted ordering key, including directory-change notices not numbered for history compression. */
+    readMessageOrderById?: (messageId: string) => number | null;
     readMessageIdOrdinals?: () => Map<string, number>;
     readMessageIdOrdinalsForRange?: (fromOrdinal: number, toOrdinal: number) => Map<string, number>;
     readMessageOrdinalPage?: (
@@ -175,6 +186,7 @@ export interface BoundedRawMessageProvider {
     readMessagePartsById(messageId: string): RawMessageParts | null;
     hasMessageById(messageId: string): boolean;
     readMessageOrdinalById(messageId: string): number | null;
+    readMessageOrderById?: (messageId: string) => number | null;
     readMessageIdOrdinalsForRange(fromOrdinal: number, toOrdinal: number): Map<string, number>;
     readMessageOrdinalPage(
         after: RawMessageOrdinalAnchor | null,
@@ -554,6 +566,27 @@ export function visitRawSessionMessages(
     }
 }
 
+/** Use async iteration for background seeds, or the existing visitor for synchronous providers. */
+export async function visitRawSessionMessagesAsync(
+    sessionId: string,
+    fromOrdinal: number,
+    toOrdinal: number,
+    visit: (message: RawMessage) => boolean,
+    options: { summary?: boolean; pageSize?: number } = {},
+): Promise<void> {
+    const from = Math.max(1, Math.floor(fromOrdinal));
+    const to = Math.floor(toOrdinal);
+    if (to < from) return;
+    const provider = sessionProviders.get(sessionId)?.provider;
+    if (!provider?.iterateMessageRangeAsync) {
+        visitRawSessionMessages(sessionId, from, to, visit, options);
+        return;
+    }
+    for await (const message of provider.iterateMessageRangeAsync(from, to)) {
+        if (!visit(message)) return;
+    }
+}
+
 /** Read the requested absolute-ordinal interval from cache and source as needed. */
 export function readRawSessionMessageRange(
     sessionId: string,
@@ -591,6 +624,48 @@ export function readRawSessionMessageRange(
 
 readRawSessionMessages.readPage = readRawSessionMessagePage;
 readRawSessionMessages.getCount = getRawSessionMessageOrdinalCount;
+readRawSessionMessages.prepare = prepareRawSessionOrdinals;
+
+/**
+ * Prepare rank checkpoints on a worker for every newly touched file session.
+ * The caller waits at most 250 ms asynchronously; the worker continues after
+ * that deadline. False means defer or retry: a synchronous count never falls
+ * back to an unbounded scan. Registered providers and absent OpenCode stores
+ * need no SQLite preparation.
+ */
+export async function prepareRawSessionOrdinals(sessionId: string): Promise<boolean> {
+    if (sessionProviders.get(sessionId)?.provider) return true;
+    if (!openCodeDbExists()) return true;
+    const db = withReadOnlySessionDb((connection) => connection);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = Date.now() + 250;
+    const prepare = async () => {
+        // Streaming writes can supersede a scan just before a tool reads history.
+        // Retry within the same deadline rather than returning a warming response
+        // after one short race; never install ranks from the superseded snapshot.
+        for (let attempt = 0; attempt < 3 && Date.now() < deadline; attempt++) {
+            if ((await prewarmRawSessionOrdinalsForDb(db, sessionId)) === "warm") return true;
+        }
+        return false;
+    };
+    try {
+        const ready = await Promise.race([
+            prepare(),
+            new Promise<false>((resolve) => {
+                timer = setTimeout(() => resolve(false), 250);
+            }),
+        ]);
+        if (!ready) {
+            sessionLog(
+                sessionId,
+                "WARN canonical ordinal preparation unavailable within 250ms; exact reads must defer or retry",
+            );
+        }
+        return ready;
+    } finally {
+        clearTimeout(timer);
+    }
+}
 
 /**
  * Prime the active raw-message cache with a TAIL-ONLY read (only messages
@@ -794,6 +869,23 @@ export function readRawSessionMessagePartsById(
     );
 }
 
+/**
+ * The facts compartment boundary resolution needs about each id (see
+ * RawBoundaryEndpoint), read from the OpenCode store in a bounded batch. Returns null when a raw-message provider
+ * serves the session; the caller then uses the provider-aware readers above.
+ */
+export function readRawSessionBoundaryEndpoints(
+    sessionId: string,
+    ids: readonly string[],
+    blockIds: readonly string[],
+): Map<string, RawBoundaryEndpoint | null> | null {
+    if (sessionProviders.get(sessionId)?.provider) return null;
+    if (!openCodeDbExists()) return new Map(ids.map((id) => [id, null]));
+    return withReadOnlySessionDb((db) =>
+        readRawSessionBoundaryEndpointsFromDb(db, sessionId, ids, blockIds),
+    );
+}
+
 export function hasRawSessionMessageById(sessionId: string, messageId: string): boolean {
     const provider = sessionProviders.get(sessionId)?.provider;
     if (provider?.hasMessageById) return provider.hasMessageById(messageId);
@@ -843,16 +935,28 @@ export function readRawSessionMessageOrdinalById(
     );
 }
 
+/** Store positions order persisted rows; raw ordinals number only messages selected for compression. */
+function readRawSessionMessageOrderPosition(sessionId: string, messageId: string): number | null {
+    const provider = sessionProviders.get(sessionId)?.provider;
+    if (provider) {
+        return provider.readMessageOrderById
+            ? provider.readMessageOrderById(messageId)
+            : (provider.readMessageOrdinalById?.(messageId) ?? null);
+    }
+    return readRawSessionMessageOrdinalById(sessionId, messageId);
+}
+
 /**
  * Compare two messages' positions in the session's persisted order without
  * reading the rest of the session: negative when `leftId` comes first, positive
  * when it comes after, 0 when they are the same row, null when either row is
  * unknown here.
  *
- * OpenCode's store is compared on (time_created, id), the order raw-message
- * ordinals are numbered in, with two primary-key lookups. A registered provider
- * is compared by ordinal only when it can look one up by id directly; any other
- * provider answers null rather than falling back to a whole-history read.
+ * OpenCode 1 uses (time_created, id), with two primary-key lookups. Other host
+ * readers supply their persisted ordering key: OpenCode 2 uses session_message.seq,
+ * which also places directory-change notices omitted from raw-message numbering.
+ * Readers without a separate ordering key use direct message-number lookups;
+ * unavailable positions answer null rather than loading the whole history.
  */
 export function compareRawSessionMessageOrder(
     sessionId: string,
@@ -861,9 +965,9 @@ export function compareRawSessionMessageOrder(
 ): number | null {
     const provider = sessionProviders.get(sessionId)?.provider;
     if (provider) {
-        if (!provider.readMessageOrdinalById) return null;
-        const left = provider.readMessageOrdinalById(leftId);
-        const right = provider.readMessageOrdinalById(rightId);
+        if (!provider.readMessageOrderById && !provider.readMessageOrdinalById) return null;
+        const left = readRawSessionMessageOrderPosition(sessionId, leftId);
+        const right = readRawSessionMessageOrderPosition(sessionId, rightId);
         return left === null || right === null ? null : left - right;
     }
     if (!openCodeDbExists()) return null;
@@ -905,6 +1009,7 @@ export function readRawSessionMessageById(sessionId: string, messageId: string):
     if (!openCodeDbExists()) return null;
     return withReadOnlySessionDb((db) => readRawSessionMessageByIdFromDb(db, sessionId, messageId));
 }
+readRawSessionMessageById.prepare = prepareRawSessionOrdinals;
 
 function readRawSessionMessagesFromSource(sessionId: string): RawMessage[] {
     const provider = sessionProviders.get(sessionId)?.provider;
@@ -1148,7 +1253,10 @@ export function readSessionChunk(
                     const call = calls.get(p.callID);
                     if (call) {
                         const expansion = expandToolPart(
-                            { ...call, state: { ...(call.state as object), output: state.output } },
+                            {
+                                ...call,
+                                state: { ...(call.state as object), output: state.output },
+                            },
                             options.expandTools,
                         );
                         if (expansion !== null) {
@@ -1429,6 +1537,17 @@ export function readSessionChunk(
     }
 
     if (flushCurrentBlock() && pendingNoiseMeta.length > 0) {
+        // Filtering removes duplicate results and other non-narrative rows from
+        // the text, not from raw coverage. Only absorb them after the preceding
+        // block is admitted; otherwise they would skip budget-rejected content.
+        const lastNoise = pendingNoiseMeta[pendingNoiseMeta.length - 1];
+        if (messagesProcessed > 0 && lastNoise) {
+            lineMeta.push(...pendingNoiseMeta);
+            messagesProcessed += pendingNoiseMeta.length;
+            lastOrdinal = lastNoise.ordinal;
+            lastMessageId = lastNoise.messageId;
+            pendingNoiseMeta = [];
+        }
         highestScannedOrdinal = Math.max(
             highestScannedOrdinal,
             pendingNoiseMeta[pendingNoiseMeta.length - 1]?.ordinal ?? highestScannedOrdinal,

@@ -15,6 +15,7 @@ import {
     resolveMemoriesByIdsForSearch,
     unifiedSearch,
 } from "../../features/magic-context/search";
+import { searchMessageHistoryOffThread } from "../../hooks/magic-context/auto-search-worker-client";
 import { getVisibleMemoryIds } from "../../hooks/magic-context/inject-compartments";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import {
@@ -218,6 +219,11 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                     // recall for symbol/command/path lookups. Auto-search hints
                     // (the hot path) leave this off to protect their latency.
                     explicitSearch: true,
+                    rerankConnectionFile: deps.rerankConnectionFile,
+                    // Probe match counts walk the session's FTS rows; run the
+                    // message lane on a worker so the serving thread stays free.
+                    searchMessageHistory: (request) =>
+                        searchMessageHistoryOffThread(deps.db, request),
                     ...dateRange,
                 },
             );

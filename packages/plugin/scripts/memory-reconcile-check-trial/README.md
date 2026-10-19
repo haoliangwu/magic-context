@@ -1,7 +1,7 @@
 # Memory reconcile-check shadow trial
 
 Investigative code only: no product prompt or memory mutation. See
-`docs/reports/memory-reconcile-check-trial.md` for results and limitations.
+the matching offline report for results and limitations. `analyze.ts` requires explicit `<report-path> <recorded-source-root>` inputs, with the source root at the revision that supplied the excerpts.
 Use the installed repository dependencies and Bun 1.4.2. Every invocation has
 an outer `timeout`, including the harness's internal Git capture commands.
 

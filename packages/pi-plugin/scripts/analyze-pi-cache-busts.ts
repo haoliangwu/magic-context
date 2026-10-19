@@ -1,5 +1,38 @@
 #!/usr/bin/env bun
-
+/**
+ * analyze-pi-cache-busts.ts — read a Pi/OMP session's assistant usage meter and
+ * Magic Context's served-array ledger, and name every request whose prompt cache
+ * was not reused.
+ *
+ * Usage fields (Pi's normalized `usage` on each assistant message, written by
+ * @earendil-works/pi-ai):
+ *   input       Uncached prompt tokens on every provider. Anthropic reports
+ *               `input_tokens`, the tokens after the last cache breakpoint
+ *               (https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching#tracking-cache-performance).
+ *               pi-ai subtracts the cached part for implicit caches: OpenAI
+ *               Responses `input_tokens - cached_tokens - cache_write_tokens`
+ *               (api/openai-responses-shared.js), Gemini `promptTokenCount -
+ *               cachedContentTokenCount` (api/google-generative-ai.js).
+ *   cacheRead   Tokens served from cache: Anthropic `cache_read_input_tokens`,
+ *               OpenAI `input_tokens_details.cached_tokens`, Gemini
+ *               `cachedContentTokenCount`.
+ *   cacheWrite  Tokens written to cache: Anthropic `cache_creation_input_tokens`
+ *               (Bedrock `cacheWriteInputTokens`). OpenAI and Gemini cache
+ *               implicitly and report 0 here: every prompt prefix they serve is
+ *               stored automatically with no write premium
+ *               (https://platform.openai.com/docs/guides/prompt-caching,
+ *               https://ai.google.dev/gemini-api/docs/caching, "Implicit caching").
+ *
+ * Meter: a request is cache-healthy when cacheRead >= previous cacheRead +
+ * previous cacheWrite - 64. Uncached input never counts as reuse. Counting it
+ * ("cacheRead + input") made a request that read only the 47k-token head and
+ * billed the other ~475k as input look exactly like a warm hit. On an
+ * Anthropic-style explicit-breakpoint meter, such a short read with no write
+ * and a large uncached input is `missing_breakpoint_after_read`; a short read
+ * with a large write is a rewrite and goes through the shared classifier. A
+ * short read more than --cache-ttl (default 5m) after the prefix was last read
+ * in full or written is `idle_cache_expiry`.
+ */
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { getOmpSessionsRoot, getPiSessionsRoot } from "../../cli/src/lib/paths";
@@ -8,8 +41,15 @@ import {
 	type CacheBustDecisionAttribution,
 	type CacheBustDivergenceClass,
 	type CacheBustSessionAnalysis,
+	cachedPrefixFloor,
+	classifyBustAfterReclaim,
 	classifyCacheBust,
+	DEFAULT_CACHE_TTL_MS,
+	isIdleCacheExpiry,
+	isMissingBreakpointAfterRead,
 	nearestCacheBustDecision,
+	parseCacheTtl,
+	refreshesCachedPrefix,
 } from "../../plugin/scripts/cache-bust-attribution";
 import {
 	clippedBodyPairVersions,
@@ -38,6 +78,7 @@ interface Args {
 	until?: string;
 	limit?: number;
 	bodiesDir?: string;
+	cacheTtl?: string;
 	showDiff: boolean;
 	allRows: boolean;
 	help: boolean;
@@ -60,6 +101,10 @@ interface PiUsageRow {
 	cacheRead: number;
 	cacheWrite: number;
 	total: number;
+	/** pi-ai `api`, `provider`, and `model` of the message; they name the cache kind. */
+	api?: string;
+	provider?: string;
+	model?: string;
 }
 
 export interface PiSessionFile {
@@ -82,14 +127,29 @@ export interface AnalysisRow {
 	verdict: Verdict;
 	prevTotal?: number;
 	meterFloor?: number;
+	/** The provider cache read; uncached input is not part of it. */
 	comparableRead?: number;
+	/** Time since the cached prefix was last read in full or written. */
+	idleGapMs?: number;
+	/** The meter is an explicit-breakpoint (Anthropic-style) cache. */
+	explicitBreakpoints?: boolean;
 	rewrittenTokens?: number;
 	attribution: string;
 	divergenceIndex: number;
 	divergenceClass?: CacheBustDivergenceClass;
+	/**
+	 * Set only when this request is the bust right after a reclaim. The analyzer
+	 * then reports `divergenceClass` as an after-reclaim class (provider short
+	 * read or double bust), and `cause` keeps the class the request would have
+	 * had if no reclaim had come just before it.
+	 */
+	cause?: CacheBustDivergenceClass;
 	decision?: CacheBustDecisionAttribution;
 	previousModel?: string;
 	currentModel?: string;
+	/** Request bodies compared for this row, after the ledger cross-check. */
+	previousBody?: PiBodySnapshot;
+	currentBody?: PiBodySnapshot;
 }
 
 export interface PiCacheBustAnalysisOptions {
@@ -102,6 +162,8 @@ export interface PiCacheBustAnalysisOptions {
 	db?: string;
 	bodiesDir?: string;
 	decisions?: readonly CacheBustDecisionAttribution[];
+	/** Idle time after which the provider prefix counts as expired; default 5 min. */
+	cacheTtlMs?: number;
 }
 
 function asJson(value: unknown): Json | undefined {
@@ -187,6 +249,7 @@ function parseArgs(argv: string[]): Args {
 		"--until",
 		"--limit",
 		"--bodies-dir",
+		"--cache-ttl",
 	]);
 	let positionalSession = "";
 	for (let index = 0; index < args.length; index += 1) {
@@ -211,6 +274,7 @@ function parseArgs(argv: string[]): Args {
 		until: getOpt("--until"),
 		limit: limitRaw ? Number.parseInt(limitRaw, 10) : undefined,
 		bodiesDir: getOpt("--bodies-dir"),
+		cacheTtl: getOpt("--cache-ttl"),
 		showDiff: args.includes("--show-diff"),
 		allRows: args.includes("--all-rows"),
 		help: args.includes("--help") || args.includes("-h"),
@@ -280,6 +344,11 @@ function parsePiSessionFile(filePath: string): PiSessionFile | undefined {
 			cacheRead,
 			cacheWrite,
 			total: input + cacheRead + cacheWrite,
+			...(typeof message.api === "string" ? { api: message.api } : {}),
+			...(typeof message.provider === "string"
+				? { provider: message.provider }
+				: {}),
+			...(typeof message.model === "string" ? { model: message.model } : {}),
 		});
 	}
 	if (!sessionId) return undefined;
@@ -479,18 +548,123 @@ export function nearestPiPassDecision(
 	)[0];
 }
 
+/**
+ * How far before its context pass a request body may be written. The ledger
+ * timestamp and the file time come from different clock reads, so a body is
+ * allowed to look a little early.
+ */
+const BODY_WRITE_LEAD_MS = 250;
+/**
+ * How long after its context pass Pi may send the request. Pi sends right after
+ * the pass returns; on 2026-10-12 every body landed 6-112 ms after its pass.
+ */
+const BODY_WRITE_LAG_MS = 20_000;
+
+export type PassBodyJoin = "write_time" | "file_number" | "none";
+
+/** Ledger records are re-read per query, so bodies are keyed by value, not object. */
+export function passBodyKey(record: PiServedArrayDigestRecord): string {
+	return `${record.pass_ts}|${record.sequence}|${record.sha256}`;
+}
+
+/**
+ * Pair each served-array ledger record with the request body Pi sent for it.
+ *
+ * Bodies are matched by the time their file was written, not by the number in
+ * the file name. The capture extension numbers files with its own counter. That
+ * counter runs ahead of the ledger sequence whenever Pi sends a request the
+ * ledger does not record, and both counters restart with every Pi process, so a
+ * later process overwrites earlier files. Matching by number paired the
+ * 2026-10-12 15:28:51 reclaim with the body of the request before it, which made
+ * the reclaim look like a pure append and the next request look like the
+ * rewrite.
+ *
+ * A body counts for a pass when it was written between just before that pass and
+ * the next pass (at most BODY_WRITE_LAG_MS later). Only when no body fits any
+ * pass, as in a copied directory that lost its file times, are file numbers
+ * used instead.
+ */
+export function joinPassBodies(
+	ledgers: readonly PiServedArrayDigestRecord[],
+	bodies: ReadonlyMap<number, PiBodySnapshot>,
+): {
+	byPass: Map<string, PiBodySnapshot>;
+	join: PassBodyJoin;
+} {
+	const byPass = new Map<string, PiBodySnapshot>();
+	if (bodies.size === 0) return { byPass, join: "none" };
+	const orderedPasses = [...ledgers].sort(
+		(left, right) => Date.parse(left.pass_ts) - Date.parse(right.pass_ts),
+	);
+	const orderedBodies = [...bodies.values()].sort(
+		(left, right) => left.writtenAtMs - right.writtenAtMs,
+	);
+	let bodyIndex = 0;
+	for (let index = 0; index < orderedPasses.length; index += 1) {
+		const pass = orderedPasses[index];
+		const passMs = Date.parse(pass.pass_ts);
+		const nextPass = orderedPasses[index + 1];
+		const windowStart = passMs - BODY_WRITE_LEAD_MS;
+		const windowEnd = Math.min(
+			passMs + BODY_WRITE_LAG_MS,
+			nextPass ? Date.parse(nextPass.pass_ts) - BODY_WRITE_LEAD_MS : Infinity,
+		);
+		while (
+			bodyIndex < orderedBodies.length &&
+			orderedBodies[bodyIndex].writtenAtMs < windowStart
+		) {
+			bodyIndex += 1;
+		}
+		const candidate = orderedBodies[bodyIndex];
+		if (candidate && candidate.writtenAtMs < windowEnd) {
+			byPass.set(passBodyKey(pass), candidate);
+			bodyIndex += 1;
+		}
+	}
+	if (byPass.size > 0) return { byPass, join: "write_time" };
+	for (const pass of orderedPasses) {
+		const body = bodies.get(pass.sequence);
+		if (body) byPass.set(passBodyKey(pass), body);
+	}
+	return { byPass, join: byPass.size > 0 ? "file_number" : "none" };
+}
+
 function isUsageMissing(pass: JoinedPass): boolean {
 	return pass.usage.cacheRead === 0 && pass.usage.input === 0;
+}
+
+/**
+ * Does this request's provider cache at explicit breakpoints (Anthropic, also
+ * through Bedrock or a Claude model behind another API) rather than implicitly
+ * (OpenAI, Gemini)? A row without any provider name falls back to whether a
+ * cache write was ever reported, since implicit caches never report one.
+ */
+export function usesExplicitBreakpoints(
+	usage: PiUsageRow,
+	previous?: PiUsageRow,
+): boolean {
+	const names = [usage.api, usage.provider, usage.model].filter(
+		(name): name is string => typeof name === "string" && name.length > 0,
+	);
+	if (names.length > 0)
+		return names.some((name) => /anthropic|bedrock|claude/i.test(name));
+	return usage.cacheWrite > 0 || (previous?.cacheWrite ?? 0) > 0;
 }
 
 export function analyzeJoinedPasses(
 	joined: readonly JoinedPass[],
 	options: {
-		bodies?: ReadonlyMap<number, PiBodySnapshot>;
+		bodies?: ReadonlyMap<string, PiBodySnapshot>;
 		decisions?: readonly CacheBustDecisionAttribution[];
+		cacheTtlMs?: number;
 	} = {},
 ): AnalysisRow[] {
+	const cacheTtlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+	// When the reusable prefix was last read in full or written; see
+	// refreshesCachedPrefix for which requests move it.
+	let prefixRefreshedAtMs: number | undefined;
 	let previousBust = false;
+	let previousBustClass: CacheBustDivergenceClass | undefined;
 	let previousBustDivergenceIndex: number | undefined;
 	let previousMetered: JoinedPass | undefined;
 	return joined.map((current) => {
@@ -509,6 +683,7 @@ export function analyzeJoinedPasses(
 		}
 		if (!previousMetered) {
 			previousMetered = current;
+			prefixRefreshedAtMs = current.usage.timestamp;
 			return {
 				current,
 				verdict: "BASE",
@@ -518,27 +693,81 @@ export function analyzeJoinedPasses(
 		}
 		const previous = previousMetered;
 		const prevTotal = previous.usage.total;
-		const meterFloor = prevTotal - Math.max(64, previous.usage.input);
-		const comparableRead = current.usage.cacheRead + current.usage.input;
-		// A bust's large direct input cannot forgive another rewrite at the
-		// same cache floor. Cache reads must recover before forgiveness resumes.
+		// Only the cache read counts as reuse: it must cover what the previous
+		// request read or wrote. Uncached input is billed in full and caches
+		// nothing, so it never stands in for a read.
+		const meterFloor = cachedPrefixFloor({
+			read: previous.usage.cacheRead,
+			write: previous.usage.cacheWrite,
+			input: previous.usage.input,
+		});
+		const comparableRead = current.usage.cacheRead;
+		// After a bust, a read that does not grow past the previous read is
+		// another bust even when it matches the previous request's small prefix.
 		const rebust =
 			previousBust && current.usage.cacheRead <= previous.usage.cacheRead;
 		const bust = rebust || comparableRead < meterFloor;
+		const bustFollowsBust = previousBust;
 		previousBust = bust;
-		const previousBody = options.bodies?.get(previous.ledger.sequence);
-		const currentBody = options.bodies?.get(current.ledger.sequence);
-		const bodyDivergence =
+		const explicitBreakpoints = usesExplicitBreakpoints(
+			current.usage,
+			previous.usage,
+		);
+		const reading = {
+			read: current.usage.cacheRead,
+			write: current.usage.cacheWrite,
+			input: current.usage.input,
+		};
+		const idleGapMs =
+			current.usage.timestamp -
+			(prefixRefreshedAtMs ?? previous.usage.timestamp);
+		const idleCacheExpiry =
+			bust &&
+			isIdleCacheExpiry(
+				current.usage.timestamp,
+				prefixRefreshedAtMs ?? previous.usage.timestamp,
+				cacheTtlMs,
+			);
+		const missingBreakpointAfterRead = isMissingBreakpointAfterRead(reading, {
+			shortRead: bust,
+			explicitBreakpoints,
+		});
+		if (
+			refreshesCachedPrefix(reading, { shortRead: bust, explicitBreakpoints })
+		) {
+			prefixRefreshedAtMs = current.usage.timestamp;
+		}
+		let previousBody = options.bodies?.get(passBodyKey(previous.ledger));
+		let currentBody = options.bodies?.get(passBodyKey(current.ledger));
+		let bodyDivergence =
 			previousBody && currentBody
 				? describeBodyPair(previousBody.messages, currentBody.messages)
 				: undefined;
+		// The ledger is Magic Context's own record of what it served. When it shows
+		// fewer messages than the previous pass, Magic Context dropped or folded
+		// something, so the request is not a pure append of the one before. If the
+		// matched bodies nevertheless read as a pure append (no divergence, or one
+		// only past the previous body's end), they were captured for different
+		// requests than these two passes. Discard them, so no body diff or
+		// provider-side verdict is drawn from the wrong pair.
+		const bodiesContradictLedger =
+			previousBody !== undefined &&
+			currentBody !== undefined &&
+			current.ledger.message_count < previous.ledger.message_count &&
+			(bodyDivergence === undefined ||
+				bodyDivergence.index >= previousBody.messages.length);
+		if (bodiesContradictLedger) {
+			previousBody = undefined;
+			currentBody = undefined;
+			bodyDivergence = undefined;
+		}
 		const compactionSeam = current.intervening.some(
 			(entry) => entry.type === "compaction",
 		);
 		const seam = compactionSeam ? " (compaction seam)" : "";
 		const attribution = bodyDivergence
 			? `${bodyDivergence.description}${seam}`
-			: digestAttribution(previous, current);
+			: `${digestAttribution(previous, current)}${bodiesContradictLedger ? " (request bodies contradict the ledger; ignored)" : ""}`;
 		const decision = nearestPiPassDecision(
 			options.decisions ?? [],
 			current.usage.timestamp,
@@ -592,7 +821,7 @@ export function analyzeJoinedPasses(
 			bodyDivergence !== undefined &&
 			previousBody !== undefined &&
 			bodyDivergence.index >= previousBody.messages.length;
-		const divergenceClass = bust
+		const ownClass = bust
 			? classifyCacheBust({
 					providerShortReadWithIdenticalPrefix: pureAppend,
 					divergenceIndex,
@@ -619,8 +848,16 @@ export function analyzeJoinedPasses(
 					compactionSeam,
 					inheritedFold: attributionDecision !== decision,
 					decision: attributionDecision,
+					idleCacheExpiry,
+					missingBreakpointAfterRead,
 				})
 			: undefined;
+		const divergenceClass =
+			ownClass && bustFollowsBust
+				? classifyBustAfterReclaim(previousBustClass, ownClass)
+				: ownClass;
+		const cause = divergenceClass !== ownClass ? ownClass : undefined;
+		previousBustClass = bust ? divergenceClass : undefined;
 		previousBustDivergenceIndex = bust ? divergenceIndex : undefined;
 		previousMetered = current;
 		return {
@@ -630,13 +867,18 @@ export function analyzeJoinedPasses(
 			prevTotal,
 			meterFloor,
 			comparableRead,
+			idleGapMs,
+			explicitBreakpoints,
 			rewrittenTokens,
 			previousModel: previousBody?.wireModel,
 			currentModel: currentBody?.wireModel,
 			attribution,
 			divergenceIndex,
 			divergenceClass,
+			cause,
 			decision: attributionDecision,
+			previousBody,
+			currentBody,
 		};
 	});
 }
@@ -698,7 +940,10 @@ export async function analyzePiCacheBustSession(
 		selected.path,
 		options.bodiesDir,
 	);
-	const bodies = loadPiBodySnapshots(bodiesDirectory);
+	const bodies = joinPassBodies(
+		ledgers,
+		loadPiBodySnapshots(bodiesDirectory),
+	).byPass;
 	const decisions =
 		options.decisions ??
 		loadPiCacheBustDecisions(selected.sessionId, ledgerDir, options.db);
@@ -726,6 +971,7 @@ export async function analyzePiCacheBustSession(
 	const rows = analyzeJoinedPasses(analysisJoined, {
 		bodies,
 		decisions,
+		cacheTtlMs: options.cacheTtlMs,
 	});
 	const requests: AnalyzedCacheRequest[] = rows.flatMap((row) => {
 		const timestampMs = row.current.usage.timestamp;
@@ -738,6 +984,7 @@ export async function analyzePiCacheBustSession(
 				verdict: row.verdict,
 				rewrittenTokens: row.rewrittenTokens,
 				divergenceClass: row.divergenceClass,
+				...(row.cause ? { cause: row.cause } : {}),
 				firstDivergence: row.attribution,
 				analyzerCmd: piAnalyzerCommand(row, options),
 			},
@@ -773,7 +1020,7 @@ function meterCell(row: AnalysisRow): string {
 		row.previousModel !== row.currentModel
 			? `; wireModel=${row.previousModel} → ${row.currentModel}`
 			: "";
-	return `read=${row.current.usage.cacheRead.toLocaleString()} + input=${row.current.usage.input.toLocaleString()} = ${row.comparableRead?.toLocaleString()}; floor=${row.meterFloor?.toLocaleString()} (prevTotal=${row.prevTotal?.toLocaleString()})${rewritten}${wireModel}`;
+	return `read=${row.current.usage.cacheRead.toLocaleString()} (write=${row.current.usage.cacheWrite.toLocaleString()}, uncached input=${row.current.usage.input.toLocaleString()}); floor=${row.meterFloor?.toLocaleString()} (prev read+write-64; prevTotal=${row.prevTotal?.toLocaleString()})${rewritten}${wireModel}`;
 }
 
 const HELP = `usage: bun scripts/analyze-pi-cache-busts.ts --session <prefix> [options]
@@ -790,6 +1037,8 @@ Options:
   --bodies-dir <path>  override the body session directory (or its parent)
   --since/--until <t>  ISO timestamp or duration ago (for example 4h)
   --limit <N>          keep the last N digest records in range
+  --cache-ttl <dur>    idle time after which the provider prefix counts as
+                       expired (default 5m; for example 1h)
   --show-diff          print both versions of the first-diverging real message
   --all-rows           also print BASE and STABLE rows`;
 
@@ -857,25 +1106,42 @@ async function main(): Promise<void> {
 		session.path,
 		options.bodiesDir,
 	);
-	const bodies = loadPiBodySnapshots(bodiesDirectory);
+	const bodySnapshots = loadPiBodySnapshots(bodiesDirectory);
+	// Pair bodies over the whole ledger, so the pass just before --since still
+	// finds its body by write time.
+	const bodyJoin = joinPassBodies(
+		loadLedger(session.sessionId, options.ledgerDir),
+		bodySnapshots,
+	);
 	const decisions = loadPiCacheBustDecisions(
 		session.sessionId,
 		options.ledgerDir,
 		options.db,
 	);
+	const cacheTtlMs = parseCacheTtl(options.cacheTtl);
 	const rows = analyzeJoinedPasses(joinPasses(ledgers, session), {
-		bodies,
+		bodies: bodyJoin.byPass,
 		decisions,
+		cacheTtlMs,
 	});
 	console.log(`Session: ${session.sessionId}`);
 	console.log(`JSONL:   ${session.path}`);
 	console.log(
-		`Bodies:  ${bodies.size}${bodiesDirectory ? ` (${bodiesDirectory})` : " (not found; using digest vectors)"}`,
+		`Bodies:  ${bodySnapshots.size}${bodiesDirectory ? ` (${bodiesDirectory})` : " (not found; using digest vectors)"}`,
 	);
+	if (bodySnapshots.size > 0) {
+		console.log(
+			bodyJoin.join === "write_time"
+				? `Body join: by write time (${bodyJoin.byPass.size} passes matched)`
+				: bodyJoin.join === "file_number"
+					? "Body join: by file number (no body write time matches a pass; numbers can be off by the requests Magic Context did not record)"
+					: "Body join: none (no body matches a pass)",
+		);
+	}
 	console.log(`Digests: ${ledgers.length}`);
 	console.log("");
 	console.log(
-		"Meter rule (Pi host): BUST when cacheRead + current input < prevTotal - ε, where prevTotal is prior input + cacheRead + cacheWrite and ε=max(64, prior input). After a bust, a read that does not grow past the prior read is another BUST (rewritten≈current input). The meter decides the verdict; normalized pi-llm-debugging request bodies attribute changed messages.",
+		`Meter rule (Pi host): BUST when cacheRead < prior cacheRead + prior cacheWrite - 64; uncached input never counts as reuse. After a bust, a read that does not grow past the prior read is another BUST (rewritten≈current input). On an explicit-breakpoint meter (Anthropic) a short read with no write and ≥1,024 uncached input tokens is missing_breakpoint_after_read; a short read more than ${options.cacheTtl ?? "5m"} after the prefix was last read in full or written is idle_cache_expiry. The meter decides the verdict; normalized pi-llm-debugging request bodies attribute changed messages.`,
 	);
 	console.log(
 		"time(UTC)            | verdict | meter                                                                  | first divergence",
@@ -889,29 +1155,32 @@ async function main(): Promise<void> {
 		if (!options.allRows && row.verdict !== "BUST") continue;
 		let attribution = row.attribution;
 		let bodyDivergence: ReturnType<typeof describeBodyPair>;
-		if (row.previous) {
-			const previousBody = bodies.get(row.previous.ledger.sequence);
-			const currentBody = bodies.get(row.current.ledger.sequence);
-			if (previousBody && currentBody) {
-				bodyDivergence = describeBodyPair(
-					previousBody.messages,
-					currentBody.messages,
-				);
-				if (bodyDivergence) {
-					const seam = row.current.intervening.some(
-						(entry) => entry.type === "compaction",
-					)
-						? " (compaction seam)"
-						: "";
-					attribution = `${bodyDivergence.description}${seam}`;
-				}
+		if (row.previous && row.previousBody && row.currentBody) {
+			bodyDivergence = describeBodyPair(
+				row.previousBody.messages,
+				row.currentBody.messages,
+			);
+			if (bodyDivergence) {
+				const seam = row.current.intervening.some(
+					(entry) => entry.type === "compaction",
+				)
+					? " (compaction seam)"
+					: "";
+				attribution = `${bodyDivergence.description}${seam}`;
 			}
 		}
 		console.log(
 			`${fmtTime(row.current.usage.createdAt).padEnd(21)} | ${row.verdict.padEnd(7)} | ${meterCell(row).padEnd(70)} | ${attribution}`,
 		);
 		if (row.divergenceClass) {
-			console.log(`          └─ divergence-class: ${row.divergenceClass}`);
+			console.log(
+				`          └─ divergence-class: ${row.divergenceClass}${row.cause ? ` (cause: ${row.cause})` : ""}`,
+			);
+		}
+		if (row.previousBody && row.currentBody) {
+			console.log(
+				`          └─ bodies: ${row.previousBody.sequence}-req.json → ${row.currentBody.sequence}-req.json`,
+			);
 		}
 		if (options.showDiff && bodyDivergence) {
 			const versions = clippedBodyPairVersions(bodyDivergence);
@@ -928,6 +1197,8 @@ async function main(): Promise<void> {
 
 export const __test = {
 	analyzeJoinedPasses,
+	joinPassBodies,
+	passBodyKey,
 	digestAttribution,
 	discoverPiSessionFiles,
 	joinPasses,

@@ -134,9 +134,24 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: park self-heal", () 
         // Inspect user content, not the system guidance that describes tag syntax.
         const users = h.lastMainMessages().filter(message => message.role === "user");
         expect(stableSerialize(users)).toMatch(/§\d+§[^§]*authorized rebuild after recovery/);
-        // A published history marker changes ingress on the first continuation,
-        // which must re-prime full arrays. The following two passes must be deltas.
-        for (let i = 0; i < 3; i++) {
+        // A flush can refresh the cached head (SOFT) before any history summary
+        // is published. The first summary must then be folded into the baseline
+        // (HARD) to record which raw messages it covers. Wait for that publication
+        // and require this one fold, rather than allowing arbitrary prefix changes.
+        const firstFoldPending = stableSerialize(h.lastMainMessages()[0]).includes("<session-history></session-history>");
+        if (firstFoldPending) {
+            expect(rebuilt.decision).toBe("SOFT");
+            expect(rebuilt.reason).toBe("explicit_flush");
+            await h.waitFor(async () => {
+                const status = await h.subc.moduleStatus(sessionId, h.env.workdir, "session.status");
+                return Number(status.compartment_count) > 0;
+            }, { label: "first historian compartment published after boundaryless flush" });
+        }
+        // Folding inserts a host compaction marker, so the next request resends
+        // the full message array. The following two requests must send only tail
+        // changes, and all requests after the fold must preserve the cached bytes.
+        const continuations = firstFoldPending ? 4 : 3;
+        for (let i = 0; i < continuations; i++) {
             const prefix = h.lastMainMessages();
             h.mock.setDefault({ text: `continued answer ${i}`, usage: { input_tokens: 1_000, output_tokens: 20 } });
             await h.sendPrompt(sessionId, `delta continuation after recovery ${i}`);
@@ -144,8 +159,21 @@ describe.skipIf(!rustPrereqs.ok)("rust incident regression: park self-heal", () 
             expect(pass.applied).toBe(true);
             expect(pass.servedFrom).toBe("transform");
             expect(pass.rowVersion).toBeGreaterThan(rebuilt.rowVersion);
-            if (i > 0) expect(pass.wireMessages).toBeLessThan(pass.inputCount);
-            expect(stableSerialize(h.lastMainMessages().slice(0, prefix.length))).toBe(stableSerialize(prefix));
+            if (firstFoldPending && i === 0) {
+                expect(pass.decision).toBe("HARD");
+                expect(pass.reason).toBe("coverage_fold");
+                expect(pass.raw).toContain("prefix_bust_permitted=true");
+                expect(stableSerialize(h.lastMainMessages()[0])).toContain("Hermetic Broca chunk");
+                const status = await h.subc.moduleStatus(sessionId, h.env.workdir, "session.status");
+                expect(status.boundary_present).toBe(true);
+                expect(Number(status.coverage_ordinal)).toBeGreaterThan(0);
+            } else {
+                expect(pass.decision).toBe("SOFT+");
+                expect(pass.reason).toBe("none");
+                expect(pass.raw).toContain("prefix_bust_permitted=false");
+                expect(stableSerialize(h.lastMainMessages().slice(0, prefix.length))).toBe(stableSerialize(prefix));
+            }
+            if (i > (firstFoldPending ? 1 : 0)) expect(pass.wireMessages).toBeLessThan(pass.inputCount);
         }
         console.log("PARK_AUTHORIZED_RECOVERY", JSON.stringify({ sessionId, passes: h.readRustPasses().slice(count - 1).map(p => p.raw) }));
     }

@@ -2,8 +2,11 @@ import { Database } from "bun:sqlite";
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { normalizeVector } from "../curate-stale-retirement-trial/retrieval";
-import { ROOT, REPO, MODEL, SYSTEM, hash, evaluate, reconcilePrompt, newerNeighbors, sample, SEED, type Batch, type Memory, type Label, type Gate } from "./core";
+import { ROOT, MODEL, SYSTEM, hash, evaluate, reconcilePrompt, newerNeighbors, sample, SEED, type Batch, type Memory, type Label, type Gate } from "./core";
 
+const reportPath = process.argv[2];
+const sourceRepo = process.argv[3];
+if (!reportPath || !sourceRepo) throw new Error("Usage: analyze.ts <report-path> <recorded-source-root>; both offline inputs are required");
 const load = <T = any>(name: string): T => JSON.parse(readFileSync(join(ROOT, name), "utf8"));
 const manifest = load("manifest.json"), batches = load<Batch[]>("batches.json"), pool = load<Memory[]>("pool.json");
 const labels = load<Label[]>("evaluation.json"), extraLabels = load<Label[]>("extra-labels.json");
@@ -43,7 +46,7 @@ const checks: [string, () => void][] = [
             assert(t.evidence.length <= 10, "Evidence quota exceeded");
             for (const e of t.evidence) {
                 assert(!e.path.startsWith("/") && !e.path.split("/").includes("..") && !/memory-reconcile|curate-stale-retirement|historian-merge-turn-trial|\.env/.test(e.path), "Unfenced excerpt");
-                if (!files.has(e.path)) files.set(e.path, readFileSync(join(REPO, e.path), "utf8").split("\n"));
+                if (!files.has(e.path)) files.set(e.path, readFileSync(join(sourceRepo, e.path), "utf8").split("\n"));
                 equal(e.text, files.get(e.path)![e.line - 1]?.slice(0, 1600), `Invented source line ${e.path}:${e.line}`);
             }
         }
@@ -78,7 +81,7 @@ const checks: [string, () => void][] = [
         for (const pass of ["A", "B"]) equal(rows.filter(r => r.pass === pass && r.group === "labelled").map(r => r.id), manifest.labelled, "Labelled pass coverage");
     }],
     ["deliverables contain no full active memory or raw model response", () => {
-        const files = [...readdirSync(import.meta.dir).filter(f => !f.startsWith(".")).map(f => join(import.meta.dir, f)), join(REPO, "docs/reports/memory-reconcile-check-trial.md")];
+        const files = [...readdirSync(import.meta.dir).filter(f => !f.startsWith(".")).map(f => join(import.meta.dir, f)), reportPath];
         for (const path of files) {
             const text = readFileSync(path, "utf8");
             for (const m of pool) {

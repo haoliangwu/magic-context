@@ -1,6 +1,6 @@
 # Curate stale-retirement shadow trial
 
-Investigative scripts only. No product prompt, memory mutation, live configuration or embedding provider is used. Read the report at `docs/reports/curate-stale-retirement-trial.md` before interpreting the numbers.
+Investigative scripts only. No product prompt, memory mutation, live configuration or embedding provider is used. Recorded results must be interpreted with the matching offline report. Verification takes explicit `<report-path> <recorded-source-root>` inputs; the source root must match the revision that supplied the excerpts.
 
 ## Reproduce
 

@@ -82,3 +82,45 @@ test("pool bounds retained handles and rechecks generation after file replacemen
         rmSync(root, { recursive: true, force: true });
     }
 });
+
+test("message timing projection is bounded, session-scoped and observes completion edits", () => {
+    const root = createTestTempDirFromPath(join(tmpdir(), "mc-reader-times-"));
+    const path = join(root, "store.db");
+    const writer = fixture(path);
+    const pool = new V2StoreReaderPool();
+    const insert = writer.prepare(
+        "INSERT INTO session_message VALUES (?, ?, 'assistant', ?, ?, ?)",
+    );
+    const ids = Array.from({ length: 501 }, (_, index) => `timed-${index}`);
+    for (const [index, id] of ids.entries())
+        insert.run(
+            id,
+            "s",
+            index + 2,
+            index === 0 ? null : 1000 + index,
+            JSON.stringify({ time: { created: 2000 + index, completed: 3000 + index } }),
+        );
+    insert.run("other-session", "other", 1, 4000, '{"time":{"completed":5000}}');
+    const reader = pool.open(path);
+    try {
+        expect(reader.messageTimes("s", [])).toEqual(new Map());
+        const times = reader.messageTimes("s", [...ids, "other-session", "missing"]);
+        expect(times.size).toBe(501);
+        expect(times.get("timed-0")).toEqual({ created: 2000, completed: 3000 });
+        expect(times.get("timed-500")).toEqual({ created: 1500, completed: 3500 });
+        expect(times.has("other-session")).toBe(false);
+        expect(times.has("missing")).toBe(false);
+        writer
+            .prepare("UPDATE session_message SET data = ? WHERE id = ?")
+            .run('{"time":{"completed":9999}}', "timed-500");
+        expect(reader.messageTimes("s", ["timed-500"]).get("timed-500")).toEqual({
+            created: 1500,
+            completed: 9999,
+        });
+    } finally {
+        reader.close();
+        pool.close();
+        writer.close();
+        rmSync(root, { recursive: true, force: true });
+    }
+});

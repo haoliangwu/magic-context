@@ -1,15 +1,14 @@
 //! `tool.catalog` and `role.describe`: Magic Context's answers under the
 //! `tool-provider/v1` role (commons `cortexkit-role-tool-provider`).
 //!
-//! `docs/designs/mc-tool-catalog-v1.md` is the design; its example payloads in
-//! `docs/designs/mc-tool-catalog-v1/` are the exact bytes this module serves,
-//! and the tests compare against them byte for byte.
+//! Pinned request/response fixtures in `src/tests/fixtures/tool-catalog/`
+//! hold the exact bytes this module serves; tests compare them byte for byte.
 //!
 //! Everything the answer says comes from one shared definition,
 //! `assets/tool_catalog_v1.json` plus the two tools-only texts beside it: the
 //! tools, their argument-schema structures, descriptions and parameter
-//! descriptions, and the guidance templates. The documentation generator
-//! (`docs/designs/mc-tool-catalog-v1/generate.ts`) reads the same files and
+//! descriptions, and the guidance templates. The fixture generator
+//! (`gen/gen-tool-catalog.ts`) reads the same files and
 //! checks them against the plugin's shipped strings.
 //!
 //! The answer is a pure function of the request (preset, params, composition,
@@ -238,6 +237,7 @@ pub(crate) struct FrozenCatalog {
 /// matches `config.json` beside the design's examples member for member.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CatalogConfig {
+    pub smart_notes_enabled: bool,
     pub compaction_enabled: bool,
     pub memory_enabled: bool,
     pub dreamer_runnable: bool,
@@ -261,6 +261,7 @@ impl CatalogConfig {
         let inputs = &config.catalog;
         Self {
             compaction_enabled: config.compaction_enabled,
+            smart_notes_enabled: config.smart_notes_enabled,
             memory_enabled: config.memory_enabled,
             dreamer_runnable: inputs.dreamer_runnable,
             temporal_awareness: config.temporal_awareness,
@@ -295,7 +296,7 @@ impl CatalogConfig {
             .iter()
             .map(|(key, surface)| (key.clone(), json!(surface.as_str())))
             .collect();
-        json!({
+        let mut resolved = json!({
             "compaction_enabled": self.compaction_enabled,
             "memory_enabled": self.memory_enabled,
             "dreamer_runnable": self.dreamer_runnable,
@@ -306,7 +307,11 @@ impl CatalogConfig {
             "guidance_override_sha256": self.guidance_override.as_deref().map(sha256_hex),
             "tool_descriptions": self.tool_descriptions,
             "disabled_tools": self.disabled_tools,
-        })
+        });
+        if !self.smart_notes_enabled {
+            resolved["smart_notes_enabled"] = json!(false);
+        }
+        resolved
     }
 
     /// The surface from Magic Context's own config: the request's `model`
@@ -646,7 +651,10 @@ fn catalog_tool(
     surface: Surface,
     config: &CatalogConfig,
 ) -> Result<Value, CatalogError> {
-    let schema = input_schema(tool, surface)?;
+    let mut schema = input_schema(tool, surface)?;
+    if tool.name == "ctx_note" && !config.smart_notes_enabled {
+        crate::prompt_surface::disable_smart_note_schema(&mut schema);
+    }
     let schema_digest = catalog::schema_digest(&schema)
         .map_err(|error| CatalogError::Internal(error.to_string()))?;
     if tool.name == "ctx_reduce" && schema_digest != FROZEN_CTX_REDUCE_SCHEMA_DIGEST {
@@ -666,6 +674,15 @@ fn catalog_tool(
                     tool.name
                 ))
             })?,
+    };
+    let description = if tool.name == "ctx_note" && !config.smart_notes_enabled {
+        crate::prompt_surface::without_smart_note_description(
+            definition()
+                .description(surface, &tool.name)
+                .unwrap_or(description),
+        )
+    } else {
+        description.to_string()
     };
     Ok(json!({
         "name": tool.name,
@@ -708,7 +725,7 @@ fn guidance_text(
         .and_then(crate::primary_language_directive);
     let flags = TextFlags {
         memory: config.memory_enabled && own.contains("ctx_memory"),
-        dreamer: config.dreamer_runnable,
+        dreamer: config.dreamer_runnable && config.smart_notes_enabled,
         temporal: config.temporal_awareness,
         caveman: config.caveman_text_compression,
         language: directive.is_some(),
@@ -728,7 +745,14 @@ fn guidance_text(
             // A user's override replaces the whole primary section; the
             // runtime clauses (temporal, caveman, language) still follow it.
             Some(text) => {
-                values.insert("override", text.clone());
+                values.insert(
+                    "override",
+                    if config.smart_notes_enabled {
+                        text.clone()
+                    } else {
+                        crate::prompt_surface::without_smart_note_guidance(text)
+                    },
+                );
                 "override".to_string()
             }
             None if reduce => format!("head/reduce/{surface}"),

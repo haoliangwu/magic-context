@@ -26,11 +26,26 @@ workspace tests. The hermetic Rust lane builds its binaries once and runs four
 manifest-selected test shards. A nightly schedule continues to check the latest
 sibling default-branch heads, and `workflow_dispatch` remains available.
 
-The release workflow runs the Rust build and four shards for version tags.
-`RELEASE_SKIP_RUST_E2E` can name one exact tag to skip the Rust jobs for that
-release; `SKIP_RUST_E2E` is the corresponding local runner environment switch.
-Without that exact tag match, publication requires the Rust build and all shards
-to pass. No App credentials are used to fetch the public siblings.
+The release workflow runs the Rust build and four shards for every version tag;
+publication requires all of them to pass. No App credentials are used to fetch
+the public siblings.
+
+`scripts/release.sh <version> --ci-gate=<sha>` avoids repeating local gates only
+when the SHA resolves to HEAD and the latest [CI](workflows/ci.yml),
+[Mutations](workflows/mutations.yml) (mutation tests), and
+[Smoke](workflows/smoke-opencode-linux.yml) (OpenCode bring-up) runs for that
+exact commit all completed successfully. CI certifies the Rust E2E gate,
+so the release script skips its local Rust E2E run as well.
+The script still builds and checks publish artifacts, checks notes, and permits
+only version and public-note changes in the bump before tagging. A different
+HEAD uses the normal local gates; missing or unsuccessful workflows refuse the
+release. The tag workflow still runs its full publish gate.
+
+CI reuse also reruns the schema and reference-seed generators to verify the
+committed outputs are current. If regenerated files differ from HEAD, the script
+prints their diff, restores the committed files, and refuses the release rather
+than including uncertified generated output in the bump. Generator failures also
+refuse the release and restore the generated files.
 
 Each build creates the binaries consumed by the shards and uploads them as a
 short-lived workflow artifact. The hermetic Cargo target cache is keyed from

@@ -15,6 +15,7 @@ it("tag snapshots reuse unchanged rows and invalidate local, external and rollba
 	initializeDatabase(db);
 	runMigrations(db);
 	const other = new Database(join(root, "context.db"));
+	initializeDatabase(other);
 	const insert = (connection: Database, id: string, number: number) =>
 		connection
 			.prepare(
@@ -153,3 +154,95 @@ it("replaces legacy TEMP revision triggers before incremental reads", () => {
 		db.close();
 	}
 });
+
+it("100k-tag snapshots ignore foreign metadata and other sessions, but reload foreign same-session edits and reopened connections", () => {
+	const root = createTestTempDirFromPath(join(tmpdir(), "pi-tags-foreign-"));
+	const path = join(root, "context.db");
+	const db = new Database(path);
+	initializeDatabase(db);
+	runMigrations(db);
+	const other = new Database(path);
+	initializeDatabase(other);
+	const insert = db.prepare(
+		"INSERT INTO tags (message_id,type,status,session_id,tag_number,byte_size) VALUES (?,'message','active',?, ?,0)",
+	);
+	try {
+		db.transaction(() => {
+			for (let i = 1; i <= 100_000; i++) insert.run(`m-${i}`, "session", i);
+		})();
+		const read = createPiTagSnapshotReader(db);
+		read("session");
+		const prepare = spyOn(db, "prepare");
+		try {
+			other
+				.prepare(
+					"INSERT OR REPLACE INTO schema_migrations_meta VALUES ('foreign-metadata', '1')",
+				)
+				.run();
+			other
+				.prepare(
+					"INSERT INTO tags (message_id,type,status,session_id,tag_number,byte_size) VALUES ('foreign','message','active','other',1,0)",
+				)
+				.run();
+			read("session");
+			insert.run("appended", "session", 100_001);
+			expect(read("session").at(-1)?.messageId).toBe("appended");
+			expect(
+				prepare.mock.calls.filter(
+					([sql]) =>
+						sql.includes("FROM tags WHERE session_id") &&
+						!sql.includes("tag_number IN"),
+				),
+			).toHaveLength(0);
+		} finally {
+			prepare.mockRestore();
+		}
+		other
+			.prepare(
+				"UPDATE tags SET status='dropped', byte_size=42 WHERE message_id='m-1'",
+			)
+			.run();
+		expect(read("session")).toEqual(getTagsBySession(db, "session"));
+		other.exec("BEGIN");
+		other
+			.prepare(
+				"UPDATE tags SET tag_number=200000, message_id='renamed' WHERE message_id='m-2'",
+			)
+			.run();
+		other.exec("ROLLBACK");
+		expect(read("session")[1]?.messageId).toBe("m-2");
+		other
+			.prepare(
+				"UPDATE tags SET session_id='other', tag_number=2 WHERE message_id='m-2'",
+			)
+			.run();
+		other.prepare("DELETE FROM tags WHERE message_id='m-3'").run();
+		insert.run("local-with-foreign", "session", 100_002);
+		expect(read("session")).toEqual(getTagsBySession(db, "session"));
+		const reopened = new Database(path);
+		initializeDatabase(reopened);
+		try {
+			const spy = spyOn(reopened, "prepare");
+			try {
+				expect(createPiTagSnapshotReader(reopened)("session")).toEqual(
+					getTagsBySession(db, "session"),
+				);
+				expect(
+					spy.mock.calls.some(
+						([sql]) =>
+							sql.includes("FROM tags WHERE session_id") &&
+							!sql.includes("tag_number IN"),
+					),
+				).toBe(true);
+			} finally {
+				spy.mockRestore();
+			}
+		} finally {
+			reopened.close();
+		}
+	} finally {
+		other.close();
+		db.close();
+		rmSync(root, { recursive: true, force: true });
+	}
+}, 60_000);

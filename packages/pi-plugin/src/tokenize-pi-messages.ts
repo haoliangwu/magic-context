@@ -42,6 +42,8 @@
 
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 
+export const PI_IMAGE_TOKENS = 1200;
+
 export interface PiMessageTokenCounts {
 	conversation: number;
 	toolCall: number;
@@ -63,6 +65,7 @@ export interface TokenizePiMessagesOptions {
 
 interface MaybePart {
 	type?: string;
+	redacted?: boolean;
 	text?: string;
 	thinking?: string;
 	thinkingSignature?: string;
@@ -77,6 +80,7 @@ interface MaybeMessage {
 	role?: string;
 	content?: unknown;
 	toolCallId?: string;
+	usage?: { output?: number; reasoning?: number };
 }
 
 /**
@@ -135,12 +139,17 @@ export function tokenizePiMessages(
 			// User/Assistant: content is array of PiTextContent | PiImageContent
 			// | PiThinkingContent | PiToolCall (or a plain string for user
 			// messages — Pi allows that shape too).
-			if (msg.role === "user" || msg.role === "assistant") {
+			if (
+				msg.role === "user" ||
+				msg.role === "assistant" ||
+				msg.role === "custom"
+			) {
 				if (typeof content === "string") {
 					conversation += estimateTokens(content);
 					continue;
 				}
 				if (!Array.isArray(content)) continue;
+				let opaqueCounted = false;
 				for (const part of content) {
 					if (!part || typeof part !== "object") continue;
 					const p = part as MaybePart;
@@ -148,14 +157,24 @@ export function tokenizePiMessages(
 						case "text":
 							if (typeof p.text === "string")
 								conversation += estimateTokens(p.text);
-							if (typeof p.textSignature === "string")
-								conversation += estimateTokens(p.textSignature);
+
 							break;
 						case "thinking":
-							if (typeof p.thinking === "string")
+						case "redacted_thinking":
+							if (!p.redacted && typeof p.thinking === "string")
 								conversation += estimateTokens(p.thinking);
-							if (typeof p.thinkingSignature === "string")
-								conversation += estimateTokens(p.thinkingSignature);
+							if (
+								!opaqueCounted &&
+								(p.redacted ||
+									p.type === "redacted_thinking" ||
+									(!p.thinking && p.thinkingSignature))
+							) {
+								opaqueCounted = true;
+								conversation += opaqueThinkingCost(
+									msg.usage?.reasoning,
+									msg.usage?.output,
+								).tokens;
+							}
 							break;
 						case "image":
 							// Pi image content is base64. Anthropic-style visual
@@ -164,7 +183,7 @@ export function tokenizePiMessages(
 							// fallback (1200 tokens) — over-estimates small
 							// thumbnails, under-estimates 4K screenshots, but is
 							// stable and matches the OpenCode fallback path.
-							conversation += 1200;
+							conversation += PI_IMAGE_TOKENS;
 							break;
 						case "toolCall":
 							// Tool invocation: name + JSON-serialized arguments.
@@ -200,7 +219,7 @@ export function tokenizePiMessages(
 					if (p.type === "text" && typeof p.text === "string") {
 						toolCall += estimateTokens(p.text);
 					} else if (p.type === "image") {
-						toolCall += 1200;
+						toolCall += PI_IMAGE_TOKENS;
 					}
 				}
 			}
@@ -233,8 +252,17 @@ export function tokenizePiMessages(
 function buildTokenCacheFingerprint(value: object): readonly (string | null)[] {
 	const message = value as MaybeMessage;
 	const role = typeof message.role === "string" ? message.role : null;
-	const fingerprint: (string | null)[] = [role];
-	if (role !== "user" && role !== "assistant" && role !== "toolResult") {
+	const fingerprint: (string | null)[] = [
+		role,
+		String(message.usage?.reasoning ?? ""),
+		String(message.usage?.output ?? ""),
+	];
+	if (
+		role !== "user" &&
+		role !== "assistant" &&
+		role !== "toolResult" &&
+		role !== "custom"
+	) {
 		return fingerprint;
 	}
 	if (typeof message.content === "string") {
@@ -266,8 +294,10 @@ function buildTokenCacheFingerprint(value: object): readonly (string | null)[] {
 				);
 				break;
 			case "thinking":
+			case "redacted_thinking":
 				fingerprint.push(
-					"thinking",
+					part.type,
+					String(part.redacted ?? false),
 					typeof part.thinking === "string" ? part.thinking : null,
 					typeof part.thinkingSignature === "string"
 						? part.thinkingSignature
@@ -294,6 +324,84 @@ function buildTokenCacheFingerprint(value: object): readonly (string | null)[] {
 		}
 	}
 	return fingerprint;
+}
+
+export function piOpaqueThinkingFallbackSteps(
+	messages: readonly unknown[],
+): number {
+	return messages.filter((raw) => {
+		if (!raw || typeof raw !== "object") return false;
+		const message = raw as MaybeMessage;
+		return (
+			opaqueThinkingCost(message.usage?.reasoning, message.usage?.output)
+				.fallback &&
+			Array.isArray(message.content) &&
+			message.content.some(
+				(p: MaybePart) =>
+					p &&
+					(p.type === "redacted_thinking" ||
+						(p.type === "thinking" &&
+							(p.redacted || (!p.thinking && p.thinkingSignature)))),
+			)
+		);
+	}).length;
+}
+
+/** The byte-size estimate omits ciphertext; replay still uses the original messages. */
+export function piFitMessageBytes(raw: unknown): number {
+	const message = raw as MaybeMessage;
+	const opaque =
+		Array.isArray(message.content) &&
+		message.content.some(
+			(p: MaybePart) =>
+				p &&
+				(p.type === "redacted_thinking" ||
+					(p.type === "thinking" &&
+						(p.redacted || (!p.thinking && p.thinkingSignature)))),
+		);
+	if (
+		!opaque &&
+		(!Array.isArray(message.content) ||
+			!message.content.some(
+				(part) =>
+					part &&
+					((part.type === "thinking" && part.thinkingSignature !== undefined) ||
+						(part.type === "text" && part.textSignature !== undefined)),
+			))
+	)
+		return Buffer.byteLength(JSON.stringify(raw));
+	const content = Array.isArray(message.content)
+		? message.content.map((part) => {
+				if (!part || typeof part !== "object") return part;
+				if (
+					part.type === "redacted_thinking" ||
+					(part.type === "thinking" && part.redacted)
+				)
+					return { type: part.type, redacted: true };
+				if (part.type === "thinking") {
+					const plain = { ...part };
+					delete plain.thinkingSignature;
+					return plain;
+				}
+				if (part.type === "text") {
+					const plain = { ...part };
+					delete plain.textSignature;
+					return plain;
+				}
+				return part;
+			})
+		: undefined;
+	const bytes = Buffer.byteLength(
+		JSON.stringify(content ? { ...message, content } : raw),
+	);
+	return (
+		bytes +
+		(opaque
+			? 4 *
+				opaqueThinkingCost(message.usage?.reasoning, message.usage?.output)
+					.tokens
+			: 0)
+	);
 }
 
 function tokenCacheFingerprintsEqual(
@@ -374,3 +482,5 @@ function safeJsonStringify(value: unknown): string {
 		return "";
 	}
 }
+
+import { opaqueThinkingCost } from "@magic-context/core/hooks/magic-context/opaque-thinking";

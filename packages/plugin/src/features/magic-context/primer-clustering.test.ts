@@ -62,6 +62,23 @@ describe("primer clustering", () => {
         expect(clusterEligibleForPromotion(summary, 2, 7)).toBe(true);
     });
 
+    it("orders candidates by Unicode code unit, including separators and accents", () => {
+        const clusters = buildPrimerClusters({
+            activePrimers: [],
+            candidates: [
+                candidate({ id: 1, sourceStartMessageId: "s10", sourceEndMessageId: "a" }),
+                candidate({ id: 2, sourceStartMessageId: "s1", sourceEndMessageId: "a" }),
+                candidate({ id: 3, sourceStartMessageId: "a", sourceEndMessageId: "a" }),
+                candidate({ id: 4, sourceStartMessageId: "A", sourceEndMessageId: "a" }),
+                candidate({ id: 5, sourceStartMessageId: "é", sourceEndMessageId: "a" }),
+                candidate({ id: 6, sourceStartMessageId: "z", sourceEndMessageId: "a" }),
+            ],
+        });
+
+        expect(clusters).toHaveLength(1);
+        expect(clusters[0].candidates.map((item) => item.id)).toEqual([4, 3, 2, 1, 6, 5]);
+    });
+
     it("is deterministic regardless of input order", () => {
         const inputs = [
             candidate({ id: 1, sourceStartMessageId: "a", sourceEndMessageId: "b" }),

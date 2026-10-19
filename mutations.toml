@@ -86,10 +86,10 @@ expect_message = '/didDrop\)\.toBe\(true\)/'
 
 [[control]]
 id = 'ts-stale-reduce-detects-only-on-bust'
-guards = 'new stale ctx_reduce strips are detected only on a pass holding the bust permission, never first-applied on a defer'
+guards = 'new stale ctx_reduce strips are detected only when the prefix is eligible for editing, never on a defer or a signed-prefix hold'
 file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts'
 old = '''
-                detect: isCacheBustingPass,
+                detect: canEditWholePrefix,
                 protectedCount: args.protectedCount,'''
 new = '''
                 detect: true,
@@ -103,10 +103,10 @@ expect_message = 'expect(received).not.toBe(expected)'
 
 [[control]]
 id = 'ts-image-strip-detects-only-on-bust'
-guards = 'processed images are newly stripped only on a pass holding the bust permission; a defer only replays the frozen ids'
+guards = 'processed images are newly stripped only when the prefix is eligible for editing; a defer only replays the frozen ids'
 file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts'
-old = 'detect: isCacheBustingPass && args.watermark > 0,'
-new = 'detect: args.watermark > 0,'
+old = 'detect: canEditWholePrefix && imageWatermark > 0,'
+new = 'detect: imageWatermark > 0,'
 test_file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts'
 runner = 'command'
 command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts', '--timeout', '30000', '-t', '{test}']
@@ -201,7 +201,7 @@ runner = 'command'
 command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts', '--timeout', '30000', '-t', '{test}']
 test_count_pattern = 'Ran {count} test'
 expect_red = ['^deferred\scompaction\smarker\srepresentation\snewer\spending\spublication\swaits\suntil\sconsumed\sby\sthe\sserved\sresponse$']
-expect_message = 'expect(received).toBeNull()'
+expect_message = 'expect(fences).toBe(0)'
 
 [[control]]
 id = 'ts-marker-cas-clear-keeps-newer-pending'
@@ -224,12 +224,8 @@ expect_message = 'Received: "cleared"'
 id = 'ts-signed-thinking-invalidated-by-prefix-edit'
 guards = 'a busting pass whose first application edits bytes before newer signed thinking strips that thinking (the provider would reject the edited signature)'
 file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts'
-old = '''
-        dropModeSwitchesThisPass ||
-        firstApplicationEdits.beforeNewerThinking;'''
-new = '''
-        dropModeSwitchesThisPass ||
-        false;'''
+old = '        firstApplicationEdits.beforeNewerThinking;'
+new = '        false;'
 test_file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts'
 runner = 'command'
 command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts', '--timeout', '30000', '-t', '{test}']

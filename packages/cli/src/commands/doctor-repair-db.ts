@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { closeSync, existsSync, openSync, renameSync, rmSync } from "node:fs";
+import { closeSync, existsSync, openSync, renameSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { ensureContextStoreUuid } from "@magic-context/core/features/magic-context/context-store-uuid";
@@ -192,13 +192,26 @@ function copyBackupBundle(dbPath: string, stamp: string): BackupBundle {
     return { basePath, copiedPaths };
 }
 
-export function copyDatabaseBundle(sourceBase: string, destinationBase: string): string[] {
+export function databaseBundleSizeBytes(sourceBase: string): number {
+    let size = 0;
+    for (const suffix of DATABASE_SUFFIXES) {
+        const source = `${sourceBase}${suffix}`;
+        if (existsSync(source)) size += statSync(source).size;
+    }
+    return size;
+}
+
+export function copyDatabaseBundle(
+    sourceBase: string,
+    destinationBase: string,
+    forcePrivate = false,
+): string[] {
     const copiedPaths: string[] = [];
     for (const suffix of DATABASE_SUFFIXES) {
         const source = `${sourceBase}${suffix}`;
         if (!existsSync(source)) continue;
         const destination = `${destinationBase}${suffix}`;
-        copyStorageFileSync(source, destination);
+        copyStorageFileSync(source, destination, forcePrivate);
         copiedPaths.push(destination);
     }
     return copiedPaths;

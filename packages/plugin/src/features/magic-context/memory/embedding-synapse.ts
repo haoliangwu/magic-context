@@ -641,12 +641,12 @@ async function getSharedClient(
     if (sharedClientPromise && sharedClientFile === options.connectionFile)
         return sharedClientPromise;
     sharedClientFile = options.connectionFile;
-    sharedClientPromise = SubcClient.connect({ connectionFile: options.connectionFile }).then(
-        (client) => {
-            sharedClient = client;
-            return client;
-        },
-    );
+    sharedClientPromise = inRootAsyncContext(() =>
+        SubcClient.connect({ connectionFile: options.connectionFile }),
+    ).then((client) => {
+        sharedClient = client;
+        return client;
+    });
     return sharedClientPromise;
 }
 
@@ -1206,3 +1206,5 @@ export function _resetSynapseClientForTests(): void {
     sharedClientFile = null;
     sharedClientPromise = null;
 }
+
+import { inRootAsyncContext } from "../../../shared/sqlite";

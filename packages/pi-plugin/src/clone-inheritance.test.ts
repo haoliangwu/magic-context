@@ -37,7 +37,9 @@ import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir
 import {
 	__test,
 	handlePiCloneSessionStart,
+	type PiCloneTransitionRegistrar,
 	readPiSessionIdFromFile,
+	registerPiCloneSessionTransitions,
 } from "./clone-inheritance";
 import { mustMaterializePi } from "./inject-compartments-pi";
 import { createTestDb } from "./test-utils.test";
@@ -195,6 +197,91 @@ function copyWithEntries(database: Database, entries: unknown[]) {
 		__test.createCloneFilter(entries),
 	);
 }
+
+async function transitionFixture() {
+	const database = db();
+	seedTag(database, { tagNumber: 1, messageId: "u1" });
+	seedTag(database, { tagNumber: 4, messageId: "abandoned" });
+	seedTag(database, { tagNumber: 9, messageId: "a1" });
+	const directory = await createTestTempDirFromPath(
+		join(tmpdir(), "mc-native-clone-"),
+	);
+	temporaryDirectories.push(directory);
+	const file = join(directory, "source.jsonl");
+	await writeFile(file, '{"type":"session","id":"source"}\n');
+	const handlers = new Map<string, Parameters<PiCloneTransitionRegistrar>[1]>();
+	const logs: string[] = [];
+	registerPiCloneSessionTransitions(
+		(name, handler) => handlers.set(name, handler),
+		{
+			db: database,
+			signalPendingMarker: () => {},
+			writeLog: (line) => logs.push(line),
+		},
+	);
+	const emit = async (name: string, reason: string, destination = "clone") => {
+		await handlers.get(name)?.(
+			{ reason, previousSessionFile: file },
+			{
+				sessionManager: {
+					getSessionId: () => destination,
+					getHeader: () => ({ parentSession: file }),
+					getBranch: () => [user("u1"), assistant("a1")],
+				},
+			},
+		);
+	};
+	return { database, logs, emit };
+}
+
+describe("OMP clone transitions", () => {
+	it("session_switch fork inherits retained tag gaps before the next context pass", async () => {
+		const { database, emit } = await transitionFixture();
+		await emit("session_switch", "fork");
+		expect(
+			getTagsBySession(database, "clone").map((tag) => tag.tagNumber),
+		).toEqual([1, 9]);
+	});
+
+	it("session_branch fork, branch and btw inherit only retained tag gaps", async () => {
+		const { database, emit } = await transitionFixture();
+		for (const reason of ["fork", "branch", "btw"]) {
+			await emit("session_branch", reason, reason);
+			expect(
+				getTagsBySession(database, reason).map((tag) => tag.tagNumber),
+			).toEqual([1, 9]);
+		}
+	});
+
+	it("resume, new and tree never copy even with an explicit parent", async () => {
+		const { database, emit, logs } = await transitionFixture();
+		await emit("session_switch", "resume");
+		await emit("session_switch", "new");
+		await emit("session_tree", "fork");
+		await emit("session_branch", "resume");
+		expect(count(database, "tags")).toBe(0);
+		expect(count(database, "session_meta")).toBe(0);
+		expect(logs).toEqual([]);
+	});
+
+	it("live copies skip a destination with prepared state without overwriting", async () => {
+		const { database, emit, logs } = await transitionFixture();
+		seedTag(database, { tagNumber: 42, messageId: "prepared" });
+		database
+			.prepare("UPDATE tags SET session_id = ? WHERE message_id = ?")
+			.run("clone", "prepared");
+		for (const name of ["session_switch", "session_branch"]) {
+			await emit(name, "fork");
+		}
+		expect(
+			getTagsBySession(database, "clone").map((tag) => tag.tagNumber),
+		).toEqual([42]);
+		expect(logs).toHaveLength(2);
+		expect(
+			logs.every((line) => line.includes("reason=destination-not-empty")),
+		).toBe(true);
+	});
+});
 
 function seedMeta(database: Database, values: Record<string, unknown>): void {
 	const columns = Object.keys(values);
@@ -360,7 +447,9 @@ describe("Pi clone state inheritance", () => {
 		const sourceFactId = (
 			database
 				.prepare("SELECT id FROM session_facts WHERE session_id = ?")
-				.get("source") as { id: number }
+				.get("source") as {
+				id: number;
+			}
 		).id;
 
 		const result = copyWithEntries(database, [user("u1"), assistant("a1")]);
@@ -1031,4 +1120,130 @@ describe("Pi clone state inheritance", () => {
 		);
 		expect(messages[0]).toContain("run /ctx-wrapup to rebuild, or re-clone");
 	});
+	it("startup fork inherits once and never overwrites a metadata-only resume", async () => {
+		const database = db();
+		seedCompartment(database, { sequence: 1, startId: "u1", endId: "a1" });
+		const directory = await createTestTempDirFromPath(
+			join(tmpdir(), "mc-sdk-fork-"),
+		);
+		temporaryDirectories.push(directory);
+		const file = join(directory, "source.jsonl");
+		await writeFile(file, '{"type":"session","id":"source"}\n');
+		const open = (id: string) =>
+			handlePiCloneSessionStart(
+				{ reason: "startup" },
+				{
+					sessionManager: {
+						getSessionId: () => id,
+						getHeader: () => ({ parentSession: file }),
+						getBranch: () => [user("u1"), assistant("a1")],
+					},
+				},
+				{ db: database, signalPendingMarker: () => {}, writeLog: () => {} },
+			);
+		expect((await open("clone"))?.compartmentsCopied).toBe(1);
+		seedCompartment(database, { sequence: 2, startId: "u1", endId: "a1" });
+		expect((await open("clone"))?.kind).toBe("destination-not-empty");
+		expect(count(database, "compartments")).toBe(1);
+		database
+			.prepare("INSERT INTO session_meta (session_id, harness) VALUES (?, ?)")
+			.run("old-fork", "pi");
+		expect((await open("old-fork"))?.kind).toBe("destination-not-empty");
+		expect(count(database, "compartments", "old-fork")).toBe(0);
+	});
+});
+
+for (const form of ["file", "bare UUID"] as const) {
+	it(`startup inheritance accepts a ${form} parentSession`, async () => {
+		const database = db();
+		const sourceId = "019f0000-1111-7000-8000-000000000689";
+		const destinationId = `startup-parent-${form}`;
+		seedCompartment(database, {
+			sessionId: sourceId,
+			sequence: 1,
+			startId: "u1",
+			endId: "a1",
+		});
+		let parent = sourceId;
+		if (form === "file") {
+			const directory = await createTestTempDirFromPath(
+				join(tmpdir(), "mc-startup-parent-"),
+			);
+			temporaryDirectories.push(directory);
+			parent = join(directory, "parent.jsonl");
+			await writeFile(
+				parent,
+				`${JSON.stringify({ type: "title", title: "OMP fork" })}\n${JSON.stringify({ type: "session", id: sourceId })}\n`,
+			);
+		}
+		const open = () =>
+			handlePiCloneSessionStart(
+				// Oh My Pi's session_start has no reason field; native Pi supplies startup.
+				form === "file" ? { reason: "startup" } : {},
+				{
+					sessionManager: {
+						getSessionId: () => destinationId,
+						getHeader: () => ({ parentSession: parent }),
+						getBranch: () => [user("u1"), assistant("a1")],
+					},
+				},
+				{ db: database, signalPendingMarker: () => {}, writeLog: () => {} },
+			);
+		expect((await open())?.compartmentsCopied).toBe(1);
+		expect((await open())?.kind).toBe("destination-not-empty");
+		expect(count(database, "compartments", destinationId)).toBe(1);
+	});
+}
+
+it("garbage startup parent is logged once and never creates inherited state", async () => {
+	const database = db();
+	const messages: string[] = [];
+	const open = () =>
+		handlePiCloneSessionStart(
+			{ reason: "startup" },
+			{
+				sessionManager: {
+					getSessionId: () => "garbage-startup-parent",
+					getHeader: () => ({ parentSession: "not-a-session-uuid" }),
+					getBranch: () => [user("u1"), assistant("a1")],
+				},
+			},
+			{
+				db: database,
+				signalPendingMarker: () => {},
+				writeLog: (line) => messages.push(line),
+			},
+		);
+	expect(await open()).toBeNull();
+	expect(await open()).toBeNull();
+	expect(messages).toHaveLength(1);
+	expect(messages[0]).toContain(
+		"neither an existing session file nor a bare session UUID",
+	);
+	expect(count(database, "compartments", "garbage-startup-parent")).toBe(0);
+});
+
+it("empty startup parent is logged once and skipped", async () => {
+	const database = db();
+	const messages: string[] = [];
+	const open = () =>
+		handlePiCloneSessionStart(
+			{ reason: "startup" },
+			{
+				sessionManager: {
+					getSessionId: () => "empty-startup-parent",
+					getHeader: () => ({ parentSession: "" }),
+					getBranch: () => [],
+				},
+			},
+			{
+				db: database,
+				signalPendingMarker: () => {},
+				writeLog: (line) => messages.push(line),
+			},
+		);
+	expect(await open()).toBeNull();
+	expect(await open()).toBeNull();
+	expect(messages).toHaveLength(1);
+	expect(messages[0]).toContain("reason=missing-parent");
 });

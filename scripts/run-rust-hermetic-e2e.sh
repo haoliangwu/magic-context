@@ -49,7 +49,7 @@ run_e2e_file() {
 }
 
 run_e2e_group() {
-    local mode="$1" label="$2" files="$3" file group_status
+    local mode="$1" label="$2" files="$3" file group_status started
     echo "  [e2e:$mode:$label:start] bun test..."
     group_status=0
 
@@ -57,8 +57,10 @@ run_e2e_group() {
     # process state after a suite finishes. Give every real daemon/module/OpenCode
     # stack a fresh parent process so one suite cannot starve a later restart.
     for file in $files; do
+        started=$SECONDS
         echo "  [e2e:$mode:$label:file:start] $file"
         if run_e2e_file "$mode" "$label" "$file"; then
+            echo "  [e2e:$mode:$label:file:duration] $file seconds=$((SECONDS - started)) attempts=1"
             echo "  [e2e:$mode:$label:file:end] $file status=pass"
             continue
         fi
@@ -70,10 +72,12 @@ run_e2e_group() {
         # lines keep recovered flakes visible in release logs instead of masked.
         echo "  [e2e:$mode:$label:file:RETRY] $file — first run failed; one fresh-process retry"
         if run_e2e_file "$mode" "$label" "$file"; then
+            echo "  [e2e:$mode:$label:file:duration] $file seconds=$((SECONDS - started)) attempts=2"
             echo "  [e2e:$mode:$label:file:end] $file status=pass (RETRY-RECOVERED — load-class flake; investigate if this line recurs across releases)"
             continue
         fi
         echo "  [e2e:$mode:$label:file:end] $file status=fail (failed twice in fresh processes)"
+        echo "  [e2e:$mode:$label:file:duration] $file seconds=$((SECONDS - started)) attempts=2"
         group_status=1
     done
 

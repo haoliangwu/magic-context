@@ -2,7 +2,10 @@ import { afterEach, expect, test } from "bun:test";
 import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildPrimerSeed } from "@magic-context/core/features/magic-context/dreamer/primer-seed";
+import {
+	buildPrimerSeed,
+	buildPrimerSeedAsync,
+} from "@magic-context/core/features/magic-context/dreamer/primer-seed";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import {
@@ -148,6 +151,20 @@ test("Pi paged primer seed is byte-identical to full conversion below the token 
 			buildPrimerSeed(db, primer),
 		);
 		expect(newSeed).toEqual(oldSeed);
+		const asyncSeed = await withRawMessageProvider(
+			"origin",
+			{
+				...provider,
+				iterateMessageRange() {
+					throw new Error("Background seed must not use the sync reader");
+				},
+				readMessagePage() {
+					throw new Error("Background seed must not use sync pages");
+				},
+			},
+			() => buildPrimerSeedAsync(db, primer),
+		);
+		expect(asyncSeed).toEqual(oldSeed);
 		expect(newSeed.orientation).not.toContain("truncated");
 		const ordinals: number[] = [];
 		withRawMessageProvider("origin", provider, () =>

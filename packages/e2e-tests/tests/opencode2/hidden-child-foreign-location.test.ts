@@ -51,7 +51,9 @@ const HIDDEN_AGENTS = [
 	"dreamer-primer-investigator",
 	"dreamer-retrospective",
 ];
-const MAP_PROMPT = "Then output ONE <mappings> manifest";
+// Route mapper requests by their heading so changes to investigation or manifest
+// instructions do not fall through to the mock's default reply.
+const MAP_PROMPT = "## Map these memories to their backing files";
 
 function hashTree(root: string): Record<string, string> {
 	const out: Record<string, string> = {};

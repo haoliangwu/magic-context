@@ -1,5 +1,5 @@
-//! Probe for the proposed store.db migration 63 (see ../migration63.sql and the design note
-//! docs/reports/ckmc-write-amplification-design.md). It only ever opens the paths it is
+//! Offline write-amplification probe for the proposed store.db migration 63
+//! (see ../migration63.sql). It only ever opens the paths it is
 //! given, and those must be APFS clones: never point it at a live store.
 //!
 //!   migcheck migrate  <db>                     run migration63.sql in one transaction

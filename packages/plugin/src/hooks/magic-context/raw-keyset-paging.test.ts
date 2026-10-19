@@ -10,11 +10,33 @@ import {
     withRawMessageProvider,
 } from "./read-session-chunk";
 import {
+    getRawMessagePageRowsVisitedForTest,
+    getRawSessionSummaryEpoch,
+    installRawSessionSummaryScan,
     type RawMessage,
     type RawMessageOrdinalAnchor,
+    RawOrdinalsNotReady,
     readRawSessionMessagePageFromDb,
     readRawSessionMessageSummaryPageFromDb,
+    resetRawMessagePageRowsVisitedForTest,
+    scanRawSessionSummaryRows,
 } from "./read-session-raw";
+
+// Frozen first-page SQL from master: the oracle must not use the new seek.
+function masterRows(db: Database, session: string, after: number, limit: number) {
+    return db
+        .prepare(`SELECT id, data, time_created, time_updated FROM message
+        WHERE session_id = ? AND NOT (
+            CASE WHEN json_valid(data) THEN COALESCE(json_extract(data, '$.summary'), 0) ELSE 0 END = 1
+            AND CASE WHEN json_valid(data) THEN COALESCE(json_extract(data, '$.finish'), '') ELSE '' END = 'stop')
+        ORDER BY time_created, id LIMIT ? OFFSET ?`)
+        .all(session, limit, after) as Array<{
+        id: string;
+        data: string;
+        time_created: number;
+        time_updated: number;
+    }>;
+}
 
 test("keyset ranges and visitors equal OFFSET rows and filtered ordinals across timestamp ties and summaries", () => {
     const dir = createTestTempDirFromPath(join(tmpdir(), "keyset-equivalence-"));
@@ -71,12 +93,21 @@ test("keyset ranges and visitors equal OFFSET rows and filtered ordinals across 
             ]) {
                 const old: RawMessage[] = [];
                 for (let after = from - 1; after < to; ) {
-                    const page = readRawSessionMessagePageFromDb(
-                        db,
-                        sid,
-                        after,
-                        Math.min(100, to - after),
-                        to,
+                    const page = masterRows(db, sid, after, Math.min(100, to - after)).map(
+                        (row, i) => {
+                            let role = "unknown";
+                            try {
+                                role = JSON.parse(row.data).role ?? "unknown";
+                            } catch {}
+                            return {
+                                id: row.id,
+                                ordinal: after + i + 1,
+                                role,
+                                createdAt: row.time_created,
+                                version: row.time_updated,
+                                parts: [{ type: "text", text: row.id }],
+                            };
+                        },
                     );
                     if (!page.length) break;
                     old.push(...page);
@@ -137,5 +168,64 @@ test("keyset ranges and visitors equal OFFSET rows and filtered ordinals across 
     } finally {
         db.close();
         rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("restarted raw pages seek warm ranks on 150k tied messages and cold pages refuse prefix scans", () => {
+    const db = new Database(":memory:");
+    try {
+        db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+            CREATE INDEX message_session_time_created_id_idx ON message(session_id,time_created,id);
+            CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+            CREATE INDEX part_message_id_idx ON part(message_id);`);
+        const insert = db.prepare("INSERT INTO message VALUES (?, 'large', 1, ?, ?)");
+        db.transaction(() => {
+            for (let i = 0; i < 150_000; i++)
+                insert.run(
+                    `m${String(i).padStart(6, "0")}`,
+                    i,
+                    i % 400 === 399
+                        ? '{"summary":true,"finish":"stop"}'
+                        : i % 997 === 0
+                          ? "{"
+                          : '{"role":"user"}',
+                );
+        })();
+        resetRawMessagePageRowsVisitedForTest();
+        expect(() => readRawSessionMessagePageFromDb(db, "large", 149_000, 100, 149_625)).toThrow(
+            RawOrdinalsNotReady,
+        );
+        expect(getRawMessagePageRowsVisitedForTest()).toBe(0);
+        expect(
+            installRawSessionSummaryScan(
+                db,
+                "large",
+                scanRawSessionSummaryRows(db, "large"),
+                getRawSessionSummaryEpoch("large"),
+                true,
+            ),
+        ).toBe(true);
+        resetRawMessagePageRowsVisitedForTest();
+        const page = readRawSessionMessagePageFromDb(db, "large", 149_000, 100, 149_625);
+        const expected = masterRows(db, "large", 149_000, 100).map((row, i) => ({
+            ordinal: 149_001 + i,
+            id: row.id,
+            role: "user",
+            parts: [],
+            createdAt: 1,
+            version: row.time_updated,
+        }));
+        expect(Buffer.from(JSON.stringify(page))).toEqual(Buffer.from(JSON.stringify(expected)));
+        const last = page.at(-1)!;
+        const next = readRawSessionMessagePageFromDb(db, "large", last.ordinal, 100, 149_625, {
+            id: last.id,
+            timeCreated: 1,
+        });
+        expect(next.map((m) => m.id)).toEqual(
+            masterRows(db, "large", last.ordinal, 100).map((r) => r.id),
+        );
+        expect(getRawMessagePageRowsVisitedForTest()).toBeLessThan(1600);
+    } finally {
+        db.close();
     }
 });

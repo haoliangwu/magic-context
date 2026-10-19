@@ -315,6 +315,17 @@ async function runHistorianWith(args: {
 	return { db, runner };
 }
 
+function latestHistorianFailureReason(
+	db: ReturnType<typeof createTestDb>,
+): string | null {
+	const row = db
+		.prepare(
+			"SELECT failure_reason FROM historian_runs WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+		)
+		.get("ses-historian") as { failure_reason: string | null } | undefined;
+	return row?.failure_reason ?? null;
+}
+
 describe("runPiHistorian", () => {
 	it("uses the Pi registry with an empty cache and sends without a window when registry misses", async () => {
 		for (const known of [true, false]) {
@@ -769,6 +780,193 @@ describe("runPiHistorian", () => {
 		}
 	});
 
+	it("records the classified Zen refusal instead of generic empty output", async () => {
+		const { db } = await runHistorianWith({
+			historianModel: "opencode/free",
+			runner: runnerWithSteps([
+				{
+					ok: false,
+					reason: "no_assistant",
+					error:
+						"opencode_zen_free_tier: choose another historian model for Pi (FreeTierError).",
+					durationMs: 1,
+					meta: { failureClass: "opencode_zen_free_tier" },
+				},
+			]),
+		});
+		try {
+			expect(latestHistorianFailureReason(db)).toBe("opencode_zen_free_tier");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("records a classified custom OpenAI-compatible provider error", async () => {
+		const customModel = "local-cpa/gpt-5.6-sol";
+		const { db } = await runHistorianWith({
+			historianModel: customModel,
+			runner: runnerWithSteps([
+				{
+					ok: false,
+					reason: "model_failed",
+					error:
+						"OpenAI API error (404): model not found; private provider details",
+					durationMs: 1,
+				},
+			]),
+		});
+		try {
+			expect(latestHistorianFailureReason(db)).toBe(
+				"provider_error:http_404:model_not_found",
+			);
+			expect(latestHistorianFailureReason(db)).not.toContain(
+				"private provider details",
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("records empty_output when a custom OpenAI-compatible provider returns no text", async () => {
+		const { db } = await runHistorianWith({
+			historianModel: "local-cpa/gpt-5.6-sol",
+			runner: runnerReturning([""]),
+		});
+		try {
+			expect(latestHistorianFailureReason(db)).toBe("empty_output");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("preserves a safe Pi extension-load stderr diagnostic on subprocess exit", async () => {
+		const stderrLine =
+			"Error: Failed to load extension '/tmp/pi/extensions/workspace.js': TypeError: loadAccounts is not a function";
+		const { db } = await runHistorianWith({
+			runner: runnerWithSteps([
+				{
+					ok: false,
+					reason: "non_zero_exit",
+					error: "pi exited (code=1, signal=null) without emitting agent_end",
+					durationMs: 1,
+					meta: {
+						exitCode: 1,
+						stderr: `${stderrLine}\nassistant response text`,
+					},
+				},
+			]),
+		});
+		try {
+			const reason = latestHistorianFailureReason(db);
+			expect(reason).toBe(`subprocess_exit:1:${stderrLine}`);
+			expect(reason).toContain("loadAccounts is not a function");
+			expect(reason).not.toContain("assistant response text");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("does not retain arbitrary stderr after a Pi subprocess exit", async () => {
+		const { db } = await runHistorianWith({
+			runner: runnerWithSteps([
+				{
+					ok: false,
+					reason: "non_zero_exit",
+					error: "pi exited (code=2, signal=null) without emitting agent_end",
+					durationMs: 1,
+					meta: { exitCode: 2, stderr: "model output must not be stored" },
+				},
+			]),
+		});
+		try {
+			expect(latestHistorianFailureReason(db)).toBe("subprocess_exit:2");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	const failureClassCases: Array<{
+		name: string;
+		steps: Array<SubagentRunResult | string>;
+		expected: string;
+	}> = [
+		{
+			name: "provider status and class",
+			steps: Array.from({ length: 3 }, () => ({
+				ok: false as const,
+				reason: "model_failed" as const,
+				error: "OpenAI API error (429): rate_limit_error private details",
+				durationMs: 1,
+			})),
+			expected: "provider_error:http_429:rate_limit_error",
+		},
+		{
+			name: "timeout",
+			steps: Array.from({ length: 3 }, () => ({
+				ok: false as const,
+				reason: "timeout" as const,
+				error: "subagent timed out",
+				durationMs: 1,
+			})),
+			expected: "timeout",
+		},
+		{
+			name: "abort",
+			steps: [
+				{
+					ok: false,
+					reason: "abort",
+					error: "pi subagent aborted by caller",
+					durationMs: 1,
+				},
+			],
+			expected: "aborted",
+		},
+		{
+			name: "parse failure",
+			steps: [
+				{
+					ok: false,
+					reason: "parse_failed",
+					error: "malformed provider event containing private text",
+					durationMs: 1,
+				},
+			],
+			expected: "parse_failed",
+		},
+		{
+			name: "subprocess exit code",
+			steps: [
+				{
+					ok: false,
+					reason: "non_zero_exit",
+					error: "pi exited (code=7, signal=null) without agent_end",
+					durationMs: 1,
+				},
+			],
+			expected: "subprocess_exit:7",
+		},
+	];
+
+	for (const failureCase of failureClassCases) {
+		it(`records a non-empty classified reason for ${failureCase.name}`, async () => {
+			const { db } = await runHistorianWith({
+				runner: runnerWithSteps(failureCase.steps),
+				retryBackoffMs: () => 0,
+			});
+			try {
+				const reason = latestHistorianFailureReason(db);
+				expect(reason).toBe(failureCase.expected);
+				expect(reason?.length).toBeGreaterThan(0);
+				expect(reason?.length).toBeLessThanOrEqual(512);
+				expect(reason).not.toContain("private details");
+				expect(reason).not.toContain("private text");
+			} finally {
+				closeQuietly(db);
+			}
+		});
+	}
+
 	it("tries configured fallbacks before the live session model last resort", async () => {
 		const { db, runner } = await runHistorianWith({
 			outputs: ["", "", successXml("Session model recovered Pi history.")],
@@ -780,6 +978,16 @@ describe("runPiHistorian", () => {
 				"test/model",
 				"fallback/model",
 				"session/model",
+			]);
+			const options = (
+				runner.run as unknown as {
+					mock: { calls: Array<[Parameters<SubagentRunner["run"]>[0]]> };
+				}
+			).mock.calls.map(([invocation]) => invocation);
+			expect(options.map((invocation) => invocation.accountingTask)).toEqual([
+				undefined,
+				"fallback",
+				"fallback-session",
 			]);
 			expect(getCompartments(db, "ses-historian")).toEqual([
 				expect.objectContaining({ title: "Initial Pi slice" }),
@@ -1380,6 +1588,9 @@ describe("Pi historian prompt sized to the producer window", () => {
 				1,
 			);
 			expect(getHistorianFailureState(db, "ses-historian").lastError).toContain(
+				"producer_prompt_unfit",
+			);
+			expect(latestHistorianFailureReason(db)).toContain(
 				"producer_prompt_unfit",
 			);
 			expect(notices.filter((text) => text.includes("(MC-H05)"))).toHaveLength(

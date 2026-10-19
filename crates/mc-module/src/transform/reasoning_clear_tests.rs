@@ -257,6 +257,8 @@ fn processed_images_match_typescript_drop_watermark_and_frozen_replay_golden() {
                 StripSelectionScope {
                     reasoning: ReasoningBudgetScope::default(),
                     image_watermark: watermark,
+                    image_protected_cutoff: None,
+                    image_emergency: false,
                 },
                 &HashSet::new(),
             );

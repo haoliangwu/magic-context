@@ -960,8 +960,10 @@ lookup. Pi does not warm that cache (see §14); when metadata is absent the gate
 never injects the mural image until vision metadata is available; OpenCode warms
 the cache from its SDK at startup.
 
-**Config:** both honor `mural.enabled` (and `mural.model`
-for the compress-cues dreamer task). No intentional per-provider image-part
+**Config:** both honor `mural.enabled`. The compress-cues dreamer task takes its
+model from each harness's own dreamer settings
+(`dreamer.<harness>.tasks.compress-cues.model`, then `dreamer.<harness>.model`);
+the old shared `mural.model` is deprecated and ignored on both. No intentional per-provider image-part
 blacklist today — every Pi serializer path that accepts user image content takes
 raw base64 the same way.
 
@@ -1144,6 +1146,6 @@ Pi storage-error fallback has no complete held system/tool observation at its ad
 
 Historian admission reads primary/fallback windows from the live Pi/OMP model registry first and uses the cached model metadata when unavailable. A missing window sends unguarded with a once-per-model warning rather than permanently refusing; measured over-limit assembled prompts still refuse before transport. The old 1.02× source-clamping fixture intentionally refuses the assembled calibrated prompt and leaves coverage unchanged; a raw source allowance did not include all instructions/system mass. `/ctx-recomp` forwards its configured historian model to shared admission rather than relying on an unobservable agent default. Pi's actual child tool schemas and later host framing remain outside the observed system/user prompt representation; no exact provider-token claim is made for those components.
 
-The full Pi suite initially reported 1,193 pass / 3 skip / 31 fail. The affected 344-test groups subsequently reported 340 pass / 4 fail, and the four remaining nested-historian cases passed after their mock window observations were supplied. The environment-only OMP/home and smart-note checks passed without product changes. Pi typecheck passed. No second full suite was run, as requested. Exact commands and counts are committed under `docs/reports/tokenizer-calibration-gates/`.
+The full Pi suite initially reported 1,193 pass / 3 skip / 31 fail. The affected 344-test groups subsequently reported 340 pass / 4 fail, and the four remaining nested-historian cases passed after their mock window observations were supplied. The environment-only OMP/home and smart-note checks passed without product changes. Pi typecheck passed. No second full suite was run, as requested.
 
 Tail-hygiene parity is active. Persisted `last_nudge_undropped` and `last_nudge_level.postReduceGraceBaselineU` convert once at the stamped bust; `growthThreshold` is derived from calibrated T. No SQL column, migration, sidecar or fence change was added.

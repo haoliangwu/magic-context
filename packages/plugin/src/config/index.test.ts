@@ -4,14 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveEpochFloorForPass } from "../features/magic-context/storage-meta-persisted";
 import { buildOpenCodeConfigWarningBanner } from "../shared/config-warning-surface";
-import { resolveHistorianModel } from "../shared/model-resolution";
+import { resolveDreamerTaskModel, resolveHistorianModel } from "../shared/model-resolution";
 import { Database } from "../shared/sqlite";
 import { createTestTempDir, createTestTempDirFromPath } from "../shared/test-temp-dir";
 import {
-    getWindowOverlay,
-    reloadWindowOverlay,
-    setWindowOverlayPath,
-} from "../shared/window-geometry";
+    MURAL_MODEL_DEPRECATION_WARNING,
+    WINDOW_OVERLAY_PATH_DEPRECATION_WARNING,
+} from "./deprecated-config";
 import { loadPluginConfig, loadPluginConfigDetailed } from "./index";
 import { resolveConfigProfile } from "./profiles";
 import { getProtectedTokensTierOverrides } from "./project-security";
@@ -122,39 +121,19 @@ function loadWithUserAndProjectConfig(
     }
 }
 
-describe("loadPluginConfig — Fusiform overlay reload", () => {
-    it("does not invalidate a same-path overlay during routine config reads", () => {
-        const overlayDir = createTestTempDirFromPath(join(tmpdir(), "mc-config-overlay-"));
-        const overlayPath = join(overlayDir, "window-overlay.json");
-        const configText = JSON.stringify({ models: { window_overlay_path: overlayPath } });
-        const writeOverlay = (modelId: string) =>
-            writeFileSync(
-                overlayPath,
-                JSON.stringify({
-                    schema: "fusiform-window-overlay/v1",
-                    generated_at: "2026-09-01T00:00:00Z",
-                    minted_provider_ids: [],
-                    cells: [{ provider_id: "hunt-provider", model_id: modelId, facts: {} }],
-                }),
-            );
+describe("loadPluginConfig — retired Fusiform window path", () => {
+    it("parses the old key but warns once that it is ignored", () => {
+        const path = "/tmp/retired-fusiform-window.json";
+        const config = loadWithUserConfig(
+            JSON.stringify({ models: { window_overlay_path: path } }),
+        );
 
-        try {
-            writeOverlay("before-rewrite");
-            loadWithUserConfig(configText);
-            expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
-
-            writeOverlay("after-rewrite");
-            expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
-
-            loadWithUserConfig(configText);
-            expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
-
-            reloadWindowOverlay(overlayPath);
-            expect(getWindowOverlay()?.cells[0]?.model_id).toBe("after-rewrite");
-        } finally {
-            setWindowOverlayPath(undefined);
-            rmSync(overlayDir, { recursive: true, force: true });
-        }
+        expect(config.models?.window_overlay_path).toBe(path);
+        const warnings = config.configWarnings?.filter((message) =>
+            message.includes("models.window_overlay_path"),
+        );
+        expect(warnings).toHaveLength(1);
+        expect(warnings?.[0]).toContain(WINDOW_OVERLAY_PATH_DEPRECATION_WARNING);
     });
 });
 
@@ -268,6 +247,71 @@ describe("loadPluginConfig — graduated mural config", () => {
         expect(result.configWarnings ?? []).not.toContain(
             expect.stringContaining('Deprecated "experimental.mural"'),
         );
+    });
+
+    it("loads a config with the retired mural.model, warns once, and leaves compress-cues on the dreamer model", () => {
+        const result = loadWithUserConfig(
+            JSON.stringify({
+                mural: { enabled: true, model: "google/antigravity-gemini-3.8-flash" },
+                dreamer: {
+                    opencode: { model: "open/dreamer-default" },
+                    pi: { model: "pi/dreamer-default" },
+                },
+            }),
+        );
+
+        expect(result.mural.enabled).toBe(true);
+        expect(
+            (result.configWarnings ?? []).filter((w) =>
+                w.endsWith(MURAL_MODEL_DEPRECATION_WARNING),
+            ),
+        ).toHaveLength(1);
+        expect(MURAL_MODEL_DEPRECATION_WARNING).toContain("mural.model");
+        expect(
+            resolveDreamerTaskModel({ config: result, harness: "opencode", task: "compress-cues" })
+                .primary,
+        ).toEqual({ model: "open/dreamer-default" });
+        expect(
+            resolveDreamerTaskModel({ config: result, harness: "pi", task: "compress-cues" })
+                .primary,
+        ).toEqual({ model: "pi/dreamer-default" });
+    });
+
+    it("emits no mural.model warning when the key is absent", () => {
+        const result = loadWithUserConfig(JSON.stringify({ mural: { enabled: true } }));
+
+        expect((result.configWarnings ?? []).some((w) => w.includes("mural.model"))).toBe(false);
+    });
+
+    it("lets a project choose the compress-cues task model like any other dreamer task model", () => {
+        const result = loadWithUserAndProjectConfig(
+            JSON.stringify({ dreamer: { opencode: { model: "open/user-default" } } }),
+            JSON.stringify({
+                mural: { model: "repo/ignored" },
+                dreamer: {
+                    opencode: {
+                        tasks: {
+                            "compress-cues": { model: "open/project-cues" },
+                            curate: { model: "open/project-curate" },
+                        },
+                    },
+                },
+            }),
+        );
+
+        expect(
+            resolveDreamerTaskModel({ config: result, harness: "opencode", task: "compress-cues" })
+                .primary,
+        ).toEqual({ model: "open/project-cues" });
+        expect(
+            resolveDreamerTaskModel({ config: result, harness: "opencode", task: "curate" })
+                .primary,
+        ).toEqual({ model: "open/project-curate" });
+        expect(
+            (result.configWarnings ?? []).filter((w) =>
+                w.endsWith(MURAL_MODEL_DEPRECATION_WARNING),
+            ),
+        ).toHaveLength(1);
     });
 });
 

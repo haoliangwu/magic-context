@@ -118,6 +118,7 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 				pi.getFlag(SUBAGENT_DREAMER_ACTIONS_FLAG) === true;
 
 			registerMagicContextTools(pi, {
+				rerankConnectionFile: cfg.subc?.connection_file,
 				db,
 				ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 				resolveProjectIdentity: (ctx) =>

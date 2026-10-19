@@ -3,11 +3,13 @@ import {
 	getSlot,
 	resetLkgSlotsForTest,
 } from "@magic-context/core/hooks/magic-context/lkg-slot";
+import * as storagePermissions from "@magic-context/core/shared/storage-permissions";
 import {
 	clearContextHandlerSession,
 	registerPiContextHandler,
 } from "./context-handler";
-import { PiStorageBusyError } from "./pi-raw-fallback";
+import { readPiCommittedServedNumbers } from "./pi-served-identities";
+import { observePiPublicationForTest } from "./publication-observer-fixture.test";
 import * as ledger from "./served-array-ledger";
 import {
 	createFakePi,
@@ -16,7 +18,7 @@ import {
 	userMessage,
 } from "./test-utils.test";
 
-test("identity persistence failure refuses and cancels the pending LKG capture", async () => {
+test("identity mirror failure serves the committed pair and repairs the mirror on the next pass", async () => {
 	const db = createTestDb();
 	const sessionId = "served-identity-persistence-refusal";
 	const fake = createFakePi();
@@ -54,33 +56,53 @@ test("identity persistence failure refuses and cancels the pending LKG capture",
 				},
 			},
 		);
+	const publication = observePiPublicationForTest(sessionId);
 	let capture: ReturnType<typeof spyOn> | undefined;
 	try {
 		const first = [userMessage("already served", 1)];
 		await handler({ messages: structuredClone(first) }, context(first));
 		await Bun.sleep(50);
 		expect(getSlot(sessionId)).toBeDefined();
-		const record = ledger.capturePiServedArray;
-		let calls = 0;
-		capture = spyOn(ledger, "capturePiServedArray").mockImplementation(
-			(...args) => {
-				if (++calls === 1)
-					throw new ledger.PiServedIdentityError(
-						new Error("identity disk unavailable"),
-					);
-				return record(...args);
-			},
+		publication.reset();
+		const write = storagePermissions.writeStorageFileSync;
+		const identityPath = ledger.getPiServedTagNumbersPath(sessionId);
+		let identityAttempts = 0;
+		capture = spyOn(
+			storagePermissions,
+			"writeStorageFileSync",
+		).mockImplementation((path, ...args) => {
+			if (path === identityPath && ++identityAttempts === 1)
+				throw new Error("identity mirror disk unavailable");
+			return write(path, ...args);
+		});
+		const raw = [...first, userMessage("served despite mirror failure", 2)];
+		const served = await handler(
+			{ messages: structuredClone(raw) },
+			context(raw),
 		);
-		const raw = [...first, userMessage("never served", 2)];
-		await expect(
-			handler({ messages: structuredClone(raw) }, context(raw)),
-		).rejects.toBeInstanceOf(PiStorageBusyError);
-		expect(capture).toHaveBeenCalledTimes(1);
+		expect(JSON.stringify(served.messages)).toContain(
+			"§2§ served despite mirror failure",
+		);
+		expect(identityAttempts).toBe(1);
 		await Bun.sleep(50);
-		expect(getSlot(sessionId)?.jsonPrefix).not.toContain("never served");
+		// The request and identities already committed. An optional mirror failure
+		// must neither block the managed result nor discard its authoritative pair.
+		expect(getSlot(sessionId)?.jsonPrefix).toContain(
+			"served despite mirror failure",
+		);
+		expect(readPiCommittedServedNumbers(db, sessionId)).toEqual([1, 2]);
 		expect([...ledger.getPiServedTagNumbers(sessionId)]).toEqual([1]);
+		publication.expect("mirror_failed", "identity_mirror_failed", 1, 1);
+		const repaired = await handler(
+			{ messages: structuredClone(raw) },
+			context(raw),
+		);
+		expect(repaired.messages).toEqual(served.messages);
+		expect(identityAttempts).toBe(2);
+		expect([...ledger.getPiServedTagNumbers(sessionId)]).toEqual([1, 2]);
 	} finally {
 		capture?.mockRestore();
+		publication.restore();
 		clearContextHandlerSession(sessionId);
 		resetLkgSlotsForTest();
 		db.close();

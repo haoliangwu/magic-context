@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-// REVIEW FINDINGS (slice A re-review, docs/reports/slice-a-review-r2.md).
+// Frozen recovery admission regressions: known-over replay must refuse, not send raw.
 //
 // Second adversarial review of the frozen last-known-good (LKG) replay changes in
 // Rust mode, after their first review's fixes. Tests whose name starts with

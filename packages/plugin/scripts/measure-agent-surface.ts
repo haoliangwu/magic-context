@@ -20,7 +20,7 @@ import {
 import { ACTIVE_TOOL_IDS } from "../src/shared/prompt-surface-runtime";
 import { validateBudgetFixture } from "./prompt-surface-fixture";
 
-const fixturePath = resolve(import.meta.dir, "../../..", "docs/specs/prompt-surface/budget-fixture.json");
+const fixturePath = resolve(import.meta.dir, "../../..", "packages/plugin/scripts/fixtures/prompt-surface/budget-fixture.json");
 const args = process.argv.slice(2);
 const assertMode = args.includes("--assert");
 const lightSurfaceIndex = args.indexOf("--light-surface");

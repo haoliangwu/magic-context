@@ -731,6 +731,11 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
             let mut conn = open_readwrite(state)?;
             json(db::dismiss_user_memory(&mut conn, a.id).map_err(to_command)?)
         }
+        "restore_user_memory" => {
+            let a: IdArgs = parse_args(args)?;
+            let mut conn = open_readwrite(state)?;
+            json(db::restore_user_memory(&mut conn, a.id).map_err(to_command)?)
+        }
         "delete_user_memory" => {
             let a: IdArgs = parse_args(args)?;
             let mut conn = open_readwrite(state)?;

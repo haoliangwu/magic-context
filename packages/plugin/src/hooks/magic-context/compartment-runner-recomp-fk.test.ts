@@ -31,7 +31,11 @@ test("recomp records a terminal failure row (status failed + reason)", () => {
     // Honors the historian_runs design intent: capture whether a run failed and
     // why, not only successes.
     expect(recompSrc).toContain('status: "failed"');
-    expect(recompSrc).toContain("failureReason: validatedPass.error");
+    // Prefer the selected reason, retaining validation text for parse failures
+    // and a summarized class for external errors.
+    expect(recompSrc).toContain(
+        "failureReason: validatedPass.failureReason ?? validatedPass.error",
+    );
 });
 
 test("runValidatedHistorianPass threads invocationId on every success path", () => {

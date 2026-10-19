@@ -1,5 +1,9 @@
 import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import {
+	isPiOrdinalAlignmentUnanchored,
+	resolvePiOrdinalAlignment,
+} from "./pi-ordinal-alignment";
 import { convertPiAssistantEntryById } from "./read-session-pi";
 
 export interface PiMessageEndIndexDeps {
@@ -65,7 +69,11 @@ export function schedulePiAssistantIndexOnMessageEnd(
 			const branch = session.readBranch();
 			const entryId = storedId ?? findEntryIdForMessage(branch, endedMessage);
 			if (!entryId || !branch) return null;
-			return convertPiAssistantEntryById(branch, entryId);
+			// The index files messages under stored ordinals; while those cannot
+			// be placed on this branch the message waits for a later index pass.
+			const alignment = resolvePiOrdinalAlignment(db, sessionId, branch);
+			if (isPiOrdinalAlignmentUnanchored(alignment)) return null;
+			return convertPiAssistantEntryById(branch, entryId, alignment.offset);
 		},
 	);
 }

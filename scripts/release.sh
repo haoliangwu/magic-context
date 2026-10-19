@@ -6,11 +6,12 @@ set -euo pipefail
 # Usage:
 #   ./scripts/release.sh 0.1.0        # release v0.1.0
 #   ./scripts/release.sh 0.1.0 --dry  # preview without committing/pushing
+#   ./scripts/release.sh 0.1.0 --ci-gate=<sha>  # reuse CI, Mutations and Smoke on HEAD
 #
 # What it does:
 #   1. Validates the version is semver
 #   2. Checks for clean working tree (no uncommitted changes)
-#   3. Syncs version in package.json
+#   3. Syncs package.json and Rust workspace crate versions
 #   4. Runs pre-release checks (lint, typecheck, build)
 #   5. Commits the version bump
 #   6. Creates a git tag (v0.1.0)
@@ -30,7 +31,6 @@ fi
 VERSION=""
 DRY=""
 FORCE_E2E_HOST=0
-SKIP_RUST_E2E=0
 CI_GATE_SHA=""
 
 for arg in "$@"; do
@@ -42,28 +42,19 @@ for arg in "$@"; do
       FORCE_E2E_HOST=1
       ;;
     --ci-gate=*)
-      # Use a green master CI run as the test gate instead of re-running the
-      # unit and host e2e suites locally (they are load-sensitive on a busy
-      # machine). Names the CI-verified commit; checked below. The tag workflow
-      # still runs its own full gate before anything publishes.
+      # Reuse only an exact certified tree. The bump is checked again before
+      # tagging; builds and consumer artifact checks still run locally.
       CI_GATE_SHA="${arg#--ci-gate=}"
-      ;;
-    --skip-rust-e2e)
-      # One-off operator decision to release without the experimental Rust-mode
-      # suite. Requires the repo variable RELEASE_SKIP_RUST_E2E to name this exact
-      # tag, so the tag workflow skips the same suite and the skip can never carry
-      # over to a later release.
-      SKIP_RUST_E2E=1
       ;;
     --*)
       echo "Error: unknown option '$arg'"
-      echo "Usage: ./scripts/release.sh <version> [--dry] [--e2e-host] [--skip-rust-e2e] [--ci-gate=<sha>]"
+      echo "Usage: ./scripts/release.sh <version> [--dry] [--e2e-host] [--ci-gate=<sha>]"
       exit 1
       ;;
     *)
       if [[ -n "$VERSION" ]]; then
         echo "Error: more than one version was supplied"
-        echo "Usage: ./scripts/release.sh <version> [--dry] [--e2e-host] [--skip-rust-e2e] [--ci-gate=<sha>]"
+        echo "Usage: ./scripts/release.sh <version> [--dry] [--e2e-host] [--ci-gate=<sha>]"
         exit 1
       fi
       VERSION="$arg"
@@ -72,7 +63,7 @@ for arg in "$@"; do
 done
 
 if [[ -z "$VERSION" ]]; then
-  echo "Usage: ./scripts/release.sh <version> [--dry] [--e2e-host] [--skip-rust-e2e] [--ci-gate=<sha>]"
+  echo "Usage: ./scripts/release.sh <version> [--dry] [--e2e-host] [--ci-gate=<sha>]"
   echo "  e.g. ./scripts/release.sh 0.1.0"
   exit 1
 fi
@@ -86,36 +77,13 @@ TAG="v$VERSION"
 
 if [[ -n "$CI_GATE_SHA" ]]; then
   CI_GATE_SHA=$(git rev-parse --verify "$CI_GATE_SHA^{commit}") || { echo "Error: --ci-gate names no commit"; exit 1; }
-  if ! git merge-base --is-ancestor "$CI_GATE_SHA" HEAD; then
-    echo "Error: --ci-gate commit $CI_GATE_SHA is not an ancestor of HEAD"; exit 1
+  if [[ "$CI_GATE_SHA" != "$(git rev-parse HEAD)" ]]; then
+    echo "  --ci-gate does not name HEAD; running all local gates instead."
+    CI_GATE_SHA=""
+  else
+    python3 "$SCRIPT_DIR/ci-gate.py" release "$CI_GATE_SHA"
+    echo "  CI, Mutations and Smoke certify $CI_GATE_SHA; skipping all local test, lint and typecheck gates."
   fi
-  # Only release tooling and release notes may differ from the CI-verified commit.
-  CI_GATE_DRIFT=$(git diff --name-only "$CI_GATE_SHA" HEAD | grep -vE '^(scripts/release[^/]*\.sh|\.cortexkit/)' || true)
-  if [[ -n "$CI_GATE_DRIFT" ]]; then
-    echo "Error: HEAD differs from the CI-verified commit outside release tooling:"; echo "$CI_GATE_DRIFT"; exit 1
-  fi
-  CI_RESULT=$(gh api "repos/cortexkit/magic-context/actions/runs?head_sha=$CI_GATE_SHA&event=push" \
-    -q '[.workflow_runs[] | select(.name=="CI")][0] | "\(.status)/\(.conclusion)"' 2>/dev/null || true)
-  if [[ "$CI_RESULT" != "completed/success" ]]; then
-    echo "Error: master CI for $CI_GATE_SHA is '${CI_RESULT:-missing}', not completed/success"; exit 1
-  fi
-  echo ""
-  echo "  NOTE: test gate = master CI run on $CI_GATE_SHA (completed/success);"
-  echo "        local unit and host e2e suites are skipped. Lint, typecheck and builds still run."
-  echo ""
-fi
-
-if [[ "$SKIP_RUST_E2E" -eq 1 ]]; then
-  SKIP_VAR=$(gh api repos/cortexkit/magic-context/actions/variables/RELEASE_SKIP_RUST_E2E -q .value 2>/dev/null || true)
-  if [[ "$SKIP_VAR" != "$TAG" ]]; then
-    echo "Error: --skip-rust-e2e needs the repo variable RELEASE_SKIP_RUST_E2E set to '$TAG' (found '${SKIP_VAR}'),"
-    echo "       so the tag workflow skips the same suite: gh variable set RELEASE_SKIP_RUST_E2E --body $TAG"
-    exit 1
-  fi
-  echo ""
-  echo "  WARNING: releasing $TAG WITHOUT the Rust hermetic e2e suite (operator decision)."
-  echo "  This release does not claim Rust transform mode passed its behaviour suite."
-  echo ""
 fi
 
 # Check if tag already exists
@@ -161,6 +129,15 @@ echo "→ Running pre-release checks..."
 echo ""
 
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+NOTES_FILE="$REPO_ROOT/.cortexkit/release-notes/$TAG.md"
+if [[ ! -s "$REPO_ROOT/CHANGELOG.md" ]]; then
+  echo "Error: CHANGELOG.md must be present and nonempty before releasing."
+  exit 1
+fi
+if [[ ! -s "$NOTES_FILE" ]]; then
+  echo "Error: draft public release notes in .cortexkit/release-notes/$TAG.md before releasing."
+  exit 1
+fi
 PLUGIN_DIR="$REPO_ROOT/packages/plugin"
 PI_DIR="$REPO_ROOT/packages/pi-plugin"
 CLI_DIR="$REPO_ROOT/packages/cli"
@@ -189,10 +166,6 @@ manifest_files() {
 # and was green (the Bun-panic case).
 run_package_tests() {
   local label="$1" dir="$2" output status
-  if [[ -n "$CI_GATE_SHA" ]]; then
-    echo "  [$label] tests: covered by master CI on $CI_GATE_SHA"
-    return 0
-  fi
   echo "  [$label] bun run test..."
   # `set -e` would abort the script at this assignment the instant the package
   # test command exits non-zero — BEFORE `status=$?` and the panic-tolerance
@@ -231,13 +204,11 @@ run_package_tests() {
   fi
 }
 
-echo "  [plugin] bun lint..."
-bun run --cwd "$PLUGIN_DIR" lint 2>&1 || { echo "Error: Plugin lint failed"; exit 1; }
-
-echo "  [plugin] bun typecheck..."
-bun run --cwd "$PLUGIN_DIR" typecheck 2>&1 || { echo "Error: Plugin typecheck failed"; exit 1; }
-
-run_package_tests "plugin" "$PLUGIN_DIR"
+if [[ -z "$CI_GATE_SHA" ]]; then
+  bun run --cwd "$PLUGIN_DIR" lint 2>&1 || { echo "Error: Plugin lint failed"; exit 1; }
+  bun run --cwd "$PLUGIN_DIR" typecheck 2>&1 || { echo "Error: Plugin typecheck failed"; exit 1; }
+  run_package_tests "plugin" "$PLUGIN_DIR"
+fi
 
 echo "  [plugin] bun build..."
 bun run --cwd "$PLUGIN_DIR" build 2>&1 || { echo "Error: Plugin build failed"; exit 1; }
@@ -245,24 +216,20 @@ bun run --cwd "$PLUGIN_DIR" build 2>&1 || { echo "Error: Plugin build failed"; e
 # Copy root README into plugin package for npm publishing
 cp README.md "$PLUGIN_DIR/README.md"
 
-echo "  [pi-plugin] bun lint..."
-bun run --cwd "$PI_DIR" lint 2>&1 || { echo "Error: Pi-plugin lint failed"; exit 1; }
-
-echo "  [pi-plugin] bun typecheck..."
-bun run --cwd "$PI_DIR" typecheck 2>&1 || { echo "Error: Pi-plugin typecheck failed"; exit 1; }
-
-run_package_tests "pi-plugin" "$PI_DIR"
+if [[ -z "$CI_GATE_SHA" ]]; then
+  bun run --cwd "$PI_DIR" lint 2>&1 || { echo "Error: Pi-plugin lint failed"; exit 1; }
+  bun run --cwd "$PI_DIR" typecheck 2>&1 || { echo "Error: Pi-plugin typecheck failed"; exit 1; }
+  run_package_tests "pi-plugin" "$PI_DIR"
+fi
 
 echo "  [pi-plugin] bun build..."
 bun run --cwd "$PI_DIR" build 2>&1 || { echo "Error: Pi-plugin build failed"; exit 1; }
 
-echo "  [cli] bun lint..."
-bun run --cwd "$CLI_DIR" lint 2>&1 || { echo "Error: CLI lint failed"; exit 1; }
-
-echo "  [cli] bun typecheck..."
-bun run --cwd "$CLI_DIR" typecheck 2>&1 || { echo "Error: CLI typecheck failed"; exit 1; }
-
-run_package_tests "cli" "$CLI_DIR"
+if [[ -z "$CI_GATE_SHA" ]]; then
+  bun run --cwd "$CLI_DIR" lint 2>&1 || { echo "Error: CLI lint failed"; exit 1; }
+  bun run --cwd "$CLI_DIR" typecheck 2>&1 || { echo "Error: CLI typecheck failed"; exit 1; }
+  run_package_tests "cli" "$CLI_DIR"
+fi
 
 echo "  [cli] bun build..."
 bun run --cwd "$CLI_DIR" build 2>&1 || { echo "Error: CLI build failed"; exit 1; }
@@ -437,28 +404,45 @@ run_host_e2e() {
 # native processes by the end-to-end scenarios. The shared runner selects the manifest
 # tests, checks prerequisites, and requires a positive test summary just like release CI.
 if [[ -n "$CI_GATE_SHA" ]]; then
-  echo "  [e2e] host legs: covered by master CI on $CI_GATE_SHA"
+  echo "  [e2e] host and Rust legs: covered by CI on $CI_GATE_SHA"
 else
   run_host_e2e
-fi
-if [[ "$SKIP_RUST_E2E" -eq 1 ]]; then
-  echo "  [e2e:rust] SKIPPED by operator for $TAG (--skip-rust-e2e)"
-else
   "$SCRIPT_DIR/run-rust-hermetic-e2e.sh"
 fi
 
 echo "  ✓ All checks passed"
 echo ""
 
+generate_release_artifacts() {
 # Step 3: Generate JSON Schema
 echo "→ Generating JSON Schema..."
-bun packages/plugin/scripts/build-schema.ts || { echo "Error: Schema generation failed"; exit 1; }
+bun packages/plugin/scripts/build-schema.ts || { echo "Error: Schema generation failed"; return 1; }
 echo ""
 
 # Step 3b: Regenerate reference-seed corpus from source XML
 echo "→ Generating historian reference seeds..."
-bun packages/plugin/scripts/build-reference-seeds.ts || { echo "Error: Reference-seed generation failed"; exit 1; }
+bun packages/plugin/scripts/build-reference-seeds.ts || { echo "Error: Reference-seed generation failed"; return 1; }
 echo ""
+}
+
+if [[ -n "$CI_GATE_SHA" ]]; then
+  # New generated output is not CI-certified. Compare it with HEAD, then restore
+  # the certified files even when a generator failed after writing partial output.
+  GENERATED_ARTIFACTS=(
+    assets/magic-context.schema.json
+    packages/plugin/src/hooks/magic-context/reference-seeds.generated.ts
+  )
+  generation_status=0
+  generate_release_artifacts || generation_status=$?
+  if ! git diff --quiet HEAD -- "${GENERATED_ARTIFACTS[@]}"; then
+    echo "Error: generated artifacts differ from HEAD; refusing CI reuse."
+    git --no-pager diff HEAD -- "${GENERATED_ARTIFACTS[@]}" || true
+    generation_status=1
+  fi
+  git checkout -- "${GENERATED_ARTIFACTS[@]}"
+  [[ "$generation_status" -eq 0 ]] || exit "$generation_status"
+else
+generate_release_artifacts
 
 # Step 3c: Re-lint generated artifacts. The pre-release lint (above) runs BEFORE
 # generation, so a generator that emits non-repo-style output would otherwise
@@ -467,6 +451,7 @@ echo ""
 echo "→ Linting generated artifacts..."
 bun run --cwd "$PLUGIN_DIR" lint 2>&1 || { echo "Error: Generated artifacts failed lint (regenerated schema/seeds not repo-style)"; exit 1; }
 echo ""
+fi
 
 # Step 4: Sync version
 echo "→ Syncing version to $VERSION..."
@@ -479,7 +464,18 @@ echo ""
 # edited in the checkout during the long gate phase into a release commit
 # (v0.42.4); anything else dirty at this point is a foreign change and aborts.
 echo "→ Committing version bump..."
+if [[ -n "$CI_GATE_SHA" ]]; then
+  git add -- packages/plugin/package.json packages/pi-plugin/package.json packages/cli/package.json \
+    crates/mc-core/Cargo.toml crates/mc-store/Cargo.toml crates/mc-module/Cargo.toml crates/mc-tokenizer/Cargo.toml Cargo.lock \
+    CHANGELOG.md "$NOTES_FILE"
+  python3 "$SCRIPT_DIR/check-release-bump.py" "$CI_GATE_SHA" "$VERSION" --staged
+  if [[ -n "$(git diff --name-only)" || -n "$(git ls-files --others --exclude-standard)" ]]; then
+    echo "Error: unrelated modified files present at bump time; refusing CI reuse."
+    exit 1
+  fi
+else
 git add -- packages/plugin/package.json packages/pi-plugin/package.json packages/cli/package.json \
+  crates/mc-core/Cargo.toml crates/mc-store/Cargo.toml crates/mc-module/Cargo.toml crates/mc-tokenizer/Cargo.toml Cargo.lock \
   assets/magic-context.schema.json \
   packages/plugin/src/hooks/magic-context/reference-seeds.generated.ts
 # Cargo.lock is the common dirty file here: Cargo can update the resolved versions
@@ -503,6 +499,7 @@ if [ -n "$unrelated" ]; then
   git reset -q
   exit 1
 fi
+fi
 if git diff --cached --quiet; then
   echo "  (no changes — version already at $VERSION)"
 else
@@ -510,6 +507,10 @@ else
 fi
 
 # Step 5: Tag
+if [[ -n "$CI_GATE_SHA" ]]; then
+  python3 "$SCRIPT_DIR/check-release-bump.py" "$CI_GATE_SHA" "$VERSION"
+  [[ -z "$(git status --porcelain)" ]] || { echo "Error: working tree changed after the release bump"; exit 1; }
+fi
 echo "→ Creating tag $TAG..."
 git tag -a "$TAG" -m "Release $TAG"
 echo ""

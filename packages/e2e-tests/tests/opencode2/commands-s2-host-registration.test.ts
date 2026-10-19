@@ -33,7 +33,8 @@ async function eventually<T>(
 	for (;;) {
 		const value = await read();
 		if (value !== undefined) return value;
-		if (Date.now() >= deadline) throw new Error(`timed out waiting for ${what}`);
+		if (Date.now() >= deadline)
+			throw new Error(`timed out waiting for ${what}`);
 		await Bun.sleep(50);
 	}
 }
@@ -95,6 +96,14 @@ test("OpenCode 2 lists and runs the /ctx-* commands without a terminal UI", asyn
 		for (const command of listed) {
 			expect(command.description ?? "").not.toBe("");
 		}
+
+		// Invoke status through the session API without a TUI; reading the status
+		// must complete even though there is no dialog surface to receive its result.
+		await client.session.command({
+			sessionID: session.id,
+			name: "ctx-status",
+			text: "",
+		});
 
 		const prompt = async (text: string): Promise<void> => {
 			await client.session.prompt({ sessionID: session.id, text });

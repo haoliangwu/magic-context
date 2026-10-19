@@ -193,6 +193,108 @@ pub fn is_known_tool_id(tool_id: &str) -> bool {
     PROMPT_SURFACE_TOOL_IDS.contains(&tool_id)
 }
 
+pub(crate) fn disable_smart_note_schema(schema: &mut serde_json::Value) {
+    if let Some(properties) = schema.get_mut("properties").and_then(|v| v.as_object_mut()) {
+        properties.remove("surface_condition");
+        if let Some(filter) = properties.get_mut("filter") {
+            filter["description"] = json!("Read filter: all, active, pending, ready, dismissed. Omitted: active session notes plus every current project note; active shows only active-status notes.");
+        }
+    }
+}
+
+pub(crate) fn without_smart_note_description(text: &str) -> String {
+    text.replace("ready smart notes first, then newest", "newest first")
+        .split("\n- surface_condition:")
+        .next()
+        .unwrap_or_default()
+        .split(" surface_condition parks")
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+pub(crate) fn without_smart_note_guidance(text: &str) -> String {
+    let plain = text.replace(" A note with a `surface_condition` is left with an outside checker that looks the condition up periodically and returns the note only when it holds.", "")
+        .replace("; a `surface_condition` leaves the note with an outside checker that returns it when the condition holds", "");
+    let mut smart_section_level = 0;
+    plain
+        .split('\n')
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            let mentions = [
+                "smart note",
+                "smart-note",
+                "smart_note",
+                "surface_condition",
+                "outside checker",
+            ]
+            .iter()
+            .any(|term| lower.contains(term));
+            let trimmed = line.trim_start();
+            let heading_level = trimmed.chars().take_while(|ch| *ch == '#').count();
+            if (1..=6).contains(&heading_level)
+                && trimmed
+                    .chars()
+                    .nth(heading_level)
+                    .is_some_and(char::is_whitespace)
+                && (smart_section_level == 0 || heading_level <= smart_section_level)
+            {
+                smart_section_level = if mentions { heading_level } else { 0 };
+            }
+            smart_section_level == 0 && !mentions
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn disable_smart_notes_in_tools(tools: &mut [Tool], preset: PromptSurfacePreset) {
+    for tool in tools.iter_mut().filter(|tool| tool.name == "ctx_note") {
+        disable_smart_note_schema(&mut tool.schema);
+        let description = if preset == PromptSurfacePreset::Light {
+            TOOL_LIGHT_DESCRIPTIONS
+                .and_then(|descriptions| {
+                    descriptions
+                        .iter()
+                        .find_map(|(id, text)| (*id == "ctx_note").then_some(*text))
+                })
+                .map(str::to_string)
+                .unwrap_or_else(ctx_note_description)
+        } else {
+            ctx_note_description()
+        };
+        tool.description = Some(without_smart_note_description(&description));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn disabled_legacy_facade_tool_and_guidance_surfaces_have_no_smart_note_clauses() {
+    for preset in [PromptSurfacePreset::Full, PromptSurfacePreset::Light] {
+        let mut tools = session_tools(&PromptSurfaceSelection {
+            preset,
+            ..Default::default()
+        });
+        disable_smart_notes_in_tools(&mut tools, preset);
+        let note = tools.iter().find(|tool| tool.name == "ctx_note").unwrap();
+        let text = serde_json::to_string(note).unwrap();
+        assert!(!text.contains("surface_condition"), "{text}");
+        assert!(!text.contains("smart note"), "{text}");
+        for variant in [GuidanceVariant::Full, GuidanceVariant::NoReduce] {
+            let text = without_smart_note_guidance(guidance_asset(preset, variant).bytes);
+            assert!(!text.contains("surface_condition"), "{text}");
+            assert!(!text.contains("outside checker"), "{text}");
+        }
+    }
+    let manifest = crate::manifest_with_route_targets_and_smart_notes(
+        crate::DEFAULT_MODULE_ID,
+        &crate::route_targets::RouteTargetConfig::default(),
+        false,
+    );
+    let text = serde_json::to_string(&manifest).unwrap();
+    assert!(!text.contains("surface_condition"), "{text}");
+    assert!(!text.contains("smart note"), "{text}");
+}
+
 pub fn warn_ignored_unknown_tool_description(tool_id: &str) {
     tracing::warn!(
         "mc-module: config warning: prompt_surface.tool_descriptions.{tool_id} is not a known ctx_* tool ID; the override was ignored."

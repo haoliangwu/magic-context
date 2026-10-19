@@ -1,3 +1,4 @@
+import "./quiet-live-log";
 /**
  * Generate the differential historian USER-prompt golden for the Rust mc-module port.
  *
@@ -22,6 +23,7 @@ const { buildCompartmentAgentPrompt } = promptMod as {
         projectMemory: string;
         inputSource: string;
         memoryEnabled?: boolean;
+        userObservationsRequested?: boolean;
         extractionFree?: boolean;
     }) => string;
 };
@@ -123,6 +125,9 @@ interface PromptCaseSpec {
     memories: MemoryJson[];
     input_source: string;
     memory_enabled: boolean;
+    /** Set only by the dreamer-disabled cases; absent means true, so the
+     *  earlier cases keep their exact JSON. */
+    user_observations_requested?: boolean;
     extraction_free: boolean;
 }
 
@@ -333,6 +338,39 @@ const promptCaseSpecs: PromptCaseSpec[] = [
         memory_enabled: false,
         extraction_free: true,
     },
+    {
+        label: "dreamer disabled skips user observations",
+        session_id: "toggle-dreamer-off",
+        chunk_start: 102,
+        session_compartments: [],
+        memories: [{ id: 8, category: "NAMING", content: "Dreamer-off projects keep memory" }],
+        input_source: "Messages 40-41:\n\n[40] U: dreamer is off here\n[41] A: ok",
+        memory_enabled: true,
+        user_observations_requested: false,
+        extraction_free: false,
+    },
+    {
+        label: "dreamer disabled and memory disabled toggle order",
+        session_id: "toggle-dreamer-and-memory-off",
+        chunk_start: 103,
+        session_compartments: [],
+        memories: [],
+        input_source: "Messages 50-51:\n\n[50] U: no dreamer and no memory\n[51] A: ok",
+        memory_enabled: false,
+        user_observations_requested: false,
+        extraction_free: false,
+    },
+    {
+        label: "dreamer disabled under extraction free adds nothing",
+        session_id: "toggle-dreamer-off-extraction-free",
+        chunk_start: 104,
+        session_compartments: [],
+        memories: [],
+        input_source: "Messages 60-61:\n\n[60] U: structural rebuild with dreamer off\n[61] A: ok",
+        memory_enabled: true,
+        user_observations_requested: false,
+        extraction_free: true,
+    },
 ];
 
 const seedCaseSpecs: SeedCaseSpec[] = [
@@ -365,6 +403,7 @@ const promptCases: PromptCase[] = promptCaseSpecs.map((spec) => {
         projectMemory,
         inputSource: spec.input_source,
         memoryEnabled: spec.memory_enabled,
+        userObservationsRequested: spec.user_observations_requested,
         extractionFree: spec.extraction_free,
     });
     return {

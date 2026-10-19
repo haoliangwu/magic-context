@@ -9,6 +9,11 @@ import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 import {
     __test,
+    type CanonicalMaterializeReason,
+    notePiSystemPromptHashChange,
+    noteSystemPromptHashChange,
+    recordPendingPiTransformDecision,
+    stageOpenCodeV2TransformDecision,
     TRANSFORM_DECISIONS_RETENTION,
     writeRustTransformDecision,
 } from "./transform-decision-log";
@@ -91,6 +96,42 @@ describe("transform_decisions retention cap", () => {
             bustedThisPass: false,
         });
     });
+    it("stores a frozen LKG release in the existing materialize_reason column", () => {
+        writeRustTransformDecision({
+            sessionId: "ses-1",
+            decision: "SOFT+",
+            materializeReason: null,
+            inputTokens: 100,
+            tsMs: 123,
+            lkgFrozenReleaseReason: "lkg_unsafe_seam",
+        });
+        const pending = __test.getPending("ses-1");
+        expect(pending).toMatchObject({
+            decision: "defer",
+            materialized: false,
+            lkgFrozenReleaseReason: "lkg_unsafe_seam",
+        });
+        if (!pending) throw new Error("released frozen pass was not staged");
+
+        __test.writeRow(dbPath, {
+            ...pending,
+            sessionId: "ses-1",
+            harness: "opencode",
+            messageId: "released-pass",
+        });
+        expect(
+            db
+                .prepare(
+                    "SELECT decision, materialized, materialize_reason FROM transform_decisions WHERE message_id = 'released-pass'",
+                )
+                .get(),
+        ).toEqual({
+            decision: "defer",
+            materialized: 0,
+            materialize_reason: "lkg_frozen_release:lkg_unsafe_seam",
+        });
+    });
+
     // The prune SQL is cap-agnostic (`LIMIT ?`), so we inject a tiny cap to
     // exercise it with a handful of rows. Writing the real 2000+ cap opened
     // that many fresh DB connections in a loop and timed out under CI load.
@@ -118,6 +159,46 @@ describe("transform_decisions retention cap", () => {
             .get();
         expect(oldest ?? null).toBeNull();
         expect(newest ?? null).not.toBeNull();
+    });
+
+    it("records new Pi decisions after the production 2000-row cap is reached", () => {
+        __test.setRetentionForTests(null);
+        // Seed history on one connection so the production-size fixture does not
+        // pay for thousands of database opens before exercising the real writer.
+        const seed = db.prepare(
+            `INSERT INTO transform_decisions
+                (session_id, harness, message_id, ts_ms, decision, materialized,
+                 emergency, dropped_tokens, dropped_count, input_tokens)
+             VALUES ('ses-1', 'pi', ?, ?, 'execute', 0, 0, 0, 0, 100)`,
+        );
+        db.transaction(() => {
+            for (let i = 0; i < TRANSFORM_DECISIONS_RETENTION; i++) {
+                seed.run(`old-${i}`, 1000 + i);
+            }
+        })();
+        for (const [messageId, tsMs] of [
+            ["new-1", 5000],
+            ["new-2", 5001],
+        ] as const) {
+            __test.writeRow(dbPath, { ...baseRow(messageId, tsMs), harness: "pi" });
+        }
+        expect(
+            db
+                .prepare(
+                    `SELECT COUNT(*) AS count, MIN(ts_ms) AS oldest, MAX(ts_ms) AS newest
+                 FROM transform_decisions WHERE session_id = 'ses-1' AND harness = 'pi'`,
+                )
+                .get(),
+        ).toEqual({ count: 2000, oldest: 1002, newest: 5001 });
+        expect(
+            db
+                .prepare(
+                    `SELECT message_id FROM transform_decisions
+                 WHERE session_id = 'ses-1' AND harness = 'pi'
+                 ORDER BY ts_ms DESC LIMIT 2`,
+                )
+                .all(),
+        ).toEqual([{ message_id: "new-2" }, { message_id: "new-1" }]);
     });
 
     it("records the compared system hashes for a system_hash fold", () => {
@@ -223,6 +304,66 @@ describe("transform_decisions retention cap", () => {
     it("keeps the production retention constant sane", () => {
         // Guard against accidental drift of the real cap.
         expect(TRANSFORM_DECISIONS_RETENTION).toBe(2000);
+    });
+});
+
+describe("system prompt change on the same request as another cause", () => {
+    function passDecision(materializeReason: CanonicalMaterializeReason | null) {
+        return {
+            tsMs: 1,
+            decision: "execute" as const,
+            materialized: false,
+            materializeReason,
+            systemHashPrev: null,
+            systemHashNew: null,
+            m0ModelKeyPrev: null,
+            m0ModelKeyNew: null,
+            emergency: false,
+            droppedTokens: 0,
+            droppedCount: 0,
+            inputTokens: 100,
+            bustedThisPass: true,
+        };
+    }
+
+    // OpenCode 1 and OpenCode 2 pick the recorded row's reason with the same
+    // function. OpenCode 1 writes the row on a timer after a completion event;
+    // OpenCode 2 staging keeps the chosen decision in memory, so the test reads
+    // the reason back immediately.
+    function stagedReasonWithSystemChange(materializeReason: string | null): string | null {
+        writeRustTransformDecision({
+            sessionId: "ses-1",
+            decision: "EXECUTE",
+            materializeReason,
+            inputTokens: 100,
+        });
+        noteSystemPromptHashChange("ses-1");
+        expect(
+            stageOpenCodeV2TransformDecision({ sessionId: "ses-1", responseAfterSequence: 7 }),
+        ).toBe(true);
+        return __test.getStagedV2("ses-1")?.materializeReason ?? null;
+    }
+
+    it("keeps an idle expiry as the cause when the cache had already expired", () => {
+        expect(stagedReasonWithSystemChange("ttl_idle")).toBe("ttl_idle");
+        __test.reset();
+        expect(stagedReasonWithSystemChange("ttl_expiry")).toBe("ttl_expiry");
+    });
+
+    it("names system_hash when the cache was still warm", () => {
+        expect(stagedReasonWithSystemChange("pressure_refold")).toBe("system_hash");
+        __test.reset();
+        expect(stagedReasonWithSystemChange(null)).toBe("system_hash");
+    });
+
+    it("applies the same precedence to Pi decisions", () => {
+        notePiSystemPromptHashChange("ses-1");
+        recordPendingPiTransformDecision("ses-1", passDecision("ttl_idle"), null);
+        expect(__test.getPendingPi("ses-1")?.materializeReason).toBe("ttl_idle");
+        __test.reset();
+        notePiSystemPromptHashChange("ses-1");
+        recordPendingPiTransformDecision("ses-1", passDecision("model_change"), null);
+        expect(__test.getPendingPi("ses-1")?.materializeReason).toBe("system_hash");
     });
 });
 

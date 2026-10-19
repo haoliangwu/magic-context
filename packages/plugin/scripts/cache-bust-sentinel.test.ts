@@ -153,6 +153,32 @@ describe("cache-bust attribution contract", () => {
         }
     });
 
+    test("accounts a released frozen replay before the defer rule", () => {
+        const classified = classifyCacheBust({
+            divergenceIndex: 2,
+            previousMessageCount: 10,
+            decision: decision({
+                decision: "defer",
+                canonicalDecision: "defer",
+                lkgFrozenReleaseReason: "lkg_unsafe_seam",
+            }),
+        });
+
+        expect(classified).toBe("accounted_lkg_frozen_release");
+        expect(isUnaccountedCacheBustClass(classified)).toBe(false);
+    });
+
+    test("a defer bust without a frozen release remains unaccounted", () => {
+        const classified = classifyCacheBust({
+            divergenceIndex: 2,
+            previousMessageCount: 10,
+            decision: decision({ decision: "defer", canonicalDecision: "defer" }),
+        });
+
+        expect(classified).toBe("unaccounted_defer_pass");
+        expect(isUnaccountedCacheBustClass(classified)).toBe(true);
+    });
+
     test("a mural-only epoch is self-inflicted unless an external epoch independently explains it", () => {
         const classify = (externalEpoch: boolean): CacheBustDivergenceClass =>
             classifyCacheBust({
@@ -620,6 +646,55 @@ describe("cache-bust windows and ids", () => {
         );
     });
 
+    test("a provider short read right after a reclaim alerts as provider-side and names its cause", () => {
+        // 2026-10-12 15:28:51Z: the reclaim request carried the refreshed m[1]
+        // and the trim; the next request only appended to it, but openai-codex
+        // still served just the 24,448-token instructions+tools prefix.
+        const state = __test.defaultState();
+        const [window] = groupBustWindows([
+            request(50_000, "BUST", "accounted_execute_published_history"),
+            request(71_000, "BUST", "provider_short_read_identical_bytes"),
+        ]);
+
+        const event = eventForWindow(window!, "/project", state);
+
+        expect(window!.rows.map((row) => row.divergenceClass)).toEqual([
+            "accounted_execute_published_history",
+            "provider_short_read_after_reclaim",
+        ]);
+        expect(event?.payload).toMatchObject({
+            divergence_class: "provider_short_read_after_reclaim",
+            cause: "provider_short_read_identical_bytes",
+            at: new Date(71_000).toISOString(),
+        });
+        expect(agentDeliverRequest(event!, "agent", "from").body.content).toContain(
+            "divergence_class=provider_short_read_after_reclaim; first_divergence=message[4] role=assistant; cause=provider_short_read_identical_bytes",
+        );
+    });
+
+    test("any other accounted bust right after a reclaim alerts as a double bust", () => {
+        const [window] = groupBustWindows([
+            request(50_000, "BUST", "accounted_hard_marker_drain"),
+            request(60_000, "BUST", "accounted_drop_applied"),
+        ]);
+
+        expect(eventForWindow(window!, "/project", __test.defaultState())?.payload).toMatchObject({
+            divergence_class: "double_bust_after_reclaim",
+            cause: "accounted_drop_applied",
+        });
+        // A lone reclaim stays accounted: it is the one bust a crossing may cost.
+        const [single] = groupBustWindows([
+            request(50_000, "BUST", "accounted_hard_marker_drain"),
+        ]);
+        expect(eventForWindow(single!, "/project", __test.defaultState())).toBeNull();
+        // A provider short read after another provider-side miss is not a reclaim pair.
+        const [providerPair] = groupBustWindows([
+            request(50_000, "BUST", "provider_full_miss"),
+            request(60_000, "BUST", "provider_short_read_identical_bytes"),
+        ]);
+        expect(eventForWindow(providerPair!, "/project", __test.defaultState())).toBeNull();
+    });
+
     test("keeps the base id stable and never emits the same window id twice", () => {
         const state = __test.defaultState();
         const [window] = groupBustWindows([request(50_000)]);
@@ -663,7 +738,9 @@ describe("MC decision store joins", () => {
             );
             INSERT INTO transform_decisions VALUES
                 ('ses_sentinel', 'opencode', 'msg-fold', 10000, 'defer', 1,
-                 'system_hash', 0, 0, 4, 100000);
+                 'system_hash', 0, 0, 4, 100000),
+                ('ses_sentinel', 'opencode', 'msg-release', 30000, 'defer', 0,
+                 'lkg_frozen_release:lkg_unsafe_seam', 0, 0, 0, 100000);
         `);
         context.close(false);
         const store = new Database(storePath);
@@ -696,6 +773,12 @@ describe("MC decision store joins", () => {
         });
 
         expect(nearestCacheBustDecision(loaded, 10_100)?.materializeReason).toBe("system_hash");
+        expect(nearestCacheBustDecision(loaded, 30_100)).toMatchObject({
+            decision: "defer",
+            materialized: false,
+            materializeReason: null,
+            lkgFrozenReleaseReason: "lkg_unsafe_seam",
+        });
         expect(nearestCacheBustDecision(loaded, 20_100)).toMatchObject({
             canonicalDecision: "execute",
             droppedCount: 2,
@@ -973,6 +1056,88 @@ describe("cache-bust sentinel runs", () => {
         expect((await runSentinelOnce(runOptions, deps)).bounded).toBe(true);
         expect(sent).toEqual(["ses_one", "ses_two"]);
     });
+    test("alerts on a second bust that a later run sees after the reclaim it follows", async () => {
+        // The run that analyzed the reclaim ended before the next request was
+        // metered. The next run sees only the second bust, so the reclaim's class
+        // must carry over in the open window.
+        const directory = temporaryDirectory("cache-bust-sentinel-reclaim-carry-");
+        const stateFile = join(directory, "state.json");
+        const events: CacheBustEvent[] = [];
+        let time = 60_000;
+        const deps = {
+            now: () => time,
+            listActiveSessions: () => [{ ...activeSession, activityMs: time }],
+            loadDecisions: () => [],
+            analyzeSession: async (_session: ActiveCacheBustSession, sinceExclusiveMs: number) => {
+                const requests = [
+                    request(50_000, "BUST", "accounted_execute_published_history"),
+                    request(71_000, "BUST", "provider_short_read_identical_bytes"),
+                ].filter((row) => row.timestampMs > sinceExclusiveMs && row.timestampMs <= time);
+                return {
+                    requests,
+                    highWaterMarkMs: requests.at(-1)?.timestampMs ?? null,
+                    directory: "/tmp/sentinel-project",
+                };
+            },
+            stdout: (line: string) => events.push(JSON.parse(line)),
+            stderr: () => {},
+        };
+        const runOptions = { ...options(stateFile), lookbackMs: 50_000 };
+
+        await runSentinelOnce(runOptions, deps);
+        expect(events).toEqual([]);
+        expect(loadSentinelState(stateFile).sessions.ses_sentinel?.openWindow).toEqual({
+            startMs: 50_000,
+            lastBustMs: 50_000,
+            lastBustClass: "accounted_execute_published_history",
+        });
+
+        time = 120_000;
+        await runSentinelOnce(runOptions, deps);
+        expect(events.map((event) => event.payload)).toEqual([
+            expect.objectContaining({
+                divergence_class: "provider_short_read_after_reclaim",
+                cause: "provider_short_read_identical_bytes",
+            }),
+        ]);
+    });
+
+    test("rotates sessions across bounded runs instead of starving the one listed last", async () => {
+        // Each Pi analysis can exhaust a run's budget. The store lists sessions in a
+        // fixed order, so the second session used to wait forever behind the first.
+        const directory = temporaryDirectory("cache-bust-sentinel-rotation-");
+        const stateFile = join(directory, "state.json");
+        const analyzed: string[][] = [];
+        let time = 10_000;
+        const sessions = ["ses_listed_first", "ses_listed_second"];
+        const deps = {
+            now: () => time,
+            listActiveSessions: () =>
+                sessions.map((sessionId) => ({ ...activeSession, sessionId, activityMs: time - 1 })),
+            loadDecisions: () => [],
+            analyzeSession: async (session: ActiveCacheBustSession) => {
+                analyzed.at(-1)?.push(session.sessionId);
+                time += 31_000;
+                return { requests: [], highWaterMarkMs: null };
+            },
+            stdout: () => {},
+            stderr: () => {},
+        };
+        const runOptions = { ...options(stateFile), maxRunMs: 30_000 };
+
+        for (let run = 0; run < 3; run += 1) {
+            analyzed.push([]);
+            expect((await runSentinelOnce(runOptions, deps)).bounded).toBe(true);
+            time += 300_000;
+        }
+
+        expect(analyzed).toEqual([
+            ["ses_listed_first"],
+            ["ses_listed_second"],
+            ["ses_listed_first"],
+        ]);
+    });
+
     test("persists and reuses the per-session request high-water mark", async () => {
         const directory = temporaryDirectory("cache-bust-sentinel-watermark-");
         const stateFile = join(directory, "state.json");
@@ -1000,6 +1165,7 @@ describe("cache-bust sentinel runs", () => {
         expect(seenSince).toEqual([500, 900]);
         expect(loadSentinelState(stateFile).sessions.ses_sentinel).toEqual({
             lastAnalyzedRequestTimestampMs: 900,
+            lastScannedAtMs: 1_000,
         });
     });
 

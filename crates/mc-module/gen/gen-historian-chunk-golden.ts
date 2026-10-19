@@ -1,3 +1,4 @@
+import "./quiet-live-log";
 /**
  * Generate historian chunk differential goldens from the real TS readSessionChunk.
  *

@@ -16,7 +16,7 @@ const { isAdmittedSynthetic, syntheticCandidates } = await import("../../src/v2/
 const { startUpdateChecks } = await import("../../src/v2/hooks/update-check");
 const { FoldOwner } = await import("../../src/v2/fold/owner");
 const { adaptPayload } = await import("../../src/v2/hooks/payload");
-const { V2GenerateReplay } = await import("../../src/v2/hooks/generate");
+const { generateReplayAnchor, V2GenerateReplay } = await import("../../src/v2/hooks/generate");
 const { RestoredRowCache } = await import("../../src/v2/hooks/restore-rows");
 const { recordV2ToolDefinitions } = await import("../../src/v2/hooks/context");
 const { sanitizeDiagnosticText, sanitizeConfigValue } = await import("../../src/shared/redaction");
@@ -87,12 +87,12 @@ try {
         const draft: Draft = { sessionID: "s", model: { providerID: "p", id: "m" }, agent: "build", system: [], tools: {}, options: {}, messages: Array.from({ length: size }, (_, i) => ({ id: `m${i}`, role: "user", content: [{ type: "text", text }] })) };
         await measure(`V2-6 ${size} adapt+commit`, 3, () => adaptPayload({ ...draft, messages: [...draft.messages] }).commit());
         const replay = new V2GenerateReplay();
-        await measure(`V2-6/7 ${size} replay capture`, 3, () => replay.capture(draft, `m${size - 1}`));
+        await measure(`V2-6/7 ${size} replay capture`, 3, () => replay.capture(draft, generateReplayAnchor(draft.messages)));
         console.log(`V2-7 ${size} retained replay serialized messages=${Buffer.byteLength(JSON.stringify(draft.messages))} bytes/session (not a heap estimate)`);
         const memoryReplay = new V2GenerateReplay();
         Bun.gc(true);
         const heapBefore = process.memoryUsage().heapUsed;
-        memoryReplay.capture(draft, `m${size - 1}`);
+        memoryReplay.capture(draft, generateReplayAnchor(draft.messages));
         Bun.gc(true);
         const heapCaptured = process.memoryUsage().heapUsed;
         memoryReplay.forget("s");

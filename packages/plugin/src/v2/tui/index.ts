@@ -1,23 +1,18 @@
 import { createElement, spread } from "@opentui/solid";
 import { COMPACTION_ENABLED_PATH } from "../../config/agent-disable";
-import { flushLogger, log } from "../../shared/logger";
+import { log } from "../../shared/logger";
 import { pluginPackageVersion } from "../../shared/plugin-package-version";
 import type { SidebarSnapshot, StatusDetail } from "../../shared/rpc-types";
 import { buildUnavailableStatusView } from "../../shared/status-view";
 import { statusVersionNotice } from "../../shared/status-view-check";
 import { compactionOffSidebarRows, nativeCompactionContextLabel } from "../../tui/compaction-off";
 import {
-    type CommandRpcResult,
     closeRpc,
     getCompartmentCount,
     initRpcClient,
     loadSidebarSnapshot,
     loadStatusDetail,
-    requestDream,
-    requestEmbed,
-    requestFlush,
     requestRecomp,
-    requestWrapup,
     type StatusDetailResult,
 } from "../../tui/data/context-db";
 import {
@@ -29,7 +24,7 @@ import { directoryForSession } from "../../tui/data/session-directory";
 import { eventSessionID } from "./events";
 import { mountV1Sidebar, sessionDirectory, type V1SidebarMount } from "./sidebar-mount";
 import { mountV1StatusDialog, type V1StatusDialogMount } from "./status-dialog-mount";
-import type { V2KeymapLayer, V2SidebarState, V2TuiContext } from "./types";
+import type { V2SidebarState, V2TuiContext } from "./types";
 
 const SIDEBAR_REFRESH_MS = 1_000;
 const inflight = new Set<string>();
@@ -174,6 +169,9 @@ type JsxFactory = (type: string, props: Record<string, unknown>) => unknown;
 
 export async function setupWithJsx(context: V2TuiContext, jsx: JsxFactory): Promise<() => void> {
     const directory = context.location?.directory ?? context.data.location.default().directory;
+    // The server command registry is the single /ctx-* registration for OpenCode 2.
+    // This TUI handles its notifications; a keymap slash layer would duplicate the
+    // palette entries and would not be available to clients without a TUI.
     initRpcClient(directory);
     const [sidebar, updateSidebar] = context.storage.memory<V2SidebarState>(
         "magic-context.sidebar.v2",
@@ -264,22 +262,6 @@ export async function setupWithJsx(context: V2TuiContext, jsx: JsxFactory): Prom
         return requested;
     };
 
-    const showDream = async (task?: string) => {
-        const target = currentSessionID(context);
-        if (!target) {
-            context.ui.toast.show({ message: "No active session", variant: "warning" });
-            return false;
-        }
-        const started = await requestDream(target, task);
-        context.ui.toast.show({
-            message: started
-                ? "Dream run started; the summary appears when it finishes"
-                : "Dream request failed",
-            variant: started ? "info" : "error",
-        });
-        return started;
-    };
-
     // One sidebar: the OpenCode 1 component, mounted on the v2 slot through the
     // host's own OpenTUI runtime. `mountV1Sidebar` returns null only when the
     // host registers no runtime modules to load it through, which is the single
@@ -310,196 +292,6 @@ export async function setupWithJsx(context: V2TuiContext, jsx: JsxFactory): Prom
             return jsx("text", { children: sidebarText(sidebar.snapshots[input.sessionID]) });
         },
     });
-
-    // Every /ctx-* command this host can reach goes through the keymap layer:
-    // OpenCode 2 has no `command.execute.before` hook, so the server-side command
-    // handler the OpenCode 1 plugin uses never runs here. Each `run` calls the
-    // RPC handler that does the same server-side work and reports back through a
-    // dialog or toast, because this host has no ignored-message chat carrier.
-    const runCommandRpc = async (
-        title: string,
-        call: (sessionID: string) => Promise<CommandRpcResult>,
-        pending?: string,
-    ): Promise<boolean> => {
-        const target = currentSessionID(context);
-        if (!target) {
-            context.ui.toast.show({ message: "No active session", variant: "warning" });
-            return false;
-        }
-        const result = await call(target);
-        if (!result.ok) {
-            context.ui.toast.show({
-                message: result.error ?? `${title} request failed`,
-                variant: "error",
-            });
-            return false;
-        }
-        // A started background run has no text yet; its outcome arrives later as a
-        // show-result-dialog notification.
-        if (result.started) {
-            context.ui.toast.show({ message: pending ?? `${title} started`, variant: "info" });
-            return true;
-        }
-        if (currentSessionID(context) !== target) return false;
-        await context.ui.dialog.alert({ title, message: result.message ?? "" });
-        return true;
-    };
-
-    // OpenCode 2 runs plugin setup() outside the TUI component tree, where
-    // context.keymap.layer() throws "Keymap.Provider is missing" (the provider is
-    // a Solid context). Try the direct call first (hosts that do run setup
-    // in-tree), then fall back to the app slot: its render executes inside the
-    // component tree, the same place the host's own built-in plugins register
-    // their layers.
-    const buildKeymapLayer = (): V2KeymapLayer => ({
-        mode: "global",
-        commands: [
-            {
-                id: "magic-context.status",
-                title: "Magic Context: Status",
-                group: "Magic Context",
-                palette: true,
-                slash: { name: "ctx-status" },
-                run: async () => {
-                    await showStatus();
-                },
-            },
-            {
-                id: "magic-context.recomp",
-                title: "Magic Context: Recomp",
-                group: "Magic Context",
-                palette: true,
-                slash: { name: "ctx-recomp" },
-                run: async () => {
-                    await showRecomp();
-                },
-            },
-            {
-                id: "magic-context.dream",
-                title: "Magic Context: Dream",
-                group: "Magic Context",
-                palette: true,
-                slash: { name: "ctx-dream", arguments: true },
-                run: async (input) => {
-                    await showDream(input?.trim() || undefined);
-                },
-            },
-            {
-                id: "magic-context.flush",
-                title: "Magic Context: Flush",
-                group: "Magic Context",
-                palette: true,
-                slash: { name: "ctx-flush" },
-                run: async () => {
-                    const flushed = await runCommandRpc("Flush", requestFlush);
-                    if (flushed) void refresh(currentSessionID(context) ?? "", true);
-                },
-            },
-            {
-                id: "magic-context.embed",
-                title: "Magic Context: Embed",
-                group: "Magic Context",
-                palette: true,
-                slash: { name: "ctx-embed", arguments: true },
-                run: async (input) => {
-                    const argument = input?.trim().toLowerCase() ?? "";
-                    if (argument !== "" && argument !== "start" && argument !== "pause") {
-                        context.ui.toast.show({
-                            message:
-                                "Usage: /ctx-embed (status), /ctx-embed start, or /ctx-embed pause",
-                            variant: "warning",
-                        });
-                        return;
-                    }
-                    const action = argument === "" ? "status" : argument;
-                    await runCommandRpc(
-                        "Embed",
-                        (sessionID) => requestEmbed(sessionID, action, directory),
-                        "Embedding started; the summary appears when it finishes",
-                    );
-                },
-            },
-            {
-                id: "magic-context.wrapup",
-                title: "Magic Context: Wrapup",
-                group: "Magic Context",
-                palette: true,
-                slash: { name: "ctx-wrapup", arguments: true },
-                run: async (input) => {
-                    const argument = input?.trim() ?? "";
-                    if (argument !== "" && !/^\d+$/.test(argument)) {
-                        context.ui.toast.show({
-                            message:
-                                "Usage: /ctx-wrapup [messages_to_keep] where messages_to_keep is a positive integer",
-                            variant: "warning",
-                        });
-                        return;
-                    }
-                    const messagesToKeep = argument === "" ? 20 : Number.parseInt(argument, 10);
-                    if (messagesToKeep <= 0) {
-                        context.ui.toast.show({
-                            message: "messages_to_keep must be a positive integer",
-                            variant: "warning",
-                        });
-                        return;
-                    }
-                    await runCommandRpc(
-                        "Wrapup",
-                        (sessionID) => requestWrapup(sessionID, messagesToKeep),
-                        "Wrapup started; the summary appears when it finishes",
-                    );
-                },
-            },
-        ],
-    });
-    let keymapLayerRegistered = false;
-    let keymapGapLogged = false;
-    const registerKeymapLayer = (): boolean => {
-        if (keymapLayerRegistered) return true;
-        try {
-            context.keymap.layer(buildKeymapLayer);
-            keymapLayerRegistered = true;
-            // The accepted layer is the only place that knows which slash commands
-            // this host actually got, so report them from it. Anything missing here
-            // is missing from the host's command palette too. It goes to the
-            // diagnostic log because a TUI host owns the screen and drops plugin
-            // console output.
-            const registered = `registered slash commands: ${buildKeymapLayer()
-                .commands.map((command) => command.slash.name)
-                .join(" ")}`;
-            log(`[magic-context] ${registered}`);
-            // Startup lines are worth an immediate write: a TUI that exits or is
-            // killed before the next buffer flush would otherwise leave no record
-            // of which commands this host received.
-            flushLogger();
-            return true;
-        } catch (error) {
-            if (!(error instanceof Error) || error.message !== "Keymap.Provider is missing")
-                throw error;
-            return false;
-        }
-    };
-    let unregisterKeymapSlot: (() => void) | undefined;
-    if (!registerKeymapLayer()) {
-        unregisterKeymapSlot = context.ui.slot({
-            append: "app",
-            render: () => {
-                let registered = false;
-                try {
-                    registered = registerKeymapLayer();
-                } catch (error) {
-                    log("[magic-context] keymap.layer registration failed", error);
-                }
-                if (!registered && !keymapGapLogged) {
-                    keymapGapLogged = true;
-                    log(
-                        "[magic-context] OpenCode 2 keymap.layer is unavailable; /ctx-status, /ctx-recomp, /ctx-dream, /ctx-flush, /ctx-embed and /ctx-wrapup were not registered",
-                    );
-                }
-                return null;
-            },
-        });
-    }
 
     // Only the text projection needs the sidebar snapshot store; the mounted
     // component keeps its own snapshot and subscribes to the same event stream
@@ -537,6 +329,7 @@ export async function setupWithJsx(context: V2TuiContext, jsx: JsxFactory): Prom
         if (notification.payload.action === "refresh-sidebar" && target) {
             if (mountedSidebar) mountedSidebar.refresh();
             else await refresh(target, true);
+            log(`[magic-context] sidebar refresh requested for session ${target}`);
             return true;
         }
         if (notification.payload.action === "show-result-dialog") {
@@ -565,7 +358,6 @@ export async function setupWithJsx(context: V2TuiContext, jsx: JsxFactory): Prom
         mountedSidebar?.dispose();
         mountedSidebar = null;
         statusDialog = null;
-        unregisterKeymapSlot?.();
         stopListening();
         stopNotificationSocket();
         closeRpc();

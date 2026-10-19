@@ -65,6 +65,23 @@ if name == "gh":
         if "--paginate" not in args or "--slurp" not in args or not any(scenario["head"] in arg for arg in args):
             sys.exit("Check-runs query must paginate the exact head")
         print(json.dumps(scenario.get("check_pages", [{"check_runs": []}])))
+    elif args[:1] == ["api"] and any("/actions/runs?head_sha=" in arg for arg in args):
+        pushes = [entry for entry in previous if entry["name"] == "git" and entry["args"][:2] == ["push", "--force"]]
+        if not pushes or "--paginate" not in args or "--slurp" not in args:
+            sys.exit("CI query must follow the trial push and paginate")
+        trial = pushes[-1]["args"][-1].split(":")[0]
+        if not any(f"head_sha={trial}" in arg for arg in args):
+            sys.exit("CI query must use the pushed SHA")
+        print(json.dumps([{"workflow_runs": [{
+            "id": 321, "name": "CI", "head_sha": scenario.get("ci_sha", trial),
+            "head_branch": "train/check-pr-123", "event": "push",
+            "status": "in_progress" if scenario.get("failed_job") else "completed",
+            "conclusion": None if scenario.get("failed_job") else "success",
+        }]}]))
+    elif args[:1] == ["api"] and any("/actions/runs/321/jobs?" in arg for arg in args):
+        jobs = [{"name": "Rust shard", "status": "completed", "conclusion": "failure"},
+                {"name": "Still running", "status": "in_progress", "conclusion": None}] if scenario.get("failed_job") else []
+        print(json.dumps([{"jobs": jobs}]))
     else:
         sys.exit("Unexpected gh command (all writes forbidden): " + repr(args))
 elif name == "git":
@@ -76,7 +93,9 @@ elif name == "git":
             sys.exit(0)
         sys.exit("Unexpected fetch")
     if args[:1] == ["push"]:
-        if args != ["push", "origin", "master"]:
+        trial = args[:3] == ["push", "--force", "origin"] and args[-1].endswith(":refs/heads/train/check-pr-123")
+        exact_master = args[:2] == ["push", "origin"] and args[-1].endswith(":refs/heads/master")
+        if args != ["push", "origin", "master"] and not trial and not exact_master:
             sys.exit("Unexpected push")
         print("Fixture push (no network)")
     else:

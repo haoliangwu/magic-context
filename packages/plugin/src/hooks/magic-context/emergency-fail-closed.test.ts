@@ -1,5 +1,6 @@
 import { afterEach, expect, it } from "bun:test";
 import golden from "../../../../../crates/mc-module/tests/fixtures/protected-tool-refusal.json";
+import signedTurnGolden from "../../../../../crates/mc-module/tests/fixtures/signed-turn-refusal.json";
 import { protectedToolTokenCount } from "../../features/magic-context/reclaim-protection";
 import {
     __resetToolDefinitionMeasurements,
@@ -13,6 +14,9 @@ import {
     PROTECTED_TOOL_RESULTS_OVER_LIMIT,
     PROTECTED_TOOL_RESULTS_OVER_LIMIT_CODE,
     protectedToolRefusal,
+    SIGNED_TURN_OVER_LIMIT,
+    SIGNED_TURN_OVER_LIMIT_CODE,
+    signedTurnContextRefusal,
 } from "./emergency-fail-closed";
 import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
 import type { MessageLike } from "./tag-messages";
@@ -114,6 +118,24 @@ it("protected overflow refusal matches the cross-language public contract", () =
     expect(PROTECTED_TOOL_RESULTS_OVER_LIMIT).toBe(golden.message);
     expect(contextRefusalError(golden.message).code).toBe(golden.code);
     expect(protectedToolRefusal({ cause: { code: golden.code } })?.message).toBe(golden.message);
+});
+
+it("signed-turn over-window refusal matches the cross-language public contract", () => {
+    expect(SIGNED_TURN_OVER_LIMIT_CODE).toBe(signedTurnGolden.code);
+    expect(SIGNED_TURN_OVER_LIMIT).toBe(signedTurnGolden.message);
+    expect(contextRefusalError(signedTurnGolden.message).code).toBe(signedTurnGolden.code);
+    const refusal = protectedToolRefusal({ cause: { code: signedTurnGolden.code } });
+    expect(refusal?.message).toBe(signedTurnGolden.message);
+    expect(refusal?.code).toBe(signedTurnGolden.code);
+});
+
+it("after a signed-thinking reset only refusal-grade evidence of non-fit refuses", () => {
+    const over = { tokens: 120_000, trusted: false, refusalGrade: true, refusalTokens: 120_000 };
+    expect(signedTurnContextRefusal(over, 100_000)).toBe(SIGNED_TURN_OVER_LIMIT);
+    // A fitting request, an estimate that cannot prove non-fit, or an unknown limit is sent.
+    expect(signedTurnContextRefusal({ ...over, refusalTokens: 90_000 }, 100_000)).toBeUndefined();
+    expect(signedTurnContextRefusal({ ...over, refusalGrade: false }, 100_000)).toBeUndefined();
+    expect(signedTurnContextRefusal(over, undefined)).toBeUndefined();
 });
 
 it("successful no-op reclaim refuses a trusted over-limit outgoing request before provider rejection", () => {

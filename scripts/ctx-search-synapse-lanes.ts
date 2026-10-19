@@ -253,7 +253,7 @@ function parseArgs(): CliArgs {
 				"--report",
 				join(
 					process.cwd(),
-					".cortexkit/alfonso/reviews/synapse-metal-vs-ane-2026-09-08.md",
+					".cortexkit/internal-docs/research/synapse-metal-vs-ane-2026-09-08.md",
 				),
 			),
 		),

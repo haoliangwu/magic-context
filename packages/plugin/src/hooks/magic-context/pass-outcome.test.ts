@@ -11,7 +11,11 @@ import {
 
 // The sources that record pass degradations, through `passOutcome.record`,
 // `args.passOutcome?.record` or the transform's `failPass`.
-const RECORDING_SOURCES = ["transform.ts", "transform-postprocess-phase.ts"];
+const RECORDING_SOURCES = [
+    "transform.ts",
+    "transform-postprocess-phase.ts",
+    "compartment-trigger-error.ts",
+];
 
 function source(name: string): string {
     return readFileSync(join(import.meta.dir, name), "utf8");
@@ -61,6 +65,7 @@ describe("pass degradation sites", () => {
             "auto-search-cas-exhaustion",
             "auto-search-internal-failure",
             "auto-search-search-failure",
+            "auto-search-storage-busy",
             "auto-search-timeout",
             "compartment-trigger-failure",
             "invalid-cache-ttl-fallback",

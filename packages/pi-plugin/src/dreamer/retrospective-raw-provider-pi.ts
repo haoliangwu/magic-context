@@ -1,4 +1,5 @@
-import { join, resolve } from "node:path";
+import { stat } from "node:fs/promises";
+import { join } from "node:path";
 import type {
 	RetrospectiveProjectSession,
 	RetrospectiveRawMessage,
@@ -6,8 +7,12 @@ import type {
 	RetrospectiveSinceRead,
 } from "@magic-context/core/features/magic-context/dreamer/retrospective-raw-provider";
 import { readSessionActivity } from "@magic-context/core/features/magic-context/session-activity";
+import { sameProjectDirectory } from "@magic-context/core/shared/project-directory-key";
 import type { Database } from "@magic-context/core/shared/sqlite";
-import { sessionEntries, sessionHeaders } from "./bounded-session-reader";
+import {
+	asyncSessionEntries,
+	asyncSessionHeaders,
+} from "./bounded-session-reader";
 import { resolvePiCodingAgentModule } from "./pi-session-api";
 
 interface PiSessionInfoLike {
@@ -56,18 +61,24 @@ export class PiRetrospectiveRawProvider implements RetrospectiveRawProvider {
 		const sessions = this.deps.listSessions
 			? await this.deps.listSessions(directory)
 			: directory
-				? sessionHeaders(directory, !this.deps.sessionDir)
+				? asyncSessionHeaders(directory, !this.deps.sessionDir)
 				: [];
-		const projectCwd = resolve(this.deps.projectCwd);
+		const projectCwd = this.deps.projectCwd;
 		const result: RetrospectiveProjectSession[] = [];
 		this.sessionPathById.clear();
 
-		for (const raw of sessions) {
+		for await (const raw of sessions) {
 			const info = raw as PiSessionInfoLike | null;
 			if (!info || typeof info !== "object") continue;
 			if (typeof info.id !== "string" || typeof info.path !== "string")
 				continue;
-			if (typeof info.cwd !== "string" || resolve(info.cwd) !== projectCwd)
+			// One spelling-normalized comparison for every host: separators,
+			// Windows drive-letter case and trailing separators do not make this
+			// project's sessions look foreign, and other directories stay out.
+			if (
+				typeof info.cwd !== "string" ||
+				!sameProjectDirectory(info.cwd, projectCwd)
+			)
 				continue;
 
 			const activity = this.deps.contextDb
@@ -98,6 +109,7 @@ export class PiRetrospectiveRawProvider implements RetrospectiveRawProvider {
 			(ts) => ts > sinceMs,
 			limit + 1,
 			false,
+			sinceMs,
 		);
 		return {
 			messages: messages.slice(0, limit),
@@ -116,6 +128,7 @@ export class PiRetrospectiveRawProvider implements RetrospectiveRawProvider {
 				(ts) => ts > sinceMs,
 				1,
 				false,
+				sinceMs,
 			);
 			if (oldest) out.set(sessionId, oldest.ts);
 		}
@@ -140,16 +153,24 @@ export class PiRetrospectiveRawProvider implements RetrospectiveRawProvider {
 		eligible: (ts: number) => boolean,
 		limit: number,
 		newest: boolean,
+		sinceMs?: number,
 	): Promise<RetrospectiveRawMessage[]> {
 		const filePath = this.sessionPathById.get(sessionId);
 		if (!filePath) return [];
 		const kept: RetrospectiveRawMessage[] = [];
 		try {
+			// Imported/branched entry timestamps may not follow file order, so scan
+			// files to EOF unless their mtime rules them out. A file cannot contain
+			// an entry written after its own mtime: mtime before sinceMs means no
+			// later-written entry can qualify for this since query.
+			if (sinceMs !== undefined && !this.deps.loadEntriesFromFile) {
+				if ((await stat(filePath)).mtimeMs < sinceMs) return [];
+			}
 			const entries = this.deps.loadEntriesFromFile
 				? await this.deps.loadEntriesFromFile(filePath)
-				: sessionEntries(filePath);
+				: asyncSessionEntries(filePath);
 			let ordinal = 0;
-			for (const entry of entries) {
+			for await (const entry of entries) {
 				const row = normalizePiUserEntry(entry, sessionId, ++ordinal);
 				if (!row || !eligible(row.ts)) continue;
 				kept.push(row);

@@ -2,7 +2,7 @@
  * Approval gates for the proposed storage batch, before a production migration exists.
  * Run: timeout 1200 bun packages/plugin/scripts/perf-audit/migration-batch-gates.ts <copy-root>
  * The root must contain a read-only VACUUM copy named context.db; only its disposable
- * copies are written. SQL is taken from the reviewed design, not installed at startup.
+ * copies are written. SQL prototypes come from the tracked fixture, not startup migrations.
  */
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
@@ -35,13 +35,11 @@ const { initializeDatabase } = await import("../../src/features/magic-context/st
 const { MIGRATIONS } = await import("../../src/features/magic-context/migrations");
 const { insertTag, updateTagStatus } = await import("../../src/features/magic-context/storage-tags");
 const { createTagger } = await import("../../src/features/magic-context/tagger");
-const design = readFileSync(
-    resolve(import.meta.dir, "../../../../docs/designs/perf-audit-migration-batch.md"),
+const sql = JSON.parse(readFileSync(
+    resolve(import.meta.dir, "fixtures/migration-batch-sql.json"),
     "utf8",
-);
-// Later repair/review examples are not part of the original approval-gate prototype.
-const sql = [...design.matchAll(/```sql\n([\s\S]*?)\n```/g)].slice(0, 11).map((match) => match[1]!);
-assert.equal(sql.length, 11, "review the extractor if the design SQL block layout changes");
+)) as string[];
+assert.equal(sql.length, 11, "the approval gate pins eleven SQL prototypes");
 assert.ok(sql[0]!.includes("CREATE TABLE IF NOT EXISTS session_meta_payloads"));
 assert.ok(sql[9]!.includes("CREATE TABLE IF NOT EXISTS git_commit_fts_rowid_map"));
 assert.ok(sql[10]!.includes("CREATE TABLE mc_chunk_transcript_payloads"));

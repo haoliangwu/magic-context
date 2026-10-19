@@ -71,6 +71,10 @@ Tool: [120] U: Can we rename the handler?
 
 **Smart notes** need Dreamer to be runnable (not `dreamer.disable: true`) and are evaluated only when the `evaluate-smart-notes` task is scheduled. Conditions must be externally checkable (GitHub, files, git, web) — not “when the user says X”.
 
+Smart notes are enabled by default. To remove condition-based authoring and its prompt guidance, set `"smart_notes": { "enabled": false }` in your **user-level** `magic-context.jsonc`. Project configs cannot set this switch: tool definitions are process-wide on some hosts, so two projects cannot disagree. The dashboard exposes the switch in **Smart notes**.
+
+Restart the host after changing it (OpenCode 1/2, Pi/OMP, or ck-mc); it is not hot-reloaded. Each session rebuilds its cached prompt once on the next restart. With the default `true`, tool definitions and injected guidance are unchanged. When off, `evaluate-smart-notes` is not scheduled or shown as due/failed. Pending notes remain stored and unchecked; notes that are already ready still surface. Reading and dismissing existing notes still works. A stale tool call passing `surface_condition` is refused rather than saved as a plain note.
+
 **`@msg` anchor.** Notes tied to a message show `↳ @msg 512` on `read` so the agent can `ctx_expand` to that point.
 
 ```text

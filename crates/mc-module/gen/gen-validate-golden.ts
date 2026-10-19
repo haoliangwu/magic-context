@@ -1,3 +1,4 @@
+import "./quiet-live-log";
 /**
  * Generate the differential historian OUTPUT VALIDATION golden for the Rust mc-module port.
  *

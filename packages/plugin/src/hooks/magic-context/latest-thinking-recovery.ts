@@ -183,6 +183,22 @@ export function prepareLatestThinkingRecovery(args: {
 }
 
 /**
+ * End the latest-thinking recovery after the Rust module served a signed-thinking reset.
+ * The reset removed every signed block of the active turn because bytes before them
+ * changed, so the originals the recovery would restore are bound to bytes that no longer
+ * exist: restoring them on a later pass would serve invalid signatures.
+ */
+export function endLatestThinkingRecoveryAfterReset(db: ContextDatabase, sessionId: string): void {
+    const target = getThinkingBindingRecoveryTarget(db, sessionId);
+    if (target?.startsWith(LATEST_THINKING_RESTORE)) {
+        db.prepare(
+            "UPDATE session_meta SET thinking_binding_recovery_target = '' WHERE session_id = ? AND thinking_binding_recovery_target = ?",
+        ).run(sessionId, target);
+    }
+    knownRejectedSessions.delete(sessionId);
+}
+
+/**
  * Read-only: whether a provider rejection armed or is restoring recovery for
  * this array's active turn. Hosts that replay frozen thinking omissions outside
  * `prepareLatestThinkingRecovery` (Pi, at the start or the end of its pass) skip

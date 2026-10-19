@@ -312,6 +312,41 @@ async fn classify_defaults_to_the_host_on_opencode_and_follows_a_configured_drea
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn memory_off_classify_refuses_before_loading_memories_or_starting_a_provider() {
+    let producer = Arc::new(ProducerState::default());
+    let (handler, store, _dir, project) =
+        handler_with_store(Arc::clone(&producer), default_test_config());
+    let mut bound = binding_with_harness(project.to_str().unwrap(), "opencode2", "ses");
+    bound.config.memory_enabled = false;
+    handler.bind_route(7, bound);
+    activate_module_authority(
+        &store,
+        "context",
+        "git:identity",
+        project.to_str().unwrap(),
+        "memories",
+    );
+    let outcome = handler
+        .handle_dreamer_run_task(
+            7,
+            &json!({
+                "v": 1,
+                "session_id": "ses",
+                "task": CLASSIFY_TASK,
+                "command_id": "memory-off-classify",
+                "model_chain": ["test/first"],
+                "payload": { "prompt_body": "classify", "items": [] },
+            }),
+        )
+        .await;
+    assert!(
+        matches!(outcome, HandlerOutcome::Error { ref code, .. } if code == "memory_disabled"),
+        "{outcome:?}"
+    );
+    assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+}
+
 /// The emergency pass (usage at or above 95% of the window) under the per-harness
 /// default, measured on the tool-bearing fixture the host-runner gate used.
 ///

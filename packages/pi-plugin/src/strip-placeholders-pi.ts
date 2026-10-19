@@ -13,8 +13,14 @@
  * Discovery of new placeholder-only ids happens only on cache-busting
  * passes, matching OpenCode's "discover on execute, replay everywhere"
  * contract.
+ * The same persisted IDs also track dropped tool results whose calls are absent
+ * from the outgoing messages. Responses/Anthropic request validation rejects
+ * Oh My Pi's conversion of those results into user text, so remove them before
+ * conversion. Chat validation accepts the exact placeholder note; defer its
+ * removal until another change already invalidates the provider's cached prefix.
  *
- * A frozen id never removes a message that owns a tool call. Pi sends every
+ * A frozen id never removes a message that owns a tool call or its paired
+ * result, nor a real result explicitly restored by ctx_expand. Pi sends every
  * `toolResult` whether or not its call is still in the array, so removing the
  * call's owner strands the result, which Responses and Chat Completions
  * endpoints reject. See `ownsToolCall`.
@@ -85,9 +91,81 @@ function ownsToolCall(message: unknown): boolean {
 	);
 }
 
+function toolCallIds(messages: readonly unknown[]): Set<string> {
+	const ids = new Set<string>();
+	for (const message of messages) {
+		const msg = message as { role?: unknown; content?: unknown } | undefined;
+		if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
+		for (const part of msg.content) {
+			if (part?.type === "toolCall" && typeof part.id === "string") {
+				ids.add(part.id);
+				// Responses may store the same call with or without its item-id suffix.
+				ids.add(part.id.split("|")[0]);
+			}
+		}
+	}
+	return ids;
+}
+
+function isPairedResult(message: unknown, calls: ReadonlySet<string>): boolean {
+	const msg = message as { role?: unknown; toolCallId?: unknown } | undefined;
+	return (
+		msg?.role === "toolResult" &&
+		typeof msg.toolCallId === "string" &&
+		(calls.has(msg.toolCallId) || calls.has(msg.toolCallId.split("|")[0]))
+	);
+}
+
+function isDroppedResult(message: unknown): boolean {
+	const msg = message as
+		| { role?: unknown; toolCallId?: unknown; content?: unknown }
+		| undefined;
+	if (
+		msg?.role !== "toolResult" ||
+		typeof msg.toolCallId !== "string" ||
+		!Array.isArray(msg.content) ||
+		msg.content.length !== 1
+	)
+		return false;
+	const part = msg.content[0];
+	return (
+		part?.type === "text" &&
+		typeof part.text === "string" &&
+		/^(?:§\d+§ )?\[dropped §\d+§\]$/.test(part.text)
+	);
+}
+
 export interface StripPiDroppedPlaceholderResult {
 	removed: number;
 	discovered: number;
+}
+
+export interface PiOrphanToolDropFacts {
+	active: boolean;
+	legacyDroppedTag?: number;
+}
+
+/** Resolve only this orphan's call ID through the existing session/message index. */
+export function readPiOrphanToolDropFacts(
+	db: ContextDatabase,
+	sessionId: string,
+	callId: string,
+): PiOrphanToolDropFacts {
+	const row = db
+		.prepare(
+			`SELECT MAX(status = 'active') AS active,
+			        MAX(CASE WHEN status = 'dropped' AND drop_mode = 'truncated'
+			                 THEN tag_number END) AS legacyTag
+			 FROM tags INDEXED BY idx_tags_session_message_id
+			 WHERE session_id = ? AND message_id = ? AND type = 'tool'`,
+		)
+		.get(sessionId, callId) as
+		| { active: number | null; legacyTag: number | null }
+		| undefined;
+	return {
+		active: row?.active === 1,
+		legacyDroppedTag: row?.legacyTag ?? undefined,
+	};
 }
 
 export function stripPiDroppedPlaceholderMessages(args: {
@@ -117,6 +195,12 @@ export function stripPiDroppedPlaceholderMessages(args: {
 	 * bytes are changing anyway.
 	 */
 	canFirstApply?: boolean;
+	/** Remove dropped results with absent calls before Responses/Anthropic rejects their conversion to user messages. */
+	retireOrphansBeforeRefusal?: boolean;
+	/** Called only for an orphan call ID, at most once per pass; defaults to indexed storage lookup. */
+	getToolDropFacts?: (callId: string) => PiOrphanToolDropFacts;
+	/** Transfer the result entry's stable session-entry ID to its replacement object. */
+	onLegacyReplay?: (previous: object, next: object) => void;
 	/** Test seam for exhausting the durable CAS write. */
 	applyDelta?: typeof applyStrippedPlaceholderDelta;
 	/** Called only for newly persisted removals, before the message is spliced. */
@@ -125,6 +209,27 @@ export function stripPiDroppedPlaceholderMessages(args: {
 	const { db, sessionId, messages, isCacheBusting, stableIdByRef } = args;
 	const persistedIds = getStrippedPlaceholderIds(db, sessionId);
 	const idsToStrip = new Set(persistedIds);
+	const calls = toolCallIds(messages);
+	let toolFacts: Map<string, PiOrphanToolDropFacts> | undefined;
+	const factsFor = (message: unknown): PiOrphanToolDropFacts | undefined => {
+		const msg = message as { role?: unknown; toolCallId?: unknown } | undefined;
+		if (
+			msg?.role !== "toolResult" ||
+			typeof msg.toolCallId !== "string" ||
+			isPairedResult(msg, calls)
+		)
+			return undefined;
+		// Results with a surviving call need no toolFacts cache or stored drop-status lookup.
+		toolFacts ??= new Map();
+		let facts = toolFacts.get(msg.toolCallId);
+		if (!facts) {
+			facts = args.getToolDropFacts
+				? args.getToolDropFacts(msg.toolCallId)
+				: readPiOrphanToolDropFacts(db, sessionId, msg.toolCallId);
+			toolFacts.set(msg.toolCallId, facts);
+		}
+		return facts;
+	};
 
 	const idOf = (msg: unknown, index: number): string | undefined => {
 		const m = msg && typeof msg === "object" ? (msg as object) : undefined;
@@ -138,12 +243,74 @@ export function stripPiDroppedPlaceholderMessages(args: {
 		(isCacheBusting || args.forceDiscovery === true) && !!stableIdByRef;
 	const presentIds = canPrune ? new Set<string>() : null;
 	const discoveredIds: string[] = [];
-	if (isCacheBusting || args.forceDiscovery) {
+	const isActiveRealResult = (message: unknown): boolean => {
+		const msg = message as { role?: unknown; toolCallId?: unknown } | undefined;
+		return (
+			msg?.role === "toolResult" &&
+			typeof msg.toolCallId === "string" &&
+			!isDroppedResult(message) &&
+			factsFor(message)?.active === true
+		);
+	};
+	const isRetiredResult = (message: unknown): boolean => {
+		const msg = message as { role?: unknown; toolCallId?: unknown } | undefined;
+		return (
+			msg?.role === "toolResult" &&
+			typeof msg.toolCallId === "string" &&
+			!isActiveRealResult(message) &&
+			(isDroppedResult(message) ||
+				factsFor(message)?.legacyDroppedTag !== undefined)
+		);
+	};
+	const discoverOrphans =
+		args.canFirstApply === true ||
+		isCacheBusting ||
+		args.retireOrphansBeforeRefusal === true;
+	// The shared tag replay leaves results unchanged when their calls are absent.
+	// For Chat, restore their old dropped placeholders so repeated requests keep
+	// the same bytes until another change invalidates the provider's cached prefix.
+	// Only stored dropped/truncated tags qualify; active results are never replaced.
+	if (!discoverOrphans) {
+		for (let i = 0; i < messages.length; i++) {
+			const msg = messages[i] as {
+				role?: unknown;
+				toolCallId?: unknown;
+				content?: unknown;
+			};
+			if (
+				msg?.role !== "toolResult" ||
+				typeof msg.toolCallId !== "string" ||
+				!Array.isArray(msg.content) ||
+				isPairedResult(msg, calls) ||
+				isActiveRealResult(msg) ||
+				idsToStrip.has(idOf(msg, i) ?? "")
+			)
+				continue;
+			const tag = factsFor(msg)?.legacyDroppedTag;
+			if (tag === undefined) continue;
+			const text = `[dropped §${tag}§]`;
+			messages[i] = {
+				...msg,
+				content: msg.content.map((part) =>
+					part?.type === "text" ? { ...part, text } : { type: "text", text },
+				),
+			};
+			args.onLegacyReplay?.(msg, messages[i] as object);
+		}
+	}
+	if (isCacheBusting || args.forceDiscovery || discoverOrphans) {
 		for (let i = 0; i < messages.length; i++) {
 			const id = idOf(messages[i], i);
 			if (!id) continue;
 			presentIds?.add(id);
-			if (messageIsPlaceholderOnly(messages[i]) && !persistedIds.has(id)) {
+			if (
+				!persistedIds.has(id) &&
+				(((isCacheBusting || args.forceDiscovery) &&
+					messageIsPlaceholderOnly(messages[i])) ||
+					(discoverOrphans &&
+						!isPairedResult(messages[i], calls) &&
+						isRetiredResult(messages[i])))
+			) {
 				discoveredIds.push(id);
 			}
 		}
@@ -156,22 +323,27 @@ export function stripPiDroppedPlaceholderMessages(args: {
 		}
 	}
 
-	// Frozen ids whose message owns a tool call on this pass. Replay keeps those
-	// messages on every pass. A pass that already busts also removes the ids from
-	// the persisted set, so a session holding such ids (stored while the call was
-	// absent, before its drop mode changed) stops carrying them.
-	const toolOwnerIds = new Set<string>();
+	// Keep assistant call owners, results with a surviving call, and real output
+	// restored by the ctx_expand tool. Forget their previously persisted removal IDs
+	// only when another change already invalidates the provider's cached prefix.
+	const protectedIds = new Set<string>();
 	for (let i = 0; i < messages.length; i++) {
 		const id = idOf(messages[i], i);
-		if (id && persistedIds.has(id) && ownsToolCall(messages[i]))
-			toolOwnerIds.add(id);
+		if (
+			id &&
+			persistedIds.has(id) &&
+			(ownsToolCall(messages[i]) ||
+				isPairedResult(messages[i], calls) ||
+				isActiveRealResult(messages[i]))
+		)
+			protectedIds.add(id);
 	}
 	const mayForgetOwners =
 		isCacheBusting ||
 		args.forceDiscovery === true ||
 		args.canFirstApply === true;
 	if (mayForgetOwners) {
-		for (const id of toolOwnerIds)
+		for (const id of protectedIds)
 			if (!removedIds.includes(id)) removedIds.push(id);
 	}
 
@@ -205,7 +377,7 @@ export function stripPiDroppedPlaceholderMessages(args: {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const id = idOf(messages[i], i);
 		if (!id || !idsToStrip.has(id)) continue;
-		if (toolOwnerIds.has(id)) continue;
+		if (protectedIds.has(id)) continue;
 		if (discovered > 0 && discoveredIds.includes(id))
 			args.onFirstApplication?.(messages[i], i);
 		messages.splice(i, 1);
@@ -215,7 +387,7 @@ export function stripPiDroppedPlaceholderMessages(args: {
 	if (removed > 0 || discovered > 0 || pruned > 0) {
 		sessionLog(
 			sessionId,
-			`placeholder strip: removed=${removed} discovered=${discovered} pruned=${pruned} keptToolOwners=${toolOwnerIds.size}`,
+			`placeholder strip: removed=${removed} discovered=${discovered} pruned=${pruned} keptToolOwners=${protectedIds.size}`,
 		);
 	}
 	return { removed, discovered };

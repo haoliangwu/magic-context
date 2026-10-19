@@ -7,6 +7,7 @@ import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createTestTempDir } from "../../plugin/src/shared/test-temp-dir";
 import { TestHarness } from "../src/harness";
+import { markerWorkerBundleFixture } from "../src/marker-worker-bundle-fixture";
 import { buildMockHistorianPayload, findHistorianOrdinalRange } from "../src/mock-historian";
 import { assertOpenPaths } from "../src/opencode2-runner/spawn";
 
@@ -64,19 +65,29 @@ function bigUsage(text: string) {
 }
 
 let h: TestHarness;
+let bundle: ReturnType<typeof markerWorkerBundleFixture>;
 
 beforeAll(async () => {
-    h = await TestHarness.create({
-        magicContextConfig: { execute_threshold_percentage: 40 },
-        // Keep only the newest turn after the summary, so the stored boundary sits
-        // before the host window (a large session's usual shape). A retained tail
-        // that reaches back past the boundary lets the trim cut the summary rows.
-        openCodeConfigExtra: { compaction: { auto: false, prune: false, tail_turns: 1 } },
-    });
+    bundle = markerWorkerBundleFixture();
+    const previousEntry = process.env.MC_E2E_PLUGIN_ENTRY;
+    process.env.MC_E2E_PLUGIN_ENTRY = bundle.entry;
+    try {
+        h = await TestHarness.create({
+            magicContextConfig: { execute_threshold_percentage: 40 },
+            // Keep only the newest turn after the summary, so the stored boundary sits
+            // before the host window (a large session's usual shape). A retained tail
+            // that reaches back past the boundary lets the trim cut the summary rows.
+            openCodeConfigExtra: { compaction: { auto: false, prune: false, tail_turns: 1 } },
+        });
+    } finally {
+        if (previousEntry === undefined) delete process.env.MC_E2E_PLUGIN_ENTRY;
+        else process.env.MC_E2E_PLUGIN_ENTRY = previousEntry;
+    }
 });
 
 afterAll(async () => {
-    await h.dispose();
+    await h?.dispose();
+    bundle?.dispose();
 });
 
 function readBaseline(sessionId: string): {
@@ -262,7 +273,33 @@ it(
         const beforeCompaction = readBaseline(sessionId);
         expect(beforeCompaction.hasM0).toBe(true);
         expect(beforeCompaction.boundary).not.toBeNull();
-        expect(mainRequestBodies().at(-1)).toContain(HISTORY_SENTINEL);
+        expect(mainRequestBodies().at(-1), pluginLog().slice(-40000)).toContain(HISTORY_SENTINEL);
+
+        // Missing marker-candidate discovery must not replace new history with an old request.
+        await h.waitFor(() => pluginLog().includes("candidate worker unavailable"), {
+            timeoutMs: 5_000, label: "missing marker worker diagnostic",
+        });
+        expect(pluginLog().match(/\[ERROR\] compaction-marker: candidate worker unavailable/g)).toHaveLength(1);
+        expect(pluginLog()).not.toContain("transform refused degraded pass");
+        expect(pluginLog()).not.toContain("compaction-marker-drain-failure");
+        const markerState = () => h.contextDb().prepare(
+            "SELECT NULLIF(compaction_marker_state,'') AS marker, NULLIF(pending_compaction_marker_state,'') AS pending FROM session_meta WHERE session_id=?",
+        ).get(sessionId) as { marker: string | null; pending: string | null };
+        expect(markerState().marker).toBeNull();
+        expect(markerState().pending).not.toBeNull();
+
+        // Put the candidate worker back and require the pending compaction marker to advance
+        // while ordinary new prompts continue to write messages to the host store.
+        bundle.restoreWorker();
+        let rebuildingPasses = 0;
+        for (; rebuildingPasses < 4 && markerState().marker === null; rebuildingPasses++) {
+            const prompt = `marker recovery rebuilding pass ${rebuildingPasses + 1}`;
+            await h.sendPrompt(sessionId, prompt);
+            expect(mainRequestBodies().at(-1)).toContain(prompt);
+            expect(mainRequestBodies().at(-1)).toContain(HISTORY_SENTINEL);
+        }
+        expect(markerState().marker, pluginLog().slice(-40000)).not.toBeNull();
+        console.log(`marker worker recovery: advanced after ${rebuildingPasses} rebuilding passes with new messages`);
 
         // Native compaction. The mock answers the summary request.
         h.mock.setDefault(smallUsage(HOST_SUMMARY_SENTINEL));

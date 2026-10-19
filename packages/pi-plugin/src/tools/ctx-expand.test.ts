@@ -1,10 +1,12 @@
 import { describe, expect, it } from "bun:test";
+import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import {
 	getRawSessionMessageCount,
 	hasRawMessageProvider,
 	setRawMessageProvider,
 } from "@magic-context/core/hooks/magic-context/read-session-chunk";
+import { clearPiOrdinalAlignmentSession } from "../pi-ordinal-alignment";
 import { convertEntriesToRawMessages } from "../read-session-pi";
 import {
 	assistantToolCall,
@@ -14,6 +16,7 @@ import {
 	userMessage,
 } from "../test-utils.test";
 import { createCtxExpandTool } from "./ctx-expand";
+import { createCtxSearchTool } from "./ctx-search";
 
 async function execute(params: {
 	message?: number;
@@ -38,6 +41,117 @@ async function execute(params: {
 function textOf(result: Awaited<ReturnType<typeof execute>>): string {
 	return (result.content[0] as { text: string }).text;
 }
+
+it("Pi search citation survives a branch prefix loss starting at message 62733", async () => {
+	const db = createTestDb();
+	const sessionId = "ses-pi-archive-prefix";
+	const ctx = fakeContext(
+		sessionId,
+		process.cwd(),
+		["live-user", "live-answer"],
+		[
+			userMessage("unrelated live message", 1),
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "surviving answer" }],
+				timestamp: 2,
+			},
+		],
+	);
+	try {
+		appendCompartments(db, sessionId, [
+			{
+				sequence: 1,
+				startMessage: 62733,
+				endMessage: 62734,
+				startMessageId: "live-user",
+				endMessageId: "live-answer",
+				title: "survivors",
+				content: "Summary",
+				p1: "Summary",
+			},
+		]);
+		// A retained, unmapped FTS row also models older stores before sidecar backfill.
+		db.prepare(
+			"INSERT INTO message_history_fts(session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
+		).run(
+			sessionId,
+			5796,
+			"archived-sender",
+			"user",
+			"ckdev-mutate 0.9.2 was sent by Ada",
+		);
+		const search = createCtxSearchTool({
+			db,
+			memoryEnabled: false,
+			embeddingEnabled: false,
+			gitCommitsEnabled: false,
+		});
+		const found = textOf(
+			await search.execute(
+				"search",
+				{ query: "ckdev-mutate", sources: ["message"], limit: 4 },
+				new AbortController().signal,
+				undefined,
+				ctx as never,
+			),
+		);
+		expect(found).toContain("ordinal=5796 range=5793-5799");
+		expect(found).toContain(
+			"search archive only, with no surrounding messages",
+		);
+		const expand = createCtxExpandTool({ db });
+		for (const params of [
+			{ start: 5788, end: 5799 },
+			{ start: 5788, end: 5799, verbose: true },
+			{ message: 5796 },
+		]) {
+			const text = textOf(
+				await expand.execute(
+					"expand",
+					params,
+					new AbortController().signal,
+					undefined,
+					ctx as never,
+				),
+			);
+			expect(text).toStartWith("From the search archive:");
+			expect(text).toContain("[5796] U: ckdev-mutate 0.9.2 was sent by Ada");
+			expect(text).not.toContain("unrelated live message");
+			expect(text).not.toContain("No messages found");
+		}
+		const missing = textOf(
+			await expand.execute(
+				"expand",
+				{ message: 5795 },
+				new AbortController().signal,
+				undefined,
+				ctx as never,
+			),
+		);
+		expect(missing).toContain("history, which now starts at message 62733");
+		const unanchored = fakeContext(
+			sessionId,
+			process.cwd(),
+			["different-branch"],
+			[userMessage("wrong branch text", 1)],
+		);
+		const recovered = textOf(
+			await expand.execute(
+				"expand",
+				{ start: 5788, end: 5799 },
+				new AbortController().signal,
+				undefined,
+				unanchored as never,
+			),
+		);
+		expect(recovered).toContain("[5796] U: ckdev-mutate 0.9.2 was sent by Ada");
+		expect(recovered).not.toContain("wrong branch text");
+	} finally {
+		clearPiOrdinalAlignmentSession(sessionId);
+		db.close();
+	}
+});
 
 describe("Pi ctx_expand verbose range", () => {
 	it("labels consecutive toolResult entries separately from real user text", async () => {

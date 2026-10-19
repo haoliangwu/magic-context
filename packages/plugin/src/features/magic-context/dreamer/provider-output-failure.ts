@@ -174,3 +174,6 @@ export function providerOutputFailureFromInvalidManifest(
         resetAt,
     );
 }
+
+// Initialize the resource root before this module's request-local quota scope.
+import "../../../shared/sqlite";

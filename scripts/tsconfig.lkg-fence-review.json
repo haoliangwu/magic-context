@@ -1,0 +1,24 @@
+{
+	"extends": "../packages/plugin/tsconfig.json",
+	"compilerOptions": {
+		"rootDir": "..",
+		"noEmit": true,
+		"declaration": false,
+		"declarationMap": false,
+		"emitDeclarationOnly": false,
+		"typeRoots": [
+			"../packages/plugin/node_modules/@types",
+			"../packages/plugin/node_modules"
+		]
+	},
+	"include": [
+		"review-lkg-fence.ts",
+		"../packages/pi-plugin/src/context-handler-lkg-debug-assertions.test.ts",
+		"../packages/pi-plugin/src/lkg-fence-independent.test.ts",
+		"../packages/pi-plugin/src/lkg-fence-restart-regression.test.ts",
+		"../packages/pi-plugin/src/lkg-fence-sigkill.test.ts",
+		"../packages/plugin/src/hooks/magic-context/lkg-fence-opencode-sigkill.test.ts",
+		"../packages/plugin/src/shared/storage-file-mutex-review.test.ts"
+	],
+	"exclude": ["../node_modules"]
+}

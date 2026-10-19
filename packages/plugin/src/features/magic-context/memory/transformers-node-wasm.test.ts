@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
@@ -25,6 +25,13 @@ describe("Node WASM Transformers fixture", () => {
     test("builds with real fs and persists a model for offline reuse", () => {
         const outputDir = createTestTempDirFromPath(join(tmpdir(), "mc-node-wasm-build-"));
         try {
+            // ONNX stays external in production bundles. Give this temporary
+            // bundle the same installed runtime dependencies as the real dist.
+            symlinkSync(
+                join(pluginRoot, "node_modules"),
+                join(outputDir, "node_modules"),
+                "junction",
+            );
             const build = run(["bun", "scripts/build-transformers-node-wasm.ts", outputDir]);
             expect(build.exitCode, build.stderr).toBe(0);
 

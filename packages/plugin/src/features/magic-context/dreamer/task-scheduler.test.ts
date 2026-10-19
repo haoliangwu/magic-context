@@ -698,6 +698,42 @@ describe("task-scheduler — runDueTasksForProject", () => {
 });
 
 describe("task-scheduler — runManualDream", () => {
+    // Only project-memory tasks are refused with memory off; maintain-docs and the
+    // other tasks that serve different settings stay runnable (task-settings-gate.test.ts).
+    it("memory-off refuses even forced memory and classifier tasks before any store read", async () => {
+        const unreadable = {
+            prepare() {
+                throw new Error("memory-off store read");
+            },
+        } as unknown as Database;
+        let executed = 0;
+        const executor = async (): Promise<TaskExecOutcome> => {
+            executed += 1;
+            return { status: "completed" };
+        };
+        for (const task of [
+            "curate",
+            "classify-memories",
+            "map-memories",
+            "refresh-primers",
+        ] as const) {
+            const tasks = [cfg(task, "0 3 * * *")];
+            const deps = {
+                db: unreadable,
+                projectIdentity: PROJECT,
+                tasks,
+                executor,
+                projectMemoryEnabled: false,
+            };
+            const result = await runManualDream({ ...deps, task });
+            expect(result.ran).toEqual([]);
+            expect(result.backlogBefore).toEqual({});
+            expect((await runManualDream(deps)).ran).toEqual([]);
+            expect(await runDueTasksForProject(deps)).toBe(0);
+        }
+        expect(executed).toBe(0);
+    });
+
     it("no task arg runs ALL enabled tasks regardless of schedule (not due)", async () => {
         db = freshDb();
         seedActiveMemory(db);

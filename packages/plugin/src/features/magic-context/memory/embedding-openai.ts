@@ -1,7 +1,12 @@
+import { createHash } from "node:crypto";
+
 import { estimateTokens } from "../../../hooks/magic-context/read-session-formatting";
 import { log } from "../../../shared/logger";
 import { sanitizeDiagnosticText } from "../../../shared/redaction";
-import { CHUNK_WINDOW_SAFETY_RATIO } from "../compartment-chunk-embedding";
+import {
+    CHUNK_WINDOW_SAFETY_RATIO,
+    DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS,
+} from "../compartment-chunk-embedding";
 import type { EmbeddingFailure, EmbeddingFailureClass } from "./embedding-failure";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import { embeddingModelsMatch, resolveEmbeddingTextPrefixes } from "./embedding-model-match";
@@ -133,6 +138,111 @@ const FAILURE_WINDOW_MS = 60_000;
 const OPEN_DURATION_MS = 5 * 60_000;
 const FETCH_TIMEOUT_MS = 30_000;
 
+/**
+ * HTTP 429 handling. A rate limit means the endpoint is healthy but asking us
+ * to slow down, so it is back-pressure, not a failure: it never feeds the
+ * circuit breaker above. Instead the endpoint enters a cooldown:
+ *   - The cooldown length comes from `Retry-After` (delta-seconds or an HTTP
+ *     date), capped at RETRY_AFTER_CAP_MS. Without a usable header it is an
+ *     exponential backoff from RATE_LIMIT_BACKOFF_BASE_MS, doubled per
+ *     consecutive 429 and capped at RATE_LIMIT_BACKOFF_CAP_MS, plus up to
+ *     RATE_LIMIT_BACKOFF_JITTER of extra delay so separate processes spread out.
+ *   - Passage (stored-content) embeds come from background drains and backfills,
+ *     so they wait out each cooldown without sending anything and then resend
+ *     the same batch. They stop only when their caller aborts or a real result
+ *     arrives; a rate limit never becomes a batch failure.
+ *   - Query embeds serve ctx_search and auto-search, which must stay fast: they
+ *     never wait. During a cooldown they return no vector at once, so that one
+ *     search runs lexical-only.
+ * The cooldown is shared by every provider instance that talks to the same
+ * endpoint with the same API key, because a quota belongs to the account, not
+ * to one project's provider instance.
+ */
+const RETRY_AFTER_CAP_MS = 60_000;
+const RATE_LIMIT_BACKOFF_BASE_MS = 1_000;
+const RATE_LIMIT_BACKOFF_CAP_MS = 30_000;
+const RATE_LIMIT_BACKOFF_JITTER = 0.25;
+
+interface RateLimitState {
+    /** Epoch ms before which no request may be sent to this endpoint. */
+    until: number;
+    /** 429s received since the last successful response; drives the backoff. */
+    consecutive: number;
+}
+
+const rateLimitStates = new Map<string, RateLimitState>();
+
+function rateLimitStateKey(endpoint: string, apiKey: string): string {
+    // Hash the key so the secret itself is never used as map state.
+    const keyHash = apiKey ? createHash("sha256").update(apiKey).digest("hex").slice(0, 16) : "";
+    return `${endpoint}\u0000${keyHash}`;
+}
+
+/**
+ * Delay requested by a `Retry-After` header, in ms, capped at
+ * RETRY_AFTER_CAP_MS. Returns null when the header is absent, unparseable, or
+ * asks for no delay at all, so the caller falls back to exponential backoff
+ * instead of retrying immediately.
+ */
+export function parseRetryAfterMs(value: string | null, nowMs: number): number | null {
+    const trimmed = value?.trim() ?? "";
+    if (!trimmed) return null;
+    let delayMs: number;
+    if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+        delayMs = Number(trimmed) * 1_000;
+    } else {
+        const at = Date.parse(trimmed);
+        if (!Number.isFinite(at)) return null;
+        delayMs = at - nowMs;
+    }
+    if (!(delayMs > 0)) return null;
+    return Math.min(Math.ceil(delayMs), RETRY_AFTER_CAP_MS);
+}
+
+/**
+ * Backoff for a 429 without a usable `Retry-After`. `consecutive` counts the
+ * 429s already seen in this streak (0 for the first). The result lies in
+ * [nominal, nominal * (1 + jitter)] with nominal = 1 s * 2^consecutive, and
+ * never exceeds RATE_LIMIT_BACKOFF_CAP_MS.
+ */
+export function rateLimitBackoffMs(
+    consecutive: number,
+    random: () => number = Math.random,
+): number {
+    const exponent = Math.min(Math.max(0, Math.floor(consecutive)), 30);
+    const nominal = Math.min(RATE_LIMIT_BACKOFF_CAP_MS, RATE_LIMIT_BACKOFF_BASE_MS * 2 ** exponent);
+    const jitter = Math.min(1, Math.max(0, random())) * RATE_LIMIT_BACKOFF_JITTER;
+    return Math.min(RATE_LIMIT_BACKOFF_CAP_MS, Math.round(nominal * (1 + jitter)));
+}
+
+/** Resolves true after `ms`, or false as soon as `signal` aborts. */
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) return Promise.resolve(false);
+    return new Promise((resolve) => {
+        const onAbort = () => {
+            clearTimeout(timer);
+            resolve(false);
+        };
+        const timer = setTimeout(() => {
+            signal?.removeEventListener("abort", onAbort);
+            resolve(true);
+        }, ms);
+        signal?.addEventListener("abort", onAbort, { once: true });
+    });
+}
+
+/** Marker returned by a single request attempt that hit HTTP 429. */
+const RATE_LIMITED = Symbol("rate-limited");
+
+/**
+ * Unset max_input_tokens falls back to the 512-token chunk default, which was
+ * sized for the bundled local model (Xenova/all-MiniLM-L6-v2 accepts at most
+ * 512 tokens). Remote models usually accept far more, and the default cannot
+ * change silently because max_input_tokens is part of every stored chunk
+ * identity. So warn once per endpoint and model instead.
+ */
+const maxInputTokensWarnings = new Set<string>();
+
 type CircuitState = "closed" | "open" | "half_open";
 
 export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
@@ -164,6 +274,7 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
      *  circuits as if the circuit were still OPEN. */
     private halfOpenProbeInFlight = false;
     private queryTruncationLogged = false;
+    private readonly rateLimitKey: string;
 
     constructor(options: OpenAICompatibleEmbeddingProviderOptions) {
         this.endpoint = normalizeEndpoint(options.endpoint);
@@ -179,10 +290,21 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
         this.queryPrefix = prefixes.queryPrefix;
         this.documentPrefix = prefixes.documentPrefix;
         this.truncate = options.truncate?.trim() ?? "";
-        this.maxInputTokens =
-            typeof options.maxInputTokens === "number" && Number.isFinite(options.maxInputTokens)
-                ? Math.max(1, Math.floor(options.maxInputTokens))
-                : 512;
+        this.rateLimitKey = rateLimitStateKey(this.endpoint, this.apiKey);
+        const maxInputTokensSet =
+            typeof options.maxInputTokens === "number" && Number.isFinite(options.maxInputTokens);
+        this.maxInputTokens = maxInputTokensSet
+            ? Math.max(1, Math.floor(options.maxInputTokens as number))
+            : DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS;
+        if (!maxInputTokensSet && this.endpoint && this.model) {
+            const warningKey = `${this.endpoint}\u0000${this.model}`;
+            if (!maxInputTokensWarnings.has(warningKey)) {
+                maxInputTokensWarnings.add(warningKey);
+                log(
+                    `[magic-context] embedding.max_input_tokens is not set for openai-compatible model "${sanitizeDiagnosticText(this.model)}"; chunk embeddings use the ${DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS}-token default, which is sized for the bundled local model and splits history into small pieces. Set embedding.max_input_tokens to the model's input limit (changing it re-embeds stored chunks once).`,
+                );
+            }
+        }
         this.modelId = getEmbeddingProviderIdentity({
             provider: "openai-compatible",
             endpoint: this.endpoint,
@@ -288,6 +410,36 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
             return Array.from({ length: texts.length }, () => null);
         }
 
+        // Rate-limit cooldown (described above RETRY_AFTER_CAP_MS). Queries never
+        // wait and a 429 never reaches the circuit breaker; passage batches wait
+        // out each cooldown and retry until they succeed or their caller aborts.
+        const isQuery = purpose === "query";
+        for (;;) {
+            if (Date.now() < this.rateLimit.until) {
+                if (isQuery) return Array.from({ length: texts.length }, () => null);
+                if (!(await this.waitForRateLimitCooldown(signal))) {
+                    return Array.from({ length: texts.length }, () => null);
+                }
+            }
+            const outcome = await this.requestOnce(texts, requestTexts, signal, purpose);
+            if (outcome !== RATE_LIMITED) return outcome;
+            if (isQuery) return Array.from({ length: texts.length }, () => null);
+        }
+    }
+
+    /**
+     * Send one embeddings request through the circuit breaker. `texts` are the
+     * caller's inputs (one result slot each) and `requestTexts` the prefixed,
+     * capped strings actually sent. Returns the vectors (null where unusable),
+     * or RATE_LIMITED when the endpoint answered HTTP 429; the cooldown is
+     * already recorded and the breaker is untouched.
+     */
+    private async requestOnce(
+        texts: string[],
+        requestTexts: string[],
+        signal: AbortSignal | undefined,
+        purpose: EmbeddingPurpose | undefined,
+    ): Promise<(Float32Array | null)[] | typeof RATE_LIMITED> {
         // Circuit check — and, if transitioning to half-open, claim the probe slot.
         // Both the claim AND the AbortController setup run inside try/finally so
         // that the half-open probe slot is guaranteed to be released even if any
@@ -343,12 +495,20 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
                 signal: internalController.signal,
             });
 
+            if (response.status === 429) {
+                // Drain the body so the connection can be reused. Its content
+                // is not needed: every 429 is handled the same way.
+                await response.text().catch(() => "");
+                this.noteRateLimit(response.headers.get("retry-after"));
+                return RATE_LIMITED;
+            }
+
             if (!response.ok) {
                 const excerpt = await response.text().catch(() => "");
                 const failure = this.failure(
                     "http_error",
                     `HTTP ${response.status} from endpoint${this.bodyExcerpt(excerpt)}`,
-                    response.status >= 500 || response.status === 408 || response.status === 429,
+                    response.status >= 500 || response.status === 408,
                 );
                 log(
                     `[magic-context] openai-compatible embedding request failed: ${failure.reason}`,
@@ -533,6 +693,46 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
         return this.initialized;
     }
 
+    /** Cooldown shared with every provider on the same endpoint and API key. */
+    private get rateLimit(): RateLimitState {
+        let state = rateLimitStates.get(this.rateLimitKey);
+        if (!state) {
+            state = { until: 0, consecutive: 0 };
+            rateLimitStates.set(this.rateLimitKey, state);
+        }
+        return state;
+    }
+
+    /** Sleep until the shared cooldown ends; false if the caller aborts first. */
+    private async waitForRateLimitCooldown(signal?: AbortSignal): Promise<boolean> {
+        // Loop because a concurrent 429 can extend the cooldown while we sleep.
+        for (;;) {
+            const remaining = this.rateLimit.until - Date.now();
+            if (remaining <= 0) return true;
+            if (!(await sleepUnlessAborted(remaining, signal))) return false;
+        }
+    }
+
+    /** Start or extend the shared cooldown after an HTTP 429. */
+    private noteRateLimit(retryAfter: string | null): void {
+        const state = this.rateLimit;
+        const now = Date.now();
+        const headerDelayMs = parseRetryAfterMs(retryAfter, now);
+        const delayMs = headerDelayMs ?? rateLimitBackoffMs(state.consecutive);
+        state.consecutive += 1;
+        const alreadyCoolingDown = now < state.until;
+        state.until = Math.max(state.until, now + delayMs);
+        const seconds = Math.ceil(delayMs / 1_000);
+        // A rate limit is not a failed embedding; leave the last real failure
+        // untouched. One line per cooldown: a 429 that only extends a running cooldown
+        // (concurrent requests sent before it began) stays quiet.
+        if (!alreadyCoolingDown) {
+            log(
+                `[magic-context] openai-compatible embedding rate limited (HTTP 429): pausing requests for ${seconds}s (${headerDelayMs !== null ? "Retry-After" : "backoff"}); background embedding resumes after the pause and searches run lexical-only until then`,
+            );
+        }
+    }
+
     /**
      * Decide what this caller should do:
      *   - "allow":         CLOSED — proceed with a real request, not as a probe
@@ -621,6 +821,7 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
         this.circuitOpenUntil = 0;
         this.openLogged = false;
         this.lastFailureReason = null;
+        this.rateLimit.consecutive = 0;
     }
 
     getLastFailureReason(): EmbeddingFailure | null {
@@ -639,6 +840,9 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
     _getFailureCount(): number {
         return this.failureTimes.length;
     }
+    _getRateLimitedUntil(): number {
+        return this.rateLimit.until;
+    }
     _resetCircuit(): void {
         this.failureTimes = [];
         this.circuitOpenUntil = 0;
@@ -646,4 +850,10 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
         this.halfOpenProbeInFlight = false;
         this.lastFailureReason = null;
     }
+}
+
+/** Test-only: forget shared rate-limit cooldowns and one-shot startup warnings. */
+export function _resetOpenAICompatibleEmbeddingStateForTests(): void {
+    rateLimitStates.clear();
+    maxInputTokensWarnings.clear();
 }

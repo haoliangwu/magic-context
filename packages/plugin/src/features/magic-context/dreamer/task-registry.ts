@@ -29,10 +29,15 @@ export const CANONICAL_DREAM_TASKS = [
 
 export type DreamTaskName = (typeof CANONICAL_DREAM_TASKS)[number];
 
-/** Prompt-token ceilings informed by docs/reports/dreamer-token-usage.md.
+export function availableDreamTasks(smartNotesEnabled = true): DreamTaskName[] {
+    return CANONICAL_DREAM_TASKS.filter(
+        (task) => smartNotesEnabled || task !== "evaluate-smart-notes",
+    );
+}
+
+/** Prompt-token ceilings leave headroom for repeated tool-loop prompt sends.
  * Completed Gemini run usage predicts 20-memory mapping/verification batches
- * at about 70% of their allowance
- * (docs/reports/verify-token-budget-2026-09-30.md); curate and other tasks retain
+ * at about 70% of their ceiling; curate and other tasks retain
  * their separate allowances. */
 export const DREAM_TOOL_LOOP_TOKEN_BUDGETS = {
     "map-memories": 2_500_000,
@@ -272,6 +277,46 @@ export const MEMORY_DOMAIN_TASKS: readonly DreamTaskName[] = [
 ];
 
 const MEMORY_DOMAIN_SET = new Set<DreamTaskName>(MEMORY_DOMAIN_TASKS);
+
+/**
+ * The dreamer tasks that maintain project memory or knowledge derived from it
+ * (primers grow out of the same sessions and live beside the memories). They
+ * run only while `memory.enabled` is true. Every other task serves a different
+ * setting and runs with memory off:
+ *  - evaluate-smart-notes follows `smart_notes.enabled`;
+ *  - review-user-memories follows user-observation collection, which is on
+ *    exactly when the review is scheduled and the dreamer is runnable, so
+ *    observations are collected exactly when they will be reviewed;
+ *  - maintain-docs needs only a runnable dreamer.
+ * A runnable dreamer is the precondition for any scheduler call at all.
+ */
+export const PROJECT_MEMORY_DREAM_TASKS: readonly DreamTaskName[] = [
+    "map-memories",
+    "verify",
+    "verify-broad",
+    "curate",
+    "compress-cues",
+    "classify-memories",
+    "retrospective",
+    "promote-primers",
+    "refresh-primers",
+];
+
+const PROJECT_MEMORY_DREAM_TASK_SET = new Set<DreamTaskName>(PROJECT_MEMORY_DREAM_TASKS);
+
+/**
+ * Whether the per-project settings let this task run. `memory.enabled` gates
+ * only the project-memory tasks and `smart_notes.enabled` only
+ * evaluate-smart-notes; an omitted setting counts as on.
+ */
+export function dreamTaskAllowedBySettings(
+    task: DreamTaskName,
+    settings: { projectMemoryEnabled?: boolean; smartNotesEnabled?: boolean },
+): boolean {
+    if (PROJECT_MEMORY_DREAM_TASK_SET.has(task)) return settings.projectMemoryEnabled !== false;
+    if (task === "evaluate-smart-notes") return settings.smartNotesEnabled !== false;
+    return true;
+}
 
 /**
  * Lease KIND per task. `memory` + the three independent kinds are per-project;

@@ -23,6 +23,7 @@
 		{
 			"id": "conv-01",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "question",
 			"project": "magic-context",
 			"query": "Where did we diagnose why note reminders vanished after disabling context reduction?",
@@ -42,6 +43,7 @@
 		{
 			"id": "conv-02",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "keyword",
 			"project": "magic-context",
 			"query": "back-to-back prompt cache busts during historian run",
@@ -61,6 +63,7 @@
 		{
 			"id": "conv-03",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "zero-shared-token paraphrase",
 			"project": "magic-context",
 			"query": "the installed desktop app stopped loading its neural model until we supplied the browser backend globally",
@@ -80,6 +83,7 @@
 		{
 			"id": "conv-04",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "question",
 			"project": "magic-context",
 			"query": "Which conversation investigated why the compressor stopped firing for issue 91?",
@@ -99,6 +103,7 @@
 		{
 			"id": "conv-05",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "keyword",
 			"project": "magic-context",
 			"query": "m0 m1 cache materialization taxonomy",
@@ -118,6 +123,7 @@
 		{
 			"id": "conv-06",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "zero-shared-token paraphrase",
 			"project": "magic-context",
 			"query": "when the background knowledge curator's second-generation blueprint was settled",
@@ -137,6 +143,7 @@
 		{
 			"id": "conv-07",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "question",
 			"project": "magic-context",
 			"query": "Where did we design Claude Code session binding for context tools through the daemon?",
@@ -156,6 +163,7 @@
 		{
 			"id": "conv-08",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "keyword",
 			"project": "magic-context",
 			"query": "shadow mode byte compare Rust transform",
@@ -175,6 +183,7 @@
 		{
 			"id": "conv-09",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "zero-shared-token paraphrase",
 			"project": "magic-context",
 			"query": "when we moved the native compaction engine behind the service boundary",
@@ -194,6 +203,7 @@
 		{
 			"id": "conv-10",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "question",
 			"project": "magic-context",
 			"query": "Why was ctx-status computing the wrong usable context denominator?",
@@ -213,6 +223,7 @@
 		{
 			"id": "conv-11",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "zero-shared-token paraphrase",
 			"project": "magic-context",
 			"query": "when we built utilities to inspect stored conversation state and watch the live stream",
@@ -232,6 +243,7 @@
 		{
 			"id": "conv-12",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "question",
 			"project": "magic-context",
 			"query": "How did we plan one dashboard for both Pi and OpenCode histories?",
@@ -251,6 +263,7 @@
 		{
 			"id": "conv-13",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "zero-shared-token paraphrase",
 			"project": "magic-context",
 			"query": "when the second chat host acquired every operator action",
@@ -270,6 +283,7 @@
 		{
 			"id": "conv-14",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "question",
 			"project": "magic-context",
 			"query": "What did we decide about the Copilot Anthropic and Pi tool issue queue?",
@@ -289,6 +303,7 @@
 		{
 			"id": "conv-15",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "keyword",
 			"project": "magic-context",
 			"query": "F2 F3 performance optimization",
@@ -308,6 +323,7 @@
 		{
 			"id": "conv-16",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "zero-shared-token paraphrase",
 			"project": "magic-context",
 			"query": "the installed app's semantic encoder could not choose wasm correctly",
@@ -327,6 +343,7 @@
 		{
 			"id": "conv-17",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "question",
 			"project": "magic-context",
 			"query": "What happened in the ckdev drive wrapup rollback and reasoning-block investigation?",
@@ -346,6 +363,7 @@
 		{
 			"id": "conv-18",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "question",
 			"project": "magic-context",
 			"query": "When did we add per-repository configuration profiles while reviewing MobileMem?",
@@ -365,6 +383,7 @@
 		{
 			"id": "conv-19",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "question",
 			"project": "magic-context",
 			"query": "Where did the terminal finally ship 0.40.1 after the automated release attempts kept dying?",
@@ -384,6 +403,7 @@
 		{
 			"id": "conv-20",
 			"class": "conversation",
+			"shape": "prose",
 			"style": "keyword",
 			"project": "magic-context",
 			"query": "Parity Hunt 3 memory-off suppression license PR 367",
@@ -404,6 +424,7 @@
 		{
 			"id": "identifier-01",
 			"class": "identifier",
+			"shape": "identifier",
 			"style": "commit-sha",
 			"project": "magic-context",
 			"query": "fec3f113e00736591aec75c5934b240f4e90dbf7",
@@ -418,6 +439,7 @@
 		{
 			"id": "identifier-02",
 			"class": "identifier",
+			"shape": "identifier",
 			"style": "commit-sha",
 			"project": "magic-context",
 			"query": "bfb943eec7733c154e98163448508d9e98e43484",
@@ -432,6 +454,7 @@
 		{
 			"id": "identifier-03",
 			"class": "identifier",
+			"shape": "identifier",
 			"style": "commit-sha",
 			"project": "magic-context",
 			"query": "6150c0ef6ee12890cfc7e4b6cc682bbaf575adc7",
@@ -446,6 +469,7 @@
 		{
 			"id": "identifier-04",
 			"class": "identifier",
+			"shape": "identifier",
 			"style": "commit-sha",
 			"project": "magic-context",
 			"query": "666493defa62665f8f636d971db70928b9c71708",
@@ -460,6 +484,7 @@
 		{
 			"id": "identifier-05",
 			"class": "identifier",
+			"shape": "identifier",
 			"style": "issue-number",
 			"project": "magic-context",
 			"query": "issue #195",
@@ -476,6 +501,7 @@
 		{
 			"id": "identifier-06",
 			"class": "identifier",
+			"shape": "exact",
 			"style": "error-string",
 			"project": "magic-context",
 			"query": "session unresolved; launch Claude Code through the CortexKit wrapper so ctx_* can bind to this conversation",
@@ -492,6 +518,7 @@
 		{
 			"id": "identifier-07",
 			"class": "identifier",
+			"shape": "identifier",
 			"style": "function-name",
 			"project": "magic-context",
 			"query": "getVisibleMemoryIds",
@@ -508,6 +535,7 @@
 		{
 			"id": "identifier-08",
 			"class": "identifier",
+			"shape": "identifier",
 			"style": "config-key",
 			"project": "magic-context",
 			"query": "ctx_reduce_enabled",
@@ -524,6 +552,7 @@
 		{
 			"id": "identifier-09",
 			"class": "identifier",
+			"shape": "identifier",
 			"style": "config-key",
 			"project": "magic-context",
 			"query": "cache_ttl",
@@ -540,6 +569,7 @@
 		{
 			"id": "identifier-10",
 			"class": "identifier",
+			"shape": "identifier",
 			"style": "identifier",
 			"project": "magic-context",
 			"query": "sqlite-vec",
@@ -557,6 +587,7 @@
 		{
 			"id": "fact-01",
 			"class": "fact_rule",
+			"shape": "prose",
 			"style": "architecture",
 			"project": "magic-context",
 			"query": "Why does ctx_search exclude memories already rendered in session history and raw messages after the compartment boundary?",
@@ -572,6 +603,7 @@
 		{
 			"id": "fact-02",
 			"class": "fact_rule",
+			"shape": "prose",
 			"style": "architecture",
 			"project": "magic-context",
 			"query": "How does temporal awareness signal conversation gaps without breaking prompt cache stability?",
@@ -587,6 +619,7 @@
 		{
 			"id": "fact-03",
 			"class": "fact_rule",
+			"shape": "prose",
 			"style": "rule",
 			"project": "magic-context",
 			"query": "What ordering keeps active user memories byte stable?",
@@ -602,6 +635,7 @@
 		{
 			"id": "fact-04",
 			"class": "fact_rule",
+			"shape": "prose",
 			"style": "architecture",
 			"project": "magic-context",
 			"query": "What is the ordinal source of truth for shadow-mode comparisons?",
@@ -617,6 +651,7 @@
 		{
 			"id": "fact-05",
 			"class": "fact_rule",
+			"shape": "prose",
 			"style": "rule",
 			"project": "magic-context",
 			"query": "How should ctx_reduce describe queued discards to models?",
@@ -632,6 +667,7 @@
 		{
 			"id": "fact-06",
 			"class": "fact_rule",
+			"shape": "prose",
 			"style": "rule",
 			"project": "magic-context",
 			"query": "Which README is canonical when translations differ?",
@@ -647,6 +683,7 @@
 		{
 			"id": "fact-07",
 			"class": "fact_rule",
+			"shape": "prose",
 			"style": "rule",
 			"project": "magic-context",
 			"query": "How are historian prompts tested against real raw message ranges?",
@@ -662,6 +699,7 @@
 		{
 			"id": "fact-08",
 			"class": "fact_rule",
+			"shape": "prose",
 			"style": "constraint",
 			"project": "magic-context",
 			"query": "What Anthropic failure can empty text blocks trigger after message mutation?",
@@ -677,6 +715,7 @@
 		{
 			"id": "fact-09",
 			"class": "fact_rule",
+			"shape": "prose",
 			"style": "rule",
 			"project": "aft",
 			"query": "Why must Cargo commands run serially in AFT?",
@@ -692,6 +731,7 @@
 		{
 			"id": "fact-10",
 			"class": "fact_rule",
+			"shape": "prose",
 			"style": "rule",
 			"project": "alfonso",
 			"query": "How should durable state machines prove crash recovery across every state?",
@@ -708,6 +748,7 @@
 		{
 			"id": "hard-01",
 			"class": "mixed_hard",
+			"shape": "prose",
 			"style": "cross-class",
 			"project": "magic-context",
 			"query": "What did we ship for issue 78 and how was the Electron crash fixed?",
@@ -724,6 +765,7 @@
 		{
 			"id": "hard-02",
 			"class": "mixed_hard",
+			"shape": "prose",
 			"style": "decision",
 			"project": "magic-context",
 			"query": "Why did we reject sqlite-vec and what storage approach replaced it?",
@@ -740,6 +782,7 @@
 		{
 			"id": "hard-03",
 			"class": "mixed_hard",
+			"shape": "prose",
 			"style": "date-anchored",
 			"project": "magic-context",
 			"query": "What happened Wednesday August 26 around the 0.40.1 release?",
@@ -757,6 +800,7 @@
 		{
 			"id": "hard-04",
 			"class": "mixed_hard",
+			"shape": "prose",
 			"style": "commit-plus-conversation",
 			"project": "magic-context",
 			"query": "What did commit 666493d change and which parity discussion led to it?",
@@ -779,6 +823,7 @@
 		{
 			"id": "hard-05",
 			"class": "mixed_hard",
+			"shape": "prose",
 			"style": "memory-plus-conversation",
 			"project": "magic-context",
 			"query": "Why are memories already visible in session history filtered from ctx_search?",
@@ -800,6 +845,7 @@
 		{
 			"id": "hard-06",
 			"class": "mixed_hard",
+			"shape": "prose",
 			"style": "cross-class",
 			"project": "magic-context",
 			"query": "When Rust mode moved to SUBC, how did Pi subagent allowlisting factor in?",
@@ -816,6 +862,7 @@
 		{
 			"id": "hard-07",
 			"class": "mixed_hard",
+			"shape": "prose",
 			"style": "memory-plus-conversation",
 			"project": "magic-context",
 			"query": "What was decided about the shadow-mode ordinal source of truth?",
@@ -837,6 +884,7 @@
 		{
 			"id": "hard-08",
 			"class": "mixed_hard",
+			"shape": "prose",
 			"style": "note-plus-conversation",
 			"project": "magic-context",
 			"query": "What did issue 305 change about context pressure math?",
@@ -858,6 +906,7 @@
 		{
 			"id": "hard-09",
 			"class": "mixed_hard",
+			"shape": "prose",
 			"style": "hard-filter-control",
 			"project": "magic-context",
 			"query": "raw messages compartment chunks",
@@ -874,6 +923,7 @@
 		{
 			"id": "hard-10",
 			"class": "mixed_hard",
+			"shape": "prose",
 			"style": "commit-plus-design",
 			"project": "magic-context",
 			"query": "What changed in fec3f11 for the historian drain budget?",
@@ -882,6 +932,42 @@
 					"source": "git_commit",
 					"id": "fec3f113e00736591aec75c5934b240f4e90dbf7",
 					"label": "Historian drain budget clock recovery"
+				}
+			]
+		}
+	],
+	"rerankSupplementQueries": [
+		{
+			"id": "path-01",
+			"class": "identifier",
+			"shape": "path",
+			"style": "literal-path-supplement",
+			"project": "magic-context",
+			"query": "packages/plugin/src/features/magic-context/memory/embedding-local.ts",
+			"gold": [
+				{
+					"source": "compartment",
+					"id": 152718,
+					"startOrdinal": 40820,
+					"endOrdinal": 40858,
+					"label": "Electron ORT_SYMBOL fix"
+				}
+			]
+		},
+		{
+			"id": "path-02",
+			"class": "identifier",
+			"shape": "path",
+			"style": "literal-path-supplement",
+			"project": "magic-context",
+			"query": "packages/plugin/src/hooks/magic-context/reference-seeds.generated.ts",
+			"gold": [
+				{
+					"source": "compartment",
+					"id": 162310,
+					"startOrdinal": 116470,
+					"endOrdinal": 116589,
+					"label": "v0.40.1 terminal release"
 				}
 			]
 		}

@@ -97,9 +97,12 @@ export function buildPrimerClusters(args: {
             modelId: primer.questionEmbeddingModelId,
         }));
 
-    const sorted = args.candidates
-        .slice()
-        .sort((a, b) => candidateSortKey(a).localeCompare(candidateSortKey(b)));
+    // Code-unit order keeps U+001F significant, so "s1\u001fa" precedes "s10\u001fa".
+    const sorted = args.candidates.slice().sort((a, b) => {
+        const left = candidateSortKey(a);
+        const right = candidateSortKey(b);
+        return left < right ? -1 : left > right ? 1 : 0;
+    });
 
     for (const candidate of sorted) {
         let best: { cluster: PrimerCluster; score: number } | null = null;

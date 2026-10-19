@@ -1,7 +1,7 @@
 import { isRecord } from "../../shared/record-type-guard";
 import { toolPartHasUserAnswer } from "../../shared/user-answer";
 import { droppedInputMarker } from "./dropped-input-guard";
-import { applyEditMarkerToInput } from "./edit-marker";
+import { applyEditMarkerToInput, needsEditMarker } from "./edit-marker";
 import { estimateMessageTokens } from "./final-wire-token-estimate";
 import { neutralizeDroppedReasoningPart } from "./sentinel";
 import { stripTagPrefix } from "./tag-content-primitives";
@@ -73,32 +73,22 @@ function setToolContent(part: unknown, content: string): void {
 }
 
 /**
- * Deep-copy a tool part so a clamp/drop can rewrite the copy without touching
+ * Copy the writable containers so a clamp/drop can rewrite them without touching
  * the original object. The transform receives `args.messages` whose part
  * objects are the LIVE instances OpenCode still holds (it reads the same
  * objects back for the wire and, for a tool that is still executing, for the
  * execution itself). Rewriting one of those in place can corrupt a live run —
  * e.g. clamping a background task part's `input.prompt` while the child agent
  * is still spawning from it. Cloning first confines every byte change to the
- * wire copy that replaces the part in the message array. Parts are plain
- * JSON-serializable data, so structuredClone (with a JSON fallback for
- * runtimes/edge values that reject it) is sufficient.
+ * wire copy that replaces the part in the message array. Clamps only assign
+ * fields on the part and state. Edit markers also copy their input before
+ * assigning top-level diff strings; untouched metadata is shared, never walked.
  */
-function clonePart(part: unknown): unknown {
-    if (part === null || typeof part !== "object") return part;
-    try {
-        return structuredClone(part);
-    } catch {
-        try {
-            return JSON.parse(JSON.stringify(part));
-        } catch {
-            // Non-serializable part: return it as-is rather than throw. The
-            // clamp then mutates the original, which is the pre-existing
-            // behavior; this branch is only reachable for exotic parts that
-            // cannot be cloned or serialized at all.
-            return part;
-        }
-    }
+function clonePart(part: Record<string, unknown>): Record<string, unknown> {
+    return {
+        ...part,
+        ...(isRecord(part.state) ? { state: { ...part.state } } : {}),
+    };
 }
 
 /**
@@ -109,12 +99,13 @@ function clonePart(part: unknown): unknown {
  * may still execute from is never touched. The swap is by reference identity
  * (`indexOf`), so it is a no-op if the part is no longer in the array.
  */
-function clampCloneInPlace(occurrence: IndexedOccurrence, clamp: (part: unknown) => void): void {
-    const clone = clonePart(occurrence.part);
-    clamp(clone);
+function clampCloneInPlace(occurrence: IndexedOccurrence, clamp: (part: unknown) => unknown): void {
     const parts = occurrence.message.parts;
     const index = parts.indexOf(servedPart(occurrence));
     if (index >= 0) {
+        // Always derive from the pristine part, even when another clamp ran first.
+        const clone = clamp(occurrence.part);
+        if (clone === servedPart(occurrence)) return;
         parts[index] = clone;
         occurrence.served = clone;
     }
@@ -131,17 +122,25 @@ function servedPart(occurrence: IndexedOccurrence): unknown {
  * written into the argument position, so a model copying this call from its
  * history copies real, executable arguments.
  */
-function skeletonRealToolPart(part: unknown, tagId: number, stripAttachments = false): void {
-    if (!isRecord(part)) return;
+function skeletonRealToolPart(part: unknown, tagId: number, stripAttachments = false): unknown {
+    if (!isRecord(part)) return part;
     const sentinel = `[dropped \u00a7${tagId}\u00a7]`;
     if (part.type === "tool" && isRecord(part.state)) {
-        part.state.output = sentinel;
-        if (stripAttachments) part.state.attachments = [];
-        return;
+        if (part.state.output === sentinel && !needsAttachmentStrip(part.state, stripAttachments))
+            return part;
+        const clone = clonePart(part);
+        const state = clone.state as Record<string, unknown>;
+        state.output = sentinel;
+        if (stripAttachments) state.attachments = [];
+        return clone;
     }
-    if (part.type === "tool_result") {
-        part.content = sentinel;
-    }
+    if (part.type === "tool_result" && part.content !== sentinel)
+        return { ...part, content: sentinel };
+    return part;
+}
+
+function needsAttachmentStrip(state: Record<string, unknown>, strip: boolean): boolean {
+    return strip && (!Array.isArray(state.attachments) || state.attachments.length !== 0);
 }
 
 /** Read a tool part's input of any JSON shape, without touching it. */
@@ -153,8 +152,17 @@ function readToolPartRawInput(part: unknown): unknown {
     return undefined;
 }
 
-function truncateToolPart(part: unknown, tagId: number): void {
-    if (!isRecord(part)) return;
+function isDroppedInput(input: unknown, sentinel: string): boolean {
+    return (
+        isRecord(input) &&
+        Object.keys(input).length === 1 &&
+        Object.hasOwn(input, "dropped") &&
+        input.dropped === sentinel
+    );
+}
+
+function truncateToolPart(part: unknown, tagId: number): unknown {
+    if (!isRecord(part)) return part;
 
     // Legacy `truncated` render, kept only so sessions that already serve it
     // replay the same bytes until a HARD fold converts them (see
@@ -164,30 +172,36 @@ function truncateToolPart(part: unknown, tagId: number): void {
 
     // OpenCode format: { type: "tool", state: { input: {...}, output: "..." } }
     if (part.type === "tool" && isRecord(part.state)) {
-        const state = part.state;
+        if (part.state.output === sentinel && isDroppedInput(part.state.input, sentinel))
+            return part;
+        const clone = clonePart(part);
+        const state = clone.state as Record<string, unknown>;
         state.output = sentinel;
 
         state.input = droppedInputMarker(tagId);
 
-        return;
+        return clone;
     }
 
     // Anthropic format: { type: "tool_result", content: "..." }
     if (part.type === "tool_result") {
-        part.content = sentinel;
-        return;
+        return part.content === sentinel ? part : { ...part, content: sentinel };
     }
 
     // OpenCode invocation format: { type: "tool-invocation", args: {...} }
     if (part.type === "tool-invocation") {
-        part.args = droppedInputMarker(tagId);
-        return;
+        return isDroppedInput(part.args, sentinel)
+            ? part
+            : { ...part, args: droppedInputMarker(tagId) };
     }
 
     // Anthropic invocation format: { type: "tool_use", input: {...} }
     if (part.type === "tool_use") {
-        part.input = droppedInputMarker(tagId);
+        return isDroppedInput(part.input, sentinel)
+            ? part
+            : { ...part, input: droppedInputMarker(tagId) };
     }
+    return part;
 }
 
 /**
@@ -197,27 +211,38 @@ function truncateToolPart(part: unknown, tagId: number): void {
  * A SEPARATE path from `truncateToolPart`: it must never alter the existing
  * skeleton bytes. Deterministic + idempotent (see edit-marker.ts).
  */
-function editMarkerToolPart(part: unknown, tagId: number, stripAttachments = false): void {
-    if (!isRecord(part)) return;
+function editMarkerToolPart(part: unknown, tagId: number, stripAttachments = false): unknown {
+    if (!isRecord(part)) return part;
     const sentinel = `[dropped \u00a7${tagId}\u00a7]`;
+    const input = readToolPartInput(part);
+    const rewriteInput = input !== null && needsEditMarker(input);
 
     if (part.type === "tool" && isRecord(part.state)) {
-        part.state.output = sentinel;
-        if (stripAttachments) part.state.attachments = [];
-        if (isRecord(part.state.input)) applyEditMarkerToInput(part.state.input);
-        return;
+        if (
+            part.state.output === sentinel &&
+            !rewriteInput &&
+            !needsAttachmentStrip(part.state, stripAttachments)
+        )
+            return part;
+        const clone = clonePart(part);
+        const state = clone.state as Record<string, unknown>;
+        state.output = sentinel;
+        if (stripAttachments) state.attachments = [];
+        if (rewriteInput) {
+            state.input = { ...input };
+            applyEditMarkerToInput(state.input as Record<string, unknown>);
+        }
+        return clone;
     }
     if (part.type === "tool_result") {
-        part.content = sentinel;
-        return;
+        return part.content === sentinel ? part : { ...part, content: sentinel };
     }
-    if (part.type === "tool-invocation" && isRecord(part.args)) {
-        applyEditMarkerToInput(part.args as Record<string, unknown>);
-        return;
+    if (rewriteInput) {
+        const markedInput = { ...input };
+        applyEditMarkerToInput(markedInput);
+        return { ...part, [part.type === "tool-invocation" ? "args" : "input"]: markedInput };
     }
-    if (part.type === "tool_use" && isRecord(part.input)) {
-        applyEditMarkerToInput(part.input as Record<string, unknown>);
-    }
+    return part;
 }
 
 /**
@@ -483,6 +508,8 @@ export function createToolDropTarget(
      * makes the plan stop early and under-evict below the ceiling.
      */
     canDrop: () => boolean;
+    /** A completed result exists; explicit drops may replace it even if it contains a user answer. */
+    prepareDrop: () => boolean;
     requiresToolArcSkeleton: boolean;
     readInput: () => Record<string, unknown> | null;
     measureReclaim: (skeleton: boolean) => {
@@ -532,8 +559,8 @@ export function createToolDropTarget(
         if (!entry.hasResult) return "incomplete";
 
         for (const occurrence of entry.occurrences) {
-            // Invocation-only parts keep their real arguments untouched; a
-            // clone still replaces any earlier clamp from this pass.
+            // Invocation-only parts restore the pristine arguments if an earlier
+            // clamp in this pass replaced them.
             clampCloneInPlace(occurrence, (part) => skeletonRealToolPart(part, tagId));
         }
         clearThinkingParts(thinkingParts);
@@ -602,8 +629,7 @@ export function createToolDropTarget(
                     parts,
                 } as MessageLike);
             const before = count(parts);
-            const retained = skeleton ? structuredClone(parts) : [];
-            for (const part of retained) skeletonRealToolPart(part, tagId);
+            const retained = skeleton ? parts.map((part) => skeletonRealToolPart(part, tagId)) : [];
             const after = count(retained);
             // Several calls can share one thinking block; credit only tool I/O here to avoid reclaiming it twice.
             return {
@@ -649,6 +675,10 @@ export function createToolDropTarget(
             const entry = index.get(compositeKey);
             if (!entry || entry.occurrences.length === 0) return false;
             return batch.wouldStrandConversationEnd(entry.occurrences);
+        },
+        prepareDrop: (): boolean => {
+            const entry = index.get(compositeKey);
+            return !!entry && entry.occurrences.length > 0 && entry.hasResult;
         },
         canDrop: (): boolean => {
             const entry = index.get(compositeKey);

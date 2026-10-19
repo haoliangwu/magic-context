@@ -12,12 +12,7 @@
  */
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import {
-	getProtectionWindowForSession,
-	readEpochFloorSnapshot,
-} from "@magic-context/core/features/magic-context/protection-window";
 import { parseRangeString } from "@magic-context/core/features/magic-context/range-parser";
-import { protectedToolTagNumbers } from "@magic-context/core/features/magic-context/reclaim-protection";
 import {
 	type ContextDatabase,
 	getOrCreateSessionMeta,
@@ -26,11 +21,11 @@ import {
 	queuePendingOp,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
-import { getInertWhitespaceAssistantTags } from "@magic-context/core/features/magic-context/storage-tags";
+import { getInertWhitespaceAssistantTagsByNumbers } from "@magic-context/core/features/magic-context/storage-tags";
 import { getErrorMessage } from "@magic-context/core/shared/error-message";
 import {
 	CTX_REDUCE_DESCRIPTION,
-	ctxReduceSelfStampMessage,
+	formatCtxReduceReply,
 } from "@magic-context/core/tools/ctx-reduce/constants";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
@@ -123,54 +118,22 @@ export function createCtxReduceTool(
 					.filter((tag) => tag.toolName?.toLowerCase() === "ctx_reduce")
 					.map((tag) => tag.tagNumber),
 			);
-			const ctxReduceSelfStampNote = dropIds
-				.filter((id) => ctxReduceSelfStampIds.has(id))
-				.filter((id, index, ids) => ids.indexOf(id) === index)
-				.map(ctxReduceSelfStampMessage)
-				.join(" ");
+			const ctxReduceSelfStampCount = new Set(
+				dropIds.filter((id) => ctxReduceSelfStampIds.has(id)),
+			).size;
 			dropIds = dropIds.filter((id) => !ctxReduceSelfStampIds.has(id));
-
-			const activeTags = allTags.filter((tag) => tag.status === "active");
-
-			// Resolve the effective token floor threshold used to compute the protection window
-			const effectiveFloor =
-				readEpochFloorSnapshot(deps.db, sessionId) ??
-				deps.resolveFloor?.(ctx) ??
-				deps.floor ??
-				deps.protectedTokens ??
-				16_000;
-			// Protection window membership in tag-number coordinate space (empty-window behaviour: empty set)
-			const windowResult = getProtectionWindowForSession(
-				deps.db,
-				sessionId,
-				effectiveFloor,
-			);
-			const hasToolTags = allTags.some((t) => t.type === "tool");
-			const windowSet = hasToolTags
-				? windowResult.tagNumberSet.tagNumbers
-				: typeof deps.protectedTags === "number" && deps.protectedTags > 0
-					? new Set(
-							activeTags
-								.map((tag) => tag.tagNumber)
-								.sort((left, right) => right - left)
-								.slice(0, deps.protectedTags),
-						)
-					: new Set<number>();
-			const protectedSet = new Set([
-				...windowSet,
-				...protectedToolTagNumbers(
-					activeTags,
-					deps.resolveProtectedTools?.(ctx) ?? deps.protectedTools,
-				),
-			]);
 
 			const tagStatusMap = new Map(
 				allTags.map((tag) => [tag.tagNumber, tag.status]),
 			);
+			// Only membership of the requested tags is consulted below, so look
+			// up just those instead of every inert tag in the session.
 			const inertWhitespaceTagNumbers = new Set(
-				getInertWhitespaceAssistantTags(deps.db, sessionId).map(
-					(tag) => tag.tagNumber,
-				),
+				getInertWhitespaceAssistantTagsByNumbers(
+					deps.db,
+					sessionId,
+					dropIds,
+				).map((tag) => tag.tagNumber),
 			);
 			const inertDropIds = [
 				...new Set(dropIds.filter((id) => inertWhitespaceTagNumbers.has(id))),
@@ -204,28 +167,9 @@ export function createCtxReduceTool(
 				return err(`Error: Conflicting operations — ${conflicts.join("; ")}.`);
 			}
 
-			const alreadyDropped = [
-				...new Set(dropIds.filter((id) => tagStatusMap.get(id) === "dropped")),
-			];
-			const alreadyQueued = [
-				...new Set(
-					dropIds.filter(
-						(id) =>
-							tagStatusMap.get(id) !== "dropped" &&
-							pendingMap.get(id) === "drop",
-					),
-				),
-			];
-			const skippedNote = [
-				alreadyDropped.length
-					? `Already dropped: ${formatIds(alreadyDropped)}.`
-					: "",
-				alreadyQueued.length
-					? `Already queued: ${formatIds(alreadyQueued)}.`
-					: "",
-			]
-				.filter(Boolean)
-				.join(" ");
+			const stampedCount = new Set(
+				dropIds.filter((id) => !inertWhitespaceTagNumbers.has(id)),
+			).size;
 			dropIds = dropIds.filter(
 				(id) =>
 					!inertWhitespaceTagNumbers.has(id) &&
@@ -234,14 +178,13 @@ export function createCtxReduceTool(
 			);
 
 			if (dropIds.length === 0) {
-				const noActionNotes = [
-					ctxReduceSelfStampNote,
-					inertNote,
-					skippedNote,
-				].filter(Boolean);
-				if (!ctxReduceSelfStampNote)
-					noActionNotes.push("No new action is needed.");
-				return ok(noActionNotes.join(" "));
+				const reply = formatCtxReduceReply(
+					stampedCount,
+					ctxReduceSelfStampCount,
+				);
+				if (reply) return ok(`${reply}${inertNote ? ` ${inertNote}` : ""}`);
+				if (inertNote) return ok(inertNote);
+				return ok("No new action is needed.");
 			}
 
 			try {
@@ -266,25 +209,8 @@ export function createCtxReduceTool(
 				lastNudgeTokens: currentInputTokens,
 			});
 
-			const immediateDropIds = dropIds.filter((id) => !protectedSet.has(id));
-			const deferredDropIds = [
-				...new Set(dropIds.filter((id) => protectedSet.has(id))),
-			];
-
-			const parts: string[] = [];
-			if (immediateDropIds.length > 0)
-				parts.push(`drop ${formatIds(immediateDropIds)}`);
-			if (deferredDropIds.length > 0)
-				parts.push(`deferred drop ${formatIds(deferredDropIds)}`);
-			const held =
-				deferredDropIds.length === 1
-					? `Held: §${deferredDropIds[0]} is inside the protected working set; it applies once newer work displaces it.`
-					: deferredDropIds.length > 1
-						? `Held: ${deferredDropIds.map((id) => `§${id}`).join(", ")} are inside the protected working set; they apply once newer work displaces them.`
-						: "";
-			return ok(
-				`Queued: ${parts.join(", ")}.${held ? ` ${held}` : ""}${skippedNote ? ` ${skippedNote}` : ""}${inertNote ? ` ${inertNote}` : ""}${ctxReduceSelfStampNote ? ` ${ctxReduceSelfStampNote}` : ""}`,
-			);
+			const reply = formatCtxReduceReply(stampedCount, ctxReduceSelfStampCount);
+			return ok(`${reply}${inertNote ? ` ${inertNote}` : ""}`);
 		},
 	};
 }

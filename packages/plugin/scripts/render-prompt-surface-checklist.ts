@@ -26,8 +26,8 @@ type Checklist = {
 };
 
 const rootDir = resolve(import.meta.dir, "../../..");
-const checklistPath = resolve(rootDir, "docs/specs/prompt-surface/checklist.json");
-const outputPath = resolve(rootDir, "docs/specs/prompt-surface/load-bearing-rules-checklist.md");
+const checklistPath = resolve(rootDir, "packages/plugin/scripts/fixtures/prompt-surface/checklist.json");
+const outputPath = resolve(rootDir, "packages/plugin/scripts/fixtures/prompt-surface/load-bearing-rules-checklist.md");
 
 function cell(value: string): string {
     return value.replaceAll("|", "\\|").replaceAll("\n", " ");

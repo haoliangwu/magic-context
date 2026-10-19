@@ -372,6 +372,60 @@ fn dismiss_user_memory_bumps_global_user_profile_not_project_memory_epoch() {
 }
 
 #[test]
+fn restore_user_memory_returns_row_to_active_set_and_bumps_global_profile() {
+    let mut conn = make_db();
+    conn.execute(
+        "INSERT INTO user_memories (content, status, promoted_at, source_candidate_ids, created_at, updated_at)
+         VALUES ('remember me', 'dismissed', 1, '[]', 1, 1)",
+        [],
+    )
+    .expect("insert user memory");
+    let id = conn.last_insert_rowid();
+    seed_project_state(&conn, "git:project-a", 4, 0);
+
+    db::restore_user_memory(&mut conn, id).expect("restore");
+
+    // The restored row is back in the active set the plugin injects from.
+    let active = db::get_user_memories(&conn, Some("active")).expect("active set");
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].id, id);
+    assert_eq!(memory_epoch(&conn, "__global__"), 0);
+    assert_eq!(user_profile_version(&conn, "__global__"), 1);
+    assert_eq!(memory_epoch(&conn, "git:project-a"), 4);
+    assert_eq!(user_profile_version(&conn, "git:project-a"), 0);
+}
+
+#[test]
+fn restore_user_memory_of_active_row_is_a_no_op_without_bump() {
+    let mut conn = make_db();
+    conn.execute(
+        "INSERT INTO user_memories (content, status, promoted_at, source_candidate_ids, created_at, updated_at)
+         VALUES ('remember me', 'active', 1, '[]', 1, 1)",
+        [],
+    )
+    .expect("insert user memory");
+    let id = conn.last_insert_rowid();
+    seed_project_state(&conn, "git:project-a", 4, 0);
+
+    // A row that is already active must not invalidate the cached profile:
+    // the status predicate keeps affected at 0, so no bump fires.
+    db::restore_user_memory(&mut conn, id).expect("restore active row");
+
+    let active = db::get_user_memories(&conn, Some("active")).expect("active set");
+    assert_eq!(active.len(), 1);
+    assert_eq!(user_profile_version(&conn, "__global__"), 0);
+    assert_eq!(memory_epoch(&conn, "__global__"), 0);
+    let updated_at: i64 = conn
+        .query_row(
+            "SELECT updated_at FROM user_memories WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .expect("updated_at");
+    assert_eq!(updated_at, 1);
+}
+
+#[test]
 fn promote_user_memory_candidate_maps_columns_and_bumps_global_profile() {
     let mut conn = make_db();
     conn.execute(

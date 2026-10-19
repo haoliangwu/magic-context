@@ -22,7 +22,6 @@ import { ensureProjectState, getProjectState } from "../storage-project-state";
 import { getUserMemoryCandidates } from "../user-memory/storage-user-memory";
 import { recordCurateSafetyRefusal } from "./curate-memory-safety";
 import { acquireLease, acquireLeaseWithAcquisition, releaseLease } from "./lease";
-import { MAP_BATCH_FLOOR_MS } from "./map-memories";
 import { recordedGeminiQuotaMessages } from "./provider-output-failure.test-support";
 import { applyRetrospectiveLearnings } from "./retrospective-learnings";
 import {
@@ -1812,8 +1811,9 @@ describe("createDreamTaskExecutor — map-memories disposition", () => {
                     messages: mock(async () => ({ data: assistantMessages(manifest) })),
                     delete: mock(async () => {
                         // The first batch is already committed when its child is
-                        // removed. Leave only one minute for the next loop turn.
-                        nowSpy.mockReturnValue(startedAt + MAP_BATCH_FLOOR_MS - 60_000);
+                        // removed. Leave three minutes: too little to start another
+                        // four-minute batch, while the task's ownership lock is valid.
+                        nowSpy.mockReturnValue(startedAt + 60_000);
                         return {};
                     }),
                 },
@@ -1855,7 +1855,7 @@ describe("createDreamTaskExecutor — map-memories disposition", () => {
             // the recorded value, and the recorded value is no earlier than the
             // run start (`now`, the clock the scheduler was invoked with).
             expect(scheduleState?.lastRunAt).toBeGreaterThanOrEqual(startedAt);
-            expect(scheduleState?.lastRunAt).toBeLessThan(startedAt + MAP_BATCH_FLOOR_MS - 60_000);
+            expect(scheduleState?.lastRunAt).toBeLessThan(startedAt + 60_000);
             expect(scheduleState).toMatchObject({
                 lastStatus: "completed",
                 retryCount: 0,
@@ -1868,14 +1868,14 @@ describe("createDreamTaskExecutor — map-memories disposition", () => {
                 backlog?: { pendingAtStart: number; pendingAtEnd: number; processed: number };
             };
             expect(summary.progress).toContain(
-                "committed 20 mapping(s) (mapped 0, independent 20); 1 remain",
+                "committed 5 mapping(s) (mapped 0, independent 5); 16 remain",
             );
             expect(summary.backlog).toEqual({
                 pendingAtStart: 21,
                 totalAtStart: 21,
-                pendingAtEnd: 1,
+                pendingAtEnd: 16,
                 totalAtEnd: 21,
-                processed: 20,
+                processed: 5,
             });
         } finally {
             nowSpy.mockRestore();

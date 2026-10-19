@@ -130,6 +130,7 @@ Live **provider cache** telemetry: per-turn cache read/write, input tokens, and 
 - **Promote** a candidate into an active user memory.
 - **Edit** content, **dismiss**, or **delete** promoted memories.
 - **Delete** candidates you do not want promoted.
+- Dismiss is reversible: dismissed memories stay listed (filter by **Dismissed**), and **Restore** returns one to the active set where it is injected into `<user-profile>` again.
 
 Collection is driven by the **`review-user-memories`** dreamer task: schedule it to collect, set its schedule to `""` to turn it off.
 

@@ -746,12 +746,10 @@ test("I16a tool_argument_surfaces_v2 preserve edit regions and share supersessio
 					},
 				]),
 			);
-			const selected = buildEditSupersessionReclaim({
-				db: db as never,
+			const selected = buildEditSupersessionReclaim({ watermark: Number.MAX_SAFE_INTEGER, db: db as never,
 				sessionId: session.id,
 				targets,
-				recentMessageIds: new Set(),
-			});
+				recentMessageIds: new Set(), });
 			expect([...selected.editMarkerTagIds]).toEqual([tags[0].tag_number]);
 			for (const [index, part] of parts.entries()) {
 				applyEditMarkerToInput(part.state.input);

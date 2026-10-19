@@ -52,7 +52,9 @@ export function runMigrationsOffThread(
     return new Promise<OffThreadMigrationOutcome>((resolve, reject) => {
         let worker: Worker;
         try {
-            worker = new Worker(workerEntryOverride ?? defaultWorkerEntry(), { workerData: data });
+            worker = inRootAsyncContext(
+                () => new Worker(workerEntryOverride ?? defaultWorkerEntry(), { workerData: data }),
+            );
         } catch (error) {
             reject(workerStartError(error instanceof Error ? error.message : String(error)));
             return;
@@ -130,3 +132,5 @@ export function runMigrationsOffThread(
         });
     });
 }
+
+import { inRootAsyncContext } from "../../shared/sqlite";

@@ -55,6 +55,7 @@ import {
     updateTagTokenCount,
 } from "../features/magic-context/storage-tags";
 import { makeToolCompositeKey, type Tagger } from "../features/magic-context/tagger";
+import type { TagEntry } from "../features/magic-context/types";
 import { droppedInputMarker } from "../hooks/magic-context/dropped-input-guard";
 import { applyEditMarkerToInput } from "../hooks/magic-context/edit-marker";
 import { estimateImageTokensFromDataUrl } from "../hooks/magic-context/image-token-estimate";
@@ -119,6 +120,122 @@ export interface TagTranscriptOptions {
 
 export interface TagTranscriptResult {
     targets: Map<number, TagTarget>;
+}
+
+/**
+ * Bind durable drops to a saved request without tagging it again. Recovery must
+ * not allocate identities, inject prefixes, or write accounting while the store
+ * is failing. Reuse the normal targets so persisted modes render identically.
+ */
+export function buildPersistedDropTargets(
+    transcript: Transcript,
+    tags: readonly TagEntry[],
+    options: { allowReasoningPrefixRewrite?: boolean } = {},
+): Map<number, TagTarget> {
+    const targets = new Map<number, TagTarget>();
+    const tools = new Map(
+        tags
+            .filter((tag) => tag.type === "tool")
+            .map((tag) => [makeToolCompositeKey(tag.toolOwnerMessageId ?? "", tag.messageId), tag]),
+    );
+    const textTags = new Map(
+        tags.filter((tag) => tag.type !== "tool").map((tag) => [tag.messageId, tag]),
+    );
+    const byNumber = new Map(tags.map((tag) => [tag.tagNumber, tag]));
+    const aggregates = new Map<
+        string,
+        { tag?: TagEntry; occurrences: ToolOccurrence[]; reasoning: boolean }
+    >();
+    const pending = new Map<string, string[]>();
+    const resolved = new Map<string, string>();
+    const ambiguousCalls = new Set<string>();
+    const end = new ConversationEndGuard(transcript.messages);
+    for (const message of transcript.messages) {
+        let ordinal = 0;
+        let resultRun: { callId: string; key: string } | undefined;
+        const parts = message.parts;
+        const reasoning =
+            message.requiresToolArcSkeleton ??
+            (message.info.role === "assistant" && parts.some((part) => part.kind === "thinking"));
+        for (const part of parts) {
+            if (part.kind !== "tool_result") resultRun = undefined;
+            if (part.kind === "text") {
+                const prefix = /^§(\d+)§\s/.exec(part.getText() ?? "");
+                const tag =
+                    (prefix ? byNumber.get(Number(prefix[1])) : undefined) ??
+                    textTags.get(`${message.info.id}:p${ordinal}`);
+                ordinal++;
+                if (tag && tag.type !== "tool")
+                    targets.set(tag.tagNumber, buildTextTarget(part, message, ""));
+            } else if ((part.kind === "tool_use" || part.kind === "tool_result") && part.id) {
+                const open = pending.get(part.id) ?? [];
+                if (open.length > 1) ambiguousCalls.add(part.id);
+                const key =
+                    (part.kind === "tool_result"
+                        ? resultRun?.callId === part.id
+                            ? resultRun.key
+                            : (open.at(-1) ?? resolved.get(part.id))
+                        : undefined) ?? makeToolCompositeKey(message.info.id ?? "", part.id);
+                if (part.kind === "tool_use") open.push(key);
+                else {
+                    const position = open.lastIndexOf(key);
+                    if (position >= 0) open.splice(position, 1);
+                    resultRun = { callId: part.id, key };
+                    resolved.set(part.id, key);
+                }
+                pending.set(part.id, open);
+                let aggregate = aggregates.get(key);
+                if (!aggregate) {
+                    aggregate = {
+                        tag: tools.get(key),
+                        occurrences: [],
+                        reasoning: false,
+                    };
+                    aggregates.set(key, aggregate);
+                }
+                aggregate.occurrences.push({ message, part, kind: part.kind });
+                aggregate.reasoning ||= reasoning;
+            }
+        }
+    }
+    const arcsByCall = new Map<string, number>();
+    for (const { occurrences } of aggregates.values()) {
+        const callId = occurrences[0]?.part.id ?? "";
+        arcsByCall.set(callId, (arcsByCall.get(callId) ?? 0) + 1);
+    }
+    for (const aggregate of aggregates.values()) {
+        const { occurrences, reasoning } = aggregate;
+        const callId = occurrences[0]?.part.id ?? "";
+        if (ambiguousCalls.has(callId)) continue;
+        const tag =
+            aggregate.tag ??
+            (arcsByCall.get(callId) === 1
+                ? tools.get(makeToolCompositeKey("", callId))
+                : undefined);
+        if (tag)
+            targets.set(
+                tag.tagNumber,
+                buildAggregateTarget(tag.tagNumber, occurrences, reasoning, end),
+            );
+    }
+    if (!options.allowReasoningPrefixRewrite) {
+        // This target builder cannot persist removal of thinking. By default,
+        // withhold edits before reasoning rather than invalidate its signature.
+        // The Pi recovery handler opts in only to test edits on a saved copy;
+        // it must compare final request prefixes and refuse unsafe changes.
+        let lastThinking = -1;
+        transcript.messages.forEach((message, index) => {
+            if (message.parts.some((part) => part.kind === "thinking")) lastThinking = index;
+        });
+        const protectedIds = new Set(
+            transcript.messages.slice(0, lastThinking + 1).map((message) => message.info.id),
+        );
+        for (const [number, target] of targets) {
+            if (target.mutationParts?.some(({ message }) => protectedIds.has(message.info.id)))
+                targets.delete(number);
+        }
+    }
+    return targets;
 }
 
 /**
@@ -1106,7 +1223,8 @@ function buildAggregateTarget(
     const role = occurrences[0]?.message.info.role ?? "user";
     const messageId = occurrences[0]?.message.info.id;
 
-    const truncate = (): "truncated" | "absent" => {
+    const truncate = (): "truncated" | "absent" | "incomplete" => {
+        if (!complete()) return "incomplete";
         // Keep the tool call and its result, but replace the call arguments with
         // a non-executable marker and the result content with the dropped marker.
         // Legacy render, replayed only for `drop_mode = 'truncated'` tags until a
@@ -1288,6 +1406,7 @@ function buildAggregateTarget(
             return any ? "truncated" : "absent";
         },
         // Open invocations still belong to the current turn; only complete arcs reclaim.
+        prepareDrop: () => !occurrences.some((occ) => occ.part.canRemove?.() === "defer"),
         canDrop: () => complete() && !occurrences.some((occ) => occ.part.hasUserAnswer?.()),
         requiresToolArcSkeleton,
         // Non-mutating read of the invocation input (the tool_use occurrence

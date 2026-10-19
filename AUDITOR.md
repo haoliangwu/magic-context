@@ -10,7 +10,6 @@ on *new* signal instead of re-deriving settled conclusions.
 
 | Document | What it records | When it matters to you |
 |---|---|---|
-| [`docs/AUDIT-KNOWN-ISSUES.md`](docs/AUDIT-KNOWN-ISSUES.md) | Cross-cutting / OpenCode-core / dashboard findings that are **accepted as-is** — correct by design, a deliberate tradeoff, or a bounded cost not yet paid down. Each entry has source-grounded reasoning. | Before reporting any correctness, leak, cache-stability, or security finding outside Pi. Check whether it's already an `A#`/`G#` entry. |
 | [`packages/pi-plugin/PARITY.md`](packages/pi-plugin/PARITY.md) | Intentional **Pi ↔ OpenCode mechanism divergences** ("same effective behavior, different mechanism") with rationale. | Before reporting any Pi-vs-OpenCode difference. Many "Pi is missing X" findings are documented-intentional. |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | The m[0]/m[1] cache-stability model, the SOFT/SOFT+/HARD materialization taxonomy, decay rendering, historian/dreamer flows, schema migrations. | Before reasoning about cache busts, materialization, or "history loss" — the invariants are subtle and documented. |
 | [`STRUCTURE.md`](STRUCTURE.md) | File/module layout and where to add new code. | When locating the owner of a behavior. |
@@ -45,7 +44,7 @@ on *new* signal instead of re-deriving settled conclusions.
 
 ## Conventions
 
-- Findings that get accepted are appended to `AUDIT-KNOWN-ISSUES.md` (or
+- Internal audit findings belong in the operator-local `.cortexkit/internal-docs/audits/` (or
   `PARITY.md` for Pi divergences) with their reasoning, so the *next* audit
   doesn't re-derive them. Code comments explain the **why** (invariant / failure
   mode / constraint) and never reference ephemeral audit artifacts (council

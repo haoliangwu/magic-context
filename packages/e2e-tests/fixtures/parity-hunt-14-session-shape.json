@@ -1,7 +1,7 @@
 {
     "schema": 2,
     "source": {
-        "report": "docs/reports/parity-hunt-13.md#H13-03--H13-04",
+        "report": "Sanitized session-shape regression cases for folded tool pairs and signed thinking",
         "capture": "sanitized live OpenCode session structures",
         "sanitization": "Only provider family, role/item order, byte lengths, placeholder class, tool pairing, and signature presence are retained; no captured prose or identifiers are present. Tool arguments are synthetic fixture behavior."
     },

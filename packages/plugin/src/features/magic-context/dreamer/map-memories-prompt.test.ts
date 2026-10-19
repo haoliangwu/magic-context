@@ -9,8 +9,33 @@ import {
     extractMemoryCandidatePaths,
     MAP_MEMORIES_SYSTEM_PROMPT,
     parseMapMemoriesManifest,
+    parsePartialMapMemoriesManifest,
     validateMapMemoriesManifest,
 } from "./map-memories-prompt";
+
+it("partial recovery never borrows attributes from a later memory after a truncated tag", () => {
+    expect(
+        parsePartialMapMemoriesManifest(
+            '<mappings><memory id="1" <memory id="2" files="src/two.ts"/>',
+            new Set([1, 2]),
+        ),
+    ).toEqual([{ id: 2, files: ["src/two.ts"], independent: false }]);
+});
+
+it("partial recovery leaves conflicting unknown and malformed entries unmapped", () => {
+    expect(
+        parsePartialMapMemoriesManifest(
+            `<mappings>
+        <memory id="1" files="src/one.ts"/>
+        <memory id="1" independent="true"/>
+        <memory id="99" independent="true"/>
+        <memory id="2"/>
+        <memory id="3" files="src/three.ts"/>
+        <memory id="4" files="src/truncated`,
+            new Set([1, 2, 3, 4]),
+        ),
+    ).toEqual([{ id: 3, files: ["src/three.ts"], independent: false }]);
+});
 
 /** Real model deviations from the map-memories contract. Each used to parse
  *  to zero entries (or silently flip independent) and skip the fallback chain. */
@@ -218,9 +243,9 @@ describe("buildMapMemoriesPrompt", () => {
             { id: 2, category: "CONSTRAINTS", content: "bar", candidates: [] },
         ]);
         expect(prompt).toContain("[1] ARCHITECTURE");
-        expect(prompt).toContain("Likely files (named in the memory, confirmed to exist): a/b.ts");
+        expect(prompt).toContain("Likely files (candidate paths, confirmed to exist): a/b.ts");
         expect(prompt).toContain("[2] CONSTRAINTS\nbar");
         // memory 2 has no candidates → no seed line for it
-        expect(prompt).not.toContain("Likely files (named in the memory, confirmed to exist): \n");
+        expect(prompt).not.toContain("Likely files (candidate paths, confirmed to exist): \n");
     });
 });

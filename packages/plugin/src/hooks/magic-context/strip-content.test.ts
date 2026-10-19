@@ -315,6 +315,84 @@ describe("strip-content", () => {
     });
 
     describe("stripProcessedImages (sentinel-based)", () => {
+        it("replays frozen images but leaves new images and first-application accounting intact when persistence fails", () => {
+            const image = { type: "file", mime: "image/png", url: buildDataUrl(2000) };
+            const frozen = message("m-frozen", "user", [image]);
+            const candidate = message("m-new", "user", [image, image]);
+            const assistant = message("m-response", "assistant", [{ type: "text", text: "seen" }]);
+            const onFirstApplication = mock(() => {});
+            const persistNewIds = mock((ids: readonly string[]) => {
+                expect(ids).toEqual(["m-new"]);
+                expect(candidate.parts).toEqual([image, image]);
+                return false;
+            });
+
+            const result = stripProcessedImages(
+                [frozen, candidate, assistant],
+                new Set(["m-frozen"]),
+                {
+                    detect: true,
+                    watermark: 5,
+                    messageTagNumbers: new Map([[candidate, 1]]),
+                    persistNewIds,
+                    onFirstApplication,
+                },
+            );
+
+            expect(result).toEqual({ stripped: 1, newlyStrippedIds: [] });
+            expect(frozen.parts).toEqual([SENTINEL]);
+            expect(candidate.parts).toEqual([image, image]);
+            expect(persistNewIds).toHaveBeenCalledTimes(1);
+            expect(onFirstApplication).not.toHaveBeenCalled();
+        });
+
+        it("persists all new image IDs before stripping or recording first applications", () => {
+            const image = { type: "file", mime: "image/png", url: buildDataUrl(2000) };
+            const candidate = message("m-new", "user", [image, image]);
+            const assistant = message("m-response", "assistant", [{ type: "text", text: "seen" }]);
+            const onFirstApplication = mock(() => {});
+            const persistNewIds = mock((ids: readonly string[]) => {
+                expect(ids).toEqual(["m-new"]);
+                expect(candidate.parts).toEqual([image, image]);
+                expect(onFirstApplication).not.toHaveBeenCalled();
+                return true;
+            });
+
+            const result = stripProcessedImages([candidate, assistant], new Set(), {
+                detect: true,
+                watermark: 5,
+                messageTagNumbers: new Map([[candidate, 1]]),
+                persistNewIds,
+                onFirstApplication,
+            });
+
+            expect(result).toEqual({ stripped: 2, newlyStrippedIds: ["m-new"] });
+            expect(candidate.parts).toEqual([SENTINEL, SENTINEL]);
+            expect(persistNewIds).toHaveBeenCalledTimes(1);
+            expect(onFirstApplication).toHaveBeenCalledTimes(2);
+        });
+
+        it("does not change image bytes or first-application accounting when persistence throws", () => {
+            const image = { type: "file", mime: "image/png", url: buildDataUrl(2000) };
+            const candidate = message("m-new", "user", [image]);
+            const assistant = message("m-response", "assistant", [{ type: "text", text: "seen" }]);
+            const onFirstApplication = mock(() => {});
+
+            expect(() =>
+                stripProcessedImages([candidate, assistant], new Set(), {
+                    detect: true,
+                    watermark: 5,
+                    messageTagNumbers: new Map([[candidate, 1]]),
+                    persistNewIds: () => {
+                        throw new Error("database is locked");
+                    },
+                    onFirstApplication,
+                }),
+            ).toThrow("database is locked");
+            expect(candidate.parts).toEqual([image]);
+            expect(onFirstApplication).not.toHaveBeenCalled();
+        });
+
         describe("#given user image uploads around assistant responses and watermark boundaries", () => {
             describe("#when stripping processed images", () => {
                 it("#then replaces eligible images with sentinels at or below the watermark", () => {
@@ -361,7 +439,9 @@ describe("strip-content", () => {
                     expect(user1.parts).toHaveLength(1);
                     expect(user2.parts).toHaveLength(1);
                     expect(user1.parts[0]).toEqual(SENTINEL);
-                    expect(user2.parts[0]).toEqual(SENTINEL);
+                    // This user row separates two assistants. An empty marker
+                    // would disappear on the wire and merge those assistant turns.
+                    expect(user2.parts[0]).toEqual({ type: "text", text: "[image stripped]" });
                 });
 
                 it("#then a DEFER pass (detect=false) does NOT first-strip an aged image, but a frozen id does", () => {

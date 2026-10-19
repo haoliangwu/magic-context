@@ -1,0 +1,96 @@
+// Extracted verbatim from 6dec81e7: strip-content.ts:1016-1091 and sentinel.ts:204-221.
+export function stripProcessedImages(
+    messages: MessageLike[],
+    frozenIds: Set<string>,
+    options: {
+        detect: boolean;
+        watermark: number;
+        messageTagNumbers: Map<MessageLike, number>;
+        /** Commit new replay IDs before changing bytes; false leaves new images intact. */
+        persistNewIds?: (ids: readonly string[]) => boolean;
+        /** Reports only first strips, never restoring an already frozen image. */
+        onFirstApplication?: (message: MessageLike, partIndex: number) => void;
+    },
+): StripProcessedImagesResult {
+    const { detect, watermark, messageTagNumbers } = options;
+    let stripped = 0;
+    const newlyStrippedIds: string[] = [];
+    const planned: { message: MessageLike; partIndex: number; firstApplication: boolean }[] = [];
+    let hasAssistantResponse = false;
+
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        if (msg.info.role === "assistant") {
+            hasAssistantResponse = true;
+            continue;
+        }
+        if (msg.info.role !== "user") {
+            continue;
+        }
+
+        const id = typeof msg.info.id === "string" ? msg.info.id : undefined;
+        const inFrozen = id !== undefined && frozenIds.has(id);
+        // DETECT (cache-busting passes only): a processed (assistant-answered),
+        // aged (maxTag <= watermark) user message not yet frozen.
+        const maxTag = messageTagNumbers.get(msg) ?? 0;
+        const isNewDetection =
+            !inFrozen && detect && hasAssistantResponse && id !== undefined && maxTag <= watermark;
+
+        if (!inFrozen && !isNewDetection) {
+            continue;
+        }
+
+        let touchedThisMsg = false;
+        for (let j = 0; j < msg.parts.length; j++) {
+            const part = msg.parts[j];
+            if (!isRecord(part) || part.type !== "file") {
+                continue;
+            }
+            if (typeof part.mime !== "string" || !part.mime.startsWith("image/")) {
+                continue;
+            }
+            if (
+                typeof part.url === "string" &&
+                part.url.startsWith("data:") &&
+                part.url.length > 200
+            ) {
+                planned.push({ message: msg, partIndex: j, firstApplication: isNewDetection });
+                touchedThisMsg = true;
+            }
+        }
+        if (touchedThisMsg && isNewDetection && id !== undefined) {
+            newlyStrippedIds.push(id);
+        }
+    }
+
+    const persisted =
+        newlyStrippedIds.length === 0 || options.persistNewIds?.(newlyStrippedIds) !== false;
+    if (!persisted) newlyStrippedIds.length = 0;
+    for (const { message, partIndex, firstApplication } of planned) {
+        if (firstApplication && !persisted) continue;
+        if (firstApplication) options.onFirstApplication?.(message, partIndex);
+        message.parts[partIndex] = makeSentinel(message.parts[partIndex]);
+        stripped++;
+    }
+
+    return { stripped, newlyStrippedIds };
+}
+
+export function makeSentinel(originalPart: unknown): {
+    type: "text";
+    text: string;
+} & Record<string, unknown> {
+    const sentinel: { type: "text"; text: string } & Record<string, unknown> = {
+        type: "text",
+        text: "",
+    };
+    if (isRecord(originalPart)) {
+        if (originalPart.cache_control !== undefined) {
+            sentinel.cache_control = originalPart.cache_control;
+        }
+        if (originalPart.cacheControl !== undefined) {
+            sentinel.cacheControl = originalPart.cacheControl;
+        }
+    }
+    return sentinel;
+}

@@ -5,7 +5,6 @@ import {
     getActiveTagsBySession,
     getMaxTagNumberBySession,
     replaceSourceContent,
-    updateTagDropMode,
     updateTagStatus,
 } from "../../features/magic-context/storage";
 import {
@@ -14,7 +13,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import type { TagEntry } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared";
-import { applyNewToolDrop, hasSmallToolInput } from "./apply-operations";
+import { applyPersistedToolDrop, hasSmallToolInput } from "./apply-operations";
 import { applyCavemanCleanup, type CavemanCleanupConfig } from "./caveman-cleanup";
 import type { DroppedTokenReduction } from "./dropped-token-estimate";
 import {
@@ -187,38 +186,31 @@ export function applyHeuristicCleanup(
         if (plan.shouldDrop) {
             const toDrop = new Set(plan.tagNumbers);
             const newestEmergencyTags = recentTags;
-            db.transaction(() => {
-                for (const tag of tags) {
-                    if (!toDrop.has(tag.tagNumber)) continue;
-                    if (tag.status !== "active" || tag.type !== "tool") continue;
-                    const target = targets.get(tag.tagNumber);
-                    const recent =
-                        (emergency.usagePercentage ?? 0) < 95 &&
-                        newestEmergencyTags.has(tag.tagNumber);
-                    // Removing the result separator beside native reasoning lets Anthropic
-                    // merge signed assistant turns, so this safety case always keeps the
-                    // pair, with its real arguments.
-                    const { result, mode } = applyNewToolDrop(target, {
-                        inWindow: recent,
-                        keepSkeleton: target?.requiresToolArcSkeleton === true,
+            for (const tag of tags) {
+                if (!toDrop.has(tag.tagNumber)) continue;
+                if (tag.status !== "active" || tag.type !== "tool") continue;
+                const target = targets.get(tag.tagNumber);
+                const recent =
+                    (emergency.usagePercentage ?? 0) < 95 && newestEmergencyTags.has(tag.tagNumber);
+                // Keep the tool call and its placeholder result beside native reasoning:
+                // removing the result can merge separately signed assistant turns.
+                // The retained call keeps its real arguments.
+                const { result } = applyPersistedToolDrop(db, sessionId, tag.tagNumber, target, {
+                    inWindow: recent,
+                    keepSkeleton: target?.requiresToolArcSkeleton === true,
+                });
+                if (result === "removed" || result === "truncated") {
+                    droppedTools++;
+                    emergencyDroppedTools++;
+                    droppedTokenReductions.push({
+                        tagNumber: tag.tagNumber,
+                        mode: result === "removed" ? "full" : "truncated",
                     });
-                    if (result === "removed" || result === "truncated") {
-                        updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
-                        // Persist the mode applied (including drop() keeping the
-                        // call whose result ends the request) so replays match.
-                        updateTagDropMode(db, sessionId, tag.tagNumber, mode);
-                        droppedTools++;
-                        emergencyDroppedTools++;
-                        droppedTokenReductions.push({
-                            tagNumber: tag.tagNumber,
-                            mode: result === "removed" ? "full" : "truncated",
-                        });
-                        emergencyReclaimedTokens += estimateEmergencyDropReclaimTokens(
-                            measuredByTag.get(tag.tagNumber) ?? tag,
-                        );
-                    }
+                    emergencyReclaimedTokens += estimateEmergencyDropReclaimTokens(
+                        measuredByTag.get(tag.tagNumber) ?? tag,
+                    );
                 }
-            }).immediate();
+            }
             sessionLog(sessionId, `emergency tiered drop: ${plan.reason}`);
         } else {
             sessionLog(sessionId, `emergency tiered drop skipped: ${plan.reason}`);
@@ -328,36 +320,32 @@ export function applyHeuristicCleanup(
             group.push(tag);
             fingerprintGroups.set(fingerprint, group);
         }
-
-        // For each group with duplicates, drop all but the newest
-        db.transaction(() => {
-            for (const [, group] of fingerprintGroups) {
-                if (group.length <= 1) continue;
-                group.sort((a, b) => a.tagNumber - b.tagNumber);
-                // Keep the newest (last), drop the rest
-                for (let i = 0; i < group.length - 1; i++) {
-                    const tag = group[i];
-                    if (config.protectedTagNumbers.has(tag.tagNumber)) continue;
-                    const target = targets.get(tag.tagNumber);
-                    if (protectedTools.has(tag.tagNumber)) continue;
-                    if (target?.canDrop?.() === false) continue;
-                    // Deduplication remains a full drop; only the emergency newest-window
-                    // arm preserves skeleton bytes. A call that cannot be removed keeps
-                    // its real arguments.
-                    const { result, mode } = applyNewToolDrop(target, { inWindow: false });
-                    if (result === "incomplete") continue;
-                    updateTagDropMode(db, sessionId, tag.tagNumber, mode);
-                    updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
-                    if (result === "removed" || result === "truncated") {
-                        deduplicatedTools++;
-                        droppedTokenReductions.push({
-                            tagNumber: tag.tagNumber,
-                            mode: result === "removed" ? "full" : "truncated",
-                        });
-                    }
+        for (const [, group] of fingerprintGroups) {
+            if (group.length <= 1) continue;
+            group.sort((a, b) => a.tagNumber - b.tagNumber);
+            // Keep the newest (last), drop the rest
+            for (let i = 0; i < group.length - 1; i++) {
+                const tag = group[i];
+                if (config.protectedTagNumbers.has(tag.tagNumber)) continue;
+                const target = targets.get(tag.tagNumber);
+                if (protectedTools.has(tag.tagNumber)) continue;
+                if (target?.canDrop?.() === false) continue;
+                // Deduplication remains a full drop; only the emergency newest-window
+                // arm preserves skeleton bytes. A call that cannot be removed keeps
+                // its real arguments.
+                const { result } = applyPersistedToolDrop(db, sessionId, tag.tagNumber, target, {
+                    inWindow: false,
+                });
+                if (result === "incomplete") continue;
+                if (result === "removed" || result === "truncated") {
+                    deduplicatedTools++;
+                    droppedTokenReductions.push({
+                        tagNumber: tag.tagNumber,
+                        mode: result === "removed" ? "full" : "truncated",
+                    });
                 }
             }
-        }).immediate();
+        }
     }
 
     if (droppedTools > 0 || deduplicatedTools > 0 || droppedInjections > 0) {

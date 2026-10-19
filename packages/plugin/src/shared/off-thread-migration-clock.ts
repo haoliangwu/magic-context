@@ -19,9 +19,26 @@ let activeSince = 0;
 let accumulatedMs = 0;
 let idleWaiters: Array<() => void> = [];
 
+interface TestClock {
+    now(): number;
+    setTimeout(callback: () => void, delayMs: number): () => void;
+}
+
+let testClock: TestClock | undefined;
+
+function now(): number {
+    return testClock?.now() ?? performance.now();
+}
+
+function scheduleTimeout(callback: () => void, delayMs: number): () => void {
+    if (testClock) return testClock.setTimeout(callback, delayMs);
+    const timer = setTimeout(callback, delayMs);
+    return () => clearTimeout(timer);
+}
+
 /** Total milliseconds any off-thread migration has been running, up to `now`. */
-export function offThreadMigrationMs(now = performance.now()): number {
-    return accumulatedMs + (activeMigrations > 0 ? Math.max(0, now - activeSince) : 0);
+export function offThreadMigrationMs(at = now()): number {
+    return accumulatedMs + (activeMigrations > 0 ? Math.max(0, at - activeSince) : 0);
 }
 
 export function isOffThreadMigrationRunning(): boolean {
@@ -33,7 +50,7 @@ export function isOffThreadMigrationRunning(): boolean {
  * end; calling it more than once has no further effect.
  */
 export function beginOffThreadMigration(): () => void {
-    if (activeMigrations === 0) activeSince = performance.now();
+    if (activeMigrations === 0) activeSince = now();
     activeMigrations += 1;
     let ended = false;
     return () => {
@@ -41,7 +58,7 @@ export function beginOffThreadMigration(): () => void {
         ended = true;
         activeMigrations -= 1;
         if (activeMigrations > 0) return;
-        accumulatedMs += Math.max(0, performance.now() - activeSince);
+        accumulatedMs += Math.max(0, now() - activeSince);
         const waiters = idleWaiters;
         idleWaiters = [];
         for (const wake of waiters) wake();
@@ -66,10 +83,10 @@ export interface BootDeadlineTimer {
  * still running.
  */
 export function startBootDeadline(timeoutMs: number, onDeferred?: () => void): BootDeadlineTimer {
-    const startedAt = performance.now();
+    const startedAt = now();
     const migratedAtStart = offThreadMigrationMs(startedAt);
     const budgetMs = Math.max(0, timeoutMs);
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let cancelTimer: (() => void) | undefined;
     let cancelled = false;
     let deferredReported = false;
     let resolveExpired!: () => void;
@@ -78,13 +95,14 @@ export function startBootDeadline(timeoutMs: number, onDeferred?: () => void): B
     });
 
     const remainingMs = (): number => {
-        const now = performance.now();
-        const countedMs = now - startedAt - (offThreadMigrationMs(now) - migratedAtStart);
+        const currentTime = now();
+        const countedMs =
+            currentTime - startedAt - (offThreadMigrationMs(currentTime) - migratedAtStart);
         return budgetMs - countedMs;
     };
 
     const check = (): void => {
-        timer = undefined;
+        cancelTimer = undefined;
         if (cancelled) return;
         if (isOffThreadMigrationRunning()) {
             if (!deferredReported) {
@@ -96,21 +114,26 @@ export function startBootDeadline(timeoutMs: number, onDeferred?: () => void): B
         }
         const left = remainingMs();
         if (left > 0) {
-            timer = setTimeout(check, left);
+            cancelTimer = scheduleTimeout(check, left);
             return;
         }
         resolveExpired();
     };
 
-    timer = setTimeout(check, budgetMs);
+    cancelTimer = scheduleTimeout(check, budgetMs);
     return {
         expired,
         cancel: () => {
             cancelled = true;
-            if (timer) clearTimeout(timer);
-            timer = undefined;
+            cancelTimer?.();
+            cancelTimer = undefined;
         },
     };
+}
+
+/** Inject deterministic time and timers in tests; production uses host APIs. */
+export function __setOffThreadMigrationClockForTests(clock?: TestClock): void {
+    testClock = clock;
 }
 
 /** Test seam: forget accumulated migration time between isolated tests. */
@@ -118,6 +141,7 @@ export function __resetOffThreadMigrationClockForTests(): void {
     activeMigrations = 0;
     activeSince = 0;
     accumulatedMs = 0;
+    testClock = undefined;
     const waiters = idleWaiters;
     idleWaiters = [];
     for (const wake of waiters) wake();

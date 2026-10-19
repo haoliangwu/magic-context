@@ -5,6 +5,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { RustTestHarness } from "../src/rust-harness";
 import {
+    rustPassTurnsForFullBranch,
+    waitForRustPassTurns,
+} from "../src/rust-pass-observation";
+import {
     assertLoudModuleFailure,
     assertMessagesHaveNoPlaceholders,
     driveToSteadyState,
@@ -55,6 +59,19 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-h
                 { label: "FM-OC-3 park transition" },
             );
 
+            // Log batches can lag completed host turns. Join the submitted turns
+            // to their raw input prefixes before marking the recovery boundary.
+            const outageTurns = rustPassTurnsForFullBranch(
+                await h.listMessages(sessionId),
+                [
+                    ...[1, 2, 3].map(turn => `steady turn ${turn}:`),
+                    ...Array.from(
+                        { length: outagePasses },
+                        (_, offset) => `FM-OC-3 outage turn ${4 + offset}:`,
+                    ),
+                ],
+            );
+            await waitForRustPassTurns(h.logPath, outageTurns, () => h.readRustPasses());
             await h.subc.restoreModule();
             const recoveryStart = h.readRustPasses().length;
             await sendOutagePasses(

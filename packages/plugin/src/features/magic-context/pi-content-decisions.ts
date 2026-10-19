@@ -3,7 +3,19 @@ import { ensureSessionMetaRow } from "./storage-meta-shared";
 
 const PREFIX = "pi-content-replay-v1:";
 export const PI_CONTENT_DECISION_LIMIT = 4096;
-export type PiContentDecisionKind = "reminder-strip" | "seam-temporal-strip";
+/**
+ * Extra room only `tag-identity-recurring` records may use once the ledger is
+ * full. Pi records at most one per tag identity that came back after its one
+ * repair, so this bounds a rare diagnostic without evicting replay choices.
+ */
+export const PI_IDENTITY_RECURRENCE_ALLOWANCE = 64;
+export type PiContentDecisionKind =
+    | "reminder-strip"
+    | "seam-temporal-strip"
+    | "tag-identity-repair-once"
+    | "tag-identity-repair-pending"
+    | "tag-identity-rebuild-failed"
+    | "tag-identity-recurring";
 
 export function encodePiContentDecision(kind: PiContentDecisionKind, messageId: string): string {
     return PREFIX + JSON.stringify([kind, messageId]);
@@ -16,7 +28,12 @@ export function decodePiContentDecision(value: string): [PiContentDecisionKind, 
         if (
             Array.isArray(pair) &&
             pair.length === 2 &&
-            (pair[0] === "reminder-strip" || pair[0] === "seam-temporal-strip") &&
+            (pair[0] === "reminder-strip" ||
+                pair[0] === "seam-temporal-strip" ||
+                pair[0] === "tag-identity-repair-once" ||
+                pair[0] === "tag-identity-repair-pending" ||
+                pair[0] === "tag-identity-rebuild-failed" ||
+                pair[0] === "tag-identity-recurring") &&
             typeof pair[1] === "string" &&
             pair[1].length > 0
         )
@@ -80,14 +97,22 @@ export function freezePiContentDecision(
                         const decision = decodePiContentDecision(value);
                         return (
                             !decision ||
+                            decision[0] === "tag-identity-repair-once" ||
+                            decision[0] === "tag-identity-repair-pending" ||
+                            decision[0] === "tag-identity-rebuild-failed" ||
+                            decision[0] === "tag-identity-recurring" ||
                             !!(decision[0] === "seam-temporal-strip"
                                 ? ownsMessage.get(sessionId, `${decision[1]}:p`, `${decision[1]}:q`)
                                 : ownsTag.get(sessionId, decision[1]))
                         );
                     });
+                    const limit =
+                        kind === "tag-identity-recurring"
+                            ? PI_CONTENT_DECISION_LIMIT + PI_IDENTITY_RECURRENCE_ALLOWANCE
+                            : PI_CONTENT_DECISION_LIMIT;
                     if (
                         kept.filter((value) => decodePiContentDecision(value) !== null).length >=
-                        PI_CONTENT_DECISION_LIMIT
+                        limit
                     )
                         return false;
                     kept.push(entry);

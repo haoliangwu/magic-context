@@ -7,7 +7,7 @@ import { measure, type Event } from "./measure";
 
 // Recover replies already captured by the OpenCode process in its temporary
 // trial directory after a scenario assertion fails. No provider is called.
-const prefix = process.argv[2] ?? "docs/reports/issue-582-self-tag-supplement-failed";
+const prefix = process.argv[2] ?? ".cortexkit/internal-docs/investigations/reports/issue-582-self-tag-supplement-failed";
 const summary = JSON.parse(readFileSync(`${prefix}-summary.json`, "utf8"));
 if (!realpathSync(summary.root).startsWith(realpathSync(join(tmpdir(), "magic-context", "self-tag-trial")) + "/")) throw new Error("Recovery root escaped trial directory");
 const allEvents: Event[] = readFileSync(join(summary.root, "capture.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));

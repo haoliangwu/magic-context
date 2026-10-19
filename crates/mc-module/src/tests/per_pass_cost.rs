@@ -561,7 +561,7 @@ fn median(values: &mut [f64]) -> f64 {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "copy-only release profile; see docs/reports/ckmc-per-pass-cost.md"]
+#[ignore = "copy-only release profile; requires an explicit disposable store copy"]
 async fn copied_sessions_per_pass_cost() {
     if cfg!(debug_assertions) {
         panic!("use --release for meaningful timings");

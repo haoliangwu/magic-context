@@ -133,31 +133,33 @@ export class MagicContextRpcServer {
         }
         this.startedAt = Date.now();
         const self = this;
-        const server = Bun.serve<WsData>({
-            port: 0,
-            hostname: "127.0.0.1",
-            fetch(req, srv) {
-                return self.handleFetch(req, srv);
-            },
-            websocket: {
-                open(ws) {
-                    // Close the socket if it doesn't authenticate promptly. A
-                    // never-authenticated socket holds no sink and is harmless,
-                    // but we don't want to keep raw connections open forever.
-                    ws.data.authTimer = setTimeout(() => {
-                        if (!ws.data.authed) ws.close(WS_CLOSE_UNAUTHORIZED, "auth timeout");
-                    }, WS_AUTH_TIMEOUT_MS);
+        const server = inRootAsyncContext(() =>
+            Bun.serve<WsData>({
+                port: 0,
+                hostname: "127.0.0.1",
+                fetch(req, srv) {
+                    return self.handleFetch(req, srv);
                 },
-                message(ws, raw) {
-                    self.handleWsMessage(ws, raw);
+                websocket: {
+                    open(ws) {
+                        // Close the socket if it doesn't authenticate promptly. A
+                        // never-authenticated socket holds no sink and is harmless,
+                        // but we don't want to keep raw connections open forever.
+                        ws.data.authTimer = setTimeout(() => {
+                            if (!ws.data.authed) ws.close(WS_CLOSE_UNAUTHORIZED, "auth timeout");
+                        }, WS_AUTH_TIMEOUT_MS);
+                    },
+                    message(ws, raw) {
+                        self.handleWsMessage(ws, raw);
+                    },
+                    close(ws) {
+                        if (ws.data.authTimer) clearTimeout(ws.data.authTimer);
+                        ws.data.unregister?.();
+                        self.sockets.delete(ws);
+                    },
                 },
-                close(ws) {
-                    if (ws.data.authTimer) clearTimeout(ws.data.authTimer);
-                    ws.data.unregister?.();
-                    self.sockets.delete(ws);
-                },
-            },
-        });
+            }),
+        );
 
         this.server = server;
         this.port = server.port ?? 0;
@@ -429,3 +431,5 @@ function json(body: unknown, status = 200): Response {
         headers: { "Content-Type": "application/json" },
     });
 }
+
+import { inRootAsyncContext } from "./sqlite";

@@ -354,10 +354,12 @@ function runHostPluginInstall(
         const onAbort = () => finish(false);
         signal?.addEventListener("abort", onAbort, { once: true });
         try {
-            const proc = spawn("opencode", ["plugin", spec, "--global", "--force"], {
-                windowsHide: true,
-                stdio: "ignore",
-            });
+            const proc = inRootAsyncContext(() =>
+                spawn("opencode", ["plugin", spec, "--global", "--force"], {
+                    windowsHide: true,
+                    stdio: "ignore",
+                }),
+            );
             processStarted = true;
             proc.on("error", () => finish(false, false));
             proc.on("exit", (code) => finish(code === 0));
@@ -536,3 +538,5 @@ export async function getLatestVersion(
         clearTimeout(timeoutId);
     }
 }
+
+import { inRootAsyncContext } from "../../shared/sqlite";

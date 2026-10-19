@@ -1,23 +1,12 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { type DiagnosticReport, renderDiagnosticsMarkdown } from "./diagnostics-opencode";
-import { capBodyToGithubLimit, extractRecentErrors } from "./issue-body";
+import { capBodyToGithubLimit, prepareIssueReport } from "./issue-body";
 import { parseLogLine, readLogLines } from "./log-lines";
 import { sanitizeConfigValue, sanitizeDiagnosticText } from "./redaction";
 
-/**
- * Replace absolute home paths, usernames, and known secret-token shapes in
- * captured log lines so users can share reports publicly without leaking
- * local paths or credentials.
- *
- * Order of operations matters:
- *   1. Path/user redaction first — paths are deterministic and the
- *      easiest to match, doing them before token redaction means
- *      tokens never appear inside a path-resolved replacement.
- *   2. Secret-token redaction in `SECRET_PATTERNS` order — more
- *      specific shapes (provider-prefixed keys) before generic
- *      assignment patterns, so a known shape doesn't get caught
- *      twice.
+/** Credential/path-prefix redaction for diagnostic text, not a public log projection.
+ * Issue attachments use prepareIssueReport so source and tool content is removed too.
  */
 export function sanitizeLogContent(content: string): string {
     return sanitizeDiagnosticText(content);
@@ -86,34 +75,6 @@ export function extractHistorianFailureLines(sanitized: string, limit = 30): str
     return matches.reverse();
 }
 
-/**
- * Drop log lines that reference a `ses_*` session ID OTHER than `sessionId`.
- * Lines without any `ses_*` reference are kept (they're shared-runtime logs
- * that may or may not be relevant — we don't have enough signal to drop
- * them, and keeping them is safe).
- *
- * When `sessionId` is null, no filtering happens — the full log slice is
- * returned. This is the Q2 design: filter only when the user picked a
- * specific session in the `--issue` picker.
- */
-function filterLogLinesBySession(lines: string[], sessionId: string | null): string[] {
-    if (!sessionId) return lines;
-    // Pattern matches OpenCode session IDs (`ses_*` with hex/alnum body, up to
-    // 32 chars). Anchored with a non-word boundary so we don't trip on names
-    // that happen to embed `ses_`.
-    const otherSessionPattern = /\bses_[A-Za-z0-9]{3,64}\b/g;
-    return lines.filter((line) => {
-        const parsed = parseLogLine(line);
-        if (parsed?.session && parsed.session !== sessionId) return false;
-        const matches =
-            parsed?.message.match(otherSessionPattern) ?? line.match(otherSessionPattern);
-        if (!matches) return true;
-        // Keep the line only if EVERY session ID it mentions matches the chosen
-        // one. Mixed-session lines (rare but possible) get dropped to be safe.
-        return matches.every((id) => id === sessionId);
-    });
-}
-
 export async function bundleIssueReport(
     report: DiagnosticReport,
     description: string,
@@ -123,15 +84,18 @@ export async function bundleIssueReport(
 ): Promise<BundledIssueReport> {
     const LOG_TAIL_LINES = 400;
     const allLogLines = readLogLines(report.logFiles ?? [report.logFile]);
-    const logLines = filterLogLinesBySession(allLogLines, sessionFilter);
-    const recentLog = sanitizeLogContent(logLines.slice(-LOG_TAIL_LINES).join("\n")).trim();
+    const prepared = prepareIssueReport(report, allLogLines, sessionFilter);
+    const { privacy, logLines, recentLog, recentErrorLines } = prepared;
+    report = prepared.report;
 
     // Also extract historian-failure lines from a wider window so issue reports
     // still capture failure signals even when more recent noise has pushed them
     // out of the 400-line tail. We scan the last 4000 lines for historian
     // patterns and keep up to 30 matches.
-    const historianScanWindow = sanitizeLogContent(logLines.slice(-4000).join("\n"));
-    const historianFailureLines = extractHistorianFailureLines(historianScanWindow, 30);
+    const historianScanWindow = logLines.slice(-4000).join("\n");
+    const historianFailureLines = extractHistorianFailureLines(historianScanWindow, 30).map(
+        (line) => privacy.logLine(line),
+    );
 
     // Pull the most recent 20 ERROR-shaped lines into their own dedicated
     // section. The body-size cap (`capBodyToGithubLimit`) only shrinks the
@@ -140,8 +104,6 @@ export async function bundleIssueReport(
     // when the body needs heavy truncation. We scan a wide window for the
     // same reason as historian: a flood of debug noise after the error
     // shouldn't push the cause out of view.
-    const errorScanWindow = sanitizeLogContent(logLines.slice(-4000).join("\n"));
-    const recentErrorLines = extractRecentErrors(errorScanWindow, 20);
 
     const configBody = JSON.stringify(
         sanitizeConfigValue(report.magicContextConfig.flags),
@@ -149,12 +111,12 @@ export async function bundleIssueReport(
         2,
     );
     const sanitizedConfigPath = sanitizeDiagnosticText(report.configPaths.magicContextConfig);
-    const sanitizedDescription = sanitizeDiagnosticText(description);
-    const sanitizedTitle = sanitizeDiagnosticText(title).trim();
+    const sanitizedDescription = privacy.userText(description);
+    const sanitizedTitle = privacy.userText(title).trim();
 
     const selectedSession = sessionFilter
         ? (report.recentSessions.available ? report.recentSessions.rows : []).find(
-              (session) => session.sessionId === sessionFilter,
+              (session) => session.sessionId === privacy.session(sessionFilter),
           )
         : undefined;
     const sessionContext = selectedSession
@@ -171,6 +133,8 @@ export async function bundleIssueReport(
         ...sessionContext,
         "## Description",
         sanitizedDescription,
+        "",
+        privacy.notice,
         "",
         "## Environment",
         `- Plugin: v${report.pluginVersion}`,

@@ -27,6 +27,7 @@ import { readReplayDocument } from "../../features/magic-context/storage-replay-
 import { createTagger } from "../../features/magic-context/tagger";
 import { Database } from "../../shared/sqlite";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
+import { requestPendingMaterialization } from "./pending-materialization";
 import { estimateTokens } from "./read-session-formatting";
 import { reasoningBudgetCutoff, reasoningStepCost } from "./reasoning-budget";
 import {
@@ -428,6 +429,13 @@ describe("reasoning removal through postprocess", () => {
             thinkingBindingRecoveryEnabledForModel: options.prefixBound ?? false,
             ...options.overrides,
         };
+        // A busting fixture explicitly requests a user flush; execute alone is not a rewrite.
+        if (options.busting)
+            requestPendingMaterialization(
+                args.pendingMaterializationSessions,
+                sessionId,
+                "user_flush",
+            );
         return runPostTransformPhase(args);
     }
 
@@ -450,7 +458,7 @@ describe("reasoning removal through postprocess", () => {
         await pass(database, sessionId, session, {
             busting: true,
             providerID: "google-vertex-anthropic",
-            prefixBound: true,
+            prefixBound: false,
             overrides: { keepReasoningTokens: 3 * rawCost },
         });
         expect(getRemovedReasoningIds(database, sessionId)).toEqual(

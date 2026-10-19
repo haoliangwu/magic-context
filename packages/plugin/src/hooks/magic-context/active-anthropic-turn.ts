@@ -10,7 +10,16 @@ export function isInActiveAnthropicTurn<T>(
     index: number,
     anthropic: boolean,
 ): boolean {
-    if (!anthropic) return false;
+    const start = activeAnthropicTurnStart(messages, anthropic);
+    return start !== undefined && index >= start;
+}
+
+/** Resolve the shared user boundary once when classifying many messages. */
+export function activeAnthropicTurnStart<T>(
+    messages: readonly T[],
+    anthropic: boolean,
+): number | undefined {
+    if (!anthropic) return undefined;
     for (let user = messages.length - 1; user >= 0; user--) {
         const message = messages[user];
         if (!isRecord(message)) continue;
@@ -34,9 +43,9 @@ export function isInActiveAnthropicTurn<T>(
             )
         )
             continue;
-        return index > user;
+        return user + 1;
     }
-    return false;
+    return undefined;
 }
 
 /** Host-independent inference for pure adapters; live callers also supply their route. */

@@ -178,9 +178,11 @@ test("a timed-out primary historian falls back to the next model and publishes i
     expect(attempted).toEqual(["prov/primary", "prov/fallback"]);
     expect(result.ok).toBe(true);
     expect(result.compartments?.[0]?.content).toContain("Fallback kept this.");
-    const statuses = getSubagentInvocations(db, "parent-timeout-fallback").map((row) => row.status);
+    const invocations = getSubagentInvocations(db, "parent-timeout-fallback");
+    const statuses = invocations.map((row) => row.status);
     expect(statuses).toContain("timed_out");
     expect(statuses).toContain("completed");
+    expect(invocations.find((row) => row.status === "completed")?.task).toBe("fallback");
 });
 
 test("32k historian reaches the provider without a configured output cap and surfaces its assistant error", async () => {

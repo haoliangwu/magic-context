@@ -7,11 +7,13 @@ import { createTestTempDirFromPath } from "./test-temp-dir";
 // The scenario runs in a child process with NODE_ENV=production because the
 // shared logger is silent under test. It imports storage-db for its side effect
 // of registering the real log sink, then drives three privileged writes and one
-// background writer through two connections on a throwaway database:
-//   wait  - another connection holds the lock for 300 ms, the hold is short
-//   hold  - the lock comes at once, the operation keeps it for 300 ms
-//   fast  - neither crosses the threshold, so nothing is logged
-//   async - beginSqliteWriterAsync acquires at once and holds for 300 ms
+// background writer through two connections on a throwaway database.
+// Acquisition measures waiting for BEGIN to succeed; hold measures time from
+// successful BEGIN through COMMIT. The injected clock separates those costs:
+//   wait  - 300 ms before BEGIN and 0 ms held: log a foreground acquisition
+//   hold  - 0 ms before BEGIN and 300 ms held: log a foreground hold
+//   fast  - 0 ms for both: do not log anything
+//   async - 0 ms before BEGIN and 300 ms held: log the background writer's own site
 const scenario = `
     await import(${JSON.stringify(new URL("../features/magic-context/storage-db.ts", import.meta.url).href)});
     const sqlite = await import(${JSON.stringify(new URL("./sqlite.ts", import.meta.url).href)});
@@ -20,19 +22,38 @@ const scenario = `
     const holder = new sqlite.Database(dbPath);
     holder.exec("PRAGMA journal_mode=WAL; CREATE TABLE context_privilege_state(id INTEGER PRIMARY KEY, enabled INTEGER)");
     const writer = new sqlite.Database(dbPath);
-    const spin = (ms) => { const end = performance.now() + ms; while (performance.now() < end) {} };
+    let now = 0;
+    performance.now = () => now;
+    const hold = () => { now += 300; };
 
     holder.exec("BEGIN IMMEDIATE");
-    setTimeout(() => holder.exec("COMMIT"), 300);
-    await sqlite.withAsyncPrivilegedWriter(writer, () => undefined);
+    await sqlite.withAsyncPrivilegedWriter(writer, () => undefined, {
+        beforeRetry: () => { now += 300; holder.exec("COMMIT"); },
+    });
 
-    await sqlite.withAsyncPrivilegedWriter(writer, () => spin(300));
+    await sqlite.withAsyncPrivilegedWriter(writer, hold);
 
     await sqlite.withAsyncPrivilegedWriter(writer, () => undefined);
 
     await sqlite.beginSqliteWriterAsync(writer, "historian-publish");
-    spin(300);
+    hold();
     writer.exec("COMMIT");
+
+    writer.exec("BEGIN IMMEDIATE");
+    now += 101;
+    writer.exec("ROLLBACK");
+
+    writer.exec("CREATE TABLE result(value)");
+    const statementTimes = [now, now + 101];
+    performance.now = () => statementTimes.shift() ?? now;
+    writer.prepare("INSERT INTO result VALUES (1)").run();
+    now += 101;
+
+    let clockReads = 0;
+    performance.now = () => { clockReads++; return now; };
+    writer.exec("BEGIN IMMEDIATE");
+    writer.exec("COMMIT");
+    if (clockReads !== 2) throw new Error("fast unscoped transaction clock reads=" + clockReads);
 
     logger.flushLogger();
     writer.close();
@@ -101,6 +122,21 @@ describe("sqlite writer diagnostics", () => {
         expect(consoleOutput).not.toContain("sqlite writer");
     });
 
+    test("unscoped rollback names the host, pid and caller at the 100ms threshold", () => {
+        const rolledBack = logLines.find((line) => line.includes("outcome=rolled_back"));
+        expect(rolledBack).toContain("lane=background");
+        expect(rolledBack).toContain("hold_ms=101");
+        expect(rolledBack).toMatch(/pid=\d+ host=opencode/);
+        expect(rolledBack).toContain("caller=");
+    });
+
+    test("native autocommit time is labelled as including acquisition, not lock ownership", () => {
+        const statement = logLines.find((line) => line.includes("site=autocommit"));
+        expect(statement).toContain("elapsed_ms=101");
+        expect(statement).toContain("timing=statement_including_acquisition");
+        expect(statement).not.toContain("hold_ms=");
+    });
+
     test("a writer that waited for the lock reports the wait, not its short hold", () => {
         const waited = logLines.find((line) => line.includes("attempts=2"));
         if (!waited) throw new Error(`no retried acquisition logged:\n${logLines.join("\n")}`);
@@ -109,6 +145,8 @@ describe("sqlite writer diagnostics", () => {
         expect(waited).toContain("outcome=committed");
         expect(field(waited, "acquire_ms")).toBeGreaterThanOrEqual(250);
         expect(field(waited, "hold_ms")).toBeLessThan(250);
+        expect(field(waited, "acquire_ms")).toBe(300);
+        expect(field(waited, "hold_ms")).toBe(0);
     });
 
     test("a writer that held the lock reports the hold, not its quick acquisition", () => {
@@ -118,6 +156,8 @@ describe("sqlite writer diagnostics", () => {
         expect(held).toHaveLength(1);
         expect(field(held[0], "acquire_ms")).toBeLessThan(250);
         expect(field(held[0], "hold_ms")).toBeGreaterThanOrEqual(300);
+        expect(field(held[0], "acquire_ms")).toBe(0);
+        expect(field(held[0], "hold_ms")).toBe(300);
     });
 
     test("an async background writer reports its hold under its own site", () => {
@@ -126,6 +166,8 @@ describe("sqlite writer diagnostics", () => {
         expect(held[0]).toContain("lane=background");
         expect(field(held[0], "acquire_ms")).toBeLessThan(250);
         expect(field(held[0], "hold_ms")).toBeGreaterThanOrEqual(300);
+        expect(field(held[0], "acquire_ms")).toBe(0);
+        expect(field(held[0], "hold_ms")).toBe(300);
     });
 
     test("a fast writer stays out of the log", () => {

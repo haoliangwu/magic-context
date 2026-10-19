@@ -20,7 +20,7 @@ import { estimateTokens } from "../../plugin/src/hooks/magic-context/read-sessio
 // fold after a policy edit; "shrink safe" requires one resize and a first request
 // within the smaller usable window. Later user-tail growth can independently
 // exhaust the window. The mock accepts all sizes; token counts are local estimates.
-// Additional isolation details: docs/reports/issue-572-render-budget-plan.md.
+// The temporary root below fences every spawned host and its generated stores.
 if (!realpathSync(tmpdir()).includes("/magic-context/issue-572"))
 	throw new Error("Set TMPDIR to a throwaway magic-context/issue-572 root");
 const mode = Bun.argv[2] ?? "configured";

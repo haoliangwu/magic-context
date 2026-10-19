@@ -387,7 +387,9 @@ describe("dream-timer message-history maintenance (static)", () => {
         );
         expect(tick).toContain("runMessageHistoryMaintenance(db)");
         expect(tick).toContain("retryPendingSessionCleanups(db)");
-        expect(tick).toContain("sweepOrphanedOpenCodeMessageIndexes(db, openOpenCodeDb)");
+        expect(tick).toContain(
+            "await sweepOrphanedOpenCodeMessageIndexesOffThread(db, openOpenCodeDb)",
+        );
     });
 });
 

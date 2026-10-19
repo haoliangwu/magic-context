@@ -54,8 +54,27 @@ const GATED_VERSION: u8 = 3;
 /// Broca's own table (`KNOWN_FEATURES` in broca-wal's framing.rs). A name
 /// missing here stops the session at the first frame that requires it: a
 /// missing `restart-pause/v1` cut every mason run Broca paused for a daemon
-/// restart at the pause, hiding every step after the resume. Each name below
-/// only adds a field or a record type this reader does not use.
+/// restart at the pause, hiding every step after the resume, and a missing
+/// `session-class/v1` did the same to every run from its first record.
+///
+/// Each name below only adds a field or a record type this reader does not
+/// use; Broca's owner confirmed that for each. `compaction/v1`,
+/// `compaction-wait/v1` and `step-transforms/v1` change which messages the
+/// model saw, which matters only to a transcript view: this reader takes
+/// usage, steps and timestamps, which they leave as they were.
+/// `input-token-cap/v1` adds a `budget_exhausted` run end, and this reader
+/// only records that a run finished, not why. `structured-output/v1` adds the
+/// run's frozen output schema to `RunStarted` and a structured result record
+/// at the run's end, neither of which this reader uses.
+/// `provider-text-state/v1` adds a `text_with_state` assistant content block
+/// and a render-config flag; this reader never reads message content, so it
+/// needs no handling here. A future transcript view must render that block's
+/// `text` like a `text` block. `openrouter-reasoning/v1` marks frames whose
+/// assistant content carries OpenRouter reasoning state as a reasoning block;
+/// usage, steps and timestamps are unchanged. `structured-output-downgrade/v1`
+/// marks a frame recording that a run's structured output fell back to
+/// non-strict after the provider refused a strict schema; it carries no
+/// messages, usage or timestamps.
 const KNOWN_FEATURES: &[&str] = &[
     "flow-scopes/v1",
     "plan-manifest/v1",
@@ -64,6 +83,19 @@ const KNOWN_FEATURES: &[&str] = &[
     "steer-queue/v1",
     "archive-index/v2",
     "dispatch-module/v1",
+    "session-class/v1",
+    "retention/v1",
+    "run-cancel-at/v1",
+    "agent-run-scopes/v1",
+    "deferred-call/v1",
+    "compaction/v1",
+    "compaction-wait/v1",
+    "step-transforms/v1",
+    "input-token-cap/v1",
+    "structured-output/v1",
+    "provider-text-state/v1",
+    "openrouter-reasoning/v1",
+    "structured-output-downgrade/v1",
 ];
 
 #[derive(serde::Deserialize)]
@@ -161,6 +193,10 @@ pub(crate) struct WalStep {
     /// run's.
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Size in bytes of the request body sent for the step's last provider
+    /// attempt (`model_attempt_finished.request_body_len`). `None` when the
+    /// WAL recorded no attempt size for the step.
+    pub request_body_len: Option<i64>,
 }
 
 /// One run (episode) of a session, from its `run_started` record on.
@@ -451,6 +487,9 @@ struct Fold {
     runs: Vec<WalRun>,
     step_started_ts: HashMap<u64, i64>,
     attempt_ts: HashMap<u64, i64>,
+    /// The request body size of each in-flight step's latest attempt; a retry
+    /// overwrites the failed attempt's size.
+    attempt_request_len: HashMap<u64, i64>,
     last_ts_ms: Option<i64>,
     activity_note: Option<String>,
 }
@@ -488,6 +527,7 @@ impl Fold {
                 .filter(|limit| *limit > 0);
             self.step_started_ts.clear();
             self.attempt_ts.clear();
+            self.attempt_request_len.clear();
             self.runs.push(WalRun {
                 run_id,
                 ts_ms: envelope_ts,
@@ -516,8 +556,12 @@ impl Fold {
                 }
             }
             "model_attempt_finished" => {
+                let step_id = step_id()?;
                 if let Some(ts) = envelope_ts {
-                    self.attempt_ts.insert(step_id()?, ts);
+                    self.attempt_ts.insert(step_id, ts);
+                }
+                if let Some(len) = record.get("request_body_len").and_then(non_negative_int) {
+                    self.attempt_request_len.insert(step_id, len);
                 }
             }
             "model_step_finished" => {
@@ -530,6 +574,7 @@ impl Fold {
                 };
                 let started = self.step_started_ts.remove(&step_id);
                 let attempted = self.attempt_ts.remove(&step_id);
+                let request_body_len = self.attempt_request_len.remove(&step_id);
                 run.steps.push(WalStep {
                     step_id,
                     ts_ms: envelope_ts.or(attempted).or(started),
@@ -542,6 +587,7 @@ impl Fold {
                     finish_reason: finish_reason(record.get("finish_reason")),
                     provider: string_field(record, "provider").or_else(|| run.provider.clone()),
                     model: string_field(record, "model").or_else(|| run.model.clone()),
+                    request_body_len,
                 });
             }
             "run_finished" => run.finished = true,
@@ -1142,6 +1188,36 @@ pub(crate) mod tests {
             .collect()
     }
 
+    #[test]
+    fn each_step_keeps_its_last_attempt_request_size() {
+        let sized = |step: u64, attempt: u64, len: u64| {
+            json!({"type": "model_attempt_finished", "step_id": step, "attempt": attempt,
+                   "ts_ms": 1_000 + step * 10 + attempt, "request_body_len": len,
+                   "request_body_sha256": "00", "response_body_len": 1,
+                   "response_body_sha256": "00", "outcome": "completed"})
+        };
+        let mut wal = Wal::new();
+        wal.push(run_started("r1", 1_000))
+            // A retried step: the request that succeeded is the second one.
+            .push(step_started(1))
+            .push(sized(1, 0, 100))
+            .push(sized(1, 1, 378_960))
+            .push(step_finished(1, usage(10, 0, 0, 10)))
+            .push(step_started(2))
+            .push(sized(2, 0, 382_956))
+            .push(step_finished(2, usage(10, 0, 0, 10)))
+            // No attempt record, so no size.
+            .push(step_started(3))
+            .push(step_finished(3, usage(10, 0, 0, 10)));
+        let runs = decode(&wal.bytes).unwrap();
+        let lens: Vec<_> = runs[0]
+            .steps
+            .iter()
+            .map(|step| step.request_body_len)
+            .collect();
+        assert_eq!(lens, [Some(378_960), Some(382_956), None]);
+    }
+
     /// Addresses produced by Broca's own `scripts/wal-addressability.py --key`
     /// for each triple, including canonical macOS temp roots and two triples
     /// taken from live WAL filenames. A port that got the separator, the
@@ -1720,10 +1796,10 @@ pub(crate) mod tests {
         assert!(runs[0].finished);
     }
 
-    /// Every feature name Broca 0.3.189 writes (`KNOWN_FEATURES` in
-    /// broca-wal's framing.rs), spelled out rather than taken from this
-    /// reader's own list, so a name Broca adds and this reader lacks shows up
-    /// here instead of silently truncating sessions.
+    /// Every feature name Broca writes (`KNOWN_FEATURES` in
+    /// broca-wal's framing.rs), spelled out rather than taken from this reader's own list,
+    /// so a name Broca adds and this reader lacks shows up here instead of
+    /// silently truncating sessions.
     #[test]
     fn every_feature_broca_writes_is_understood() {
         for feature in [
@@ -1734,6 +1810,19 @@ pub(crate) mod tests {
             "steer-queue/v1",
             "archive-index/v2",
             "dispatch-module/v1",
+            "session-class/v1",
+            "retention/v1",
+            "run-cancel-at/v1",
+            "agent-run-scopes/v1",
+            "deferred-call/v1",
+            "compaction/v1",
+            "compaction-wait/v1",
+            "step-transforms/v1",
+            "input-token-cap/v1",
+            "structured-output/v1",
+            "provider-text-state/v1",
+            "openrouter-reasoning/v1",
+            "structured-output-downgrade/v1",
         ] {
             let bytes = wal_bytes(&[
                 json!({"requires": [feature], "record": run_started("r1", 1)}),
@@ -1742,6 +1831,38 @@ pub(crate) mod tests {
             let runs = decode(&bytes).unwrap_or_else(|e| panic!("{feature}: {e}"));
             assert_eq!(step_ids(&runs), [("r1".to_string(), 1)], "{feature}");
         }
+    }
+
+    /// `structured-output/v1` adds the frozen schema settings to `RunStarted`
+    /// and a structured result record at the run's end; a run that carries both
+    /// still yields its steps and finishes.
+    #[test]
+    fn a_structured_output_run_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["structured_output"] = json!({"schema_digest": "sha256:00", "mode": "best_effort"});
+        let bytes = wal_bytes(&[
+            json!({"requires": ["structured-output/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+            json!({"requires": ["structured-output/v1"],
+                   "record": {"type": "structured_result", "run_id": "r1", "value": {"ok": true}}}),
+        ]);
+        let runs = decode(&bytes).unwrap();
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `session-class/v1` adds `session_class` to `RunStarted`; a run that
+    /// carries it still yields its steps (Broca's 03:25Z deploy on
+    /// 2026-10-17 started writing it on every run).
+    #[test]
+    fn a_run_started_with_a_session_class_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["session_class"] = json!("mason");
+        let bytes = wal_bytes(&[
+            json!({"requires": ["session-class/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).unwrap();
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
     }
 
     #[test]
@@ -2129,7 +2250,10 @@ pub(crate) mod tests {
     fn decoded_archived_members_are_bounded() {
         let mut cache = WalCache::default();
         for i in 0..(MAX_REMEMBERED_ARCHIVED as u64 + 5) {
-            cache.remember_archived((PathBuf::from(format!("c{i}.ark")), 0, 100), Err("x".into()));
+            cache.remember_archived(
+                (PathBuf::from(format!("c{i}.ark")), 0, 100),
+                Err("x".into()),
+            );
         }
         assert!(cache.archived.len() <= MAX_REMEMBERED_ARCHIVED);
 

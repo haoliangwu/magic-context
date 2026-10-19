@@ -25,6 +25,7 @@ import {
     startCompartmentAgent,
 } from "./compartment-runner";
 import { checkCompartmentTrigger } from "./compartment-trigger";
+import { requestPendingMaterialization } from "./pending-materialization";
 import { deriveProtectedTailTokenTarget, selectPerRunCap } from "./protected-tail-boundary";
 import { setRawMessageProvider } from "./read-session-chunk";
 import { createTransform } from "./transform";
@@ -243,7 +244,7 @@ for (const lane of ["defer", "flush", "fold", "force"] as const) {
             "incremental",
         );
         updateSessionMeta(db, sessionId, { compartmentInProgress: true });
-        if (lane === "flush") materialize.add(sessionId);
+        if (lane === "flush") requestPendingMaterialization(materialize, sessionId, "user_flush");
         if (lane === "fold")
             models.set(sessionId, { providerID: "anthropic", modelID: "claude-opus-4-6" });
         if (lane === "force")

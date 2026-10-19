@@ -1,5 +1,6 @@
 import { expect, it } from "bun:test";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
+import { requestPendingMaterialization } from "@magic-context/core/hooks/magic-context/pending-materialization";
 import { createTransform } from "@magic-context/core/hooks/magic-context/transform";
 import { createTestTempDir } from "@magic-context/core/shared/test-temp-dir";
 import fixture from "../../../testdata/temporal-session-parity.json";
@@ -74,6 +75,8 @@ it("Pi and both OpenCode transforms serve the shared Rust session fixture's exac
 				runtime === "OpenCode 2"
 					? createHostSeams({} as V2Context, read, read, models)
 					: {};
+			const pending = new Set<string>();
+			requestPendingMaterialization(pending, id, "user_flush");
 			await createTransform({
 				...seams,
 				db,
@@ -81,7 +84,7 @@ it("Pi and both OpenCode transforms serve the shared Rust session fixture's exac
 				scheduler: { shouldExecute: () => "defer" },
 				contextUsageMap: new Map(),
 				historyRefreshSessions: new Set(),
-				pendingMaterializationSessions: new Set([id]),
+				pendingMaterializationSessions: pending,
 				lastHeuristicsTurnId: new Map(),
 				experimentalTemporalAwareness: true,
 				historianRunnable: false,

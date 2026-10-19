@@ -10,6 +10,33 @@
  * Both shapes are normalized to role + part type/length/text-prefix messages so
  * attribution and --show-diff have the same output on either lane.
  *
+ * Usage fields and the meter, per provider:
+ *   Anthropic  `input_tokens` are the uncached tokens after the last cache
+ *              breakpoint; `cache_read_input_tokens` were served from cache and
+ *              `cache_creation_input_tokens` were written to it
+ *              (https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching#tracking-cache-performance).
+ *              A request is cache-healthy when its read covers what the previous
+ *              request read or wrote: read >= previous read + previous write - 64.
+ *              Uncached input never counts as reuse. Counting it ("read + input")
+ *              let a request with no breakpoint after the head, which read 47k and
+ *              billed ~475k as input, pass as a warm hit. A short read that wrote
+ *              nothing while >= 1,024 tokens went uncached is
+ *              `missing_breakpoint_after_read` and always a BUST: the request's own
+ *              shape caused it, whatever its bytes. A short read with a large write
+ *              is a rewrite and goes through the shared classifier.
+ *   OpenAI     `prompt_tokens`/`input_tokens` include `cached_tokens`; there are no
+ *              breakpoints or write meter, because every prompt prefix is cached
+ *              implicitly (https://platform.openai.com/docs/guides/prompt-caching).
+ *              The read is `cached_tokens` alone; the uncached part never counts.
+ *   Gemini     `promptTokenCount` includes `cachedContentTokenCount`; implicit
+ *              caching has no write meter either
+ *              (https://ai.google.dev/gemini-api/docs/caching, "Implicit caching").
+ *   For OpenAI and Gemini the previous request's uncached tail may not be cached
+ *   yet when the next request arrives, so the floor is the previous read, not the
+ *   previous prompt.
+ * Any provider: a short read more than --cache-ttl (default 5m) after the prefix
+ * was last read in full or written is `idle_cache_expiry`.
+ *
  * Usage:
  *   bun scripts/analyze-cache-busts.ts <sessionIdPrefix> [options]
  *   bun scripts/analyze-cache-busts.ts --session <sessionIdPrefix> [options]
@@ -21,6 +48,7 @@
  *   --since <time>   created at/after ISO time or duration ago (for example 30m)
  *   --until <time>   created at/before ISO time or duration ago
  *   --limit <N>      only the last N requests in range
+ *   --cache-ttl <d>  idle time after which the provider prefix is expired (default 5m)
  *   --show-diff      print before/after snippet of the first-diverging segment
  *   --all-busts      list every diverging segment, not just the first
  *   --all-rows       also print STABLE and UNMETERED rows
@@ -33,8 +61,15 @@ import {
     type CacheBustDecisionAttribution,
     type CacheBustDivergenceClass,
     type CacheBustSessionAnalysis,
+    CACHE_READ_EPSILON_TOKENS,
+    cachedPrefixFloor,
     classifyCacheBust,
+    DEFAULT_CACHE_TTL_MS,
+    isIdleCacheExpiry,
+    isMissingBreakpointAfterRead,
     nearestCacheBustDecision,
+    parseCacheTtl,
+    refreshesCachedPrefix,
 } from "./cache-bust-attribution";
 import {
     type BodyProvider,
@@ -68,6 +103,7 @@ interface Args {
     since?: string;
     until?: string;
     limit?: number;
+    cacheTtl?: string;
     showDiff: boolean;
     allBusts: boolean;
     allRows: boolean;
@@ -159,6 +195,8 @@ export interface AnalysisRow {
     meterFloor?: number;
     comparableRead?: number;
     shortRead?: boolean;
+    /** Time since the cached prefix was last read in full or written. */
+    idleGapMs?: number;
     rewrittenTokens?: number;
     divergenceClass?: CacheBustDivergenceClass;
     decision?: CacheBustDecisionAttribution;
@@ -176,6 +214,8 @@ export interface OpenCodeCacheBustAnalysisOptions {
     scanCursor?: string;
     scanDeadlineMs?: number;
     scanNow?: () => number;
+    /** Idle time after which the provider prefix counts as expired; default 5 min. */
+    cacheTtlMs?: number;
 }
 
 interface DumpCandidate {
@@ -208,6 +248,7 @@ function parseArgs(argv: string[]): Args {
         "--until",
         "--limit",
         "--meter",
+        "--cache-ttl",
     ]);
     let positionalSession = "";
     for (let index = 0; index < args.length; index += 1) {
@@ -255,6 +296,7 @@ function parseArgs(argv: string[]): Args {
         since: getOpt("--since"),
         until: getOpt("--until"),
         limit: limitRaw ? Number.parseInt(limitRaw, 10) : undefined,
+        cacheTtl: getOpt("--cache-ttl"),
         showDiff: args.includes("--show-diff"),
         allBusts: args.includes("--all-busts"),
         allRows: args.includes("--all-rows"),
@@ -399,7 +441,7 @@ function meterUsage(
         total: (cacheRead ?? 0) + (cacheCreation ?? 0) + usage.input_tokens,
         source,
         provider,
-        rule: "Anthropic explicit cache: cache_read_input_tokens + direct input versus prior read/write/input total",
+        rule: "Anthropic explicit cache: cache_read_input_tokens versus prior read + write; uncached input_tokens never count as reuse",
     };
 }
 
@@ -781,7 +823,11 @@ export function analyzeOpenCodeCacheBustSession(
             : boundedSnapshots.slice(
                   options.sinceExclusiveMs === undefined ? 0 : Math.max(0, firstNewIndex - 2),
               );
-    const rows = analyzeSnapshots(analysisSnapshots, withSchedulerLogFallback(options.decisions ?? [], options.sessionId, options.mcLogPath));
+    const rows = analyzeSnapshots(
+        analysisSnapshots,
+        withSchedulerLogFallback(options.decisions ?? [], options.sessionId, options.mcLogPath),
+        { cacheTtlMs: options.cacheTtlMs },
+    );
     const requests: AnalyzedCacheRequest[] = rows.flatMap((row) => {
         const timestampMs = Date.parse(row.current.createdAt);
             if (!Number.isFinite(timestampMs) || !inWindow(row.current)) return [];
@@ -924,7 +970,12 @@ function bustsReusablePrefix(
 export function analyzeSnapshots(
     snaps: readonly Snapshot[],
     decisionsAndMarkers: readonly CacheBustDecisionAttribution[] = [],
+    options: { cacheTtlMs?: number } = {},
 ): AnalysisRow[] {
+    const cacheTtlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+    // When the reusable prefix was last read in full or written; see
+    // refreshesCachedPrefix for which requests move it.
+    let prefixRefreshedAtMs: number | undefined;
     // Disruption markers explain a following epoch HARD but never serve a request, so
     // they stay out of every request join.
     const decisions = decisionsAndMarkers.filter((record) => record.disruption === undefined);
@@ -984,6 +1035,7 @@ export function analyzeSnapshots(
         if (!previousMetered) {
             rows.push({ current, divergenceIndex: -1, verdict: "BASE" });
             previousMetered = current;
+            prefixRefreshedAtMs = current.requestTimestampMs;
             continue;
         }
         const previous = previousMetered;
@@ -1005,32 +1057,63 @@ export function analyzeSnapshots(
                 : previous;
         const referenceUsage = reference.usage ?? previous.usage;
         const prevTotal = referenceUsage.total;
+        // Anthropic-style breakpoints: the read alone must cover what the previous
+        // request read or wrote; uncached input_tokens never count as reuse.
+        const explicitBreakpoints = !isImplicitPrefixCache(current.usage.provider);
         // Gemini's cachedContentTokenCount over a byte-identical prefix routinely
         // reads a few tokens (8-9 in Code Assist exports) below the previous read,
         // so the 64-token allowance is added on top of the previous uncached input
         // instead of only standing in for a smaller one. Without it every such dip
         // reads as a short read.
-        const epsilon =
-            referenceUsage.provider === "gemini"
-                ? 64 + referenceUsage.input
-                : Math.max(64, referenceUsage.input);
-        const meterFloor = prevTotal - epsilon;
-        // Anthropic separates direct input from cache writes, so it belongs in the
-        // comparable read. OpenAI's uncached prompt tokens include rewritten prefix
-        // tokens; adding them back would make every prompt look fully cached. Gemini's
-        // promptTokenCount works the same way. The meter's own kind decides, since
-        // the body provider and the meter differ when --meter forces one.
-        const comparableRead = isImplicitPrefixCache(current.usage.provider)
-            ? current.usage.cacheRead
-            : current.usage.cacheRead + current.usage.input;
+        const epsilon = explicitBreakpoints
+            ? CACHE_READ_EPSILON_TOKENS
+            : referenceUsage.provider === "gemini"
+              ? 64 + referenceUsage.input
+              : Math.max(64, referenceUsage.input);
+        // For the implicit caches, prevTotal - epsilon is at most the previous
+        // read: the previous uncached tail may not be cached yet.
+        const meterFloor = explicitBreakpoints
+            ? cachedPrefixFloor({
+                  read: referenceUsage.cacheRead,
+                  write: referenceUsage.cacheCreation ?? 0,
+                  input: referenceUsage.input,
+              })
+            : prevTotal - epsilon;
+        // Only the provider cache read counts as reuse, on every meter. OpenAI's
+        // and Gemini's uncached prompt tokens include rewritten prefix tokens, and
+        // Anthropic's input_tokens are billed in full and cached nothing.
+        const comparableRead = current.usage.cacheRead;
         // A rewrite cannot use the prior rewrite's direct input as forgiveness
         // while cacheRead remains at the same floor.
         const rebust: boolean =
             previousShortRead && current.usage.cacheRead <= previous.usage.cacheRead;
         const shortRead: boolean = rebust || comparableRead < meterFloor;
         previousShortRead = shortRead;
+        const reading = {
+            read: current.usage.cacheRead,
+            write: current.usage.cacheCreation ?? 0,
+            input: current.usage.input,
+        };
+        const idleGapMs =
+            current.requestTimestampMs - (prefixRefreshedAtMs ?? previous.requestTimestampMs);
+        const idleCacheExpiry =
+            shortRead &&
+            isIdleCacheExpiry(
+                current.requestTimestampMs,
+                prefixRefreshedAtMs ?? previous.requestTimestampMs,
+                cacheTtlMs,
+            );
+        const missingBreakpointAfterRead = isMissingBreakpointAfterRead(reading, {
+            shortRead,
+            explicitBreakpoints,
+        });
+        if (refreshesCachedPrefix(reading, { shortRead, explicitBreakpoints })) {
+            prefixRefreshedAtMs = current.requestTimestampMs;
+        }
+        // A missing breakpoint is the request's own shape, not provider latency,
+        // so it is a BUST even when the reusable bytes are unchanged.
         const verdict: MeterVerdict = shortRead
-            ? byteVerdict === "BUST"
+            ? byteVerdict === "BUST" || (missingBreakpointAfterRead && !idleCacheExpiry)
                 ? "BUST"
                 : "LATENCY"
             : "STABLE";
@@ -1065,6 +1148,8 @@ export function analyzeSnapshots(
                       divergenceIndex,
                       previousMessageCount: previous.segments.length,
                       previousBustDivergenceIndex,
+                      idleCacheExpiry,
+                      missingBreakpointAfterRead,
                       previousProvider: previous.provider,
                       currentProvider: current.provider,
                       firstDivergenceRole: divergentSegment?.role,
@@ -1132,6 +1217,7 @@ export function analyzeSnapshots(
             meterFloor,
             comparableRead,
             shortRead,
+            idleGapMs,
             rewrittenTokens,
             divergenceClass,
             decision: attributionDecision,
@@ -1189,7 +1275,7 @@ function meterCell(row: AnalysisRow): string {
     const directInput = row.current.usage?.input ?? 0;
     const comparable = isImplicitPrefixCache(row.current.usage?.provider ?? row.current.provider)
         ? `cached=${read.toLocaleString()}`
-        : `read=${read.toLocaleString()} + input=${directInput.toLocaleString()} = ${row.comparableRead?.toLocaleString()}`;
+        : `read=${read.toLocaleString()} (write=${(row.current.usage?.cacheCreation ?? 0).toLocaleString()}, uncached input=${directInput.toLocaleString()})`;
     const wireModel =
         row.previous?.wireModel &&
         row.current.wireModel &&
@@ -1199,7 +1285,10 @@ function meterCell(row: AnalysisRow): string {
     const reference = row.meterReference
         ? `; ref=${fmtTime(row.meterReference.createdAt)} (last read before the LATENCY run)`
         : "";
-    return `${comparable}; floor=${row.meterFloor?.toLocaleString()} (prevTotal=${row.prevTotal?.toLocaleString()}, ε=${row.epsilon?.toLocaleString()})${reference}${rewritten}${wireModel}`;
+    const floorBasis = isImplicitPrefixCache(row.current.usage?.provider ?? row.current.provider)
+        ? `prevTotal=${row.prevTotal?.toLocaleString()}, ε=${row.epsilon?.toLocaleString()}`
+        : `prev read+write-${row.epsilon?.toLocaleString()}; prevTotal=${row.prevTotal?.toLocaleString()}`;
+    return `${comparable}; floor=${row.meterFloor?.toLocaleString()} (${floorBasis})${reference}${rewritten}${wireModel}`;
 }
 
 const HELP = `usage: bun scripts/analyze-cache-busts.ts --session <prefix> [options]
@@ -1228,6 +1317,8 @@ Options:
   --meter <kind>        force the anthropic, openai, or gemini meter for every request
   --since/--until <t>   ISO timestamp or duration ago (for example 2h)
   --limit <N>           keep the last N requests in range
+  --cache-ttl <dur>     idle time after which the provider prefix counts as
+                        expired (default 5m; for example 1h)
   --show-diff           print both versions of the first-diverging message
   --all-busts           list every diverging message
   --all-rows            also print STABLE and UNMETERED rows`;
@@ -1261,7 +1352,11 @@ function main(): void {
         );
         console.log("");
     }
-    const rows = analyzeSnapshots(snaps, withSchedulerLogFallback([], snaps[0].session, opts.mcLogPath));
+    const rows = analyzeSnapshots(
+        snaps,
+        withSchedulerLogFallback([], snaps[0].session, opts.mcLogPath),
+        { cacheTtlMs: parseCacheTtl(opts.cacheTtl) },
+    );
     const provider = snaps[0].provider;
     const meterKind = snaps[0].meter ?? provider;
     const meterRule =
@@ -1294,10 +1389,12 @@ function main(): void {
     console.log("Dashboard times are local (UTC+2); table times are UTC.");
     const shortRule =
         meterKind === "gemini"
-            ? "ε=64 + previous uncached input, measured from the last request before a run of LATENCY rows"
-            : "ε=max(64, previous direct/uncached input)";
+            ? "Short when the provider-comparable read < prevTotal - ε, ε=64 + previous uncached input, measured from the last request before a run of LATENCY rows"
+            : meterKind === "anthropic"
+              ? "Short when the cache read < previous read + previous write - 64, and a short read with no write and ≥1,024 uncached input tokens is a missing-breakpoint BUST"
+              : "Short when the provider-comparable read < prevTotal - ε, ε=max(64, previous direct/uncached input)";
     console.log(
-        `Meter rule (${meterKind}): ${meterRule}. Short when the provider-comparable read < prevTotal - ε, ${shortRule}; bytes distinguish BUST from LATENCY.`,
+        `Meter rule (${meterKind}): ${meterRule}. ${shortRule}; bytes distinguish BUST from LATENCY.`,
     );
     console.log(
         "time(UTC)          | segs | verdict          | meter                                                  | meterVsBytes | first-divergence                | prevBodyBytes → curBodyBytes | reusableNormalizedPrefix@breakpoint",
@@ -1409,6 +1506,12 @@ function main(): void {
     if (latencyCount > 0) {
         console.log(
             `${latencyCount} latency-only short read(s) had no reusable-prefix byte divergence.`,
+        );
+    }
+    const expiryCount = rows.filter((row) => row.divergenceClass === "idle_cache_expiry").length;
+    if (expiryCount > 0) {
+        console.log(
+            `${expiryCount} short read(s) came more than ${opts.cacheTtl ?? "5m"} after the prefix was last read in full or written (idle_cache_expiry; --cache-ttl changes the window).`,
         );
     }
     if (unmeteredBustCount > 0) {

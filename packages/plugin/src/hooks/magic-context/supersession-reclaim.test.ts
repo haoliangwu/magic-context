@@ -200,6 +200,7 @@ describe("buildEditSupersessionReclaim (superseded-edit compression)", () => {
             [3, target({ filePath: "B.ts", content: "z" })],
         ]);
         const { ops, editMarkerTagIds } = buildEditSupersessionReclaim({
+            watermark: Number.MAX_SAFE_INTEGER,
             db,
             sessionId: SES,
             targets,
@@ -219,6 +220,7 @@ describe("buildEditSupersessionReclaim (superseded-edit compression)", () => {
         ]);
 
         const { ops } = buildEditSupersessionReclaim({
+            watermark: Number.MAX_SAFE_INTEGER,
             db,
             sessionId: SES,
             targets,
@@ -236,7 +238,12 @@ describe("buildEditSupersessionReclaim (superseded-edit compression)", () => {
             [1, target(undefined)], // no input → no filePath
             [2, target(undefined)],
         ]);
-        const { ops } = buildEditSupersessionReclaim({ db, sessionId: SES, targets });
+        const { ops } = buildEditSupersessionReclaim({
+            watermark: Number.MAX_SAFE_INTEGER,
+            db,
+            sessionId: SES,
+            targets,
+        });
         expect(ops).toHaveLength(0);
     });
 
@@ -248,7 +255,12 @@ describe("buildEditSupersessionReclaim (superseded-edit compression)", () => {
             [1, target({ filePath: "A.ts" })],
             [2, target({ filePath: "A.ts" })],
         ]);
-        const { ops } = buildEditSupersessionReclaim({ db, sessionId: SES, targets });
+        const { ops } = buildEditSupersessionReclaim({
+            watermark: Number.MAX_SAFE_INTEGER,
+            db,
+            sessionId: SES,
+            targets,
+        });
         expect(ops).toHaveLength(0);
     });
 
@@ -265,6 +277,7 @@ describe("buildEditSupersessionReclaim (superseded-edit compression)", () => {
             [3, target({ filePath: "A.ts" })],
         ]);
         const { ops, editMarkerTagIds } = buildEditSupersessionReclaim({
+            watermark: Number.MAX_SAFE_INTEGER,
             db,
             sessionId: SES,
             targets,
@@ -282,6 +295,7 @@ describe("buildEditSupersessionReclaim (superseded-edit compression)", () => {
             [2, target({ filePath: "A.ts" })],
         ]);
         const { ops } = buildEditSupersessionReclaim({
+            watermark: Number.MAX_SAFE_INTEGER,
             db,
             sessionId: SES,
             targets,
@@ -321,6 +335,7 @@ describe("buildEditSupersessionReclaim (superseded-edit compression)", () => {
         expect(newerId).toBeDefined();
 
         const { editMarkerTagIds } = buildEditSupersessionReclaim({
+            watermark: Number.MAX_SAFE_INTEGER,
             db,
             sessionId: SES,
             targets,
@@ -363,6 +378,7 @@ describe("buildEditSupersessionReclaim (superseded-edit compression)", () => {
         // Tag 1 is older edit to A.ts, normally compressed. But protectedTagNumbers protects tag 1.
         const protectedTagNumbers: ReadonlySet<number> = new Set([1]);
         const { ops, editMarkerTagIds } = buildEditSupersessionReclaim({
+            watermark: Number.MAX_SAFE_INTEGER,
             db,
             sessionId: SES,
             targets,

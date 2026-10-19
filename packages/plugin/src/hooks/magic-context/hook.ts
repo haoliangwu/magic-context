@@ -17,6 +17,8 @@ import { OpenCodeRetrospectiveRawProvider } from "../../features/magic-context/d
 import {
     buildDreamTaskRuntimeConfigs,
     userMemoryCollectionEnabled,
+    userObservationCollectionEnabled,
+    userObservationsRequested,
 } from "../../features/magic-context/dreamer/task-config";
 import { createDreamTaskExecutor } from "../../features/magic-context/dreamer/task-executor";
 import {
@@ -102,7 +104,7 @@ import { createModuleToolBackends } from "./module-tool-backends";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import { runManagedRecomp } from "./recomp-orchestrator";
-import type { RustModeModuleClient } from "./rust-mode-transform";
+import { type RustModeModuleClient, rustWrapupHistorianFields } from "./rust-mode-transform";
 import { createRustRefusalRecovery } from "./rust-refusal-recovery";
 import { createTextCompleteHandler } from "./text-complete";
 import { createTransform } from "./transform";
@@ -179,7 +181,7 @@ export interface MagicContextDeps {
             provider?: "local" | "openai-compatible" | "off" | "synapse";
         };
         dreamer?: DreamerConfig;
-        smart_notes?: { retina_handoff?: boolean };
+        smart_notes?: { enabled?: boolean; retina_handoff?: boolean };
         commit_cluster_trigger?: { enabled: boolean; min_clusters: number };
         /** Issue #53: per-agent system-prompt injection opt-out. Optional in
          *  the inline type so legacy tests/callers don't have to construct it;
@@ -199,7 +201,7 @@ export interface MagicContextDeps {
          *  session-hook construction boundary via isCompactionEnabled; the
          *  resolved boolean is threaded to the transform phases. */
         compaction?: { enabled?: boolean };
-        mural?: { enabled: boolean; model?: string };
+        mural?: { enabled: boolean };
     };
     /** Registration-owned prompt-surface loader shared with the tool registry. */
     promptSurfaceRuntime?: PromptSurfaceRuntime;
@@ -326,7 +328,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             twoPass: config.historian?.two_pass === true,
             expandTools: config.historian?.expand_tools,
             autoPromote: config.memory?.auto_promote ?? true,
-            userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
+            userMemoriesEnabled: userObservationCollectionEnabled(config.dreamer),
+            userObservationsRequested: userObservationsRequested(config.dreamer),
             commitClusterTrigger: config.commit_cluster_trigger,
             chunkTokens: deriveHistorianChunkTokens(
                 resolveHistorianContextLimit(attempts.primary?.model),
@@ -507,6 +510,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             // review-user-memories task (schedule != ""). Replaces the v1
             // user_memories.enabled flag that gated both collection and review.
             userMemoriesEnabled: historianRun.userMemoriesEnabled,
+            userObservationsRequested: historianRun.userObservationsRequested,
             ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
             getNotificationParams: (sid) =>
                 getLiveNotificationParams(
@@ -798,7 +802,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         projectPath,
         historianRunnable,
         compactionOff,
-        experimentalUserMemories: userMemoryCollectionEnabled(dreamerConfig),
+        experimentalUserMemories: userObservationCollectionEnabled(dreamerConfig),
+        userObservationsRequested: userObservationsRequested(dreamerConfig),
         experimentalTemporalAwareness: deps.config.temporal_awareness === true,
         muralEnabled: deps.config.mural?.enabled === true,
         historianTwoPass: deps.config.historian?.two_pass === true,
@@ -932,7 +937,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             dreaming,
             "opencode",
             deps.config.language,
-            sampledDream.mural?.model,
+            deps.config.smart_notes?.enabled,
         );
         const executor = createDreamTaskExecutor({
             client: deps.client,
@@ -948,6 +953,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             userMemoryCollectionEnabled: userMemoryCollectionEnabled(dreaming),
             language: deps.config.language,
             retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
+            smartNotesEnabled: deps.config.smart_notes?.enabled,
             transformMode: deps.config.transform_mode,
             // Scheduled/message-triggered runs must share the same direct
             // authority.status transport as the transform path. The
@@ -969,12 +975,14 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             tasks: runtimeConfigs,
             executor,
             projectMemoryEnabled: deps.config.memory?.enabled !== false,
+            smartNotesEnabled: deps.config.smart_notes?.enabled,
         }).catch((error: unknown) => {
             log("[dreamer] scheduled task run failed:", error);
         });
     };
 
     const commandHandler = createMagicContextCommandHandler({
+        smartNotesEnabled: deps.config.smart_notes?.enabled,
         db,
         compactionOff,
         toastDurationMs: deps.config.toast_duration_ms,
@@ -984,6 +992,15 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         historyBudgetPercentage: deps.config.history_budget_percentage,
         transformMode: deps.config.transform_mode,
         rustModeModuleClient,
+        resolveRustWrapupHistorianFields: () => {
+            const run = sampleHistorian();
+            return rustWrapupHistorianFields({
+                historianModel: run.model,
+                fallbackModels: run.fallbackModels,
+                timeoutMs: run.timeoutMs,
+                maxOutputTokens: run.maxOutputTokens,
+            });
+        },
         projectRoot: deps.directory,
         commitClusterTrigger: deps.config.commit_cluster_trigger,
         sampleCommitClusterTrigger: () =>
@@ -1027,7 +1044,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         onFlush: (sessionId) => {
             historyRefreshSessions.add(sessionId);
             systemPromptRefreshSessions.add(sessionId);
-            pendingMaterializationSessions.add(sessionId);
+            requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
         },
         // E3 (recomp) runs through the SHARED orchestrator (runManagedRecomp) so
         // the command path gets identical model fallback + live progress +
@@ -1071,11 +1088,13 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       return runManualDream({
                           db,
                           projectIdentity: projectPath,
+                          projectMemoryEnabled: sampledDream.memory?.enabled,
+                          smartNotesEnabled: deps.config.smart_notes?.enabled,
                           tasks: buildDreamTaskRuntimeConfigs(
                               currentDreamer,
                               "opencode",
                               deps.config.language,
-                              sampledDream.mural?.model,
+                              deps.config.smart_notes?.enabled,
                           ),
                           executor: createDreamTaskExecutor({
                               client: deps.client,
@@ -1093,6 +1112,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               memoryInjectionBudgetTokens:
                                   deps.config.memory?.injection_budget_tokens,
                               retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
+                              smartNotesEnabled: deps.config.smart_notes?.enabled,
                               transformMode: deps.config.transform_mode,
                               // Manual /ctx-dream uses the same live authority
                               // lookup and module transport as scheduled runs.
@@ -1119,6 +1139,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const systemPromptHash = createSystemPromptHashHandler({
         db,
         dreamerEnabled: dreamerRunnable,
+        smartNotesEnabled: deps.config.smart_notes?.enabled,
         // Gates ctx_memory guidance out of the prompt when memory is off (the
         // ctx_memory TOOL is gated in tool-registry.ts on the same flag).
         memoryEnabled: deps.config.memory?.enabled !== false,
@@ -1312,3 +1333,5 @@ export async function createMagicContextHookAsync(
         openDatabaseForHook: () => database,
     });
 }
+
+import { requestPendingMaterialization } from "./pending-materialization";

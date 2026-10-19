@@ -1,7 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { updateSessionMeta } from "../../features/magic-context/storage-meta";
@@ -9,8 +6,7 @@ import { recordDetectedContextLimit } from "../../features/magic-context/storage
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
-import { clearWindowOverlayCacheForTest, setWindowOverlayPath } from "../../shared/window-geometry";
+import { clearWindowGeometryLogForTest } from "../../shared/window-geometry";
 import {
     historyBudgetPolicyIdentity,
     resolveCacheTtl,
@@ -143,44 +139,18 @@ describe("event-resolvers", () => {
                     90_000,
                 );
             } finally {
+                clearWindowGeometryLogForTest();
                 clearModelsDevCache();
                 closeQuietly(db);
             }
         });
 
-        it("clears a persisted floor above an overlay-backed absolute wall", async () => {
+        it("preserves a proven floor above catalog metadata", async () => {
             const db = new Database(":memory:");
             initializeDatabase(db);
             runMigrations(db);
-            const sessionId = "ses-poisoned-overlay-floor";
-            const dir = createTestTempDirFromPath(join(tmpdir(), "mc-floor-overlay-"));
-            const overlayPath = join(dir, "window-overlay.json");
+            const sessionId = "ses-proven-catalog-floor";
             try {
-                writeFileSync(
-                    overlayPath,
-                    JSON.stringify({
-                        schema: "fusiform-window-overlay/v1",
-                        generated_at: "2026-09-11T00:00:00Z",
-                        minted_provider_ids: [],
-                        cells: [
-                            {
-                                provider_id: "test-provider",
-                                model_id: "test-model",
-                                facts: {
-                                    "window.enforced": {
-                                        value: { kind: "stated", value: 272_000 },
-                                        grade: "measured",
-                                        units: "provider",
-                                        boundary: "Observed",
-                                        source_ref: "session regression fixture",
-                                        observed_at: "2026-09-11T00:00:00Z",
-                                    },
-                                },
-                            },
-                        ],
-                    }),
-                );
-                setWindowOverlayPath(overlayPath);
                 await refreshModelLimitsFromApi({
                     config: {
                         providers: async () => ({
@@ -190,7 +160,7 @@ describe("event-resolvers", () => {
                                         id: "test-provider",
                                         models: {
                                             "test-model": {
-                                                limit: { context: 272_000, output: 128_000 },
+                                                limit: { context: 272_000, output: 32_000 },
                                             },
                                         },
                                     },
@@ -213,27 +183,24 @@ describe("event-resolvers", () => {
                     db,
                     sessionID: sessionId,
                 });
-                expect(geometry?.usableSoft).toBe(240_000);
-                expect(geometry?.usableHard).toBe(240_000);
-                expect(geometry?.derivation.absoluteWall).toBe(272_000);
+                expect(geometry?.usableSoft).toBe(593_717);
+                expect(geometry?.usableHard).toBe(593_717);
+                expect(geometry?.derivation.absoluteWall).toBe(593_717);
                 const meta = db
                     .prepare(
                         "SELECT observed_safe_input_tokens, last_usage_context_limit, last_input_tokens, last_context_percentage, cache_alert_sent FROM session_meta WHERE session_id = ?",
                     )
                     .get(sessionId) as Record<string, number>;
                 expect(meta).toMatchObject({
-                    observed_safe_input_tokens: 0,
-                    last_usage_context_limit: 240_000,
-                    last_input_tokens: 0,
-                    last_context_percentage: 0,
-                    cache_alert_sent: 0,
+                    observed_safe_input_tokens: 593_717,
+                    last_usage_context_limit: 593_717,
+                    last_input_tokens: 285_310,
+                    last_context_percentage: 48.1,
+                    cache_alert_sent: 1,
                 });
             } finally {
-                setWindowOverlayPath(undefined);
-                clearWindowOverlayCacheForTest();
                 clearModelsDevCache();
                 closeQuietly(db);
-                rmSync(dir, { recursive: true, force: true });
             }
         });
 

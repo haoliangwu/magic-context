@@ -1,6 +1,6 @@
 {
   "schema": 2,
-  "description": "Fleet log line format r2 (docs/specs/fleet-logging.md). Each render case gives the structured event and the exact line both cortexkit-log (Rust) and @cortexkit/log (TS) must produce. Timestamps are fixed inputs; a renderer that reads the clock cannot pass this fixture and must accept an injected instant. Schema 2 is a breaking rewrite of schema 1: `module`+`tag` became `logger` (dotted, rooted at the module id, always followed by a colon), `session` became one entry among ordered `bound` fields rendered in a bracket before the message, and the bracket is absent when `bound` is empty. Two new sections pin the file layout: `segment_name` (the UTC day names the file) and `retention_prune` (the writer prunes by filename comparison).",
+  "description": "Fleet log line format r2. Each render case gives the structured event and the exact line both cortexkit-log (Rust) and @cortexkit/log (TS) must produce. Timestamps are fixed inputs; a renderer that reads the clock cannot pass this fixture and must accept an injected instant. Schema 2 is a breaking rewrite of schema 1: `module`+`tag` became `logger` (dotted, rooted at the module id, always followed by a colon), `session` became one entry among ordered `bound` fields rendered in a bracket before the message, and the bracket is absent when `bound` is empty. Two new sections pin the file layout: `segment_name` (the UTC day names the file) and `retention_prune` (the writer prunes by filename comparison).",
   "cases": [
     {
       "name": "plain-info-no-bound",

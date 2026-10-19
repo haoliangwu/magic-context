@@ -7,6 +7,7 @@ import { parseCompartmentOutput } from "@magic-context/core/hooks/magic-context/
 import {
     getMagicContextStorageResolution,
     getProjectMagicContextHistorianDir,
+    isMagicContextStorageOutsideEngram,
 } from "@magic-context/core/shared/data-path";
 import { loadPiConfig } from "@magic-context/pi-core/config";
 import { parse as parseJsonc } from "comment-json";
@@ -467,6 +468,9 @@ export function renderDiagnosticsMarkdown(report: PiDiagnosticReport): string {
         exists: report.storageDir.exists,
         context_db_size: formatBytes(report.storageDir.contextDbSizeBytes),
     };
+    const storageBackupWarning = isMagicContextStorageOutsideEngram(report.storageDir.path)
+        ? `- Warning: Magic Context storage is at ${sanitizeString(report.storageDir.path)}, outside the folder Engram backs up (~/.local/share/cortexkit/magic-context). It is not included in CortexKit backups.`
+        : null;
 
     return [
         `- Timestamp: ${report.timestamp}`,
@@ -510,6 +514,7 @@ export function renderDiagnosticsMarkdown(report: PiDiagnosticReport): string {
             : report.loadWarnings.map((warning) => `- ${warning}`).join("\n"),
         "",
         "### Shared storage",
+        ...(storageBackupWarning ? [storageBackupWarning] : []),
         "```json",
         JSON.stringify(storage, null, 2),
         "```",

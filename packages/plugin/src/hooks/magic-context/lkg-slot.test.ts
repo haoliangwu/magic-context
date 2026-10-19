@@ -14,6 +14,7 @@ import {
     lkgContentDigest,
     lkgContentDigestFromFields,
     lkgContentFields,
+    lkgSlotRejection,
     memoizedLkgContentDigestFromFields,
     noteEntry,
     registerLkgPersistence,
@@ -91,6 +92,33 @@ describe("LKG durable hydration pass", () => {
         expect(getInMemorySlot("captured")?.lastInputMessageId).toBe("m1");
         expect(loads).toBe(0);
         registerLkgPersistence(undefined);
+    });
+});
+
+describe("LKG slot size cap", () => {
+    const slotWithPrefixChars = (chars: number): LkgSlot => ({
+        jsonPrefix: `["${"x".repeat(chars)}"]`,
+        inputIdSeq: ["m1"],
+        inputContentDigests: ["digest-m1"],
+        lastInputMessageId: "m1",
+        modelKey: "test/model",
+        providerKey: "test",
+        capturedAt: 1,
+    });
+
+    it("keeps a snapshot of any request size a provider accepts (Anthropic allows 32 MB)", () => {
+        resetLkgSlotsForTest();
+        // A 32 MB request: the old cap refused anything over about 12 MB of JSON.
+        const atLimit = slotWithPrefixChars(32 * 1000 * 1000);
+        expect(lkgSlotRejection("big", atLimit)).toBeNull();
+        expect(captureSlot("big", atLimit)).toBe(true);
+    });
+
+    it("still rejects a single slot beyond any provider's request limit", () => {
+        resetLkgSlotsForTest();
+        expect(lkgSlotRejection("huge", slotWithPrefixChars(40 * 1024 * 1024))).toMatch(
+            /^slot_bytes=/,
+        );
     });
 });
 

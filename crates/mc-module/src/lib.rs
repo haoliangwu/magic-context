@@ -71,6 +71,7 @@ mod reply_pages;
 mod retained_size;
 mod transport_handler;
 pub use transport_handler::McTransportHandler;
+mod reclaim_distance;
 pub mod route_targets;
 pub mod runner_choices;
 pub mod scheduler;
@@ -4312,6 +4313,81 @@ fn terminal_wrapup_failure_summary(reason: &str, summary: &str, detail: &str) ->
     )
 }
 
+/// The historian settings a `session.wrapup` request carries, resolved by the host from
+/// the current config. Every field is optional: an older host sends none of them, and
+/// wrapup then uses the values from the session's last completed transform, which go
+/// stale while that session's passes keep failing.
+#[derive(Debug, Default)]
+struct WrapupHistorianOverrides {
+    chain: Option<WrapupHistorianChain>,
+    timeout_ms: Option<u64>,
+    max_output_tokens: Option<u32>,
+}
+
+/// The chain with its per-model limits and variants. The two maps are keyed by the
+/// chain's models, so they only apply together with a chain.
+#[derive(Debug)]
+struct WrapupHistorianChain {
+    models: Vec<String>,
+    limits: std::collections::BTreeMap<String, historian::HistorianModelLimits>,
+    variants: std::collections::BTreeMap<String, String>,
+}
+
+impl WrapupHistorianOverrides {
+    fn is_empty(&self) -> bool {
+        self.chain.is_none() && self.timeout_ms.is_none() && self.max_output_tokens.is_none()
+    }
+
+    /// The snapshot's request with every carried setting replacing the snapshot's own.
+    fn apply_to(self, request: &TransformRequest) -> TransformRequest {
+        let mut request = request.clone();
+        if let Some(chain) = self.chain {
+            request.historian_model_chain = Some(chain.models);
+            request.historian_model_limits = chain.limits;
+            request.historian_model_variants = chain.variants;
+        }
+        if let Some(timeout_ms) = self.timeout_ms {
+            request.historian_timeout_ms = Some(timeout_ms);
+        }
+        if let Some(max_output_tokens) = self.max_output_tokens {
+            request.historian_max_output_tokens = Some(max_output_tokens);
+        }
+        request
+    }
+}
+
+fn wrapup_historian_overrides(request: &Value) -> Result<WrapupHistorianOverrides, String> {
+    fn field<T: serde::de::DeserializeOwned>(
+        request: &Value,
+        name: &str,
+    ) -> Result<Option<T>, String> {
+        request
+            .get(name)
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("session.wrapup {name}: {error}"))
+            })
+            .transpose()
+    }
+    let chain = match field::<Vec<String>>(request, "historian_model_chain")? {
+        None => None,
+        Some(models) => Some(WrapupHistorianChain {
+            models,
+            limits: field(request, "historian_model_limits")?.unwrap_or_default(),
+            variants: field(request, "historian_model_variants")?.unwrap_or_default(),
+        }),
+    };
+    // Null reads as absent, as it does on a transform request, where both fields are
+    // `Option`s.
+    let timeout_ms = field::<Option<u64>>(request, "historian_timeout_ms")?.flatten();
+    let max_output_tokens = field::<Option<u32>>(request, "historian_max_output_tokens")?.flatten();
+    Ok(WrapupHistorianOverrides {
+        chain,
+        timeout_ms,
+        max_output_tokens,
+    })
+}
+
 fn terminal_wrapup_failure_fields(summary: &str) -> Option<(String, String, String)> {
     let encoded = summary.strip_prefix(TERMINAL_WRAPUP_FAILURE_PREFIX)?;
     let value: Value = serde_json::from_str(encoded).ok()?;
@@ -4818,11 +4894,13 @@ impl McHandler {
                 protected_tokens_project: None,
                 keep_reasoning_tokens: None,
                 compaction_enabled: true,
+                smart_notes_enabled: true,
                 memory_enabled: true,
                 auto_search: crate::config::AutoSearchConfig::default(),
                 caveman: crate::config::CavemanConfig::default(),
                 auto_promote: true,
                 user_memory_collection_enabled: false,
+                user_observations_requested: true,
                 historian_context_limit_tokens: 128_000,
                 historian_context_limit_known: false,
                 memory_budget_tokens: 4_000.0,
@@ -5673,6 +5751,14 @@ impl McHandler {
             .effective_for_project(project_root);
         self.pause_memory_if_unresolved(project_root, &mut config);
         config
+    }
+
+    pub fn with_startup_smart_notes_enabled(self, enabled: bool) -> Self {
+        self.config
+            .lock()
+            .expect("config mutex")
+            .freeze_smart_notes_enabled(enabled);
+        self
     }
 
     /// Turn memory off in `config` while the route root's identity is unavailable, so the
@@ -6731,6 +6817,7 @@ impl McHandler {
                 memory_enabled: cfg.memory_enabled,
                 auto_promote: cfg.auto_promote,
                 user_memory_collection_enabled: cfg.user_memory_collection_enabled,
+                user_observations_requested: cfg.user_observations_requested,
                 extraction_free: false,
                 in_emergency: parsed.emergency_recovery_armed,
                 force_keep_last_compartment: false,
@@ -6971,6 +7058,7 @@ impl McHandler {
                 memory_enabled: cfg.memory_enabled,
                 auto_promote: cfg.auto_promote,
                 user_memory_collection_enabled: cfg.user_memory_collection_enabled,
+                user_observations_requested: cfg.user_observations_requested,
                 extraction_free: false,
                 in_emergency: false,
                 force_keep_last_compartment: false,
@@ -7012,7 +7100,11 @@ impl McHandler {
             harness: binding.harness.clone(),
             language,
             historian_temperature: binding.config.historian_temperature,
-            historian_await_timeout: historian::historian_await_timeout(None),
+            // The host's per-attempt timeout, as the autonomous historian uses: the wrapup
+            // request's own when it carries one, else the session's last transform's.
+            historian_await_timeout: historian::historian_await_timeout(
+                parsed.historian_timeout_ms,
+            ),
             project_path,
             project_root: binding.project_root.clone(),
             project_slug,
@@ -7786,6 +7878,7 @@ impl McHandler {
                     &mut response,
                     &ctx_reduce_self_stamps,
                     &accepted_tag_numbers,
+                    0,
                 );
                 return respond(response);
             }
@@ -7820,6 +7913,7 @@ impl McHandler {
                     &mut response,
                     &ctx_reduce_self_stamps,
                     &accepted_tag_numbers,
+                    0,
                 );
                 respond(response)
             }
@@ -7844,6 +7938,7 @@ impl McHandler {
                     &mut resp,
                     &ctx_reduce_self_stamps,
                     &accepted_tag_numbers,
+                    outcome.queued as usize,
                 );
                 respond(resp)
             }
@@ -8380,8 +8475,8 @@ impl McHandler {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
-        match store.authorize_historian_report(&project_path, &run_id, &token) {
-            Ok(mc_store::HistorianReportOutcome::Authorized(_)) => {}
+        let authorization = match store.authorize_historian_report(&project_path, &run_id, &token) {
+            Ok(mc_store::HistorianReportOutcome::Authorized(authorization)) => authorization,
             Ok(mc_store::HistorianReportOutcome::Refused(refusal)) => {
                 return respond(json!({ "ok": false, "refusal": refusal.as_wire_str() }));
             }
@@ -8391,13 +8486,14 @@ impl McHandler {
                     message: error.to_string(),
                 };
             }
-        }
+        };
 
         let report = match parse_historian_report(request) {
             Ok(report) => report,
             Err(outcome) => return outcome,
         };
         let durable = durable_report(&report);
+        let deferred_telemetry = report.clone();
         match self.host_runs.deliver(&run_id, report) {
             Ok(()) => respond(json!({ "ok": true, "accepted": true, "publish": "immediate" })),
             Err(
@@ -8420,6 +8516,11 @@ impl McHandler {
                     now_ms(),
                 ) {
                     Ok(mc_store::HistorianRecordOutcome::Recorded) => {
+                        deferred_telemetry.record_invocations(
+                            store,
+                            &authorization.session_id,
+                            &binding.harness,
+                        );
                         eprintln!(
                             "mc-module: historian report for {run_id} stored for the next pass (no firing task in this process is waiting on it)"
                         );
@@ -9016,6 +9117,17 @@ impl McHandler {
                 }
             },
         };
+        // Validated with the other request fields, so a malformed chain is refused before
+        // the wrapup claims the session or reports a retryable state such as a backoff.
+        let historian_overrides = match wrapup_historian_overrides(request) {
+            Ok(overrides) => overrides,
+            Err(message) => {
+                return HandlerOutcome::Error {
+                    code: "bad_request".to_string(),
+                    message,
+                };
+            }
+        };
 
         // The module owns the only store writer, so a process-local per-session latch is
         // sufficient to prevent duplicate producer drives. Durable historian state still
@@ -9082,7 +9194,14 @@ impl McHandler {
                 );
             }
         };
-        let parsed = Arc::clone(&ready.request);
+        // The snapshot's historian settings are whatever the last completed transform
+        // carried. A session whose passes have been failing keeps old ones, so the host
+        // sends the settings resolved from the current config with the wrapup itself.
+        let parsed = if historian_overrides.is_empty() {
+            Arc::clone(&ready.request)
+        } else {
+            Arc::new(historian_overrides.apply_to(&ready.request))
+        };
         let initial_snapshot = match store.load_historian_assembly_snapshot(&session_id) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -9636,7 +9755,10 @@ impl McHandler {
             requested.guidance_override = binding.config.prompt_surface_guidance_override;
         }
         let selection = self.freeze_prompt_surface_selection(session_id, requested);
-        let tools = prompt_surface::session_tools(&selection);
+        let mut tools = prompt_surface::session_tools(&selection);
+        if !binding.config.smart_notes_enabled {
+            prompt_surface::disable_smart_notes_in_tools(&mut tools, selection.preset);
+        }
         respond(json!({
             "ok": true,
             "preset": selection.preset.as_str(),
@@ -9648,7 +9770,9 @@ impl McHandler {
             "preset_fallback": prompt_surface::tool_manifest_falls_back(selection.preset),
             "fallback_notice": prompt_surface::tool_manifest_falls_back(selection.preset)
                 .then_some(prompt_surface::LIGHT_FALLBACK_NOTICE),
-            "content_epoch": prompt_surface::manifest_content_epoch(&selection),
+            "content_epoch": if binding.config.smart_notes_enabled {
+                prompt_surface::manifest_content_epoch(&selection)
+            } else { sha256_hex(&serde_json::to_vec(&tools).unwrap_or_default()) },
             "tools": tools,
         }))
     }
@@ -9743,6 +9867,13 @@ impl McHandler {
             .guidance_override
             .as_deref()
             .unwrap_or(asset.bytes);
+        let filtered_text;
+        let base_text = if binding.config.smart_notes_enabled {
+            base_text
+        } else {
+            filtered_text = prompt_surface::without_smart_note_guidance(base_text);
+            &filtered_text
+        };
         let language_text = request
             .get("language")
             .and_then(Value::as_str)
@@ -10510,6 +10641,8 @@ impl McHandler {
                 crate::transform::TransformError::ProtectedToolResultsOverLimit
             ) {
                 crate::transform::PROTECTED_TOOL_RESULTS_OVER_LIMIT_CODE
+            } else if matches!(e, crate::transform::TransformError::SignedTurnOverLimit) {
+                crate::transform::SIGNED_TURN_OVER_LIMIT_CODE
             } else {
                 "transform_failed"
             };
@@ -11990,6 +12123,12 @@ impl McHandler {
                 Ok(value) => value,
                 Err(outcome) => return outcome,
             };
+        if !binding.config.memory_enabled {
+            return HandlerOutcome::Error {
+                code: "memory_disabled".to_string(),
+                message: "project memory is disabled; dreamer tasks cannot run".to_string(),
+            };
+        }
         let Some(store) = self.store.get().cloned() else {
             return self.store_refusal();
         };
@@ -13051,7 +13190,7 @@ impl McHandler {
             .iter()
             .copied()
             .collect::<HashSet<_>>();
-        let ctx_reduce_self_stamp_note = ctx_reduce_self_stamp_notes(&ctx_reduce_self_stamps);
+        let ctx_reduce_self_stamp_count = ctx_reduce_self_stamps.len();
         let pending_ids = pending
             .iter()
             .map(|drop| drop.target_id.as_str())
@@ -13082,13 +13221,16 @@ impl McHandler {
             })
             .collect::<Vec<_>>();
         if queueable.is_empty() {
-            if !ctx_reduce_self_stamp_note.is_empty()
-                && unknown.is_empty()
-                && already_queued.is_empty()
-            {
-                return mcp_text_result(ctx_reduce_self_stamp_note, false);
+            if unknown.is_empty() && !already_queued.is_empty() {
+                return mcp_text_result(
+                    ctx_reduce_reply(already_queued.len(), ctx_reduce_self_stamp_count),
+                    false,
+                );
             }
-            let reason = ctx_reduce_ack_details(&unknown, &already_queued);
+            if !ctx_reduce_self_stamps.is_empty() && unknown.is_empty() {
+                return mcp_text_result(ctx_reduce_reply(0, ctx_reduce_self_stamp_count), false);
+            }
+            let reason = ctx_reduce_ack_details(&unknown);
             let mut refusal = format!(
                 "Refused: no valid tags to queue. {}",
                 if reason.is_empty() {
@@ -13097,70 +13239,25 @@ impl McHandler {
                     reason
                 }
             );
-            if !ctx_reduce_self_stamp_note.is_empty() {
+            let self_stamp_note = ctx_reduce_reply(0, ctx_reduce_self_stamp_count);
+            if !self_stamp_note.is_empty() {
                 refusal.push(' ');
-                refusal.push_str(&ctx_reduce_self_stamp_note);
+                refusal.push_str(&self_stamp_note);
             }
             return tool_error_result(refusal);
         }
 
-        let loaded = match store.load(session_id) {
-            Ok(loaded) => loaded,
-            Err(error) => return tool_error_result(format!("Error: {error}")),
-        };
-        let floor = loaded
-            .meta
-            .protected_tokens_effective
-            .or_else(|| {
-                protection_window::pre_snapshot_floor(store.tag_cache_namespace(), session_id)
-            })
-            .unwrap_or_else(|| protection_window::derive_default_floor(200_000));
-        let window = protection_window::ProtectionWindow::from_persisted_rows_calibrated(
-            &tags,
-            floor,
-            loaded
-                .meta
-                .decision_calibration
-                .as_ref()
-                .and_then(decision_calibration::DecisionCalibration::from_frozen)
-                .unwrap_or_else(decision_calibration::DecisionCalibration::neutral)
-                .tools_ratio,
-        );
-        let (deferred, immediate): (Vec<_>, Vec<_>) =
-            queueable.iter().copied().partition(|number| {
-                window
-                    .tag_numbers
-                    .tag_numbers
-                    .contains(&protection_window::TagNumber(*number as i64))
-                    || by_number.get(number).is_some_and(|tag| {
-                        loaded.meta.protected_tool_block_ids.contains(&tag.block_id)
-                    })
-            });
-        let mut details = Vec::new();
-        if !immediate.is_empty() {
-            details.push(format!("drop {}", format_tag_numbers(&immediate)));
-        }
-        let validation_detail = ctx_reduce_ack_details(&unknown, &already_queued);
-        if !validation_detail.is_empty() {
-            details.push(validation_detail);
-        }
+        let stamped_count = queueable.len() + already_queued.len();
+        let validation_detail = ctx_reduce_ack_details(&unknown);
         // This acknowledgement validates the durable tag state but deliberately does not
         // mutate it. The response observer owns asynchronous delivery on this facade.
-        let mut reply = if details.is_empty() {
-            String::new()
-        } else {
-            format!("Queued: {}.", details.join("; "))
-        };
-        if !deferred.is_empty() {
+        let mut reply = ctx_reduce_reply(stamped_count, ctx_reduce_self_stamp_count);
+        if !validation_detail.is_empty() {
             if !reply.is_empty() {
                 reply.push(' ');
             }
-            reply.push_str(&ctx_reduce_held_reply(&deferred));
-        }
-        reply.push_str(" Marking QUEUES content for release. It stays fully visible to you until it is actually released, which may be the next turn or many turns later.");
-        if !ctx_reduce_self_stamp_note.is_empty() {
-            reply.push(' ');
-            reply.push_str(&ctx_reduce_self_stamp_note);
+            reply.push_str(&validation_detail);
+            reply.push('.');
         }
         mcp_text_result(reply, false)
     }
@@ -13840,6 +13937,15 @@ impl McHandler {
             return invalid_params_error("ctx_note arguments must be an object");
         };
         let args = &args;
+        if args.get("surface_condition").is_some() {
+            if let Some(binding) = self.bindings.lock().expect("bindings mutex").get(&channel) {
+                if !binding.config.smart_notes_enabled {
+                    return tool_error_result(
+                        "Error: Smart notes are disabled; surface_condition is unavailable.",
+                    );
+                }
+            }
+        }
         if let Err(error) = validate_string_cap(args, "content", MAX_NOTE_CONTENT_BYTES)
             .and_then(|_| validate_string_cap(args, "surface_condition", MAX_SHORT_FIELD_BYTES))
             .and_then(|_| validate_string_cap(args, "compiled_provider", MAX_SHORT_FIELD_BYTES))
@@ -14485,6 +14591,7 @@ fn optional_run_string(request: &Value, field: &str) -> Result<Option<String>, H
 /// the report it is handed.
 fn durable_report(report: &HostRunReport) -> mc_store::HistorianRunReport {
     match report {
+        HostRunReport::WithInvocations { report, .. } => durable_report(report),
         HostRunReport::Output(output) => mc_store::HistorianRunReport::Output {
             text: output.text.clone(),
             length_capped: output.length_capped,
@@ -14497,6 +14604,34 @@ fn durable_report(report: &HostRunReport) -> mc_store::HistorianRunReport {
 }
 
 fn parse_historian_report(request: &Value) -> Result<HostRunReport, HandlerOutcome> {
+    let report = parse_historian_report_body(request)?;
+    let Some(attempts) = request.get("invocations") else {
+        return Ok(report);
+    };
+    // Accounting is optional: a malformed telemetry extension must not discard paid output.
+    match serde_json::from_value::<Vec<mc_store::HistorianInvocation>>(attempts.clone()) {
+        Ok(invocations)
+            if invocations.len() <= 64
+                && invocations.iter().all(|attempt| {
+                    matches!(
+                        attempt.status.as_str(),
+                        "completed" | "failed" | "aborted" | "timed_out" | "empty"
+                    )
+                }) =>
+        {
+            Ok(HostRunReport::WithInvocations {
+                report: Box::new(report),
+                invocations,
+            })
+        }
+        _ => {
+            eprintln!("mc-module: ignoring invalid historian invocation telemetry");
+            Ok(report)
+        }
+    }
+}
+
+fn parse_historian_report_body(request: &Value) -> Result<HostRunReport, HandlerOutcome> {
     let output = request.get("output").filter(|value| !value.is_null());
     let error = request.get("error").filter(|value| !value.is_null());
     match (output, error) {
@@ -17059,16 +17194,7 @@ fn render_cached_expand_part(part: &ck_wire::CkWireBlock) -> Option<String> {
     }
 }
 
-fn ctx_reduce_held_reply(held: &[u64]) -> String {
-    let tags = format_tag_numbers(held);
-    if held.len() == 1 {
-        format!("Held: {tags} is inside the protected working set; it applies once newer work displaces it.")
-    } else {
-        format!("Held: {tags} are inside the protected working set; they apply once newer work displaces them.")
-    }
-}
-
-fn ctx_reduce_ack_details(unknown: &[u64], already_queued: &[u64]) -> String {
+fn ctx_reduce_ack_details(unknown: &[u64]) -> String {
     let mut details = Vec::new();
     if !unknown.is_empty() {
         details.push(format!(
@@ -17076,20 +17202,25 @@ fn ctx_reduce_ack_details(unknown: &[u64], already_queued: &[u64]) -> String {
             format_plain_tag_numbers(unknown)
         ));
     }
-    if !already_queued.is_empty() {
-        details.push(format!(
-            "tags {} already queued",
-            format_plain_tag_numbers(already_queued)
-        ));
-    }
     details.join("; ")
 }
 
-const CTX_REDUCE_SELF_STAMP_MESSAGE_TEMPLATE: &str =
-    "§N§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.";
-
-fn ctx_reduce_self_stamp_message(tag_number: u64) -> String {
-    CTX_REDUCE_SELF_STAMP_MESSAGE_TEMPLATE.replace("§N§", &format!("§{tag_number}§"))
+fn ctx_reduce_reply(stamped_count: usize, self_stamp_count: usize) -> String {
+    let mut parts = Vec::new();
+    if stamped_count > 0 {
+        parts.push(format!(
+            "{stamped_count} tag{} stamped.",
+            if stamped_count == 1 { "" } else { "s" }
+        ));
+    }
+    if self_stamp_count > 0 {
+        parts.push(if self_stamp_count == 1 {
+            "1 was a ctx_reduce call; leave those alone, they are cleaned up automatically.".to_owned()
+        } else {
+            format!("{self_stamp_count} were ctx_reduce calls; leave those alone, they are cleaned up automatically.")
+        });
+    }
+    parts.join(" ")
 }
 
 fn cached_tool_name_for_tag(
@@ -17127,17 +17258,16 @@ fn ctx_reduce_self_stamp_tag_numbers(
     refused
 }
 
-fn ctx_reduce_self_stamp_notes(numbers: &[u64]) -> String {
-    numbers
-        .iter()
-        .map(|number| ctx_reduce_self_stamp_message(*number))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn add_ctx_reduce_stamp_fields(response: &mut Value, refused: &[u64], accepted: &[u64]) {
+fn add_ctx_reduce_stamp_fields(
+    response: &mut Value,
+    refused: &[u64],
+    accepted: &[u64],
+    queued: usize,
+) {
     if !refused.is_empty() {
         response["ctx_reduce_self_stamps"] = json!(refused);
+    }
+    if !refused.is_empty() || accepted.len() != queued {
         response["ctx_reduce_queued_tags"] = json!(accepted);
     }
 }
@@ -17146,14 +17276,6 @@ fn format_plain_tag_numbers(numbers: &[u64]) -> String {
     numbers
         .iter()
         .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn format_tag_numbers(numbers: &[u64]) -> String {
-    numbers
-        .iter()
-        .map(|number| format!("§{number}§"))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -19015,6 +19137,18 @@ pub fn manifest_with_route_targets(
     module_id: &str,
     resolved_routes: &RouteTargetConfig,
 ) -> ModuleManifest {
+    manifest_with_route_targets_and_smart_notes(module_id, resolved_routes, true)
+}
+
+pub fn manifest_with_route_targets_and_smart_notes(
+    module_id: &str,
+    resolved_routes: &RouteTargetConfig,
+    smart_notes_enabled: bool,
+) -> ModuleManifest {
+    let mut tools = prompt_surface::module_tools(&PromptSurfaceSelection::default());
+    if !smart_notes_enabled {
+        prompt_surface::disable_smart_notes_in_tools(&mut tools, PromptSurfacePreset::Full);
+    }
     // Constructed via the subc-protocol builder (never a struct literal): ModuleManifest is
     // #[non_exhaustive], so builder methods are the only construction path that survives additive
     // field landings. Every field below is set to the exact value the pre-builder struct literal
@@ -19063,7 +19197,7 @@ pub fn manifest_with_route_targets(
         }
     })
     .provides(vec![ProviderRole::ToolProvider {
-        tools: prompt_surface::module_tools(&PromptSurfaceSelection::default()),
+        tools,
         identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
         concurrency: Concurrency::ModuleManaged,
         emits_push: false,
@@ -19104,6 +19238,7 @@ mod tests {
     // slice merged together. Kept in its own files so the sequences it executes
     // read as one argument instead of being scattered through this module.
     mod broca_contract;
+    mod explicit_flush;
     mod gate_a1_b0;
     mod gate_a1_b0_baseline_probe;
     mod gate_a2;
@@ -21589,6 +21724,95 @@ mod tests {
         handler_with_store_and_resolver(state, config, Arc::new(MissingSessionResolver))
     }
 
+    /// A line-oriented test bridge lets the real TypeScript adapter drive the module
+    /// without a daemon or access to an operator's stores. It is ignored by Cargo's
+    /// normal suite and explicitly launched by the system-delivery integration test.
+    #[tokio::test]
+    #[ignore]
+    async fn system_delivery_adapter_fixture() {
+        use std::io::{BufRead, Write};
+        let (mut handler, mut store, _dir, _) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        for line in std::io::stdin().lock().lines() {
+            let request: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let session = request["session_id"].as_str().unwrap_or("ses");
+            let root = request["project_root"]
+                .as_str()
+                .unwrap_or("/nonexistent-docs");
+            if request["method"] == "test.init" {
+                let home = request["data_home"].as_str().unwrap();
+                let mut descriptor = dev_descriptor_at(home);
+                descriptor.backend = StorageBackend::Sqlite {
+                    path: PathBuf::from(home)
+                        .join("store.db")
+                        .to_string_lossy()
+                        .into_owned(),
+                };
+                store = Arc::new(McStore::open_for_test(&descriptor).unwrap());
+                handler = McHandler::with_producer_factory_config_resolver(
+                    Arc::new(TestProducerFactory {
+                        state: Arc::new(ProducerState::default()),
+                    }),
+                    default_test_config(),
+                    Arc::new(MissingSessionResolver),
+                );
+                handler.store.set(Arc::clone(&store)).ok().unwrap();
+            }
+            handler.bind_route(7, binding_with_harness(root, "opencode", session));
+            let response = match request["method"].as_str().unwrap() {
+                "test.init" => serde_json::json!({"ok": true}),
+                "test.queue" => {
+                    let target = store
+                        .load_tags_for_session(session)
+                        .unwrap()
+                        .into_iter()
+                        .find(|tag| tag.block_id.starts_with("old-answer#"))
+                        .unwrap()
+                        .block_id;
+                    store
+                        .append_pending_agent_drops(session, &[target], 1)
+                        .unwrap();
+                    serde_json::json!({"ok": true})
+                }
+                "test.status" => {
+                    let loaded = store.load(session).unwrap();
+                    let last_request = handler
+                        .transform_snapshots
+                        .lock()
+                        .unwrap()
+                        .ready_request_clone(session);
+                    serde_json::json!({
+                        "pending": store.load_pending_agent_drops(session).unwrap().len(),
+                        "system_hash": loaded.meta.last_system_prompt_hash,
+                        "render_config": loaded.meta.last_render_config,
+                        "soft_refresh": loaded.meta.soft_refresh_pending,
+                        "signed_turn_active": last_request.as_ref().map(|req| transform::active_signed_head_for_test(req)),
+                        "last_request_mids": last_request.as_ref().map(|req| req.messages.iter().map(|m| (&m.mid, &m.ck.role, m.ck.meta.synthetic)).collect::<Vec<_>>()),
+                    })
+                }
+                "test.other_identity" => {
+                    let mut loaded = store.load(session).unwrap();
+                    let (current, previous) = match request["input"].as_str().unwrap() {
+                        "model" => ("claude-opus-5-5", "claude-opus-5-4"),
+                        "renderer" => ("mre3", "mre2"),
+                        "workspace" => ("ws:0:", "ws:3:old"),
+                        _ => panic!("unknown identity input"),
+                    };
+                    assert!(loaded.meta.last_render_config.contains(current));
+                    loaded.meta.last_render_config =
+                        loaded.meta.last_render_config.replace(current, previous);
+                    store
+                        .commit(session, loaded.row_version, &loaded.core, &loaded.meta)
+                        .unwrap();
+                    serde_json::json!({"ok": true})
+                }
+                _ => call_dispatch_request_on_channel(&handler, 7, request).await,
+            };
+            println!("SYSTEM_DELIVERY_RESPONSE {}", response);
+            std::io::stdout().flush().unwrap();
+        }
+    }
+
     fn handler_with_store_and_resolver(
         state: Arc<ProducerState>,
         config: McModuleConfig,
@@ -22014,11 +22238,13 @@ mod tests {
             protected_tokens_project: None,
             keep_reasoning_tokens: None,
             compaction_enabled: true,
+            smart_notes_enabled: true,
             memory_enabled: true,
             auto_search: crate::config::AutoSearchConfig::default(),
             caveman: crate::config::CavemanConfig::default(),
             auto_promote: true,
             user_memory_collection_enabled: false,
+            user_observations_requested: true,
             historian_context_limit_tokens: 200_000,
             historian_context_limit_known: true,
             memory_budget_tokens: 4_000.0,
@@ -27107,6 +27333,21 @@ mod tests {
             json!({"info":{"id":"a0","role":"assistant"},"parts":[{"type":"text","text":"first answer"}]}),
         ];
         for pass in 0..5 {
+            if pass >= 3 {
+                // From pass 3 on, mark a pending bootstrap-seed fold in both stores. The
+                // fixture is one open Anthropic turn with signed thinking on a prefix-bound
+                // model, so the render-identity change below would wait for the turn to end
+                // (the m0/m1 head is frozen while that thinking is kept). A pending seed fold
+                // makes the pass a HARD (a full m0/m1 rebuild) whatever else is queued, so it
+                // gives these passes their rewrite instead.
+                for store in [&store, &reference_store] {
+                    let mut loaded = store.load("ses").unwrap();
+                    loaded.meta.bootstrap_seed_fold_pending = true;
+                    store
+                        .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                        .unwrap();
+                }
+            }
             if pass == 4 {
                 for (store, project) in [(&store, &project), (&reference_store, &reference_project)]
                 {
@@ -27333,6 +27574,15 @@ mod tests {
             .any(|unit| unit.key == "strip:native_reasoning_keep:step-0"));
         let mut priced_request = make_request(&native);
         priced_request["render_config"] = json!("independent-priced-config-change");
+        // Mark a pending bootstrap-seed fold. A render-identity change inside the open signed
+        // turn would wait for the turn to end, but a pending seed fold makes the pass a
+        // HARD (a full m0/m1 rebuild) whatever else is queued (the HARD asserted below). It re-renders the same head, so
+        // the turn's signed thinking stays valid.
+        let mut loaded = store.load("ses").unwrap();
+        loaded.meta.bootstrap_seed_fold_pending = true;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
         let priced = call_transform_request(&handler, priced_request).await;
         assert_eq!(priced["action"], "HARD");
         // step-0 belongs to the active Anthropic turn (no real user message follows
@@ -27434,6 +27684,15 @@ mod tests {
         }
         let mut priced_request = make_request(&native, "claude-fable-5-1");
         priced_request["render_config"] = json!("independent-priced-config-change");
+        // Mark a pending bootstrap-seed fold. A render-identity change inside the open signed
+        // turn would wait for the turn to end, but a pending seed fold makes the pass a
+        // HARD (a full m0/m1 rebuild) whatever else is queued (the HARD asserted below). It re-renders the same head, so
+        // the turn's signed thinking stays valid.
+        let mut loaded = store.load("ses").unwrap();
+        loaded.meta.bootstrap_seed_fold_pending = true;
+        store
+            .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
         let priced = call_transform_request(&handler, priced_request).await;
         assert_eq!(priced["action"], "HARD");
         let target = priced["native_messages"]
@@ -30225,79 +30484,98 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn note_facade_glance_lists_one_row_per_note_with_age_and_stale_markers() {
-        let producer = Arc::new(ProducerState::default());
-        let resolver =
-            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
-        let (handler, store, _dir, _project) =
-            handler_with_store_and_resolver(producer, default_test_config(), resolver);
-        handler.bind_route(7, binding("/repo", "token"));
+        for smart_notes_enabled in [true, false] {
+            let producer = Arc::new(ProducerState::default());
+            let resolver =
+                FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+            let (handler, store, _dir, _project) =
+                handler_with_store_and_resolver(producer, default_test_config(), resolver);
+            let mut route = binding("/repo", "token");
+            route.config.smart_notes_enabled = smart_notes_enabled;
+            handler.bind_route(7, route);
+            if !smart_notes_enabled {
+                let refused = tool_text(
+                    call_facade(
+                        &handler,
+                        "ctx_note",
+                        json!({"content": "cached", "surface_condition": "old"}),
+                    )
+                    .await,
+                );
+                assert_eq!(
+                    refused,
+                    "Error: Smart notes are disabled; surface_condition is unavailable."
+                );
+            }
 
-        let now = now_ms();
-        let day = 24 * 60 * 60 * 1000;
-        // A ready smart note, a parked smart note, and three plain notes: one
-        // fresh, one two days old, one untouched for 40 days.
-        let ready = store
-            .insert_project_note(NoteWriteInput {
-                project_path: "/repo",
-                route_project_root: None,
-                session_id: Some("session"),
-                content: "Ready smart item",
-                surface_condition: Some("condition"),
-                compiled_provider: None,
-                compiled_config: None,
-                compiled_at: None,
-                compile_status: None,
-                anchor_block_id: None,
-                anchor_ordinal: None,
-                now_ms: now - 5 * day,
-            })
-            .unwrap();
-        store
-            .write_note_evaluation(NoteEvaluationInput {
-                project_path: "/repo",
-                note_id: ready.id,
-                source_revision: ready.status_version,
-                verdict: true,
-                compiled_check: None,
-                manifest_json: None,
-                check_hash: None,
-                next_due_at: None,
-                now_ms: now - 5 * day,
-            })
-            .unwrap();
-        store
-            .insert_project_note(NoteWriteInput {
-                project_path: "/repo",
-                route_project_root: None,
-                session_id: Some("session"),
-                content: "Parked smart item",
-                surface_condition: Some("condition"),
-                compiled_provider: None,
-                compiled_config: None,
-                compiled_at: None,
-                compile_status: None,
-                anchor_block_id: None,
-                anchor_ordinal: None,
-                now_ms: now - 2 * day,
-            })
-            .unwrap();
-        insert_session_note_at(&store, "Fresh plain item", now);
-        insert_session_note_at(&store, "Two-day-old plain item", now - 2 * day);
-        insert_session_note_at(&store, "Forty-day-old plain item", now - 40 * day);
+            let now = now_ms();
+            let day = 24 * 60 * 60 * 1000;
+            // A ready smart note, a parked smart note, and three plain notes: one
+            // fresh, one two days old, one untouched for 40 days.
+            let ready = store
+                .insert_project_note(NoteWriteInput {
+                    project_path: "/repo",
+                    route_project_root: None,
+                    session_id: Some("session"),
+                    content: "Ready smart item",
+                    surface_condition: Some("condition"),
+                    compiled_provider: None,
+                    compiled_config: None,
+                    compiled_at: None,
+                    compile_status: None,
+                    anchor_block_id: None,
+                    anchor_ordinal: None,
+                    now_ms: now - 5 * day,
+                })
+                .unwrap();
+            store
+                .write_note_evaluation(NoteEvaluationInput {
+                    project_path: "/repo",
+                    note_id: ready.id,
+                    source_revision: ready.status_version,
+                    verdict: true,
+                    compiled_check: None,
+                    manifest_json: None,
+                    check_hash: None,
+                    next_due_at: None,
+                    now_ms: now - 5 * day,
+                })
+                .unwrap();
+            store
+                .insert_project_note(NoteWriteInput {
+                    project_path: "/repo",
+                    route_project_root: None,
+                    session_id: Some("session"),
+                    content: "Parked smart item",
+                    surface_condition: Some("condition"),
+                    compiled_provider: None,
+                    compiled_config: None,
+                    compiled_at: None,
+                    compile_status: None,
+                    anchor_block_id: None,
+                    anchor_ordinal: None,
+                    now_ms: now - 2 * day,
+                })
+                .unwrap();
+            insert_session_note_at(&store, "Fresh plain item", now);
+            insert_session_note_at(&store, "Two-day-old plain item", now - 2 * day);
+            insert_session_note_at(&store, "Forty-day-old plain item", now - 40 * day);
 
-        let glance = tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
+            let glance =
+                tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
 
-        // Ready smart notes first, then pending, then plain notes newest first.
-        assert_eq!(
-            glance,
-            "## Notes\n\n\
+            // Ready smart notes first, then pending, then plain notes newest first.
+            assert_eq!(
+                glance,
+                "## Notes\n\n\
              #1 · 5d · Ready smart item · ready\n\
              #2 · 2d · Parked smart item · pending\n\
              #3 · 0m · Fresh plain item\n\
              #4 · 2d · Two-day-old plain item\n\
              #5 · 5w · Forty-day-old plain item · stale\n\n\
              To dismiss a stale note: ctx_note(action=\"dismiss\", note_ids=[N])"
-        );
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -30991,9 +31269,26 @@ mod tests {
     }
 
     #[test]
-    fn ctx_reduce_held_copy_has_no_totals_or_countdown() {
-        assert_eq!(ctx_reduce_held_reply(&[7]), "Held: §7§ is inside the protected working set; it applies once newer work displaces it.");
-        assert_eq!(ctx_reduce_held_reply(&[7, 8]), "Held: §7§, §8§ are inside the protected working set; they apply once newer work displaces them.");
+    fn ctx_reduce_reply_matches_shared_cases() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            label: String,
+            stamped: usize,
+            self_stamps: usize,
+            expected: String,
+        }
+        let cases: Vec<Case> = serde_json::from_str(include_str!(
+            "../../../packages/plugin/src/tools/ctx-reduce/reply-cases.json"
+        ))
+        .unwrap();
+        for case in cases {
+            assert_eq!(
+                ctx_reduce_reply(case.stamped, case.self_stamps),
+                case.expected,
+                "{}",
+                case.label
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -31058,15 +31353,7 @@ mod tests {
     }
 
     #[test]
-    fn ctx_reduce_self_stamp_message_matches_typescript_golden() {
-        let golden =
-            include_str!("../../../packages/plugin/src/tools/ctx-reduce/self-stamp-message.golden")
-                .trim_end();
-        assert_eq!(CTX_REDUCE_SELF_STAMP_MESSAGE_TEMPLATE, golden);
-        assert_eq!(
-            ctx_reduce_self_stamp_message(41),
-            golden.replace("§N§", "§41§")
-        );
+    fn ctx_reduce_self_stamp_identification_uses_cached_call() {
         let cached_calls = vec![cached_tool_call("call-mid", "ctx_reduce")];
         assert_eq!(
             cached_tool_name_for_tag(Some(&cached_calls), "call-mid#0").as_deref(),
@@ -31124,21 +31411,15 @@ mod tests {
         );
 
         let ack = tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1,2,3" })).await);
-        assert!(
-            ack.contains("Held: §2§, §3§ are inside the protected working set"),
-            "{ack}"
+        assert_eq!(
+            ack,
+            "2 tags stamped. 1 was a ctx_reduce call; leave those alone, they are cleaned up automatically."
         );
-        assert!(!ack.contains("drop §1§"), "{ack}");
-        assert!(
-            ack.contains(
-                "§1§ is a ctx_reduce call; leave those alone, they are cleaned up automatically."
-            ),
-            "{ack}"
-        );
+        assert!(!ack.contains("§1§"), "{ack}");
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
         assert_eq!(
             tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1" })).await),
-            "§1§ is a ctx_reduce call; leave those alone, they are cleaned up automatically."
+            "1 was a ctx_reduce call; leave those alone, they are cleaned up automatically."
         );
 
         let delivered = handler.handle_agent_drops_value(
@@ -31235,12 +31516,7 @@ mod tests {
                 )
                 .await,
             );
-            assert_eq!(
-                ack,
-                ctx_reduce_self_stamp_message(case.drop as u64),
-                "{}",
-                case.label
-            );
+            assert_eq!(ack, ctx_reduce_reply(0, 1), "{}", case.label);
             let delivered = tool_body(handler.handle_agent_drops_value(
                 7,
                 json!({
@@ -31290,7 +31566,7 @@ mod tests {
             ],
         );
         let ack = tool_text(call_facade(&handler, "ctx_reduce", json!({"drop":"2,1,3"})).await);
-        assert_eq!(ack, "Queued: drop §3§. Held: §1§ is inside the protected working set; it applies once newer work displaces it. Marking QUEUES content for release. It stays fully visible to you until it is actually released, which may be the next turn or many turns later. §2§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.");
+        assert_eq!(ack, "2 tags stamped. 1 was a ctx_reduce call; leave those alone, they are cleaned up automatically.");
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
         let delivered = tool_body(handler.handle_agent_drops_value(7, json!({
             "method":"agent_drops.append", "session_id":"ses", "drop":"2,1,3", "command_id":"mixed-reply",
@@ -31335,8 +31611,7 @@ mod tests {
             )
             .await,
         );
-        assert!(mixed_ack.contains("drop §1§"));
-        assert!(mixed_ack.contains("Held: §21§ is inside the protected working set; it applies once newer work displaces it."));
+        assert!(mixed_ack.contains("2 tags stamped."));
         assert!(mixed_ack.contains("tags 99, 100 not found"));
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
@@ -31364,18 +31639,20 @@ mod tests {
         );
         assert_eq!(
             tool_body(retry),
-            json!({ "ok": true, "queued": 0, "duplicate": true })
+            json!({ "ok": true, "queued": 0, "duplicate": true, "ctx_reduce_queued_tags": [1, 21] })
         );
         assert_eq!(
             store.load_pending_agent_drops("ses").unwrap(),
             pending_after_delivery
         );
 
+        let already_queued_ack =
+            tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1, 21" })).await);
+        assert_eq!(already_queued_ack, "2 tags stamped.");
+
         let queued_ack =
             tool_text(call_facade(&handler, "ctx_reduce", json!({ "drop": "1, 2, 99" })).await);
-        assert!(queued_ack.contains("Held: §2§ is inside the protected working set; it applies once newer work displaces it."), "{queued_ack}");
-        assert!(queued_ack.contains("tags 1 already queued"));
-        assert!(queued_ack.contains("tags 99 not found"));
+        assert_eq!(queued_ack, "2 tags stamped. tags 99 not found.");
 
         let refused = tool_body(call_facade(&handler, "ctx_reduce", json!({ "drop": "99" })).await);
         assert_eq!(refused["isError"], json!(true));
@@ -31492,7 +31769,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protected_tool_ctx_reduce_ack_reuses_selection_snapshot() {
+    async fn protected_tool_ctx_reduce_ack_counts_held_tags_and_delivery_preserves_hold() {
         let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
         let (handler, store, _dir, _project) = handler_with_store_and_resolver(
             Arc::new(ProducerState::default()),
@@ -31517,10 +31794,7 @@ mod tests {
             .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
             .unwrap();
         let ack = tool_text(call_facade(&handler, "ctx_reduce", json!({"drop":"2"})).await);
-        assert!(
-            ack.contains("Held: §2§ is inside the protected working set"),
-            "{ack}"
-        );
+        assert_eq!(ack, "1 tag stamped.");
         let delivery = tool_body(handler.handle_agent_drops_value(
             7,
             json!({"session_id":"ses", "drop":"2", "command_id":"held-tool-command"}),
@@ -32134,6 +32408,30 @@ mod tests {
         assert_ne!(
             after_update, before_update,
             "content updates advance the m1 mutation signal"
+        );
+
+        // A rewrite onto another memory's exact content (same project and
+        // category) is rejected by name instead of failing the whole batch on the
+        // UNIQUE index; the other row in the same call still applies.
+        let duplicate = call_facade(&handler, "memory.set_verification", json!({
+            "memory_project": identity, "context_store_uuid": "context", "authority_generation": generation,
+            "rows": [
+                {"memory_id": archived_id, "content_hash_at_prompt": hash(archived_id), "verification_status": "update", "updated_content": "updated by verifier"},
+                {"memory_id": verified_id, "content_hash_at_prompt": hash(verified_id), "verification_status": "verified"}
+            ]
+        })).await;
+        let duplicate_body = match duplicate {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("duplicate update facade failed: {other:?}"),
+        };
+        assert_eq!(duplicate_body["accepted"], json!([verified_id]));
+        assert_eq!(
+            duplicate_body["rejected"],
+            json!([{"memory_id": archived_id, "reason": format!("duplicate_of:{updated_id}")}])
+        );
+        assert_eq!(
+            store.get_memory_full(archived_id).unwrap().unwrap().content,
+            "archived"
         );
 
         let before_archive =
@@ -35198,7 +35496,10 @@ mod tests {
         let pending = store.load_pending_agent_drops("ses").unwrap();
 
         let retry = queue_drop_command_with_id(&handler, "tool-use-1");
-        assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
+        assert_eq!(
+            retry,
+            json!({ "ok": true, "queued": 0, "duplicate": true, "ctx_reduce_queued_tags": [1] })
+        );
         assert_eq!(store.load_pending_agent_drops("ses").unwrap(), pending);
     }
 
@@ -35319,7 +35620,10 @@ mod tests {
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
         let retry = queue_drop_command_with_id(&handler, "tool-use-1");
-        assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
+        assert_eq!(
+            retry,
+            json!({ "ok": true, "queued": 0, "duplicate": true, "ctx_reduce_queued_tags": [1] })
+        );
         assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
 
         let new_request = queue_drop_command_with_id(&handler, "tool-use-2");
@@ -35422,7 +35726,10 @@ mod tests {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         };
-        assert_eq!(repeat, json!({ "ok": true, "queued": 0 }));
+        assert_eq!(
+            repeat,
+            json!({ "ok": true, "queued": 0, "ctx_reduce_queued_tags": [1, 2] })
+        );
 
         // Malformed range syntax is a typed bad_request, nothing partially queued.
         match handler.handle_agent_drops_value(
@@ -35483,7 +35790,10 @@ mod tests {
             HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
             other => panic!("unexpected handler outcome: {other:?}"),
         };
-        assert_eq!(retry, json!({ "ok": true, "queued": 0, "duplicate": true }));
+        assert_eq!(
+            retry,
+            json!({ "ok": true, "queued": 0, "duplicate": true, "ctx_reduce_queued_tags": [1] })
+        );
         assert_eq!(store.load_pending_agent_drops("ses").unwrap().len(), 1);
     }
 
@@ -35656,6 +35966,158 @@ mod tests {
             "{response}"
         );
         assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+    }
+
+    /// The chain a wrapup request carries is the host's current config. It replaces the
+    /// chain cached from the session's last completed transform, which goes stale while
+    /// that session's passes keep failing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_request_chain_overrides_the_snapshot_chain() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_snapshot(
+            &handler,
+            "ses",
+            wrapup_messages(80, 800),
+            200_000,
+            Some(vec!["test/stale-snapshot-model".to_string()]),
+        );
+        let response = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method": "session.wrapup",
+                        "v": 1,
+                        "session_id": "ses",
+                        "historian_model_chain": ["test/live-config-model", "test/live-fallback"],
+                        "historian_model_limits": {
+                            "test/live-config-model": { "context": 200_000 }
+                        },
+                        "historian_model_variants": { "test/live-config-model": "medium" },
+                        "historian_timeout_ms": 90_000,
+                        "historian_max_output_tokens": 12_000
+                    }),
+                )
+                .await,
+        );
+
+        assert_eq!(response["ok"], json!(true), "{response}");
+        assert_eq!(response["disposition"], json!("completed"), "{response}");
+        let models = producer.models.lock().expect("models mutex").clone();
+        assert!(!models.is_empty(), "the wrapup must reach the producer");
+        assert!(
+            models.iter().all(|model| model == "test/live-config-model"),
+            "every round runs on the request's head model, never the snapshot's: {models:?}"
+        );
+        let variants = producer.variants.lock().expect("variants mutex").clone();
+        assert_eq!(
+            variants.len(),
+            models.len(),
+            "every start names its variant: {variants:?}"
+        );
+        assert!(
+            variants
+                .iter()
+                .all(|variant| variant.as_deref() == Some("medium")),
+            "the request's variant rides with its model: {variants:?}"
+        );
+        // The snapshot's transform carried no timeout, which would mean the 600 s
+        // default; every await uses the request's 90 s instead.
+        let await_timeouts = producer
+            .await_timeouts
+            .lock()
+            .expect("await timeouts mutex")
+            .clone();
+        assert!(!await_timeouts.is_empty());
+        assert!(
+            await_timeouts
+                .iter()
+                .all(|timeout| *timeout == Duration::from_secs(90)),
+            "{await_timeouts:?}"
+        );
+    }
+
+    /// Each historian setting a wrapup request carries replaces the snapshot's value; a
+    /// setting it omits, or sends as null, keeps the snapshot's.
+    #[test]
+    fn wrapup_historian_overrides_replace_only_the_settings_they_carry() {
+        let mut snapshot = transform_request(Vec::new(), 1, 200_000);
+        snapshot.historian_model_chain = Some(vec!["test/snapshot".to_string()]);
+        snapshot.historian_timeout_ms = Some(600_000);
+        snapshot.historian_max_output_tokens = Some(4_000);
+
+        let all = wrapup_historian_overrides(&json!({
+            "historian_model_chain": ["test/live"],
+            "historian_timeout_ms": 90_000,
+            "historian_max_output_tokens": 12_000,
+        }))
+        .unwrap()
+        .apply_to(&snapshot);
+        assert_eq!(
+            all.historian_model_chain,
+            Some(vec!["test/live".to_string()])
+        );
+        assert_eq!(all.historian_timeout_ms, Some(90_000));
+        assert_eq!(all.historian_max_output_tokens, Some(12_000));
+
+        let output_only = wrapup_historian_overrides(&json!({
+            "historian_max_output_tokens": 12_000,
+            "historian_timeout_ms": null,
+        }))
+        .unwrap();
+        assert!(!output_only.is_empty());
+        let output_only = output_only.apply_to(&snapshot);
+        assert_eq!(
+            output_only.historian_model_chain,
+            Some(vec!["test/snapshot".to_string()])
+        );
+        assert_eq!(output_only.historian_timeout_ms, Some(600_000));
+        assert_eq!(output_only.historian_max_output_tokens, Some(12_000));
+
+        let none = wrapup_historian_overrides(&json!({ "keep": 20 })).unwrap();
+        assert!(none.is_empty());
+    }
+
+    /// A chain field of the wrong shape is a malformed request, not a reason to fall back
+    /// to the snapshot's chain.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_wrapup_malformed_request_chain_is_bad_request() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, _project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+        for (field, value) in [
+            ("historian_model_chain", json!("test/live-config-model")),
+            ("historian_model_chain", json!(["test/model", 7])),
+            ("historian_model_limits", json!(["not", "a", "map"])),
+            ("historian_model_variants", json!({ "test/model": 3 })),
+            ("historian_timeout_ms", json!("90s")),
+            ("historian_timeout_ms", json!(-1)),
+            ("historian_max_output_tokens", json!(5_000_000_000_u64)),
+            ("historian_max_output_tokens", json!(1.5)),
+        ] {
+            let mut request = json!({
+                "method": "session.wrapup",
+                "v": 1,
+                "session_id": "ses",
+                "historian_model_chain": ["test/model"],
+            });
+            request[field] = value.clone();
+            match handler.dispatch_value(7, request).await {
+                HandlerOutcome::Error { code, message } => {
+                    assert_eq!(code, "bad_request", "{field}={value}: {message}");
+                    assert!(message.contains(field), "{field}={value}: {message}");
+                }
+                other => panic!("{field}={value} must be a bad request, got {other:?}"),
+            }
+        }
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+        assert!(
+            !handler.wrapup_active("ses"),
+            "a refused request leaves no wrapup claim behind"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -41329,7 +41791,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn the_historian_claim_lane_answers_the_wire_a2_codes_against() {
         let golden = claim_wire_golden();
-        let (handler, store, _dir, project) =
+        let (handler, store, dir, project) =
             handler_with_store(Arc::new(ProducerState::default()), default_test_config());
         let project_path = project.to_string_lossy().to_string();
         let queued_at_ms = now_ms();
@@ -41464,15 +41926,39 @@ mod tests {
         // and its token is still current, but nothing in this process is waiting for
         // the answer. The report is stored on the queue row rather than refused.
         assert_eq!(handler.host_runs.waiting_count(), 0);
-        drive_claim_wire_case(
-            &handler,
-            claim_wire_case(
-                &golden,
-                "a-report-with-no-firing-waiting-is-stored-for-the-next-pass",
-            ),
-            Some(&token),
-        )
-        .await;
+        let invocations = json!([
+            { "provider_id": "prov", "model_id": "broken", "started_at": queued_at_ms,
+              "ended_at": queued_at_ms + 1, "status": "failed", "error": "provider unavailable" },
+            { "provider_id": "other", "model_id": "good", "started_at": queued_at_ms + 1,
+              "ended_at": queued_at_ms + 2, "status": "completed", "input_tokens": 120,
+              "output_tokens": 40, "cache_read_tokens": 80, "cache_write_tokens": 10, "error": null }
+        ]);
+        let case = claim_wire_case(
+            &golden,
+            "a-report-with-no-firing-waiting-is-stored-for-the-next-pass",
+        );
+        let mut deferred = case.request.clone();
+        deferred["token"] = json!(token);
+        deferred["invocations"] = invocations.clone();
+        let observed = call_dispatch_request(&handler, deferred).await;
+        assert_eq!(observed, case.response);
+        let descriptor = dev_descriptor_at(dir.path().join("data").to_str().unwrap());
+        let context_path = match descriptor.backend {
+            StorageBackend::Sqlite { path } => {
+                PathBuf::from(path).parent().unwrap().join("context.db")
+            }
+            _ => panic!("test store is SQLite"),
+        };
+        let conn = rusqlite::Connection::open(context_path).unwrap();
+        let rows: Vec<(i64,String,Option<i64>,Option<String>)> = conn.prepare(
+            "SELECT id,status,parent_invocation_id,error FROM subagent_invocations WHERE session_id='ses' ORDER BY id"
+        ).unwrap().query_map([], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap()
+            .collect::<Result<_,_>>().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, "failed");
+        assert_eq!(rows[0].3.as_deref(), Some("provider unavailable"));
+        assert_eq!(rows[1].1, "completed");
+        assert_eq!(rows[1].2, Some(rows[0].0));
         let parked = store
             .load_parked_historian_run("ses")
             .unwrap()
@@ -41495,12 +41981,24 @@ mod tests {
                 "run_id": CLAIM_RUN_ID,
                 "token": token,
                 "output": { "text": "<compartments/>", "length_capped": false },
+                "invocations": invocations,
             }),
         )
         .await;
         assert_eq!(
             duplicate,
             json!({ "ok": false, "refusal": "already_reported" })
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM subagent_invocations WHERE session_id='ses'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "a refused duplicate cannot record the attempts again"
         );
     }
 

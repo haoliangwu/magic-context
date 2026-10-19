@@ -1446,3 +1446,82 @@ it("Pi rotation inside the adopted policy keeps queued mass out of U on SOFT+", 
 		effectivePiTailHygiene(before).u,
 	);
 });
+
+it("the hygiene projection counts real user turns without a second message walk", () => {
+	const input = {
+		messages: [
+			{ role: "user", content: "synthetic leading history" },
+			{ role: "user", content: "first real prompt" },
+			{ role: "custom", content: "hidden nudge" },
+			{ role: "assistant", content: [{ type: "text", text: "reply" }] },
+			{ role: "user", content: "second real prompt" },
+		],
+		tags: [],
+		protectedTagNumbers: new Set<number>(),
+		syntheticLeadingCount: 1,
+	};
+	expect(measurePiTailHygiene(input).realUserTurnCount).toBe(2);
+	const first = refreshPiTailHygieneBaseline({ ...input, cacheBusting: true });
+	expect(first.realUserTurnCount).toBe(2);
+	const next = refreshPiTailHygieneBaseline({
+		...input,
+		messages: [
+			...input.messages,
+			{ role: "user", content: "third real prompt" },
+		],
+		cacheBusting: false,
+		previous: first,
+	});
+	expect(next.realUserTurnCount).toBe(3);
+});
+
+it("immutable hygiene tag attribution extends appends and rebuilds rewritten, deleted and reowned rows", () => {
+	const key = {};
+	const first = Object.freeze([
+		Object.freeze(tag(1, "user:p0", "message")),
+		Object.freeze(tag(2, "call", "tool", { toolOwnerMessageId: "assistant" })),
+	]);
+	const messages = [
+		{ role: "user", content: "§1§ prompt" },
+		{
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call", name: "read", arguments: {} }],
+		},
+		{
+			role: "toolResult",
+			toolCallId: "call",
+			content: [{ type: "text", text: "§2§ result" }],
+		},
+	];
+	const compare = (tags: readonly TagEntry[]) => {
+		const input = {
+			messages,
+			tags,
+			protectedTagNumbers: new Set<number>(),
+			stableId: (_message: unknown, index: number) =>
+				["user", "assistant", "result"][index],
+		};
+		expect(measurePiTailHygiene({ ...input, tagCacheKey: key })).toEqual(
+			measurePiTailHygiene(input),
+		);
+	};
+	compare(first);
+	const appended = Object.freeze([
+		...first,
+		Object.freeze(tag(3, "hidden:p0", "message")),
+	]);
+	compare(appended);
+	compare(
+		Object.freeze([
+			first[0] as TagEntry,
+			Object.freeze(
+				tag(2, "call", "tool", {
+					toolOwnerMessageId: "different",
+					status: "dropped",
+				}),
+			),
+			appended[2] as TagEntry,
+		]),
+	);
+	compare(Object.freeze([first[0] as TagEntry]));
+});

@@ -8,6 +8,28 @@
 
 use std::path::Path;
 
+pub fn read_smart_notes_enabled(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&strip_jsonc(&raw)).ok())
+        .and_then(|value| {
+            value
+                .pointer("/smart_notes/enabled")
+                .and_then(|v| v.as_bool())
+        })
+        .unwrap_or(true)
+}
+
+/// Freeze smart-note task visibility until dashboard restart, matching the hosts' startup-only tool definitions.
+pub fn startup_smart_notes_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        read_smart_notes_enabled(&crate::config::resolve_user_config_path(
+            &crate::config::config_home(),
+        ))
+    })
+}
+
 /// Strip JSONC line/block comments AND trailing commas, respecting string
 /// literals, so the result parses as plain JSON.
 ///
@@ -158,6 +180,16 @@ pub fn read_dreamer_task_schedules(path: &Path) -> std::collections::HashMap<Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn smart_notes_visibility_defaults_on_and_reads_user_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magic-context.jsonc");
+        assert!(super::read_smart_notes_enabled(&path));
+        std::fs::write(&path, "{\"smart_notes\": {\"enabled\": false}} // disabled").unwrap();
+        assert!(!super::read_smart_notes_enabled(&path));
+        std::fs::write(&path, "{\"smart_notes\": {\"enabled\": true}}").unwrap();
+        assert!(super::read_smart_notes_enabled(&path));
+    }
     use super::*;
 
     #[test]

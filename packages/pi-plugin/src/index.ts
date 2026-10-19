@@ -28,6 +28,7 @@ import {
 	isCompactionEnabled,
 	isDreamerRunnable,
 } from "@magic-context/core/config/agent-disable";
+import { logConfigDependencyNotesOnce } from "@magic-context/core/config/dependency-notes";
 import {
 	changedLiveKeys,
 	dreamerRunConfig,
@@ -41,10 +42,11 @@ import type {
 	HistorianConfig,
 	MagicContextConfig,
 } from "@magic-context/core/config/schema/magic-context";
-import { createSubcCheckoutClaimGate } from "@magic-context/core/features/magic-context/checkout-claim";
 import {
 	summarizeDreamSchedule,
 	userMemoryCollectionEnabled,
+	userObservationCollectionEnabled,
+	userObservationsRequested,
 } from "@magic-context/core/features/magic-context/dreamer/task-config";
 import {
 	type FailClosedReason,
@@ -85,7 +87,6 @@ import {
 	resolveHistorianContextLimit,
 	resolveKnownHistorianContextLimit,
 } from "@magic-context/core/hooks/magic-context/derive-budgets";
-import { getDefaultSubcConnectionFile } from "@magic-context/core/hooks/magic-context/module-transport";
 import {
 	clearNoteNudgeTriggerAndCooldown,
 	onNoteTrigger,
@@ -108,7 +109,11 @@ import {
 	claimConfigParseFailuresOnce,
 	formatConfigParseNotice,
 } from "@magic-context/core/shared/config-diagnostics";
-import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
+import {
+	claimStorageBackupWarningCheck,
+	getMagicContextStorageDir,
+	isMagicContextStorageOutsideEngram,
+} from "@magic-context/core/shared/data-path";
 import { setEmbeddingSessionBusy } from "@magic-context/core/shared/embedding-activity";
 import { setHarness } from "@magic-context/core/shared/harness";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
@@ -124,9 +129,14 @@ import {
 	providerResponseFailed,
 } from "@magic-context/core/shared/provider-response-completion";
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
-import { reloadWindowOverlay } from "@magic-context/core/shared/window-geometry";
-import { gatePiEventsByCheckoutClaim } from "./checkout-claim-pi";
-import { handlePiCloneSessionStart } from "./clone-inheritance";
+import { registerStandalonePluginMarker } from "@magic-context/core/standalone-plugin-marker";
+import { startHostStallProfilerSwitch } from "../../plugin/src/shared/host-stall-profiler";
+import packageMetadata from "../package.json";
+import {
+	handlePiCloneSessionStart,
+	type PiCloneTransitionRegistrar,
+	registerPiCloneSessionTransitions,
+} from "./clone-inheritance";
 import { registerCtxDreamCommand } from "./commands/ctx-dream";
 import {
 	maybeAutoEmbedPiSession,
@@ -156,9 +166,7 @@ import {
 	registerPiContextHandler,
 	signalPiDeferredHistoryRefresh,
 	signalPiDeferredMaterialization,
-	signalPiHistoryRefresh,
-	signalPiPendingMaterialization,
-	signalPiSystemPromptRefresh,
+	signalPiSystemHashChange,
 	signalPiSystemPromptRefreshForProject,
 	trackSessionForProject,
 } from "./context-handler";
@@ -194,6 +202,7 @@ import {
 	formatEmptyPiModelChain,
 	formatEmptyPiModelChainsNotice,
 	type PiModelRegistryLike,
+	waitForPiModelRegistryRefresh,
 } from "./model-chain-health";
 import { bootPiRuntimeWithDeadline } from "./pi-boot-deadline";
 import {
@@ -204,6 +213,7 @@ import {
 	type PiHarnessKind,
 	resolvePiHarnessDetection,
 } from "./pi-harness-kind";
+import { buildPiHistorianCommandOptions } from "./pi-historian-command-options";
 import { notePiLkgProviderUsage } from "./pi-lkg";
 import {
 	computePiPressure,
@@ -241,6 +251,10 @@ import {
 	composeMagicContextSystemPrompt,
 	processSystemPromptForCache,
 } from "./system-prompt";
+import {
+	acknowledgePiPendingSystemPromptResponses,
+	acknowledgePiSystemPromptResponse,
+} from "./system-prompt-delivery-pi";
 import { withTimeout } from "./timeout";
 import { registerMagicContextTools, syncCtxMemoryToolEnabled } from "./tools";
 import {
@@ -250,6 +264,8 @@ import {
 	rememberTodowriteToolCallTodos,
 	setTodoSnapshot,
 } from "./tools/todo-view-pi";
+
+registerStandalonePluginMarker(packageMetadata.version);
 
 const PI_HARNESS_DETECTION = await resolvePiHarnessDetection();
 const PI_HARNESS_KIND = PI_HARNESS_DETECTION.kind;
@@ -623,8 +639,25 @@ export function registerConfiguredTodoLifecycle(
 		: undefined;
 }
 
+const PI_MARKER_REHYDRATION_SESSION_ID_LIMIT = 5;
+
+function formatPiMarkerRehydrationLine(
+	sessionIds: readonly string[],
+	activeSessionId: string,
+): string {
+	const shownIds = sessionIds.slice(0, PI_MARKER_REHYDRATION_SESSION_ID_LIMIT);
+	const omitted = sessionIds.length - shownIds.length;
+	const suffix = omitted > 0 ? ` +${omitted} more` : "";
+	return (
+		`${PREFIX} rehydrated ${sessionIds.length} Pi deferred compaction marker session(s)` +
+		`; sessionIds=${shownIds.join(",")}${suffix}` +
+		`; activeSessionIncluded=${sessionIds.includes(activeSessionId)}`
+	);
+}
+
 export const __test = {
 	logPiConfigLoad,
+	formatPiMarkerRehydrationLine,
 	resetLoggedPiConfigDirs(): void {
 		loggedPiConfigDirs.clear();
 	},
@@ -708,6 +741,7 @@ export async function persistPiPressureFromMessageEnd(args: {
 	readBranch?: () => readonly unknown[] | undefined;
 	notifyIssue?: (message: string) => unknown | Promise<unknown>;
 }): Promise<void> {
+	acknowledgePiSystemPromptResponse(args.sessionId, args.message);
 	// Pi emits message_end before it appends the message to the branch, so the
 	// branch read for the flag does not hold this message yet. A reply with
 	// provider usage becomes the anchor of Pi's live figure once appended.
@@ -1087,7 +1121,8 @@ export function resolveHistorianFromConfig(
 		historyBudgetPercentage: config.history_budget_percentage,
 		memoryEnabled: config.memory.enabled,
 		autoPromote: config.memory.auto_promote,
-		userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
+		userMemoriesEnabled: userObservationCollectionEnabled(config.dreamer),
+		userObservationsRequested: userObservationsRequested(config.dreamer),
 		language: config.language,
 		allowHomeProject: config.allow_home_project,
 	};
@@ -1138,6 +1173,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		);
 		return;
 	}
+	startHostStallProfilerSwitch();
 	registerPiSubagentHostTools(pi, PI_HARNESS_KIND);
 	const unregisterPiSubagentInitContext = registerPiSubagentInitContext(pi);
 	registerPiSubagentInitContextCleanup(pi, unregisterPiSubagentInitContext);
@@ -1159,7 +1195,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		info("plugin DISABLED via config (enabled: false) — skipping registration");
 		return;
 	}
-	reloadWindowOverlay(bootConfig.config.models?.window_overlay_path);
 	setStoragePrivatePermissionEnforcement(
 		bootConfig.config.storage.enforce_private_permissions,
 	);
@@ -1175,6 +1210,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		databaseExitHookRegistered = true;
 	}
 	const storageDir = getMagicContextStorageDir();
+	if (
+		claimStorageBackupWarningCheck() &&
+		isMagicContextStorageOutsideEngram(storageDir)
+	) {
+		warn(
+			`Magic Context storage is at ${storageDir}, outside the folder Engram backs up (~/.local/share/cortexkit/magic-context). It is not included in CortexKit backups.`,
+		);
+		flushLogger();
+	}
 	const dbPath = join(storageDir, "context.db");
 	let openFailureCause: string | null = null;
 	const openStorage = async (): Promise<ContextDatabase | null> => {
@@ -1249,23 +1293,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
  * runtime without requiring a process restart.
  */
 async function startPiMagicContextRuntime(
-	hostPi: ExtensionAPI,
+	pi: ExtensionAPI,
 	database: ContextDatabase,
 	dbPath: string,
 ): Promise<void> {
-	// One checkout-claim gate per runtime: Magic Context must not write for a
-	// session whose agent another machine holds. Session start and every context
-	// pass check it explicitly (session start tells the user, the context pass
-	// refuses the turn); every other event handler registered through `pi` below
-	// skips such a session. Verdicts are cached per session, so a pass pays for
-	// at most one check per cache period. The connection file is resolved per
-	// check, so the configured one applies once the config below has loaded.
-	let subcConnectionFile: string | undefined;
-	const checkoutClaim = createSubcCheckoutClaimGate(
-		"pi",
-		() => subcConnectionFile ?? getDefaultSubcConnectionFile(),
-	);
-	const pi = gatePiEventsByCheckoutClaim(hostPi, () => checkoutClaim);
 	const db = database;
 
 	// v22 deferred legacy-memory identity backfill. openDatabase() has already
@@ -1387,20 +1418,20 @@ async function startPiMagicContextRuntime(
 		`loaded v${PLUGIN_VERSION} | harness=${PI_HARNESS_KIND} (via ${PI_HARNESS_DETECTION.via}) | db=${dbPath} | ` +
 			`project=${projectIdentity || "(none)"} | dir=${projectDir}`,
 	);
+	// Settings that are on but inert because another section turns off what
+	// they rely on (for example smart notes with the dreamer disabled).
+	logConfigDependencyNotesOnce(config, log);
 	// Pi tools are registered once per process, so this mode is intentionally
 	// boot-resolved rather than following later /cd project config changes.
 	const compactionOff = !isCompactionEnabled(config);
 	setCtxReduceRegisteredGlobally(!compactionOff);
+	let pendingPiMarkerSessions: string[] = [];
+	let piMarkerRehydrationLogged = false;
 	if (!compactionOff) {
 		try {
-			const pendingPiMarkerSessions = getSessionsWithPendingPiMarker(db);
+			pendingPiMarkerSessions = getSessionsWithPendingPiMarker(db);
 			for (const sid of pendingPiMarkerSessions) {
 				signalPiDeferredCompactionMarkerDrain(sid);
-			}
-			if (pendingPiMarkerSessions.length > 0) {
-				log(
-					`${PREFIX} rehydrated ${pendingPiMarkerSessions.length} Pi deferred compaction marker session(s)`,
-				);
 			}
 		} catch (err) {
 			warn(
@@ -1610,6 +1641,8 @@ async function startPiMagicContextRuntime(
 			dedupe: true,
 		});
 		const switchedConfig = switchedLoad.config;
+		// A new cwd or session may reload config, but registered tool text belongs to this process's startup.
+		switchedConfig.smart_notes.enabled = config.smart_notes.enabled;
 		const switchedIdentity =
 			identityOverride ??
 			resolveProjectIdentityForSession(
@@ -1635,21 +1668,44 @@ async function startPiMagicContextRuntime(
 	let activeModelRegistry:
 		| { find(provider: string, modelId: string): unknown }
 		| undefined;
+	// The latest session context Pi handed the extension, kept alongside the
+	// active registry. A report deferred behind a discovery refresh resolves
+	// its dependencies through this instead of replaying the context captured
+	// when the wait was scheduled: after a session switch that capture belongs
+	// to a dead session (its `ui` reaches nowhere, its registry is not the
+	// live catalogue), and after a config reload its project is stale. The
+	// context and its cwd stay paired: reports belong to the session's
+	// current project, never to a project merely cached in the process.
+	type PiModelChainReportContext = {
+		modelRegistry?: PiModelRegistryLike;
+		cwd?: string;
+		hasUI?: boolean;
+		ui?: { notify?: (message: string, level?: "warning") => unknown };
+	};
+	let activeModelChainContext: PiModelChainReportContext | undefined;
 
 	// Config generation last checked per project directory.
 	const modelChainsCheckedGeneration = new Map<string, number>();
+	// Project directories whose chain report already awaited the host's
+	// discovery-backed catalogue once. Set only when that await has settled.
+	const modelChainReadinessWaited = new Set<string>();
+	// Project directories with a discovery await still in flight. Reports
+	// defer to it while it is pending; it is the only thing allowed to
+	// schedule the settled re-check.
+	const modelChainRefreshPending = new Set<string>();
 	/**
 	 * Validate the historian and dreamer chains against Pi's model registry:
 	 * log the historian chain that will actually run, and notify the session
 	 * once per process for each set of chains left empty (see
 	 * model-chain-health.ts). Runs at session start and after a config reload.
+	 * An empty chain is first re-checked after one background-refresh await,
+	 * because a registration-time miss on a discovery-backed provider means
+	 * "not hydrated yet" far more often than "not configured". While that
+	 * await is in flight every further report defers to it, and it re-checks
+	 * through current lifecycle state, never the pass that scheduled it.
 	 */
 	function reportPiModelChains(
-		ctx: {
-			modelRegistry?: PiModelRegistryLike;
-			hasUI?: boolean;
-			ui?: { notify?: (message: string, level?: "warning") => unknown };
-		},
+		ctx: PiModelChainReportContext,
 		project: ResolvedPiProjectDeps,
 	): void {
 		const registry = ctx.modelRegistry;
@@ -1668,6 +1724,51 @@ async function startPiMagicContextRuntime(
 				registry,
 				harness: PI_HARNESS_KIND,
 			});
+
+			// Nothing is logged or notified from a pass that found an empty
+			// chain before the host's discovery has settled: on OMP the provider
+			// that owns these models is queued during extension loading and
+			// merged by a boot refresh nobody awaits, so announcing "will not
+			// run" from an unsettled catalogue is usually wrong and, once
+			// notified, sticky for the process through
+			// loggedPiModelChainLines/notifiedPiModelChainKeys. One await per
+			// project: any event arriving inside the refresh window -- a second
+			// session_start, or the reload-driven agent_start gate -- defers to
+			// the in-flight await instead of skipping the wait and reporting the
+			// miss.
+			if (
+				empty.length > 0 &&
+				!modelChainReadinessWaited.has(project.projectDir)
+			) {
+				if (!modelChainRefreshPending.has(project.projectDir)) {
+					modelChainRefreshPending.add(project.projectDir);
+					const waitingDir = project.projectDir;
+					void waitForPiModelRegistryRefresh(registry).then(() => {
+						// Marked settled only now: the await has actually
+						// finished, so a miss remaining from here on is
+						// trustworthy and later passes may report it.
+						modelChainRefreshPending.delete(waitingDir);
+						modelChainReadinessWaited.add(waitingDir);
+						try {
+							reportPiModelChainsAfterRefresh(waitingDir);
+						} catch (err) {
+							// The re-check resolves deps and polls the config
+							// outside reportPiModelChains' own try/catch; a
+							// rejection on the void chain. The settled marker
+							// stands (the await really finished) and the last
+							// checked generation was not updated -- this throw
+							// happens before reportPiModelChains records it --
+							// so the next session_start re-runs the check and
+							// reports directly, and a config reload that moves
+							// the generation re-runs it through agent_start's
+							// gate; with the config unchanged, agent_start
+							// alone does not re-report.
+							warn("model chain post-refresh check failed:", err);
+						}
+					});
+				}
+				return;
+			}
 			const emptyHistorian = empty.find((chain) => chain.owner === "historian");
 			const historianLine = historian
 				? `registered historian trigger (model=${historian.model}${historian.fallbackModels?.length ? `, fallbacks=${historian.fallbackModels.join(",")}` : ""}, executeThreshold=${formatExecuteThresholdForLog(historian.executeThresholdPercentage)})`
@@ -1693,6 +1794,32 @@ async function startPiMagicContextRuntime(
 		} catch (err) {
 			warn("model chain check failed:", err);
 		}
+	}
+	/**
+	 * Re-run the chain report once a scheduled discovery refresh has settled.
+	 * Nothing from the scheduled pass is replayed: the session may have been
+	 * switched and the config reloaded while the await was open, so the
+	 * report resolves the current session context and this directory's
+	 * dependencies from the lifecycle state above. The context and project
+	 * stay paired -- if the session switched to another project, this one's
+	 * warning must not reach that project's UI, and the once-per-process
+	 * notice must not be spent here; the next session_start of this
+	 * directory re-checks (the settled-catalogue marker is process-wide, so
+	 * it reports directly). A config whose generation moved past the last
+	 * checked one was replaced while the await was open, and its report is
+	 * left to the reload-aware path (agent_start's generation gate, or the
+	 * next session_start) rather than announced from a superseded file.
+	 */
+	function reportPiModelChainsAfterRefresh(projectDir: string): void {
+		const ctx = activeModelChainContext;
+		const registry = ctx?.modelRegistry;
+		if (!ctx || !registry) return;
+		if (ctx.cwd !== undefined && ctx.cwd !== projectDir) return;
+		const project = resolveProjectDepsForDir(projectDir);
+		const generation = liveReaderFor(project.projectDir, project.config).poll()
+			.generation;
+		if (modelChainsCheckedGeneration.get(projectDir) !== generation) return;
+		reportPiModelChains(ctx, project);
 	}
 	function resolveContextOptionsForProject(
 		dir: string,
@@ -1726,7 +1853,6 @@ async function startPiMagicContextRuntime(
 		},
 	);
 	projectDepsByDir.set(projectDir, bootProjectDeps);
-	subcConnectionFile = config.subc?.connection_file;
 
 	function syncDreamerProjectRegistration(
 		current: ResolvedPiProjectDeps,
@@ -1740,7 +1866,9 @@ async function startPiMagicContextRuntime(
 			return;
 		}
 		seenDreamerProjectIdentities.add(current.projectIdentity);
-		if (!current.dreamerConfig) {
+		// A disabled dreamer still needs commit indexing and live timer settings.
+		const timerConfig = current.dreamerConfig ?? current.config.dreamer;
+		if (!timerConfig) {
 			unregisterPiDreamerProject({
 				projectIdentity: current.projectIdentity,
 				registrationOwner: dreamerRegistrationOwner,
@@ -1752,7 +1880,7 @@ async function startPiMagicContextRuntime(
 			projectDir: current.projectDir,
 			projectIdentity: current.projectIdentity,
 			registrationOwner: dreamerRegistrationOwner,
-			config: current.dreamerConfig,
+			config: timerConfig,
 			modelRegistry,
 			sampleDreamRun: () => {
 				const fresh = liveReaderFor(current.projectDir, current.config).poll()
@@ -1772,6 +1900,7 @@ async function startPiMagicContextRuntime(
 			embeddingConfig: current.config.embedding,
 			memoryEnabled: current.config.memory.enabled,
 			retinaHandoff: current.config.smart_notes.retina_handoff,
+			smartNotesEnabled: config.smart_notes.enabled,
 			mural: current.config.mural,
 			language: current.config.language,
 			gitCommitIndexing: current.config.memory.git_commit_indexing,
@@ -1793,6 +1922,7 @@ async function startPiMagicContextRuntime(
 	// project with a different value, users need `/reload` or a Pi restart for the
 	// tool/command/overlay surface to change, matching Pi's registration lifecycle.
 	registerMagicContextTools(pi, {
+		rerankConnectionFile: config.subc?.connection_file,
 		expandTools: config.historian?.expand_tools,
 		db,
 		ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
@@ -1819,6 +1949,7 @@ async function startPiMagicContextRuntime(
 		// running — otherwise the note sits `pending` forever with no
 		// path to surface. Match the user's dreamer config flag.
 		dreamerEnabled: isDreamerRunnable(config),
+		smartNotesEnabled: config.smart_notes.enabled,
 		resolveDreamerEnabled: (ctx) =>
 			resolveCurrentProjectDeps(ctx).dreamerEnabled,
 		todowriteEnabled,
@@ -1836,6 +1967,16 @@ async function startPiMagicContextRuntime(
 				: "registered tools: ctx_search, ctx_memory, ctx_note, ctx_expand, ctx_reduce (todowrite disabled)",
 	);
 
+	// Stock Pi's types omit OMP's completed-copy events. OMP reuses the extension
+	// instance when copying sessions, so finish copying durable tag state before
+	// the destination's first context preparation can assign fresh tag numbers.
+	registerPiCloneSessionTransitions(
+		pi.on.bind(pi) as unknown as PiCloneTransitionRegistrar,
+		{
+			db,
+			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
+		},
+	);
 	pi.on("session_start", async (event, ctx) => {
 		bindStaleBuildNotice(ctx, import.meta.url);
 		// Pi emits session_start for new, resumed, and reloaded sessions. Re-read
@@ -1844,6 +1985,7 @@ async function startPiMagicContextRuntime(
 		projectDepsByDir.delete(ctx.cwd);
 		const current = resolveCurrentProjectDeps(ctx);
 		activeModelRegistry = ctx.modelRegistry;
+		activeModelChainContext = ctx;
 		reportPiModelChains(ctx, current);
 		if (ctx.hasUI) syncDreamerProjectRegistration(current, ctx.modelRegistry);
 		syncCtxMemoryToolEnabled(pi, current.config.memory.enabled);
@@ -1863,16 +2005,20 @@ async function startPiMagicContextRuntime(
 			ctx.ui.notify(formatProtectedTagsDeprecationNotice(), "warning");
 		}
 
+		// Inherit before saving cache-TTL preferences creates the child's metadata
+		// row: the clone guard uses that row to distinguish first open from resume.
+		await handlePiCloneSessionStart(event, ctx, {
+			db,
+			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
+		});
 		const sessionId = resolveSessionId(ctx);
-		// Session start is Magic Context's first write for a session in this
-		// process. Skip every write below when another machine holds the
-		// session's agent; the first turn is then refused by the context handler.
-		if (sessionId) {
-			const claimRefusal = await checkoutClaim.refusal(sessionId, ctx.cwd);
-			if (claimRefusal) {
-				if (ctx.hasUI) ctx.ui.notify(claimRefusal.message, "error");
-				return;
-			}
+		if (
+			!piMarkerRehydrationLogged &&
+			pendingPiMarkerSessions.length > 0 &&
+			sessionId
+		) {
+			log(formatPiMarkerRehydrationLine(pendingPiMarkerSessions, sessionId));
+			piMarkerRehydrationLogged = true;
 		}
 		const model = ctx.model;
 		if (sessionId && model?.provider && model.id) {
@@ -1883,11 +2029,6 @@ async function startPiMagicContextRuntime(
 				modelKey: canonicalPiModelKey(model.provider, model.id),
 			});
 		}
-
-		await handlePiCloneSessionStart(event, ctx, {
-			db,
-			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
-		});
 	});
 
 	pi.on("agent_start", (_event, ctx) => {
@@ -1916,9 +2057,7 @@ async function startPiMagicContextRuntime(
 	// Register the per-LLM-call transform pipeline. Tags eligible message
 	// parts via the shared Tagger and applies queued drops from
 	// `pending_ops` so /ctx-flush and ctx_reduce work against Pi sessions.
-	registerPiContextHandler(pi, bootProjectDeps.contextOptions, {
-		checkoutClaim,
-	});
+	registerPiContextHandler(pi, bootProjectDeps.contextOptions);
 	// Pi's model registry reaches the extension only with the first session
 	// context, so the chain the historian will actually use is logged by
 	// reportPiModelChains at session start. Logging the configured model here
@@ -1949,6 +2088,7 @@ async function startPiMagicContextRuntime(
 	const recompRunner = new PiSubagentRunner();
 	const wrapupRunner = new PiSubagentRunner();
 	registerCtxStatusCommand(pi, {
+		smartNotesEnabled: config.smart_notes.enabled,
 		db,
 		projectIdentity,
 		resolveProject: resolveCurrentProject,
@@ -1962,7 +2102,10 @@ async function startPiMagicContextRuntime(
 		executeThresholdTokens: bootProjectDeps.config.execute_threshold_tokens,
 		dreamer: {
 			runnable: bootProjectDeps.dreamerEnabled,
-			scheduleSummary: summarizeDreamSchedule(bootProjectDeps.config.dreamer),
+			scheduleSummary: summarizeDreamSchedule(
+				bootProjectDeps.config.dreamer,
+				config.smart_notes.enabled,
+			),
 		},
 		activeProfile: bootProjectDeps.config.profile,
 		cacheTtlConfig: bootProjectDeps.config.cache_ttl,
@@ -1976,6 +2119,7 @@ async function startPiMagicContextRuntime(
 			const fresh = live.poll().effective;
 			const failure = live.lastFailure();
 			return {
+				smartNotesEnabled: config.smart_notes.enabled,
 				configGeneration: live.current().generation,
 				configAdoptedAt: live.current().adoptedAt,
 				configReloadFailure: failure
@@ -1991,7 +2135,10 @@ async function startPiMagicContextRuntime(
 				executeThresholdTokens: current.config.execute_threshold_tokens,
 				dreamer: {
 					runnable: current.dreamerEnabled,
-					scheduleSummary: summarizeDreamSchedule(current.config.dreamer),
+					scheduleSummary: summarizeDreamSchedule(
+						current.config.dreamer,
+						config.smart_notes.enabled,
+					),
 				},
 				modelChainWarning: (() => {
 					const registry = activeModelRegistry;
@@ -2037,13 +2184,10 @@ async function startPiMagicContextRuntime(
 	registerCtxRecompCommand(pi, {
 		db,
 		runner: recompRunner,
-		historianModel: bootProjectDeps.historianConfig?.model,
-		historianChunkTokens: deriveHistorianChunkTokens(
-			resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
+		...buildPiHistorianCommandOptions(
+			bootProjectDeps.historianConfig,
+			bootProjectDeps.config,
 		),
-		historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
-		historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
-		historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
 		language: bootProjectDeps.config.language,
 		memoryEnabled: bootProjectDeps.config.memory.enabled,
 		autoPromote: bootProjectDeps.config.memory.auto_promote,
@@ -2062,16 +2206,7 @@ async function startPiMagicContextRuntime(
 			return {
 				db,
 				runner: recompRunner,
-				historianModel: historian?.model,
-				historianChunkTokens:
-					historian?.historianChunkTokens ??
-					deriveHistorianChunkTokens(
-						resolveHistorianContextLimit(historian?.model),
-					),
-				historianFallbacks: historian?.fallbackModels,
-				historianTimeoutMs:
-					historian?.timeoutMs ?? current.config.historian_timeout_ms,
-				historianThinkingLevel: historian?.thinkingLevel,
+				...buildPiHistorianCommandOptions(historian, current.config),
 				language: current.config.language,
 				memoryEnabled: current.config.memory.enabled,
 				autoPromote: fresh.memory.auto_promote,
@@ -2085,18 +2220,18 @@ async function startPiMagicContextRuntime(
 		shutdownSignal: commandLifecycleController.signal,
 		db,
 		runner: wrapupRunner,
-		historianModel: bootProjectDeps.historianConfig?.model,
-		historianChunkTokens: deriveHistorianChunkTokens(
-			resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
+		...buildPiHistorianCommandOptions(
+			bootProjectDeps.historianConfig,
+			bootProjectDeps.config,
 		),
-		historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
-		historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
-		historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
 		language: bootProjectDeps.config.language,
 		memoryEnabled: bootProjectDeps.config.memory.enabled,
 		autoPromote: bootProjectDeps.config.memory.auto_promote,
 		compactionOff,
-		userMemoriesEnabled: userMemoryCollectionEnabled(
+		userMemoriesEnabled: userObservationCollectionEnabled(
+			bootProjectDeps.config.dreamer,
+		),
+		userObservationsRequested: userObservationsRequested(
 			bootProjectDeps.config.dreamer,
 		),
 		executeThresholdPercentage:
@@ -2116,21 +2251,15 @@ async function startPiMagicContextRuntime(
 			return {
 				db,
 				runner: wrapupRunner,
-				historianModel: historian?.model,
-				historianChunkTokens:
-					historian?.historianChunkTokens ??
-					deriveHistorianChunkTokens(
-						resolveHistorianContextLimit(historian?.model),
-					),
-				historianFallbacks: historian?.fallbackModels,
-				historianTimeoutMs:
-					historian?.timeoutMs ?? current.config.historian_timeout_ms,
-				historianThinkingLevel: historian?.thinkingLevel,
+				...buildPiHistorianCommandOptions(historian, current.config),
 				language: current.config.language,
 				memoryEnabled: current.config.memory.enabled,
 				autoPromote: fresh.memory.auto_promote,
 				compactionOff,
-				userMemoriesEnabled: userMemoryCollectionEnabled(
+				userMemoriesEnabled: userObservationCollectionEnabled(
+					current.config.dreamer,
+				),
+				userObservationsRequested: userObservationsRequested(
 					current.config.dreamer,
 				),
 				executeThresholdPercentage: current.config.execute_threshold_percentage,
@@ -2152,6 +2281,7 @@ async function startPiMagicContextRuntime(
 			};
 		},
 		dreamerEnabled: bootProjectDeps.dreamerEnabled,
+		smartNotesEnabled: config.smart_notes.enabled,
 		resolveDreamerEnabled: (ctx) =>
 			resolveCurrentProjectDeps(ctx).dreamerEnabled,
 		onProjectSeen: (identity) => seenDreamerProjectIdentities.add(identity),
@@ -2279,6 +2409,7 @@ async function startPiMagicContextRuntime(
 			// shared helper releases that ownership explicitly.
 			try {
 				activeModelRegistry = ctx.modelRegistry;
+				activeModelChainContext = ctx;
 				if (ctx.hasUI)
 					syncDreamerProjectRegistration(
 						effectiveProjectDeps,
@@ -2411,6 +2542,7 @@ async function startPiMagicContextRuntime(
 				protectedTags: effectiveConfig.protected_tags,
 				ctxReduceCallable: !compactionOff,
 				dreamerEnabled: effectiveProjectDeps.dreamerEnabled,
+				smartNotesEnabled: config.smart_notes.enabled,
 				temporalAwarenessEnabled: effectiveConfig.temporal_awareness ?? false,
 				cavemanTextCompressionEnabled:
 					effectiveConfig.caveman_text_compression?.enabled === true,
@@ -2428,21 +2560,45 @@ async function startPiMagicContextRuntime(
 				existingSystemPrompt: event.systemPrompt,
 			});
 
-			// Compose the final system prompt: base prompt from Pi + our
-			// magic-context block. We always run hash detection on the
-			// composed string so even sessions with no data block (e.g.
-			// memories disabled, no docs, no key files) still get
-			// sticky-date freezing and hash-change tracking.
+			// Compose the reference system prompt (base prompt from Pi +
+			// our magic-context block) for hash detection. We always run
+			// hash detection on the composed string so even sessions with
+			// no data block (e.g. memories disabled, no docs, no key
+			// files) still get hash-change tracking.
 			const composedPrompt = composeMagicContextSystemPrompt(
 				event.systemPrompt,
 				block,
 			);
 
+			// Inject through the host's structured sections API when it has
+			// one. On Pi, returning `systemPrompt` from before_agent_start
+			// makes the host replace the WHOLE prompt with opaque text:
+			// sections set by later-registered extensions are then still
+			// recorded in the transcript but never sent to the provider
+			// (Pi renders forceSystemPrompt instead of the structured
+			// sections), so any extension registered after us silently
+			// loses its system-prompt section. Oh My Pi's before_agent_start
+			// event has no systemPromptOptions at all, and Pi releases
+			// before 0.87 have no `sections` field, so the forced prompt
+			// return below remains the only injection path on those hosts.
+			// The plugin compiles against Pi 0.83 types, which predate
+			// `sections`; the widened type below describes newer hosts
+			// without claiming the field always exists.
+			const promptOptions:
+				| (NonNullable<typeof event.systemPromptOptions> & {
+						sections?: Record<string, string>;
+				  })
+				| undefined = event.systemPromptOptions;
+			const hostSections = promptOptions?.sections;
+			if (block && hostSections) {
+				hostSections.magic_context = block;
+			}
+
 			if (!sessionId) {
-				// No session id yet — return the composed prompt without
-				// cache logic. The next turn (with a session id) will
-				// compute the first hash and set sticky date.
-				if (block) return { systemPrompt: composedPrompt };
+				// No session id yet — inject without cache logic. The
+				// next turn (with a session id) will compute the first
+				// hash and set sticky date.
+				if (block && !hostSections) return { systemPrompt: composedPrompt };
 				return;
 			}
 
@@ -2461,9 +2617,7 @@ async function startPiMagicContextRuntime(
 				// materialize, AND the next before_agent_start refreshes
 				// adjuncts (since this turn's adjunct read used the
 				// cached values that are now potentially stale).
-				signalPiHistoryRefresh(sessionId);
-				signalPiSystemPromptRefresh(sessionId);
-				signalPiPendingMaterialization(sessionId);
+				signalPiSystemHashChange(sessionId, result.currentHash);
 			}
 
 			// PEEK-then-drain-on-success (Oracle audit Round 8 #6):
@@ -2475,6 +2629,16 @@ async function startPiMagicContextRuntime(
 				clearSystemPromptRefresh(sessionId);
 			}
 
+			// On hosts with a sections API (Pi) the block already went
+			// out as a structured section above; returning a forced
+			// prompt here would hide later extensions' sections from the
+			// provider. Only hosts without that API
+			// (Oh My Pi) still need the forced return. Pi's prompt has
+			// no `Today's date:` line for processSystemPromptForCache
+			// to freeze, so dropping the force there loses nothing.
+			if (hostSections) {
+				return;
+			}
 			return { systemPrompt: result.systemPrompt };
 		} catch (error) {
 			warn("failed to build magic-context block:", error);
@@ -2517,6 +2681,9 @@ async function startPiMagicContextRuntime(
 	// Headless Pi exits after agent_end. The context handler leaves eligible
 	// history queued rather than launching a child that would outlive Pi.
 	pi.on("agent_end", (event, ctx) => {
+		acknowledgePiPendingSystemPromptResponses(
+			ctx.sessionManager.getSessionId(),
+		);
 		setEmbeddingSessionBusy(ctx.sessionManager.getSessionId(), false);
 		// Synchronous return — DO NOT await background work here.
 		// awaitInFlightHistorians()/awaitInFlightDreamers() are still

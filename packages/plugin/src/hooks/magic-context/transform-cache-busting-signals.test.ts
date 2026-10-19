@@ -51,6 +51,7 @@ import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
 import { registerActiveCompartmentRun } from "./compartment-runner";
 import { createChatMessageHook } from "./hook-handlers";
 import * as prefixRenderer from "./inject-compartments";
+import { requestPendingMaterialization } from "./pending-materialization";
 import { createTransform } from "./transform";
 
 /**
@@ -199,7 +200,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         });
         await transform({}, { messages: buildSimpleMessages(sessionId) });
         historyRefreshSessions.add(sessionId);
-        pendingMaterializationSessions.add(sessionId);
+        requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
         const lift = blockCompartmentRun(sessionId);
 
         try {
@@ -293,7 +294,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
 
         try {
             historyRefreshSessions.add(sessionId);
-            pendingMaterializationSessions.add(sessionId);
+            requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
             await transform({}, { messages: buildSimpleMessages(sessionId) });
             expect(historyRefreshSessions.has(sessionId)).toBe(false);
             expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
@@ -332,7 +333,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         });
         await transform({}, { messages: buildSimpleMessages(sessionId) });
         const lift = blockCompartmentRun(sessionId);
-        pendingMaterializationSessions.add(sessionId);
+        requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
 
         try {
             await transform({}, { messages: buildSimpleMessages(sessionId) });
@@ -758,7 +759,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
             protectedTokens: 0,
         });
 
-        pendingMaterializationSessions.add(sessionId);
+        requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
         await transform({}, { messages: sourceMessages(true, true) });
         expect(getTrailingBlankDecisions(db, sessionId).get("blank-owner")).toBe("strip");
         const toolTag = getTagsBySession(db, sessionId).find(
@@ -1110,7 +1111,8 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         useTempDataHome("ctx-busting-test15-");
         const sessionId = "ses-explicit-drain";
         const historyRefreshSessions = new Set<string>([sessionId]);
-        const pendingMaterializationSessions = new Set<string>([sessionId]);
+        const pendingMaterializationSessions = new Set<string>();
+        requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
         const deferredHistoryRefreshSessions = new Set<string>([sessionId]);
         const deferredMaterializationSessions = new Set<string>([sessionId]);
         const transform = createTransform({
@@ -1183,7 +1185,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         try {
             await transform({}, { messages: buildSimpleMessages(sessionId) });
             historyRefreshSessions.add(sessionId);
-            pendingMaterializationSessions.add(sessionId);
+            requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
             const passA = buildSimpleMessages(sessionId);
             await transform({}, { messages: passA });
             passAText = JSON.stringify(passA[0]);
@@ -1268,7 +1270,8 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         useTempDataHome("ctx-busting-test20-");
         const sessionId = "ses-test20";
         const historyRefreshSessions = new Set<string>([sessionId]);
-        const pendingMaterializationSessions = new Set<string>([sessionId]);
+        const pendingMaterializationSessions = new Set<string>();
+        requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
         const deferredHistoryRefreshSessions = new Set<string>([sessionId]);
         const deferredMaterializationSessions = new Set<string>([sessionId]);
         const transform = createTransform({
@@ -1338,7 +1341,7 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
         const lift = blockCompartmentRun(sessionId);
         await transform({}, { messages: buildSimpleMessages(sessionId) });
         historyRefreshSessions.add(sessionId);
-        pendingMaterializationSessions.add(sessionId);
+        requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
         const passA = buildSimpleMessages(sessionId);
         try {
             await transform({}, { messages: passA });

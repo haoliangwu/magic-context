@@ -26,6 +26,11 @@ use serde_json::{json, Value};
 use subc_client_rs::{CallError, CallOptions, ConsumerOptions, RetryBackoff, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
 
+#[path = "support/daemon_checkout.rs"]
+mod daemon_checkout;
+#[path = "support/executable.rs"]
+mod executable_staging;
+
 const MODULE_ID: &str = "magic-context";
 // Cold daemon and debug-module startup under sibling build load; see real_daemon.rs.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
@@ -151,6 +156,9 @@ async fn a_module_on_a_store_ahead_of_it_refuses_on_health_and_on_transform() {
     std::env::remove_var(subc_os::LAUNCH_NONCE_FD_ENV);
 
     let workspace = workspace_root();
+    if !daemon_checkout::available(&workspace) {
+        return;
+    }
     let subconscious = workspace.parent().unwrap().join("subconscious");
     let daemon_bin = ensure_binary(
         &subconscious,
@@ -457,27 +465,20 @@ fn dev_named_binary(path: &Path) -> PathBuf {
             .or_else(|| filename.strip_prefix("ck-"))
             .unwrap_or_else(|| panic!("expected a ck, ck-* or ckdev-* test binary, got {filename}"))
     };
-    let dev_dir = std::env::temp_dir()
-        .join("magic-context/mc-module-test-binaries")
-        .join(std::process::id().to_string());
-    fs::create_dir_all(&dev_dir).expect("create isolated binary staging directory");
-    let dev_path = dev_dir.join(format!("ckdev-{suffix}"));
-    if path == dev_path.as_path() {
-        return dev_path;
-    }
-    let _ = fs::remove_file(&dev_path);
-    // A copy, never a hard link: on macOS a daemon exec'd through a hard link to
-    // cargo's output was occasionally SIGKILLed at startup, while a copy never was.
-    fs::copy(path, &dev_path)
-        .map(|_| ())
+    let identifier = if filename == "ck" {
+        "ck".to_string()
+    } else if let Some(name) = filename.strip_prefix("ckdev-") {
+        format!("ck-{}", name.split('-').next().unwrap_or(name))
+    } else {
+        filename.to_string()
+    };
+    executable_staging::stage_executable(path, &format!("ckdev-{suffix}"), &identifier)
         .unwrap_or_else(|error| {
             panic!(
-                "failed to stage test binary {} as {}: {error}",
-                path.display(),
-                dev_path.display()
+                "failed to stage test binary {} as ckdev-{suffix}: {error}",
+                path.display()
             )
-        });
-    dev_path
+        })
 }
 
 fn workspace_root() -> PathBuf {

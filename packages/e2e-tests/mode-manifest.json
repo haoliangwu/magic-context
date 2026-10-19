@@ -3,12 +3,36 @@
     "header": "CI push workflows run the manifest-derived TypeScript suites and Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh; tag releases run the same Rust invocation. Cargo.lock pins the Rust dependency versions and git revisions. CI mc-module daemon tests and push/release builders use the locked subconscious source to build ck-subc; the scheduled CI builder intentionally probes default-branch HEAD as drift, while test shards consume its prebuilt artifact.",
     "entries": [
         {
+            "path": "tests/processed-images.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 1 user and tool images reach the mock provider first, then lose their bytes only after an admitted positive-watermark rewrite and remain stripped on replay. OpenCode 2, Pi and Rust have adapter and module unit coverage.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
+        },
+        {
+            "path": "tests/pi-tree-history.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real Pi and OMP tree navigation leaves abandoned entries in JSONL. Published compartments must retire on proven active-branch mismatch so wrapup and later provider requests use reachable history; host PID lsof proves throwaway containment.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["pi", "omp"]
+        },
+        {
             "path": "tests/latest-turn-thinking.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
-            "rationale": "Real OpenCode 1.18.x task child and primary long tool loop at execute and force against a provider-side thinking oracle; negative controls reject edited, removed and reordered latest-turn blocks, queued drops release only after a real user turn, accepted legacy strips replay unchanged, a provider rejection restores the original thinking once, and host PID lsof proves throwaway containment. OpenCode 2, Pi and Rust have caller and module unit gates.",
+            "rationale": "Real OpenCode 1 task child and primary long tool loop at execute and force against a provider-side thinking oracle; negative controls reject edited, removed and reordered latest-turn blocks, a plain real user turn preserves the primary signed prefix and queued drop until explicit flush, accepted legacy strips replay unchanged, a provider rejection restores the original thinking once, and host PID lsof proves throwaway containment.",
             "contract_refs": ["FOLD-UNDER-PRESSURE"],
             "hosts": ["opencode"]
+        },
+        {
+            "path": "tests/opencode2/signed-drop-rebuild.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real pinned OpenCode 2 signed-thinking tool loop at 76 percent queues a drop, preserves every historical request byte and signed block on the next plain real user turn with a named hold reason, then drains only on explicit ctx-flush. Host PID lsof proves throwaway-store containment.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE", "OC2-S1"],
+            "hosts": ["opencode2"]
         },
         {
             "path": "tests/pi-historian-runtime.test.ts",
@@ -57,14 +81,6 @@
             "rationale": "Real OpenCode 2.0.22 Anthropic tool loop against the provider-side thinking oracle: a replayed legacy omission in the active turn is rejected once, the host's session event arms recovery bound to the turn's real user message, a same-id resubmission reaches no provider, and the synthetic resume ends the turn, disarms without restoring and is accepted. Host PID lsof proves throwaway containment.",
             "contract_refs": ["FOLD-UNDER-PRESSURE", "OC2-S1"],
             "hosts": ["opencode2"]
-        },
-        {
-            "path": "tests/checkout-claim.test.ts",
-            "tier": "ts-only",
-            "invocation": { "ts": true, "rust": false },
-            "rationale": "Agent checkout claim: real OpenCode 1, Pi and OMP hosts against a wire-level fake subc daemon playing ALF agent.for_host_session and engram claim.read refuse a held-elsewhere session before any Magic Context write or provider call, then serve it once the claim moves back; PID lsof proves throwaway-store containment. OpenCode 2 runs the same gate in its context hook (unit-tested against the same fake daemon); Rust mode goes through the TypeScript plugin's pass",
-            "contract_refs": ["AGENT-CHECKOUT-CLAIM"],
-            "hosts": ["opencode", "pi", "omp"]
         },
         {
             "path": "tests/cache-ttl-live-config.test.ts",
@@ -161,6 +177,14 @@
             "invocation": { "ts": true, "rust": false },
             "rationale": "native OpenCode 2 manual and scheduled retrospective read five real user sessions and advance the shared content watermark; throwaway roots with host PID lsof containment",
             "contract_refs": ["S2-MIGRATION"],
+            "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/opencode2/out-of-order-history-boundary.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Issue 702: a real OpenCode 2 host serves a session whose stored summary boundary is missing from the context-hook window (moved session, deleted rows) by placing it from stored order instead of refusing; throwaway roots with host PID lsof containment",
+            "contract_refs": ["OC2-S1"],
             "hosts": ["opencode2"]
         },
         {
@@ -672,6 +696,31 @@
             "behavior": true
         },
         {
+            "path": "tests/subagent-temperature-hosts.test.ts",
+            "tier": "ts-only",
+            "invocation": {
+                "ts": true,
+                "rust": false
+            },
+            "rationale": "Real OpenCode 1, OpenCode 2 and Pi hosts run the historian against models whose metadata comes from a copied models.dev catalogue; the mock-captured request bodies prove Gemini 3.8 Flash gets the configured temperature and Codex GPT-6.1 Sol gets none, and lsof over every spawned process proves no live store is open. OMP shares the Pi calibration extension and has unit gates.",
+            "contract_refs": [
+                "S2-MIGRATION"
+            ],
+            "hosts": [
+                "opencode",
+                "opencode2",
+                "pi"
+            ],
+            "divergences": [
+                {
+                    "host": "omp",
+                    "reason": "OMP loads the same historian calibration extension as Pi, and its Gemini models carry no sampling flag either, so the shared catalogue fallback is covered by the Pi lane and the OMP unit gates in historian-calibration-extension.test.ts",
+                    "contract_ref": "packages/pi-plugin/src/historian-calibration-extension.test.ts"
+                }
+            ],
+            "behavior": true
+        },
+        {
             "path": "tests/long-running-session.test.ts",
             "tier": "both-modes",
             "invocation": {
@@ -812,6 +861,21 @@
             "contract_refs": [
                 "R22",
                 "R36"
+            ],
+            "hosts": [
+                "opencode2"
+            ]
+        },
+        {
+            "path": "tests/opencode2/empty-text-sentinels.test.ts",
+            "tier": "excluded",
+            "invocation": {
+                "ts": false,
+                "rust": false
+            },
+            "rationale": "OpenCode v2 lane: a system row Magic Context neutralizes on canonical Anthropic must leave the request instead of reaching the API as an empty text block (OpenCode 2 sends system rows to Claude models with native system updates as they are), checked against an Anthropic-strict mock on the real host; the v2 lane runs from its own invocation (bun test tests/opencode2), not through the v1 mode-selected spawn seam",
+            "contract_refs": [
+                "OC2-S1"
             ],
             "hosts": [
                 "opencode2"
@@ -989,7 +1053,22 @@
                 "ts": false,
                 "rust": false
             },
-            "rationale": "OpenCode v2 lane: OpenCode 2 has no command.execute.before hook, so the TUI keymap layer is the only source of a /ctx-* command; asserts the real TUI's own record of the slash names the host accepted; the v2 lane runs from its own invocation (bun test tests/opencode2) and joins the release gates when the v2 hooks slice lands, not through the v1 mode-selected spawn seam",
+            "rationale": "OpenCode v2 lane: the server command registry is the single /ctx-* registration; asserts each command is listed once and that the real TUI adds no second slash layer; the v2 lane runs from its own invocation (bun test tests/opencode2), not through the v1 mode-selected spawn seam",
+            "contract_refs": [
+                "OC2-S1"
+            ],
+            "hosts": [
+                "opencode2"
+            ]
+        },
+        {
+            "path": "tests/opencode2/commands-s2-tui-feedback.test.ts",
+            "tier": "excluded",
+            "invocation": {
+                "ts": false,
+                "rust": false
+            },
+            "rationale": "OpenCode v2 lane: drives every server-registered /ctx-* command in a real TUI and asserts the user sees its feedback (dialogs, toasts, usage messages, sidebar refresh); the v2 lane runs from its own invocation (bun test tests/opencode2), not through the v1 mode-selected spawn seam",
             "contract_refs": [
                 "OC2-S1"
             ],
@@ -2651,26 +2730,6 @@
             ]
         },
         {
-            "path": "tests/window-overlay-reload.test.ts",
-            "tier": "excluded",
-            "invocation": {
-                "ts": false,
-                "rust": false
-            },
-            "rationale": "one manifest-driven host behavior scenario runs from the shared HostHarness contract",
-            "contract_refs": [
-                "OVERLAY-SAME-PATH-AUTO-REFRESH",
-                "PI-EXTENSION-RELOAD"
-            ],
-            "hosts": [
-                "opencode",
-                "opencode2",
-                "pi",
-                "omp"
-            ],
-            "behavior": true
-        },
-        {
             "path": "tests/opencode2/rust-mode-boundary-restart-gate.test.ts",
             "tier": "excluded",
             "invocation": {
@@ -2865,6 +2924,30 @@
             "hosts": ["opencode2"]
         },
         {
+            "path": "tests/opencode2/generate-tool-tail.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 2 generate hook after a tool step: the side-question request replays the last served runner request byte for byte, including id-less tool results",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/opencode2/active-thinking-prefix-hold.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 2 thinking loop past the execute threshold: the prefix before kept signed thinking stays byte-identical through the loop, and queued work lands in one rebuild on the next user turn",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/opencode2/copied-tag-persistence.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 2 host with a mock model that copies §N§ tags into its replies (issue 671): the host stores the replies unchanged, the next request carries them stripped under a fresh tag, later defer passes replay those bytes unchanged, and host PID lsof shows only throwaway databases. OpenCode 1 and Pi strip at persistence and have their own unit gates.",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
             "path": "tests/degraded-pass-lock.test.ts",
             "tier": "excluded",
             "invocation": { "ts": false, "rust": false },
@@ -2910,6 +2993,14 @@
             "rationale": "manual regression probe on a real OpenCode 2.0.22 host (MC_E2E_MAPPER_STEP_PROBE=1): before the native 60-step ceiling the mapper is asked for its manifest with tools removed, so a verify-broad batch keeps a partial result; throwaway root with host PID lsof containment",
             "contract_refs": ["OC2-S1"],
             "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/zen-primary-surface.test.ts",
+            "tier": "excluded",
+            "invocation": { "ts": false, "rust": false },
+            "rationale": "Opt-in probe on real OpenCode 1 and 2 hosts that an ordinary session never exposes the Zen hidden summarizer variants (system prompt, Task tool, agent lists). Set MC_PRIMARY_PROBE_ROOT, MC_PRIMARY_BASE_PLUGIN, MC_PRIMARY_OC1 and MC_PRIMARY_OC2; without them the host tests skip and the carrier-leak guard tests run as plain unit tests.",
+            "contract_refs": ["ZEN-PRIMARY-SURFACE"],
+            "hosts": ["opencode", "opencode2"]
         }
     ]
 }

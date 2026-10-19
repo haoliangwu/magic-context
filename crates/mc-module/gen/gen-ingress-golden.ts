@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import "./quiet-live-log";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, resolve } from "node:path";

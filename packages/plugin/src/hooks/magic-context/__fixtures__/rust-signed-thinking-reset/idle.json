@@ -1,0 +1,561 @@
+{
+ "before": {
+  "decision": "SOFT+",
+  "native_messages": [
+   {
+    "info": {
+     "role": "user",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "synthetic": true,
+      "text": "<session-history>\n## 1-1 · C1\nSUMMARY-1\n</session-history>",
+      "type": "text"
+     }
+    ]
+   },
+   {
+    "info": {
+     "role": "user",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "synthetic": true,
+      "text": "<session-history-since>(no new content since last materialization)</session-history-since>",
+      "type": "text"
+     }
+    ]
+   },
+   {
+    "info": {
+     "id": "a2",
+     "role": "assistant",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "metadata": {
+       "anthropic": {
+        "signature": "sig-older-think"
+       }
+      },
+      "text": "older-think",
+      "type": "reasoning"
+     },
+     {
+      "text": "earlier answer",
+      "type": "text"
+     }
+    ]
+   },
+   {
+    "info": {
+     "id": "u3",
+     "role": "user",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "text": "current task",
+      "type": "text"
+     }
+    ]
+   },
+   {
+    "info": {
+     "id": "a4",
+     "role": "assistant",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "metadata": {
+       "anthropic": {
+        "signature": "sig-think 4"
+       }
+      },
+      "text": "think 4",
+      "type": "reasoning"
+     },
+     {
+      "text": "note 4",
+      "type": "text"
+     },
+     {
+      "callID": "t4",
+      "state": {
+       "input": {
+        "path": "a.txt"
+       },
+       "output": "output 4 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+       "status": "completed"
+      },
+      "tool": "read",
+      "type": "tool"
+     }
+    ]
+   },
+   {
+    "info": {
+     "id": "a5",
+     "role": "assistant",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "metadata": {
+       "anthropic": {
+        "signature": "sig-think 5"
+       }
+      },
+      "text": "think 5",
+      "type": "reasoning"
+     },
+     {
+      "text": "note 5",
+      "type": "text"
+     },
+     {
+      "callID": "t5",
+      "state": {
+       "input": {
+        "path": "a.txt"
+       },
+       "output": "output 5 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+       "status": "completed"
+      },
+      "tool": "read",
+      "type": "tool"
+     }
+    ]
+   },
+   {
+    "info": {
+     "id": "a6",
+     "role": "assistant",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "metadata": {
+       "anthropic": {
+        "signature": "sig-think 6"
+       }
+      },
+      "text": "think 6",
+      "type": "reasoning"
+     },
+     {
+      "text": "note 6",
+      "type": "text"
+     },
+     {
+      "callID": "t6",
+      "state": {
+       "input": {
+        "path": "a.txt"
+       },
+       "output": "output 6 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+       "status": "completed"
+      },
+      "tool": "read",
+      "type": "tool"
+     }
+    ]
+   },
+   {
+    "info": {
+     "id": "a7",
+     "role": "assistant",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "text": "unsigned step after the kept thinking",
+      "type": "text"
+     },
+     {
+      "callID": "t7",
+      "state": {
+       "input": {
+        "path": "late.txt"
+       },
+       "output": "late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output ",
+       "status": "completed"
+      },
+      "tool": "read",
+      "type": "tool"
+     }
+    ]
+   }
+  ],
+  "prefix_bust_permitted": false,
+  "reasoning_trim_only": null
+ },
+ "idle": true,
+ "input": [
+  {
+   "info": {
+    "id": "u1",
+    "role": "user",
+    "sessionID": "review-r2-host-idle"
+   },
+   "parts": [
+    {
+     "text": "earlier task",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "info": {
+    "id": "a2",
+    "role": "assistant",
+    "sessionID": "review-r2-host-idle"
+   },
+   "parts": [
+    {
+     "metadata": {
+      "anthropic": {
+       "signature": "sig-older-think"
+      }
+     },
+     "text": "older-think",
+     "type": "reasoning"
+    },
+    {
+     "text": "earlier answer",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "info": {
+    "id": "u3",
+    "role": "user",
+    "sessionID": "review-r2-host-idle"
+   },
+   "parts": [
+    {
+     "text": "current task",
+     "type": "text"
+    }
+   ]
+  },
+  {
+   "info": {
+    "id": "a4",
+    "role": "assistant",
+    "sessionID": "review-r2-host-idle"
+   },
+   "parts": [
+    {
+     "metadata": {
+      "anthropic": {
+       "signature": "sig-think 4"
+      }
+     },
+     "text": "think 4",
+     "type": "reasoning"
+    },
+    {
+     "text": "note 4",
+     "type": "text"
+    },
+    {
+     "callID": "t4",
+     "state": {
+      "input": {
+       "path": "a.txt"
+      },
+      "output": "output 4 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "status": "completed"
+     },
+     "tool": "read",
+     "type": "tool"
+    }
+   ]
+  },
+  {
+   "info": {
+    "id": "a5",
+    "role": "assistant",
+    "sessionID": "review-r2-host-idle"
+   },
+   "parts": [
+    {
+     "metadata": {
+      "anthropic": {
+       "signature": "sig-think 5"
+      }
+     },
+     "text": "think 5",
+     "type": "reasoning"
+    },
+    {
+     "text": "note 5",
+     "type": "text"
+    },
+    {
+     "callID": "t5",
+     "state": {
+      "input": {
+       "path": "a.txt"
+      },
+      "output": "output 5 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "status": "completed"
+     },
+     "tool": "read",
+     "type": "tool"
+    }
+   ]
+  },
+  {
+   "info": {
+    "id": "a6",
+    "role": "assistant",
+    "sessionID": "review-r2-host-idle"
+   },
+   "parts": [
+    {
+     "metadata": {
+      "anthropic": {
+       "signature": "sig-think 6"
+      }
+     },
+     "text": "think 6",
+     "type": "reasoning"
+    },
+    {
+     "text": "note 6",
+     "type": "text"
+    },
+    {
+     "callID": "t6",
+     "state": {
+      "input": {
+       "path": "a.txt"
+      },
+      "output": "output 6 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "status": "completed"
+     },
+     "tool": "read",
+     "type": "tool"
+    }
+   ]
+  },
+  {
+   "info": {
+    "id": "a7",
+    "role": "assistant",
+    "sessionID": "review-r2-host-idle"
+   },
+   "parts": [
+    {
+     "text": "unsigned step after the kept thinking",
+     "type": "text"
+    },
+    {
+     "callID": "t7",
+     "state": {
+      "input": {
+       "path": "late.txt"
+      },
+      "output": "late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output late output ",
+      "status": "completed"
+     },
+     "tool": "read",
+     "type": "tool"
+    }
+   ]
+  }
+ ],
+ "kind": "idle",
+ "pressured": {
+  "decision": "SOFT",
+  "native_messages": [
+   {
+    "info": {
+     "role": "user",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "synthetic": true,
+      "text": "<session-history>\n## 1-1 · C1\nSUMMARY-1\n</session-history>",
+      "type": "text"
+     }
+    ]
+   },
+   {
+    "info": {
+     "role": "user",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "synthetic": true,
+      "text": "<session-history-since>(no new content since last materialization)</session-history-since>",
+      "type": "text"
+     }
+    ]
+   },
+   {
+    "info": {
+     "id": "a2",
+     "role": "assistant",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "metadata": {
+       "anthropic": {
+        "signature": "sig-older-think"
+       }
+      },
+      "text": "older-think",
+      "type": "reasoning"
+     },
+     {
+      "text": "earlier answer",
+      "type": "text"
+     }
+    ]
+   },
+   {
+    "info": {
+     "id": "u3",
+     "role": "user",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "text": "current task",
+      "type": "text"
+     }
+    ]
+   },
+   {
+    "info": {
+     "id": "a4",
+     "role": "assistant",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "metadata": {
+       "anthropic": {
+        "signature": "sig-think 4"
+       }
+      },
+      "text": "think 4",
+      "type": "reasoning"
+     },
+     {
+      "text": "note 4",
+      "type": "text"
+     },
+     {
+      "callID": "t4",
+      "state": {
+       "input": {
+        "path": "a.txt"
+       },
+       "output": "output 4 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+       "status": "completed"
+      },
+      "tool": "read",
+      "type": "tool"
+     }
+    ]
+   },
+   {
+    "info": {
+     "id": "a5",
+     "role": "assistant",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "metadata": {
+       "anthropic": {
+        "signature": "sig-think 5"
+       }
+      },
+      "text": "think 5",
+      "type": "reasoning"
+     },
+     {
+      "text": "note 5",
+      "type": "text"
+     },
+     {
+      "callID": "t5",
+      "state": {
+       "input": {
+        "path": "a.txt"
+       },
+       "output": "output 5 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+       "status": "completed"
+      },
+      "tool": "read",
+      "type": "tool"
+     }
+    ]
+   },
+   {
+    "info": {
+     "id": "a6",
+     "role": "assistant",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "metadata": {
+       "anthropic": {
+        "signature": "sig-think 6"
+       }
+      },
+      "text": "think 6",
+      "type": "reasoning"
+     },
+     {
+      "text": "note 6",
+      "type": "text"
+     },
+     {
+      "callID": "t6",
+      "state": {
+       "input": {
+        "path": "a.txt"
+       },
+       "output": "output 6 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+       "status": "completed"
+      },
+      "tool": "read",
+      "type": "tool"
+     }
+    ]
+   },
+   {
+    "info": {
+     "id": "a7",
+     "role": "assistant",
+     "sessionID": "review-r2-host-idle"
+    },
+    "parts": [
+     {
+      "text": "unsigned step after the kept thinking",
+      "type": "text"
+     }
+    ]
+   }
+  ],
+  "prefix_bust_permitted": true,
+  "reasoning_trim_only": null,
+  "signed_thinking_reset": null
+ },
+ "session_id": "review-r2-host-idle"
+}

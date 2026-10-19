@@ -10,10 +10,9 @@
  *     as parts of type `"toolCall"` with `{ id, name, arguments }`.
  *     OpenCode's `extractToolInfo` checks `"tool" | "tool_use" |
  *     "tool-invocation"` shapes that don't exist in Pi.
- *   - Stale `ctx_reduce` removal also walks Pi shape directly. New discovery is
- *     gated to providers that can safely drop empty sentinels; Pi persists
- *     `tags.status='dropped'` and lets `applyFlushedStatuses` replay existing
- *     drops on every provider, which is the cache-stable mechanism Pi already uses.
+ *   - Stale `ctx_reduce` removal also walks Pi shape directly. Only after the
+ *     caller permits a prefix rewrite, it records removal or a non-empty result
+ *     skeleton. The saved representation replays on every provider.
  *
  *   - Everything else (tiered emergency reclaim, strip system injections from
  *     message tags, age-tier caveman compression) is tag-driven and
@@ -42,13 +41,12 @@ import {
 	type ContextDatabase,
 	getActiveTagsBySession,
 	getMaxTagNumberBySession,
-	updateTagDropMode,
 	updateTagStatus,
 } from "@magic-context/core/features/magic-context/storage";
 import { getEmergencyInputSample } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import type { TagEntry } from "@magic-context/core/features/magic-context/types";
 import {
-	applyNewToolDrop,
+	applyPersistedToolDrop,
 	hasSmallToolInput,
 } from "@magic-context/core/hooks/magic-context/apply-operations";
 import {
@@ -312,8 +310,8 @@ function collectStaleReduceCallIds(
  *   3. Deduplicate tools when routine cleanup is enabled.
  *   4. Apply age-tier caveman compression when routine cleanup is enabled.
  *
- * Each pass commits within its own `db.transaction` so partial
- * progress survives mid-pass failures.
+ * Each tool decision commits before its transcript edit. A failed write stops
+ * cleanup; earlier drops remain durable and later tools stay untouched.
  */
 export function applyPiHeuristicCleanup(
 	sessionId: string,
@@ -469,35 +467,35 @@ export function applyPiHeuristicCleanup(
 			const tPersist = performance.now();
 			const toDrop = new Set(plan.tagNumbers);
 			const newestEmergencyTags = recentTags;
-			db.transaction(() => {
-				for (const tag of tags) {
-					if (!toDrop.has(tag.tagNumber)) continue;
-					if (tag.status !== "active" || tag.type !== "tool") continue;
-					const target = targets.get(tag.tagNumber);
-					const recent =
-						(emergency.usagePercentage ?? 0) < 95 &&
-						newestEmergencyTags.has(tag.tagNumber);
-					// Removing the result separator beside native reasoning lets Anthropic
-					// merge signed assistant turns, so this safety case always keeps the
-					// pair, with its real arguments.
-					const { result, mode } = applyNewToolDrop(target, {
+			for (const tag of tags) {
+				if (!toDrop.has(tag.tagNumber)) continue;
+				if (tag.status !== "active" || tag.type !== "tool") continue;
+				const target = targets.get(tag.tagNumber);
+				const recent =
+					(emergency.usagePercentage ?? 0) < 95 &&
+					newestEmergencyTags.has(tag.tagNumber);
+				// Keep the tool call and its placeholder result beside native reasoning:
+				// removing the result can merge separately signed assistant turns.
+				// The retained call keeps its real arguments.
+				const { result, mode } = applyPersistedToolDrop(
+					db,
+					sessionId,
+					tag.tagNumber,
+					target,
+					{
 						inWindow: recent,
 						keepSkeleton: target?.requiresToolArcSkeleton === true,
+					},
+				);
+				if (result === "removed" || result === "truncated") {
+					droppedTools++;
+					emergencyDroppedTools++;
+					droppedTokenReductions.push({
+						tagNumber: tag.tagNumber,
+						mode: mode === "full" ? "full" : "truncated",
 					});
-					if (result === "removed" || result === "truncated") {
-						// Persist the mode applied (including drop() keeping the
-						// call whose result ends the request) so replays match.
-						updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
-						updateTagDropMode(db, sessionId, tag.tagNumber, mode);
-						droppedTools++;
-						emergencyDroppedTools++;
-						droppedTokenReductions.push({
-							tagNumber: tag.tagNumber,
-							mode: mode === "full" ? "full" : "truncated",
-						});
-					}
 				}
-			}).immediate();
+			}
 			logStep(
 				"applyEmergencyDrops",
 				tPersist,
@@ -525,34 +523,36 @@ export function applyPiHeuristicCleanup(
 		config.staleReduceStripEnabled &&
 		(staleReduce.composite.size > 0 || staleReduce.bareCallIds.size > 0)
 	) {
-		db.transaction(() => {
-			for (const tag of tags) {
-				if (tag.status !== "active") continue;
-				if (tag.type !== "tool") continue;
-				if (protectedTools.has(tag.tagNumber)) continue;
-				if (!tag.messageId) continue;
-				// Composite match for tags carrying an owner — prevents a reused
-				// callId in a fresh turn from being dropped by a stale call in an
-				// old turn. Legacy NULL-owner rows fall back to bare callId match
-				// (lazy adoption: they predate composite identity).
-				const matched = tag.toolOwnerMessageId
-					? staleReduce.composite.has(
-							`${tag.toolOwnerMessageId}\x00${tag.messageId}`,
-						)
-					: staleReduce.bareCallIds.has(tag.messageId);
-				if (!matched) continue;
-				const target = targets.get(tag.tagNumber);
-				if (target?.canDrop?.() === false) continue;
-				const { result, mode } = applyNewToolDrop(target, { inWindow: false });
-				if (result === "incomplete") continue;
-				updateTagDropMode(db, sessionId, tag.tagNumber, mode);
-				updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
-				if (result === "removed" || result === "truncated") {
-					droppedStaleReduceCalls++;
-					config.onStaleReduceEdit?.(tag);
-				}
+		for (const tag of tags) {
+			if (tag.status !== "active") continue;
+			if (tag.type !== "tool") continue;
+			if (protectedTools.has(tag.tagNumber)) continue;
+			if (!tag.messageId) continue;
+			// Composite match for tags carrying an owner — prevents a reused
+			// callId in a fresh turn from being dropped by a stale call in an
+			// old turn. Legacy NULL-owner rows fall back to bare callId match
+			// (lazy adoption: they predate composite identity).
+			const matched = tag.toolOwnerMessageId
+				? staleReduce.composite.has(
+						`${tag.toolOwnerMessageId}\x00${tag.messageId}`,
+					)
+				: staleReduce.bareCallIds.has(tag.messageId);
+			if (!matched) continue;
+			const target = targets.get(tag.tagNumber);
+			if (target?.canDrop?.() === false) continue;
+			const { result } = applyPersistedToolDrop(
+				db,
+				sessionId,
+				tag.tagNumber,
+				target,
+				{ inWindow: false },
+			);
+			if (result === "incomplete") continue;
+			if (result === "removed" || result === "truncated") {
+				droppedStaleReduceCalls++;
+				config.onStaleReduceEdit?.(tag);
 			}
-		}).immediate();
+		}
 	}
 
 	// ── Pass 2: strip system injections from message tags ─────────────
@@ -574,7 +574,8 @@ export function applyPiHeuristicCleanup(
 				const strippedSource = stripTagPrefix(stripped);
 
 				if (strippedSource.trim().length === 0) {
-					if (target.thinkingDropProtected) continue;
+					if (target.thinkingDropProtected || target.identityRepairProtected)
+						continue;
 					const dropResult = target.drop?.() ?? "absent";
 					const didReplace =
 						dropResult === "absent"
@@ -642,36 +643,37 @@ export function applyPiHeuristicCleanup(
 			group.push(tag);
 			fingerprintGroups.set(fingerprint, group);
 		}
-
-		db.transaction(() => {
-			for (const [, group] of fingerprintGroups) {
-				if (group.length <= 1) continue;
-				group.sort((a, b) => a.tagNumber - b.tagNumber);
-				// Keep the newest, drop the rest.
-				for (let i = 0; i < group.length - 1; i++) {
-					const tag = group[i];
-					if (tag.tagNumber > protectedCutoff) continue;
-					const target = targets.get(tag.tagNumber);
-					if (protectedTools.has(tag.tagNumber)) continue;
-					if (target?.canDrop?.() === false) continue;
-					// Deduplication stays full-drop; only emergency recent arcs keep
-					// skeletons. A call that cannot be removed keeps real arguments.
-					const { result, mode } = applyNewToolDrop(target, {
+		for (const [, group] of fingerprintGroups) {
+			if (group.length <= 1) continue;
+			group.sort((a, b) => a.tagNumber - b.tagNumber);
+			// Keep the newest, drop the rest.
+			for (let i = 0; i < group.length - 1; i++) {
+				const tag = group[i];
+				if (tag.tagNumber > protectedCutoff) continue;
+				const target = targets.get(tag.tagNumber);
+				if (protectedTools.has(tag.tagNumber)) continue;
+				if (target?.canDrop?.() === false) continue;
+				// Deduplication stays full-drop; only emergency recent arcs keep
+				// skeletons. A call that cannot be removed keeps real arguments.
+				const { result, mode } = applyPersistedToolDrop(
+					db,
+					sessionId,
+					tag.tagNumber,
+					target,
+					{
 						inWindow: false,
+					},
+				);
+				if (result === "incomplete") continue;
+				if (result === "removed" || result === "truncated") {
+					deduplicatedTools++;
+					droppedTokenReductions.push({
+						tagNumber: tag.tagNumber,
+						mode: mode === "full" ? "full" : "truncated",
 					});
-					if (result === "incomplete") continue;
-					updateTagDropMode(db, sessionId, tag.tagNumber, mode);
-					updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
-					if (result === "removed" || result === "truncated") {
-						deduplicatedTools++;
-						droppedTokenReductions.push({
-							tagNumber: tag.tagNumber,
-							mode: mode === "full" ? "full" : "truncated",
-						});
-					}
 				}
 			}
-		}).immediate();
+		}
 	}
 
 	if (

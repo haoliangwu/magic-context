@@ -163,8 +163,16 @@ function flush(): void {
         let currentSize = getCurrentLogSize(logFile);
         const dataSize = Buffer.byteLength(data);
         if (currentSize > 0 && currentSize + dataSize > MAX_LOG_FILE_BYTES) {
-            rotateLogFile(logFile, currentSize);
-            currentSize = 0;
+            // Several processes share this file and each caches its size. A stale
+            // cache must not rotate a file another process already rotated: that
+            // second rotation would overwrite the full predecessor with the few
+            // lines written since. Decide on the file's real size instead.
+            flushesSinceSizeCheck = SIZE_CHECK_INTERVAL_FLUSHES;
+            currentSize = getCurrentLogSize(logFile);
+            if (currentSize > 0 && currentSize + dataSize > MAX_LOG_FILE_BYTES) {
+                rotateLogFile(logFile, currentSize);
+                currentSize = 0;
+            }
         }
         fs.appendFileSync(logFile, data, { encoding: "utf8", mode: 0o600 });
         buffer = [];

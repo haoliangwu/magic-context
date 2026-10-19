@@ -8,7 +8,12 @@ import {
 } from "./merged-reasoning-decisions";
 import { decodePiContentDecision, encodePiContentDecision } from "./pi-content-decisions";
 import {
+    getPendingPiCompactionMarkerState,
+    logPiCompactionMarkerClear,
+    type PendingPiCompactionMarker,
+    parseProcessedImageMarkers,
     parseStrippedPlaceholderState,
+    serializeProcessedImageMarkers,
     serializeStrippedPlaceholderState,
     THINKING_BINDING_RECOVERY_FROZEN_PREFIX,
 } from "./storage-meta-persisted";
@@ -35,6 +40,8 @@ export interface CloneTagRow {
 }
 
 export interface CloneSessionStateFilter {
+    /** Require no destination metadata, even if the child has no compartments or tags yet. */
+    requireEmptyDestinationMeta?: boolean;
     resolveBoundaryOrdinal(messageId: string): number | undefined;
     includeTag(tag: CloneTagRow): boolean;
     includeMessageId(messageId: string): boolean;
@@ -333,6 +340,16 @@ function filterIdBlob(raw: string | null, filter: CloneSessionStateFilter): stri
     }
 }
 
+function filterProcessedImageBlob(raw: string | null, filter: CloneSessionStateFilter): string {
+    return serializeProcessedImageMarkers(
+        new Map(
+            [...parseProcessedImageMarkers(raw)]
+                .filter(([id]) => filter.includeMessageId(id))
+                .map(([id, marker]) => [mapMessageId(filter, id) ?? id, marker]),
+        ),
+    );
+}
+
 /**
  * The stripped-placeholder column has two shapes: a plain id array, and an
  * `{ ids, hiddenSeamIds }` object once a fold has hidden seam placeholders.
@@ -459,11 +476,14 @@ export function copySessionStateForClone(
     destinationSessionId: string,
     filter: CloneSessionStateFilter,
 ): CopySessionStateForCloneResult {
-    return runImmediate(db, () => {
+    let clearedMarker: PendingPiCompactionMarker | null = null;
+    const result: CopySessionStateForCloneResult = runImmediate(db, () => {
         // The offline clone command also supports pre-v95 stores without
         // upgrading them; only current stores have indexed temporal choices.
         const hasTemporalDecisions = tableExists(db, "temporal_decisions");
         if (
+            (filter.requireEmptyDestinationMeta === true &&
+                countRows(db, "session_meta", destinationSessionId) > 0) ||
             countRows(db, "compartments", destinationSessionId) > 0 ||
             countRows(db, "tags", destinationSessionId) > 0 ||
             (hasTemporalDecisions &&
@@ -705,6 +725,8 @@ export function copySessionStateForClone(
             meta?.pending_pi_compaction_marker_state ?? null,
             copiedCompartments,
         );
+        if (pendingMarker === null)
+            clearedMarker = getPendingPiCompactionMarkerState(db, destinationSessionId);
         const todoAnchor = meta?.todo_synthetic_anchor_message_id ?? "";
         const migrateTodo = todoAnchor.length > 0 && filter.includeMessageId(todoAnchor);
 
@@ -746,7 +768,7 @@ export function copySessionStateForClone(
                 : null,
             filterStrippedPlaceholderBlob(meta?.stripped_placeholder_ids ?? null, filter),
             filterIdBlob(meta?.stale_reduce_stripped_ids ?? null, filter),
-            filterIdBlob(meta?.processed_image_stripped_ids ?? null, filter),
+            filterProcessedImageBlob(meta?.processed_image_stripped_ids ?? null, filter),
             clonePiContentDecisions(meta?.merged_reasoning_stripped_ids ?? null, filter),
             pendingMarker,
             migrateTodo ? (meta?.last_todo_state ?? "") : "",
@@ -783,4 +805,7 @@ export function copySessionStateForClone(
             pendingMarkerMigrated: pendingMarker !== null,
         };
     });
+    if (clearedMarker)
+        logPiCompactionMarkerClear(destinationSessionId, clearedMarker, "clone-replaced");
+    return result;
 }

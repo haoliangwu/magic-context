@@ -1,0 +1,21 @@
+{
+  "host": "opencode v2.0.27",
+  "databases": [
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/opencode/opencode2.db-shm",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/cortexkit/magic-context/context.db-shm",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/opencode/opencode2.db",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/opencode/opencode2.db-wal",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/opencode/opencode2.db-shm",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/cortexkit/magic-context/context.db",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/cortexkit/magic-context/context.db-wal",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/cortexkit/magic-context/context.db-shm",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/opencode/opencode2.db",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/opencode/opencode2.db-wal",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/opencode/opencode2.db",
+    "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/cortexkit/magic-context/context.db"
+  ],
+  "baselineCaptureSkip": "no-anchor",
+  "baselineApplyExit": "none (stale first-step prefix applied)",
+  "runnerBytes": 37718,
+  "btwBytes": 37962
+}

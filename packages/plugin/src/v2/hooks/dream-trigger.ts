@@ -7,6 +7,7 @@ import { openCurrentDatabase as openDatabase } from "../../features/magic-contex
 import type { HiddenCompletionExecutor } from "../../hooks/magic-context/compartment-runner-types";
 import { getDataDir } from "../../shared/data-path";
 import { log } from "../../shared/logger";
+import { sameProjectDirectory } from "../../shared/project-directory-key";
 import { V2RetrospectiveRawProvider } from "../retrospective-raw-provider";
 import { gaDatabasePath, V2StoreReader } from "../store-reader";
 import { selectRunnableDreamTasks } from "./dream-manual";
@@ -23,7 +24,10 @@ import type { V2Context } from "./types";
  * location, and its turns would reach the other instance, which never
  * registered the run: the child would run unshaped, in the other directory,
  * under the user's own permissions. A session that cannot be read is treated
- * as foreign.
+ * as foreign. Directories are compared by `sameProjectDirectory`, so two
+ * spellings of this location (separators, Windows drive-letter case, a
+ * trailing separator) still count as this location, and any other directory
+ * does not.
  */
 export async function sessionInThisLocation(
     context: Pick<V2Context, "location" | "session">,
@@ -36,7 +40,8 @@ export async function sessionInThisLocation(
         return false;
     }
     return (
-        location?.directory === context.location.directory &&
+        location?.directory !== undefined &&
+        sameProjectDirectory(location.directory, context.location.directory) &&
         (location.workspaceID ?? "") === (context.location.workspaceID ?? "")
     );
 }
@@ -48,13 +53,18 @@ export function startDreamTrigger(
     context: Pick<V2Context, "location" | "event" | "session">,
     args: {
         config: DreamerConfig;
-        sample?: () => { config: DreamerConfig; mural?: { enabled: boolean; model?: string } };
+        smartNotesEnabled?: boolean;
+        sample?: () => { config: DreamerConfig; mural?: { enabled: boolean } };
         executor: HiddenCompletionExecutor;
         projectIdentity: () => string;
-        /** The project's `memory.enabled`; `false` keeps the identity unscheduled. */
+        /** The project's `memory.enabled`; `false` leaves its project-memory tasks unscheduled. */
         projectMemoryEnabled?: boolean;
         language?: string;
-        mural?: { enabled: boolean; model?: string };
+        mural?: { enabled: boolean };
+        memoryInjectionBudgetTokens?: number;
+        retinaHandoff?: boolean;
+        transformMode?: "ts" | "rust";
+        moduleClient?: Parameters<typeof createDreamTaskExecutor>[0]["moduleClient"];
         /** Native source boundary; injectable for scheduler-only tests. */
         openReader?: () => Pick<V2StoreReader, "rootSessionActivity" | "close">;
     },
@@ -100,7 +110,7 @@ export function startDreamTrigger(
                             sampled?.config ?? args.config,
                             "opencode",
                             args.language,
-                            (sampled?.mural ?? args.mural)?.model,
+                            args.smartNotesEnabled,
                         ),
                         toolsSupported: args.executor.capabilities.tools === true,
                     });
@@ -108,6 +118,7 @@ export function startDreamTrigger(
                         db,
                         projectIdentity: args.projectIdentity(),
                         projectMemoryEnabled: args.projectMemoryEnabled,
+                        smartNotesEnabled: args.smartNotesEnabled,
                         tasks: runnable,
                         executor: createDreamTaskExecutor({
                             hiddenCompletionExecutor: args.executor,
@@ -117,6 +128,11 @@ export function startDreamTrigger(
                             retrospectiveRawProvider: (db) => new V2RetrospectiveRawProvider(db),
                             language: args.language,
                             mural: sampled?.mural ?? args.mural,
+                            memoryInjectionBudgetTokens: args.memoryInjectionBudgetTokens,
+                            retinaHandoff: args.retinaHandoff,
+                            transformMode: args.transformMode,
+                            moduleClient: args.moduleClient,
+                            smartNotesEnabled: args.smartNotesEnabled,
                         }),
                     });
                 } catch (error) {

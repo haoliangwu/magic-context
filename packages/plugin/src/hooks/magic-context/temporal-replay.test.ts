@@ -12,6 +12,7 @@ import { createTestTempDir } from "../../shared/test-temp-dir";
 import { createHostSeams } from "../../v2/hooks/context";
 import type { V2Context } from "../../v2/hooks/types";
 import { resetLkgSlotsForTest } from "./lkg-slot";
+import { requestPendingMaterialization } from "./pending-materialization";
 import { createTransform } from "./transform";
 
 it.each([
@@ -21,7 +22,8 @@ it.each([
     const root = createTestTempDir("temporal-replay-");
     let db = openDatabase(join(root.dir, "context.db"))!;
     const sessionId = `temporal-${runtime}`;
-    const pending = new Set([sessionId]);
+    const pending = new Set<string>();
+    requestPendingMaterialization(pending, sessionId, "user_flush");
     const models = new Map([
         [sessionId, { providerID: "anthropic", modelID: "claude-sonnet-4-5" }],
     ]);
@@ -69,7 +71,7 @@ it.each([
         const defer = structuredClone([user, newUser]);
         await makeTransform()({}, { messages: defer });
         expect(defer[1].parts[0].text).not.toContain("<!-- +");
-        pending.add(sessionId);
+        requestPendingMaterialization(pending, sessionId, "user_flush");
         const priced = structuredClone([user, newUser]);
         await makeTransform()({}, { messages: priced });
         expect(priced[1].parts[0].text).toContain("<!-- +50m -->");

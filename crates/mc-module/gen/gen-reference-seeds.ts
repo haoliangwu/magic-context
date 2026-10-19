@@ -1,3 +1,4 @@
+import "./quiet-live-log";
 /**
  * Vendor the historian reference-seed corpus for the Rust prompt builder.
  *

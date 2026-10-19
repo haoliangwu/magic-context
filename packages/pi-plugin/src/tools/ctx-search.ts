@@ -109,6 +109,7 @@ export interface CtxSearchToolDeps {
 	memoryEnabled?: boolean;
 	embeddingEnabled?: boolean;
 	gitCommitsEnabled?: boolean;
+	rerankConnectionFile?: string;
 	/** Resolve a directory's project identity, allowing home only when user-level configuration enables it. */
 	resolveProjectIdentity?: (directory: string) => string | undefined;
 }
@@ -273,6 +274,7 @@ export function createCtxSearchTool(
 					// (parity with OpenCode's ctx_search). Pi auto-search leaves
 					// this off to protect its latency budget.
 					explicitSearch: true,
+					rerankConnectionFile: deps.rerankConnectionFile,
 					...dateRange,
 				},
 			);

@@ -1,20 +1,18 @@
 import type { Hooks, Plugin, PluginModule } from "@opencode-ai/plugin";
-
+import packageMetadata from "../package.json";
 import {
     buildHiddenAgentConfig,
     buildHiddenAgentRegistrations,
+    buildZenReadAgentRegistrations,
 } from "./agents/hidden-agent-registrations";
 import { withContentLanguageDirective } from "./agents/language-directive";
 import { denyTaskRoutingToCallerAgents } from "./agents/permissions";
 import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
+import { logConfigDependencyNotesOnce } from "./config/dependency-notes";
 import { createDreamerOutputCapSampler } from "./config/live-child-output-cap";
 import { dreamerRunConfig, historianRunConfig, pluginConfigReader } from "./config/live-run-config";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
-import {
-    createSubcCheckoutClaimGate,
-    openCodeEventSessionId,
-} from "./features/magic-context/checkout-claim";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
 import type {
@@ -85,9 +83,14 @@ import {
     detectConflicts,
     resolveCompactionForBoot,
 } from "./shared/conflict-detector";
-import { getMagicContextStorageDir } from "./shared/data-path";
+import {
+    claimStorageBackupWarningCheck,
+    getMagicContextStorageDir,
+    isMagicContextStorageOutsideEngram,
+} from "./shared/data-path";
 import { registerExitAbort, unregisterExitAbort } from "./shared/exit-abort-registry";
 import { setHarness } from "./shared/harness";
+import { shapeV1HiddenMessage } from "./shared/hidden-zen-read";
 import { setKeepSubagents } from "./shared/keep-subagents";
 import { flushLogger, log } from "./shared/logger";
 import {
@@ -107,12 +110,25 @@ import { MagicContextRpcServer } from "./shared/rpc-server";
 import { closeQuietly } from "./shared/sqlite-helpers";
 import { importPluginModule } from "./shared/stale-plugin-build";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
-import { reloadWindowOverlay } from "./shared/window-geometry";
+import { applyHiddenSubagentTemperature } from "./shared/subagent-temperature";
+import { registerStandalonePluginMarker } from "./standalone-plugin-marker";
 import { CTX_MEMORY_LIST_TOOL_NAME } from "./tools/ctx-memory";
 import { setup } from "./v2/server";
 
 const BOOT_SERVER_DEADLINE_MS = 15_000;
 const RESOLVED_CONFIG_TIMEOUT_MS = 2_000;
+
+function warnStorageBackupOnce(storageDir: string): void {
+    if (!claimStorageBackupWarningCheck()) return;
+    if (isMagicContextStorageOutsideEngram(storageDir)) {
+        log(
+            `[magic-context] Magic Context storage is at ${storageDir}, outside the folder Engram backs up (~/.local/share/cortexkit/magic-context). It is not included in CortexKit backups.`,
+        );
+        flushLogger();
+    }
+}
+
+registerStandalonePluginMarker(packageMetadata.version);
 
 const server: Plugin = async (ctx) => {
     bindStaleBuildNotice(ctx.client, import.meta.url);
@@ -137,8 +153,7 @@ const server: Plugin = async (ctx) => {
     // session-scoped row under the wrong harness.
     setHarness("opencode");
     // Off-by-default diagnostic for multi-second host main-thread stalls. Without
-    // its enable file this is one existsSync every 30 s; see
-    // docs/reports/host-stall-profiler.md. Process-wide and idempotent.
+    // its enable file this is one existsSync every 30 s. Process-wide and idempotent.
     startHostStallProfilerSwitch();
 
     const configStartedAt = performance.now();
@@ -159,7 +174,6 @@ const server: Plugin = async (ctx) => {
         pluginConfig,
         () => liveConfigReader.poll().effective,
     );
-    reloadWindowOverlay(pluginConfig.models?.window_overlay_path);
     const promptSurfaceRuntime = createPromptSurfaceRuntime({
         harness: "opencode",
         directory: ctx.directory,
@@ -237,6 +251,10 @@ const server: Plugin = async (ctx) => {
                 }
             }, 3000);
     }
+
+    // Settings that are on but inert because another section turns off what
+    // they rely on (for example smart notes with the dreamer disabled).
+    logConfigDependencyNotesOnce(pluginConfig, log);
 
     const openCodeDbResolution = resolveOpenCodeDbPath();
     if (
@@ -530,6 +548,7 @@ const server: Plugin = async (ctx) => {
     // `enabled` block lets the auto-update checker still coordinate even
     // when the rest of the runtime is disabled by config or conflicts.
     const storageDir = getMagicContextStorageDir();
+    warnStorageBackupOnce(storageDir);
 
     // Per-instance process-resident handles, hoisted to function scope so the
     // server.instance.disposed cleanup (wired into the event handler below, which
@@ -592,6 +611,7 @@ const server: Plugin = async (ctx) => {
                 },
                 mural: pluginConfig.mural,
                 retinaHandoff: pluginConfig.smart_notes.retina_handoff,
+                smartNotesEnabled: pluginConfig.smart_notes.enabled,
                 gitCommitIndexing: pluginConfig.memory.git_commit_indexing?.enabled
                     ? {
                           enabled: true,
@@ -847,24 +867,6 @@ const server: Plugin = async (ctx) => {
         }),
     );
 
-    // The checkout claim: Magic Context must not write for a session whose agent
-    // another machine holds. Its first write for a session can come from the
-    // event stream (session.created), chat.message, or a transform pass, so
-    // each of those consults the gate first. The verdict is cached per session,
-    // so only a session's first sight (and each cache expiry) pays for a check.
-    // Nothing is written when the plugin is disabled, so nothing is checked.
-    const checkoutClaimGate = pluginConfig.enabled
-        ? createSubcCheckoutClaimGate(
-              "opencode",
-              () => pluginConfig.subc?.connection_file ?? getDefaultSubcConnectionFile(),
-          )
-        : undefined;
-    const isCheckoutClaimRefused = async (sessionId: string | undefined): Promise<boolean> => {
-        if (!checkoutClaimGate || !sessionId) return false;
-        if (liveSessionState.internalChildSessions.has(sessionId)) return false;
-        return (await checkoutClaimGate.refusal(sessionId, ctx.directory)) !== null;
-    };
-
     return {
         tool: tools,
         event: createEventHandler({
@@ -873,11 +875,6 @@ const server: Plugin = async (ctx) => {
                     if (input.event.type === "session.deleted") {
                         const properties = input.event.properties as { info?: { id?: string } };
                         if (properties.info?.id) dreamerCap.delete(properties.info.id);
-                    } else if (await isCheckoutClaimRefused(openCodeEventSessionId(input.event))) {
-                        // The host's own deletion of a session still clears its local
-                        // state above; every other event of a session held elsewhere
-                        // is left for the machine that holds it.
-                        return;
                     }
                     await magicContextRuntime.magicContext?.event?.(input);
                 },
@@ -938,32 +935,13 @@ const server: Plugin = async (ctx) => {
         }),
         "chat.params": async (input, output) => {
             dreamerCap.apply(input, output);
+            applyHiddenSubagentTemperature(input, output, log);
         },
         "experimental.chat.messages.transform": createMessagesTransformHandler({
             magicContext: magicContextRuntime.magicContext,
             getMagicContext: () => magicContextRuntime.magicContext,
             failClosed,
             failClosedBlockingEnabled,
-            // Refuse before any write when another machine holds the session's
-            // agent; MC writes nothing when the plugin is disabled.
-            checkoutClaim: checkoutClaimGate
-                ? {
-                      gate: checkoutClaimGate,
-                      projectRoot: ctx.directory,
-                      onRefusal: async (sessionId, message) => {
-                          const { sendStatusNotification } = await importPluginModule(
-                              () => import("./hooks/magic-context/send-session-notification"),
-                          );
-                          const { abortSessionFailClosed } = await importPluginModule(
-                              () => import("./hooks/magic-context/transform-postprocess-phase"),
-                          );
-                          await sendStatusNotification(ctx.client, sessionId, message, {
-                              toastDurationMs: 15000,
-                          });
-                          await abortSessionFailClosed(ctx.client, sessionId);
-                      },
-                  }
-                : undefined,
             // Compaction-off mode (issue #266): fail_closed_blocking is inert
             // BY DESIGN in this mode — a failed transform degrades to
             // passthrough of the input messages instead of blocking the turn.
@@ -992,9 +970,6 @@ const server: Plugin = async (ctx) => {
             },
         }) as unknown as NonNullable<Hooks["experimental.chat.messages.transform"]>,
         "experimental.chat.system.transform": async (input, output) => {
-            // The messages transform refuses such a turn loudly; this hook only
-            // has to stay out of the store.
-            if (await isCheckoutClaimRefused((input as { sessionID?: string }).sessionID)) return;
             await magicContextRuntime.magicContext?.["experimental.chat.system.transform"]?.(
                 input,
                 output,
@@ -1025,8 +1000,7 @@ const server: Plugin = async (ctx) => {
                 provId && modId
                     ? { providerID: provId, modelID: modId, agentName: agent || "default" }
                     : null;
-            // The turn itself is refused by the messages transform, loudly.
-            if (await isCheckoutClaimRefused((input as { sessionID?: string }).sessionID)) return;
+            shapeV1HiddenMessage(input.sessionID, output.message);
             await magicContextRuntime.magicContext?.["chat.message"]?.(input, output);
         },
         "tool.definition": async (input, output) => {
@@ -1161,6 +1135,7 @@ const server: Plugin = async (ctx) => {
                     historianOverrides: historianAgentOverrides,
                     historianDisallowed: pluginConfig.historian?.disallowed_tools ?? [],
                 });
+                registrations.push(...buildZenReadAgentRegistrations(registrations));
 
                 const agentConfig = { ...(config.agent ?? {}) } as NonNullable<typeof config.agent>;
                 const agentConfigRecord = agentConfig as Record<string, Record<string, unknown>>;

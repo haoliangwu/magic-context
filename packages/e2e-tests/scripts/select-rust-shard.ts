@@ -1,17 +1,12 @@
 #!/usr/bin/env bun
 
 import { filesForMode, validateModeManifest } from "./validate-mode-manifest";
+import durations from "./shard-durations.json";
+import { selectWeightedShard } from "./select-weighted-shard";
 
-/** Stable manifest-order partition; every file belongs to exactly one shard. */
+/** The validated manifest owns membership; historical timings only affect assignment. */
 export function selectRustShard(files: string[], spec: string): string[] {
-    const match = /^(\d+)\/(\d+)$/.exec(spec);
-    if (!match) throw new Error(`invalid MC_E2E_SHARD: ${spec} (expected i/n)`);
-    const index = Number(match[1]);
-    const count = Number(match[2]);
-    if (!Number.isSafeInteger(index) || !Number.isSafeInteger(count) || count < 1 || count > files.length || index >= count) {
-        throw new Error(`invalid MC_E2E_SHARD: ${spec} (expected 0 <= i < n)`);
-    }
-    return files.filter((_, position) => position % count === index);
+    return selectWeightedShard(files, spec, durations.seconds.rust);
 }
 
 if (import.meta.main) {

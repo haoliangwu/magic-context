@@ -1,3 +1,4 @@
+import "./quiet-live-log";
 /**
  * Generate the differential scheduler golden for the Rust mc-module port.
  *

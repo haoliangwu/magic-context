@@ -181,3 +181,47 @@ describe("applyPendingOperations with protection window set form", () => {
         expect(getTagById(db!, SES, 2)?.status).toBe("active");
     });
 });
+
+describe("pending tool drop persistence", () => {
+    it("commits the first drop and stops before the failed second and untouched third", () => {
+        useTempDataHome("apply-write-failure-");
+        const db = openDatabase()!;
+        const applied: number[] = [];
+        const targets = new Map();
+        for (let n = 1; n <= 3; n++) {
+            insertTag(db, SES, `call-${n}`, "tool", 4000, n);
+            queuePendingOp(db, SES, n, "drop");
+            targets.set(n, {
+                canDrop: () => true,
+                cannotRemove: () => true,
+                skeletonReal: () => {
+                    expect(getTagById(db, SES, n)?.status).toBe("dropped");
+                    applied.push(n);
+                    return "truncated" as const;
+                },
+                setContent: () => false,
+            });
+        }
+        db.exec(`CREATE TEMP TRIGGER abort_second_drop BEFORE UPDATE OF status ON tags
+            WHEN NEW.tag_number = 2 AND NEW.status = 'dropped'
+            BEGIN SELECT RAISE(ABORT, 'abort second drop'); END`);
+        expect(() => applyPendingOperations(SES, db, targets, new Set())).toThrow(
+            "abort second drop",
+        );
+        expect(applied).toEqual([1]);
+        expect([1, 2, 3].map((n) => getTagById(db, SES, n)?.status)).toEqual([
+            "dropped",
+            "active",
+            "active",
+        ]);
+        expect([1, 2, 3].map((n) => getTagById(db, SES, n)?.dropMode)).toEqual([
+            "skeleton_real",
+            "full",
+            "full",
+        ]);
+        expect(db.prepare("SELECT tag_id FROM pending_ops ORDER BY tag_id").all()).toEqual([
+            { tag_id: 2 },
+            { tag_id: 3 },
+        ]);
+    });
+});

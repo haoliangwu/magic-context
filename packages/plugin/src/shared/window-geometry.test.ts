@@ -1,179 +1,12 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { describe, expect, test } from "bun:test";
 import { resolveLimit, resolveOutputReserve } from "./models-dev-cache";
-import { createTestTempDirFromPath } from "./test-temp-dir";
 import {
     applyProvenInputFloor,
     deriveWindowGeometry,
     formatCompactTokens,
     formatWindowDerivationLine,
-    parseWindowOverlay,
     placeholderFilteredOutput,
-    readWindowOverlayFile,
-    resolveWindowOverlayFacts,
-    scalarizeFact,
-    type WindowOverlay,
-    type WindowOverlayFact,
 } from "./window-geometry";
-
-const fixture = JSON.parse(
-    readFileSync(new URL("./__fixtures__/window-overlay.v1.json", import.meta.url), "utf8"),
-) as unknown;
-const parsedFixture = parseWindowOverlay(fixture).overlay as WindowOverlay;
-const tempDirs: string[] = [];
-
-function fact(
-    value: WindowOverlayFact["value"],
-    overrides: Partial<WindowOverlayFact> = {},
-): WindowOverlayFact {
-    return {
-        value,
-        grade: "measured",
-        units: "provider",
-        boundary: "Observed",
-        source_ref: "test",
-        observed_at: "2026-08-13T00:00:00Z",
-        ...overrides,
-    };
-}
-
-function overlay(
-    provider: string,
-    model: string,
-    facts: Record<string, WindowOverlayFact>,
-): WindowOverlay {
-    return {
-        schema: "fusiform-window-overlay/v1",
-        generated_at: "2026-08-13T00:00:00Z",
-        minted_provider_ids: [],
-        cells: [{ provider_id: provider, model_id: model, facts }],
-    };
-}
-
-afterEach(() => {
-    for (const path of tempDirs.splice(0)) rmSync(path, { recursive: true, force: true });
-});
-
-describe("Fusiform overlay v1", () => {
-    test("scalarizes every tagged union conservatively", () => {
-        expect(scalarizeFact({ kind: "stated", value: 272_000 })).toBe(272_000);
-        expect(scalarizeFact({ kind: "bracket", at_least: 340_000, below: 372_001 })).toBe(340_000);
-        expect(scalarizeFact({ kind: "bracket", below: 372_001 })).toBeUndefined();
-        expect(scalarizeFact({ kind: "unknown", why: "never_measured" })).toBeUndefined();
-    });
-
-    test("preserves a half-open bracket and derives exactly from at_least", () => {
-        const halfOpen = parseWindowOverlay({
-            schema: "fusiform-window-overlay/v1",
-            generated_at: "2026-08-13T00:00:00Z",
-            minted_provider_ids: [],
-            cells: [
-                {
-                    provider_id: "openai-chatgpt-oauth",
-                    model_id: "gpt-5.6-sol",
-                    facts: {
-                        "window.advertised": fact({ kind: "stated", value: 272_000 }),
-                        "window.enforced": fact({ kind: "bracket", at_least: 340_000 }),
-                    },
-                },
-            ],
-        }).overlay;
-        const parsedValue = halfOpen?.cells[0]?.facts["window.enforced"]?.value;
-        expect(parsedValue).toEqual({ kind: "bracket", at_least: 340_000 });
-        expect(parsedValue && "below" in parsedValue).toBe(false);
-        const halfOpenResult = deriveWindowGeometry(
-            "openai-chatgpt-oauth",
-            "gpt-5.6-sol",
-            { context: 272_000, output: 128_000 },
-            {
-                overlay: resolveWindowOverlayFacts("openai-chatgpt-oauth", "gpt-5.6-sol", halfOpen),
-            },
-        );
-        const statedResult = deriveWindowGeometry(
-            "openai-chatgpt-oauth",
-            "gpt-5.6-sol",
-            { context: 272_000, output: 128_000 },
-            {
-                overlay: resolveWindowOverlayFacts(
-                    "openai-chatgpt-oauth",
-                    "gpt-5.6-sol",
-                    overlay("openai-chatgpt-oauth", "gpt-5.6-sol", {
-                        "window.enforced": fact({ kind: "stated", value: 340_000 }),
-                    }),
-                ),
-            },
-        );
-        expect(halfOpenResult).toEqual(statedResult);
-    });
-
-    test("specific cells override wildcard facts per fact", () => {
-        const data: WindowOverlay = {
-            schema: "fusiform-window-overlay/v1",
-            generated_at: "2026-08-13T00:00:00Z",
-            minted_provider_ids: [],
-            cells: [
-                {
-                    provider_id: "ollama-cloud",
-                    model_id: "*",
-                    facts: {
-                        "output.enforced": fact({ kind: "stated", value: 65_536 }),
-                        geometry: fact({ kind: "stated", value: "shared_upfront" }),
-                    },
-                },
-                {
-                    provider_id: "ollama-cloud",
-                    model_id: "deepseek-v4",
-                    facts: {
-                        "output.enforced": fact({ kind: "stated", value: 32_000 }),
-                    },
-                },
-            ],
-        };
-        const facts = resolveWindowOverlayFacts("ollama-cloud", "deepseek-v4", data)?.facts;
-        expect(scalarizeFact(facts?.["output.enforced"]?.value as never)).toBe(32_000);
-        expect(facts?.geometry?.value).toEqual({ kind: "stated", value: "shared_upfront" });
-    });
-
-    test("refuses an unrecognized schema before considering familiar cells", () => {
-        const v2 = {
-            ...(fixture as Record<string, unknown>),
-            schema: "fusiform-window-overlay/v2",
-        };
-        const parsed = parseWindowOverlay(v2);
-        expect(parsed.overlay).toBeUndefined();
-        expect(parsed.refusal).toContain("unrecognized schema");
-    });
-
-    test("skips bad cells once and keeps valid cells", () => {
-        const badCell = {
-            provider_id: "bad",
-            model_id: "model",
-            facts: { "window.enforced": { value: { kind: "stated", value: 1_000_000 } } },
-        };
-        const parsed = parseWindowOverlay({
-            ...(fixture as Record<string, unknown>),
-            cells: [badCell, ...(fixture as { cells: unknown[] }).cells],
-        });
-        expect(parsed.badCells).toBe(1);
-        expect(parsed.overlay?.cells.length).toBe(parsedFixture.cells.length);
-    });
-
-    test("a missing file is silent and a bad file logs one summary", () => {
-        const dir = createTestTempDirFromPath(join(tmpdir(), "window-overlay-test-"));
-        tempDirs.push(dir);
-        const logs: string[] = [];
-        expect(
-            readWindowOverlayFile(join(dir, "missing.json"), (message) => logs.push(message)),
-        ).toBeUndefined();
-        expect(logs).toEqual([]);
-        const path = join(dir, "bad.json");
-        writeFileSync(path, JSON.stringify({ ...(fixture as object), schema: "v2" }));
-        expect(readWindowOverlayFile(path, (message) => logs.push(message))).toBeUndefined();
-        expect(logs).toHaveLength(1);
-    });
-});
 
 describe("window geometry", () => {
     test("filters placeholders independently in both directions", () => {
@@ -190,63 +23,106 @@ describe("window geometry", () => {
         ).toBe(300_000);
     });
 
-    test("fixture table yields the 65% execution bases from the spec", () => {
+    test("preserves catalog geometry for representative models", () => {
         const cases = [
-            ["openai-chatgpt-oauth", "gpt-5.6", 272_000, 128_000, 200_200],
-            ["anthropic", "claude-opus-5", 1_000_000, 128_000, 629_200],
-            // Producer batch downgraded google's geometry to considered-unknown
-            // (Google's docs contradict the separate-quota reading), so the
-            // derivation demotes to shared_upfront and reserves OpenCode's
-            // actual request cap B = min(65_536, 32_000):
-            // floor(0.65 * (1_048_576 - 32_000)) — not the no-reserve 681_574.
-            ["google", "gemini-3.5-flash", 1_048_576, 65_536, 660_774],
-            ["xai", "grok-4.6", 500_000, 500_000, 304_200],
-            ["ollama-cloud", "deepseek-v4-flash", 1_048_576, 384_000, 660_774],
-            ["moonshotai", "kimi-k3", 1_048_576, 1_048_576, 660_774],
-        ] as const;
-        for (const [provider, model, context, output, expectedExecute] of cases) {
-            const result = deriveWindowGeometry(
-                provider,
-                model,
-                { context, output },
-                {
-                    overlay: resolveWindowOverlayFacts(provider, model, parsedFixture),
+            {
+                provider: "openai",
+                model: "gpt-4o",
+                limit: { context: 128_000, output: 16_384 },
+                expected: {
+                    usableSoft: 111_616,
+                    usableHard: 111_616,
+                    geometry: "shared_upfront",
+                    derivation: {
+                        window: 128_000,
+                        reserve: 16_384,
+                        reserveSource: "output_catalog",
+                        geometry: "shared_upfront",
+                        windowSource: "catalog",
+                        absoluteWall: 128_000,
+                    },
                 },
-            );
-            expect(Math.floor((result?.usableSoft ?? 0) * 0.65)).toBe(expectedExecute);
+            },
+            {
+                provider: "anthropic",
+                model: "claude-3-7-sonnet",
+                limit: { context: 200_000, output: 64_000 },
+                expected: {
+                    usableSoft: 150_000,
+                    usableHard: 195_904,
+                    geometry: "shared_truncating",
+                    derivation: {
+                        window: 200_000,
+                        reserve: 50_000,
+                        reserveSource: "output_catalog",
+                        geometry: "shared_truncating",
+                        windowSource: "catalog",
+                        absoluteWall: 200_000,
+                    },
+                },
+            },
+            {
+                provider: "google",
+                model: "gemini-2.5-pro",
+                limit: { context: 1_000_000, output: 65_536 },
+                expected: {
+                    usableSoft: 1_000_000,
+                    usableHard: 1_000_000,
+                    geometry: "separate",
+                    derivation: {
+                        window: 1_000_000,
+                        reserve: 0,
+                        reserveSource: "none",
+                        geometry: "separate",
+                        windowSource: "catalog",
+                        absoluteWall: 1_000_000,
+                    },
+                },
+            },
+            {
+                provider: "xai",
+                model: "grok-3",
+                limit: { context: 131_072, output: 32_768 },
+                expected: {
+                    usableSoft: 98_304,
+                    usableHard: 126_976,
+                    geometry: "shared_truncating",
+                    derivation: {
+                        window: 131_072,
+                        reserve: 32_768,
+                        reserveSource: "output_catalog",
+                        geometry: "shared_truncating",
+                        windowSource: "catalog",
+                        absoluteWall: 131_072,
+                    },
+                },
+            },
+            {
+                provider: "openai-codex",
+                model: "gpt-5.6-sol",
+                limit: { context: 272_000, output: 128_000 },
+                expected: {
+                    usableSoft: 204_000,
+                    usableHard: 240_000,
+                    geometry: "shared_upfront",
+                    derivation: {
+                        window: 272_000,
+                        reserve: 68_000,
+                        reserveSource: "output_catalog",
+                        geometry: "shared_upfront",
+                        windowSource: "catalog",
+                        absoluteWall: 272_000,
+                    },
+                },
+            },
+        ] as const;
+
+        for (const { provider, model, limit, expected } of cases) {
+            expect(deriveWindowGeometry(provider, model, limit)).toEqual(expected);
         }
     });
 
-    test("grok derives from geometry, window, and default output without an enforced output", () => {
-        const facts = resolveWindowOverlayFacts("xai", "grok-4.6", parsedFixture);
-        expect(facts?.facts["output.enforced"]).toBeUndefined();
-        const result = deriveWindowGeometry(
-            "xai",
-            "grok-4.6",
-            { context: 500_000, output: 500_000 },
-            { overlay: facts },
-        );
-        expect(result?.geometry).toBe("shared_truncating");
-        expect(result?.usableSoft).toBe(468_000);
-    });
-
-    test("kimi reserves its default output instead of placeholder advertised output", () => {
-        const result = deriveWindowGeometry(
-            "moonshotai",
-            "kimi-k3",
-            { context: 1_048_576, output: 1_048_576 },
-            {
-                overlay: resolveWindowOverlayFacts("moonshotai", "kimi-k3", parsedFixture),
-            },
-        );
-        expect(result?.derivation.reserve).toBe(32_000);
-        expect(result?.usableSoft).toBe(1_016_576);
-    });
-
-    test("output_reserve forms override a pre-carved input and overlay output facts", () => {
-        const data = overlay("openai-codex", "gpt-5.6-sol", {
-            "output.enforced": fact({ kind: "stated", value: 68_000 }),
-        });
+    test("output_reserve forms override a pre-carved input and catalog output", () => {
         const cases = [
             16_384,
             { default: 16_384 },
@@ -259,7 +135,6 @@ describe("window geometry", () => {
                 "gpt-5.6-sol",
                 { context: 400_000, input: 272_000, output: 128_000 },
                 {
-                    overlay: resolveWindowOverlayFacts("openai-codex", "gpt-5.6-sol", data),
                     outputReserveOverride: resolveOutputReserve(
                         "openai-codex",
                         "gpt-5.6-sol",
@@ -276,27 +151,18 @@ describe("window geometry", () => {
         }
     });
 
-    test("provider hook wins over overlay, while overlay beats catalog", () => {
-        const data = overlay("provider", "model", {
-            "window.enforced": fact({ kind: "stated", value: 300_000 }),
-            "output.enforced": fact({ kind: "stated", value: 20_000 }),
+    test("provider hook overrides catalog limits field by field", () => {
+        const catalog = deriveWindowGeometry("provider", "model", {
+            context: 200_000,
+            output: 10_000,
         });
-        const overlayOnly = deriveWindowGeometry(
-            "provider",
-            "model",
-            { context: 200_000, output: 10_000 },
-            { overlay: resolveWindowOverlayFacts("provider", "model", data) },
-        );
         const hooked = deriveWindowGeometry(
             "provider",
             "model",
             { context: 200_000, output: 10_000 },
-            {
-                overlay: resolveWindowOverlayFacts("provider", "model", data),
-                providerLimit: { context: 400_000, output: 30_000 },
-            },
+            { providerLimit: { context: 400_000, output: 30_000 } },
         );
-        expect(overlayOnly?.derivation.window).toBe(300_000);
+        expect(catalog?.derivation.window).toBe(200_000);
         expect(hooked?.derivation.window).toBe(400_000);
         expect(hooked?.derivation.reserve).toBe(30_000);
     });
@@ -360,7 +226,7 @@ describe("window geometry", () => {
         expect(logs[0]).toContain("clamped");
     });
 
-    test("keeps no-overlay usableSoft byte-identical to legacy resolveLimit", () => {
+    test("catalog usableSoft matches the legacy resolver", () => {
         const corpus = [
             ["openai", "real", { context: 200_000, output: 32_000 }],
             ["openai", "zero", { context: 200_000, output: 0 }],

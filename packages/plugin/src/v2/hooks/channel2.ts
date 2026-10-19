@@ -8,8 +8,8 @@ import {
 import {
     buildChannel2Reminder,
     type Channel1State,
+    currentReclaimableToolOutputCount,
     evaluateChannel2,
-    reclaimableToolOutputCount,
 } from "../../hooks/magic-context/ctx-reduce-nudge";
 import type { V2Context } from "./types";
 
@@ -79,7 +79,7 @@ export async function deliverPendingChannel2(
             sessionID,
             buildChannel2Reminder(
                 evaluation.reclaimableTokens,
-                reclaimableToolOutputCount(baseline?.baselineParts ?? []),
+                currentReclaimableToolOutputCount(baseline),
             ),
         );
     } catch (error) {

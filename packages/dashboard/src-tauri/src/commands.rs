@@ -1506,6 +1506,13 @@ pub fn dismiss_user_memory(state: State<'_, AppState>, id: i64) -> Result<(), St
 }
 
 #[tauri::command(async)]
+pub fn restore_user_memory(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let path = state.get_db_path()?;
+    let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;
+    db::restore_user_memory(&mut conn, id).map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
 pub fn delete_user_memory(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     let path = state.get_db_path()?;
     let mut conn = db::open_readwrite(&path).map_err(|e| e.to_string())?;

@@ -414,11 +414,22 @@ function openCodeConfigFileChain(
         .flatMap((dir) => [join(dir, "opencode.json"), join(dir, "opencode.jsonc")]);
     const explicitConfig = process.env.OPENCODE_CONFIG?.trim();
     const explicit = explicitConfig ? [explicitConfig] : [];
-    const direct = [join(directory, "opencode.json"), join(directory, "opencode.jsonc")];
-    const projectSupplementary = [
-        join(directory, ".opencode", "opencode.json"),
-        join(directory, ".opencode", "opencode.jsonc"),
-    ];
+    // OpenCode 1 can ignore project opencode.json/jsonc and .opencode configs.
+    // If config.get() times out during bootstrap, compaction detection falls
+    // back here and must not read settings from those host-disabled files.
+    const disableProjectConfig = process.env.OPENCODE_DISABLE_PROJECT_CONFIG?.toLowerCase();
+    const skipProject =
+        hostGeneration === "v1" &&
+        (disableProjectConfig === "true" || disableProjectConfig === "1");
+    const direct = skipProject
+        ? []
+        : [join(directory, "opencode.json"), join(directory, "opencode.jsonc")];
+    const projectSupplementary = skipProject
+        ? []
+        : [
+              join(directory, ".opencode", "opencode.json"),
+              join(directory, ".opencode", "opencode.jsonc"),
+          ];
 
     const files =
         hostGeneration === "v2"

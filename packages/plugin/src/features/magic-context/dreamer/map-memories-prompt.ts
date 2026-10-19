@@ -1,5 +1,7 @@
+import { execFile } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import path from "node:path";
+import { promisify } from "node:util";
 
 import {
     assertNoDuplicateManifestIds,
@@ -27,25 +29,25 @@ export const MAP_MEMORIES_SYSTEM_PROMPT = `You are a memory mapper for the magic
 
 A memory's BACKING FILES are the file(s) whose code the memory makes a claim about — the files you would open to check whether the memory is accurate. You do NOT judge accuracy, rewrite, or remove anything. You only LOCATE backing files.
 
-Tools (read-only): read, grep, glob. Request line ranges rather than full files; use offset/limit for longer files. Each memory may come with "Likely files" already named in it and confirmed to exist — confirm those FIRST (cheap) instead of searching. Use search/grep to FIND code only when no likely files are given. Do not guess — confirm a file exists and genuinely backs the memory before listing it. Keep reads minimal: you do not need to read a whole file to confirm it backs a one-line claim.
+Tools (read-only): read, grep, glob. Use at most 3 tool calls per memory, including searches and reads. Never read the same file twice in a batch; reuse what you already learned. Never repeat an identical search or use broad searches such as "fn " or ".*". Request one useful line range, not repeated slices. Each memory may come with "Likely files" from paths it names or a literal identifier search, confirmed to exist — confirm those FIRST (cheap) instead of searching. Use search/grep to FIND code only when no likely files are given. Do not guess — confirm a file exists and genuinely backs the memory before listing it. You are locating code, not exhaustively verifying the claim. If the call budget runs out before you can decide, leave that id unmapped and move on; uncertainty is not evidence of file-independence.
 
 For each memory decide ONE of:
-- Backing files found → the COMPLETE set of repo-relative paths whose code the memory is about.
+- Backing files found → the specific repo-relative paths whose code the memory is about; do not chase every caller or related implementation.
 - File-independent → the memory describes EXTERNAL behavior (a provider / API / platform / protocol limit, e.g. "Anthropic returns 400 on empty content"), or a pure process / workflow / philosophy rule, with NO specific local file that backs it. A BEHAVIORAL claim (when to act, how to work, who decides, or tool-usage discipline) is file-independent even when it cites file paths or commands as examples: a named file is not the file backing the rule.
 
-Output ONE XML manifest at the very end and NOTHING else — no narration, no per-memory commentary, no reasoning:
+Output ONE XML manifest and NOTHING else — no narration, no per-memory commentary, no reasoning. Open <mappings> before investigating. Emit each <memory> element as soon as you decide its mapping, before investigating the next memory, so an interruption cannot lose completed work. Close </mappings> when finished:
 <mappings>
 <memory id="N" files="path/a.ts,path/b.ts"/>
 <memory id="M" independent="true"/>
 </mappings>
 
 Rules:
-- Every input memory id MUST appear exactly once.
+- Every decided input memory id MUST appear exactly once. Omit uncertain ids rather than inventing backing files or declaring them independent.
 - files: repo-relative, comma-separated, no spaces inside a path. Only files that actually exist and genuinely back the memory.
 - A BACKING FILE is CODE that implements or handles the claim — not a file that merely mentions it. A path named inside a process directive is an action target or example, not evidence that the file backs the directive. A markdown doc (.md), a PARITY/notes file, or a test that only DESCRIBES an external fact is NOT a backing file. If the only place a memory's fact appears is prose/docs/a test (no code implements or handles it), mark it independent="true".
 - Many CONSTRAINTS are HYBRID: "external system does X, and OUR code handles it here." Map those to the HANDLING code (you can verify the handling, even though you can't verify the external behavior). Only mark independent when there is NO local code that implements or handles the fact.
 - Prefer the most specific file(s); do not pad with tangential files. Most memories map to one file; some to a few.
-- When you genuinely cannot find any local backing and it is not clearly external, still emit the memory with independent="true" (do not drop it).`;
+- Mark independent="true" only for the file-independent cases above; an investigation that runs out of calls stays unmapped.`;
 
 // CONTEXT GUARD: seed at most this many candidate PATHS per memory (path strings
 // only — never file contents, which is what blows up context). The agent
@@ -89,11 +91,87 @@ export interface MapMemoryInput {
     candidates: string[];
 }
 
+const execFileAsync = promisify(execFile);
+
+/** One bounded literal source search per batch; only paths enter the model context.
+ * An unavailable repository or oversized/slow search leaves path seeds intact. */
+export async function seedIdentifierCandidates(
+    memories: MapMemoryInput[],
+    repoDir: string,
+): Promise<MapMemoryInput[]> {
+    const identifiers = new Map(
+        memories
+            .filter((memory) => memory.candidates.length === 0)
+            .map((memory) => [
+                memory.id,
+                [
+                    ...new Set(
+                        memory.content.match(
+                            /\b(?:[A-Z][A-Za-z0-9_]{3,}|[a-z][a-z0-9]*[A-Z][A-Za-z0-9_]*|[a-z][a-z0-9]*_[A-Za-z0-9_]{2,})\b/g,
+                        ) ?? [],
+                    ),
+                ].slice(0, 3),
+            ]),
+    );
+    const terms = [...new Set([...identifiers.values()].flat())];
+    if (terms.length === 0) return memories;
+    let stdout: string;
+    try {
+        const result = await execFileAsync(
+            "git",
+            [
+                "-c",
+                "core.quotePath=false",
+                "grep",
+                "--no-color",
+                "-n",
+                "-I",
+                "-F",
+                ...terms.flatMap((term) => ["-e", term]),
+                "--",
+                ...["ts", "tsx", "js", "jsx", "mjs", "cjs", "rs", "go", "py", "sql", "sh"].map(
+                    (extension) => `*.${extension}`,
+                ),
+            ],
+            {
+                cwd: repoDir,
+                encoding: "utf8",
+                timeout: 2_000,
+                maxBuffer: 256 * 1024,
+                windowsHide: true,
+                // A timed-out or oversized lookup must terminate even if Git ignores SIGTERM.
+                killSignal: "SIGKILL",
+            },
+        );
+        stdout = result.stdout;
+    } catch {
+        return memories;
+    }
+    const matches = stdout.split("\n").flatMap((line) => {
+        const match = line.match(/^([^:]+):\d+:(.*)$/);
+        return match ? [{ file: match[1], text: match[2] }] : [];
+    });
+    return memories.map((memory) => {
+        const names = identifiers.get(memory.id);
+        if (!names?.length) return memory;
+        const files = new Map<string, number>();
+        for (const match of matches) {
+            const score = names.filter((name) => match.text.includes(name)).length;
+            if (score) files.set(match.file, Math.max(files.get(match.file) ?? 0, score));
+        }
+        const candidates = [...files]
+            .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+            .slice(0, MAX_SEED_PATHS_PER_MEMORY)
+            .map(([file]) => file);
+        return candidates.length ? { ...memory, candidates } : memory;
+    });
+}
+
 export function buildMapMemoriesPrompt(projectPath: string, memories: MapMemoryInput[]): string {
     const list = memories
         .map((m) => {
             const seed = m.candidates.length
-                ? `\nLikely files (named in the memory, confirmed to exist): ${m.candidates.join(", ")}`
+                ? `\nLikely files (candidate paths, confirmed to exist): ${m.candidates.join(", ")}`
                 : "";
             return `[${m.id}] ${m.category}\n${m.content}${seed}`;
         })
@@ -102,7 +180,7 @@ export function buildMapMemoriesPrompt(projectPath: string, memories: MapMemoryI
 
 Project: ${projectPath}
 
-For each memory below, find the repo file(s) it makes a claim about, or mark it file-independent. Behavioral process/workflow directives stay file-independent even when they name files. When "Likely files" are listed, those paths are named in the memory and confirmed to exist — START there only for code claims: confirm each actually backs the claim (a quick read/outline), drop any that don't, add others only if genuinely needed. Search from scratch only when no likely files are given. Then output ONE <mappings> manifest covering every id.
+For each memory below, find the repo file(s) it makes a claim about, or mark it file-independent. Behavioral process/workflow directives stay file-independent even when they name files. When "Likely files" are listed, those paths either occur in the memory or match its identifiers in a bounded literal source search — START there only for code claims: confirm each actually backs the claim (a quick read/outline), drop any that don't, add others only if genuinely needed. Search from scratch only when no likely files are given. Use at most 3 tool calls per memory, reuse prior reads, and emit each decided mapping immediately in ONE <mappings> manifest. Leave uncertain ids unmapped and move on.
 
 <memories>
 ${list}
@@ -116,7 +194,7 @@ export interface ParsedMemoryMapping {
 }
 
 // Built fresh per call — a shared /g regex carries lastIndex across inputs.
-const MEMORY_ELEMENT_PATTERN = "<memory\\b([^>]*)(?:\\/>|>([\\s\\S]*?)<\\/memory>)";
+const MEMORY_ELEMENT_PATTERN = "<memory\\b([^<>]*)(?:\\/>|>([\\s\\S]*?)<\\/memory>)";
 const NESTED_FILE_PATTERN = "<file\\b([^>]*)\\/?>";
 
 function extractNestedFilePaths(inner: string): string[] {
@@ -198,4 +276,32 @@ export function validateMapMemoriesManifest(
         "mappings",
     );
     return parsed;
+}
+
+/** Recover only closed, individually valid decisions from an interrupted manifest.
+ * Conflicting decisions for one id are left unmapped, never resolved by guessing. */
+export function parsePartialMapMemoriesManifest(
+    text: string,
+    expectedIds: ReadonlySet<number>,
+): ParsedMemoryMapping[] {
+    const start = text.indexOf("<mappings>");
+    if (start < 0) return [];
+    const entries = new Map<number, ParsedMemoryMapping>();
+    const conflicts = new Set<number>();
+    for (const match of text.slice(start).matchAll(new RegExp(MEMORY_ELEMENT_PATTERN, "gi"))) {
+        try {
+            const entry = parseMapMemoriesManifest(`<mappings>${match[0]}</mappings>`)[0];
+            if (!entry || !expectedIds.has(entry.id) || conflicts.has(entry.id)) continue;
+            const previous = entries.get(entry.id);
+            if (previous && JSON.stringify(previous) !== JSON.stringify(entry)) {
+                entries.delete(entry.id);
+                conflicts.add(entry.id);
+            } else {
+                entries.set(entry.id, entry);
+            }
+        } catch {
+            // A malformed decision must not prevent banking other completed memories.
+        }
+    }
+    return [...entries.values()];
 }

@@ -14,7 +14,11 @@ import {
 } from "./idle-schedule-prune";
 import { getDreamState, setDreamState } from "./storage-dream-state";
 import { getTaskScheduleState, writeTaskScheduleState } from "./storage-task-schedule";
-import { CANONICAL_DREAM_TASKS, type DreamTaskName } from "./task-registry";
+import {
+    CANONICAL_DREAM_TASKS,
+    type DreamTaskName,
+    PROJECT_MEMORY_DREAM_TASKS,
+} from "./task-registry";
 import {
     type DreamTaskRuntimeConfig,
     planDueTasks,
@@ -26,7 +30,8 @@ import {
  * Schedule rows used to be created for every canonical task of every directory
  * that ever hosted a session, and were never removed. These tests pin the rules
  * that replaced that: rows exist only for tasks that have input, idle identities
- * are pruned, and an identity with project memory disabled is never scheduled.
+ * are pruned, and an identity with project memory disabled never schedules its
+ * project-memory tasks.
  */
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -305,7 +310,7 @@ describe("idle identities are pruned", () => {
     });
 });
 
-describe("a caller with project memory disabled schedules nothing", () => {
+describe("a caller with project memory disabled leaves its project-memory tasks alone", () => {
     function countingExecutor() {
         const calls = { count: 0 };
         const executor = async (): Promise<TaskExecOutcome> => {
@@ -315,7 +320,7 @@ describe("a caller with project memory disabled schedules nothing", () => {
         return { calls, executor };
     }
 
-    function allRows(d: Database, project: string): unknown[] {
+    function allRows(d: Database, project: string): Array<Record<string, unknown>> {
         return d
             .prepare<[string], Record<string, unknown>>(
                 "SELECT * FROM task_schedule_state WHERE project_path = ? ORDER BY task",
@@ -347,7 +352,7 @@ describe("a caller with project memory disabled schedules nothing", () => {
         expect(calls.count).toBe(0);
     });
 
-    it("existing rows are left intact and are not run", async () => {
+    it("existing project-memory rows are left intact and are not run", async () => {
         db = freshDb();
         const project = "git:memory-off-here";
         // Overdue rows for a project with memories: a caller with memory on
@@ -355,8 +360,17 @@ describe("a caller with project memory disabled schedules nothing", () => {
         writeLegacyRows(db, project, NOW - DAY_MS);
         addMemory(db, project);
         makePruneFresh(db);
-        const before = allRows(db, project);
-        const { calls, executor } = countingExecutor();
+        const memoryRows = () =>
+            allRows(db!, project).filter((row) =>
+                (PROJECT_MEMORY_DREAM_TASKS as readonly unknown[]).includes(row.task),
+            );
+        const before = memoryRows();
+        expect(before).toHaveLength(PROJECT_MEMORY_DREAM_TASKS.length);
+        const ran: string[] = [];
+        const executor = async (config: DreamTaskRuntimeConfig): Promise<TaskExecOutcome> => {
+            ran.push(config.task);
+            return { status: "completed" };
+        };
 
         await runDueTasksForProject({
             db,
@@ -366,8 +380,12 @@ describe("a caller with project memory disabled schedules nothing", () => {
             now: NOW,
             projectMemoryEnabled: false,
         });
-        expect(calls.count).toBe(0);
-        expect(allRows(db, project)).toEqual(before);
+        // The tasks that serve other settings (docs, smart notes, user-memory
+        // review) are still taken up; the memory tasks are untouched.
+        expect(
+            ran.filter((task) => (PROJECT_MEMORY_DREAM_TASKS as readonly string[]).includes(task)),
+        ).toEqual([]);
+        expect(memoryRows()).toEqual(before);
     });
 
     it("a shared identity keeps its watermarks when one caller has memory off and another on", async () => {

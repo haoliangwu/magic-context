@@ -1,4 +1,5 @@
 import type { PromptSurfacePreset } from "../shared/prompt-surface";
+import { NOTES_FILTER_DESCRIPTION } from "./ctx-note/constants";
 
 export const FULL_PARAMETER_DESCRIPTIONS = {
     ctx_reduce: {
@@ -85,18 +86,25 @@ export type PromptSurfaceParameterToolId = keyof typeof FULL_PARAMETER_DESCRIPTI
 export function parameterDescriptionsFor(
     toolId: string,
     preset: PromptSurfacePreset,
+    smartNotesEnabled = true,
 ): Readonly<Record<string, string>> | undefined {
     const descriptions =
         preset === "light" ? LIGHT_PARAMETER_DESCRIPTIONS : FULL_PARAMETER_DESCRIPTIONS;
-    return descriptions[toolId as PromptSurfaceParameterToolId];
+    const selected = descriptions[toolId as PromptSurfaceParameterToolId];
+    if (toolId === "ctx_note" && !smartNotesEnabled) {
+        const { surface_condition: _condition, ...plain } = descriptions.ctx_note;
+        return { ...plain, filter: NOTES_FILTER_DESCRIPTION };
+    }
+    return selected;
 }
 
 export function applyJsonSchemaParameterDescriptions(
     toolId: string,
     input: unknown,
     preset: PromptSurfacePreset,
+    smartNotesEnabled = true,
 ): void {
-    const descriptions = parameterDescriptionsFor(toolId, preset);
+    const descriptions = parameterDescriptionsFor(toolId, preset, smartNotesEnabled);
     if (!descriptions || !input || typeof input !== "object") return;
     const properties = (input as { properties?: unknown }).properties;
     if (!properties || typeof properties !== "object") return;

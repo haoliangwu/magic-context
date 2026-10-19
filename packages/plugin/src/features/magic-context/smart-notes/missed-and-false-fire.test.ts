@@ -87,6 +87,17 @@ function output(url: string): string {
         check_cron: "0 * * * *",
     });
 }
+function cronOutput(checkCron: string): string {
+    return JSON.stringify({
+        compiled_check: "function check() { return { met: false }; }",
+        manifest: { capabilities: [] },
+        check_cron: checkCron,
+    });
+}
+function sparseCron(): string {
+    const moreThanOneDayOut = new Date(Date.now() + 48 * 60 * 60 * 1000);
+    return `${moreThanOneDayOut.getMinutes()} ${moreThanOneDayOut.getHours()} ${moreThanOneDayOut.getDate()} ${moreThanOneDayOut.getMonth() + 1} *`;
+}
 function compile(
     condition: string,
     capabilities: SmartNoteCapabilityApi,
@@ -149,6 +160,28 @@ test("oversized repair failure stops after two compiler calls", async () => {
         transport.executor,
     );
     expect(result).toMatchObject({ ok: false, persistent: true });
+    expect(transport.requests).toHaveLength(2);
+});
+
+test("sparse check_cron recompiles with correction and succeeds with a frequent cron", async () => {
+    const transport = carrier([cronOutput(sparseCron()), cronOutput("0 * * * *")]);
+    const result = await compile("wait until a future date", emptyCapabilities, transport.executor);
+
+    expect(result).toMatchObject({ ok: true, checkCron: "0 * * * *" });
+    expect(transport.requests).toHaveLength(2);
+    expect(transport.requests[1]).toContain(
+        "check_cron must fire at least once every 24 hours; put date conditions inside compiled_check",
+    );
+});
+
+test("sparse check_cron repair fails with the scheduling ceiling error", async () => {
+    const transport = carrier([cronOutput(sparseCron())]);
+    const result = await compile("wait until a future date", emptyCapabilities, transport.executor);
+
+    expect(result).toMatchObject({
+        ok: false,
+        error: "check_cron has no occurrence within the scheduling ceiling",
+    });
     expect(transport.requests).toHaveLength(2);
 });
 

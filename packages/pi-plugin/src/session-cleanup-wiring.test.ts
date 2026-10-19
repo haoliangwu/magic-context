@@ -49,7 +49,9 @@ describe("clearContextHandlerSession internals", () => {
 		// a stale pendingMaterializationSessions entry would force the
 		// pipeline to materialize pending ops on a session that no
 		// longer exists.
-		expect(body).toContain("pendingMaterializationSessions.delete(sessionId)");
+		expect(body).toContain(
+			"clearPendingMaterialization(pendingMaterializationSessions, sessionId)",
+		);
 	});
 
 	test("deletes from systemPromptRefreshSessions", () => {

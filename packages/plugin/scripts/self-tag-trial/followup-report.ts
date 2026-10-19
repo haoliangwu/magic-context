@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 
-const base = process.argv[2] ?? "docs/reports/issue-582-self-tag";
+const base = process.argv[2] ?? ".cortexkit/internal-docs/investigations/reports/issue-582-self-tag";
 const suffix = process.argv[3] ?? "c";
 const phases = process.argv.slice(4);
 if (!phases.length) throw new Error("Supply phase names, e.g. live-c supplement-c");

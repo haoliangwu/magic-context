@@ -7,7 +7,10 @@ import {
     getDreamerTickFailure,
 } from "@magic-context/core/features/magic-context/dreamer/tick-failure";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
-import { getMagicContextStorageResolution } from "@magic-context/core/shared/data-path";
+import {
+    getMagicContextStorageResolution,
+    isMagicContextStorageOutsideEngram,
+} from "@magic-context/core/shared/data-path";
 import { loadPiConfig } from "@magic-context/pi-core/config";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 import { OmpAdapter } from "../adapters/omp";
@@ -23,7 +26,8 @@ import {
     type GhCommandResult,
     submitGithubIssue,
 } from "../lib/github-issue";
-import { formatLogFileInspection, inspectMagicContextLogs } from "../lib/log-lines";
+import { capBodyToGithubLimit, getLogSessionIds, prepareIssueReport } from "../lib/issue-body";
+import { formatLogFileInspection, inspectMagicContextLogs, readLogLines } from "../lib/log-lines";
 import {
     detectOmpBinary,
     getOmpSetting,
@@ -33,6 +37,7 @@ import {
     type OmpBinaryInfo,
     runOmpCommand,
 } from "../lib/omp-helpers";
+import { checkOmpHideSecrets, collectHideSecretsSources } from "../lib/omp-hide-secrets";
 import {
     getOmpAgentDir,
     getOmpConfigPath,
@@ -43,13 +48,14 @@ import {
     getOmpUserConfigPath,
 } from "../lib/paths";
 import { type PromptIO, promptIO } from "../lib/prompts";
-import { sanitizeDiagnosticText } from "../lib/redaction";
 
 const MIN_OMP_VERSION = "17.1.7";
 type Status = "pass" | "warn" | "fail" | "info";
 interface CheckResult {
     status: Status;
     message: string;
+    /** Fixed text with no paths or values, used verbatim by the issue report. */
+    issueMessage?: string;
 }
 interface RepairPlan {
     installPlugin: boolean;
@@ -60,6 +66,9 @@ interface RepairPlan {
 interface HealthReport {
     results: CheckResult[];
     repairPlan: RepairPlan;
+    pluginVersion: string | null;
+    ompVersion: string | null;
+    logFiles: ReturnType<DoctorDeps["inspectMagicContextLogs"]>;
     pass: number;
     warn: number;
     fail: number;
@@ -174,6 +183,8 @@ async function runHealthChecks(options: {
     quiet?: boolean;
 }): Promise<HealthReport> {
     const results: CheckResult[] = [];
+    let pluginVersion: string | null = null;
+    let ompVersion: string | null = null;
     const repairPlan: RepairPlan = {
         installPlugin: false,
         disableCompaction: false,
@@ -185,82 +196,103 @@ async function runHealthChecks(options: {
         add(results, "fail", "OMP binary not found on PATH or in standard user bin directories");
     } else {
         const version = options.deps.getOmpVersion(omp.path);
-        if (!version) add(results, "fail", `OMP at ${omp.path} could not report its version`);
-        else if (isOlderThan(version, MIN_OMP_VERSION)) {
-            add(results, "fail", `OMP ${version} is older than tested minimum ${MIN_OMP_VERSION}`);
-        } else add(results, "pass", `OMP ${version} detected at ${omp.path}`);
-
+        ompVersion = version;
         const plugins = options.deps.listOmpPlugins(omp.path);
         if (!plugins) {
             add(results, "fail", "`omp plugin list --json` failed or returned invalid JSON");
         } else {
             const plugin = plugins.find((entry) => entry.name === OMP_PLUGIN_PACKAGE);
+            pluginVersion = plugin?.version ?? null;
             if (!plugin) {
-                add(results, "fail", `${OMP_PLUGIN_PACKAGE} is not installed in OMP`);
-                repairPlan.installPlugin = true;
-            } else if (!plugin.enabled) {
-                add(results, "fail", `${OMP_PLUGIN_PACKAGE} is installed but disabled in OMP`);
-                repairPlan.installPlugin = true;
-            } else {
-                add(results, "pass", `${OMP_PLUGIN_PACKAGE} ${plugin.version} is enabled`);
-                const manifest = pluginDeclaresOmp(plugin.path);
-                if (manifest === true)
-                    add(results, "pass", "Plugin exposes an OMP/Pi extension manifest");
-                else if (manifest === false)
-                    add(results, "fail", "Installed plugin has no OMP/Pi extension manifest");
-                else add(results, "warn", "Could not inspect the installed plugin manifest");
-            }
-        }
-
-        const compaction = options.deps.getOmpSetting(omp.path, "compaction.enabled");
-        if (compaction === false) add(results, "pass", "OMP native compaction is disabled");
-        else if (compaction === true) {
-            add(
-                results,
-                "fail",
-                "OMP native compaction is enabled and conflicts with Magic Context",
-            );
-            repairPlan.disableCompaction = true;
-        } else add(results, "fail", "Could not read OMP compaction.enabled");
-
-        const memory = options.deps.getOmpSetting(omp.path, "memory.backend");
-        if (memory === "off") add(results, "pass", "OMP automatic memory backend is disabled");
-        else if (typeof memory === "string") {
-            add(
-                results,
-                "fail",
-                `OMP memory.backend=${memory} duplicates Magic Context memory injection`,
-            );
-            repairPlan.disableMemory = true;
-        } else add(results, "fail", "Could not read OMP memory.backend");
-
-        const nonGlobalSources = getOmpNonGlobalConfigSources(options.cwd);
-        if (
-            nonGlobalSources.length > 0 &&
-            (repairPlan.disableCompaction || repairPlan.disableMemory)
-        ) {
-            add(
-                results,
-                "warn",
-                "OMP project/overlay config owns effective conflicting settings; automatic global repair is disabled: " +
-                    nonGlobalSources.join(", "),
-            );
-        }
-
-        const reportedAgentDir = options.deps.runOmpCommand(omp.path, ["config", "path"], 10_000);
-        if (!reportedAgentDir.ok) {
-            add(results, "warn", "Could not verify OMP active agent directory");
-        } else {
-            const reportedPath = resolve(reportedAgentDir.stdout);
-            const expectedPath = resolve(getOmpAgentDir());
-            if (reportedPath === expectedPath) {
-                add(results, "pass", `OMP agent directory resolved to ${getOmpAgentDir()}`);
-            } else {
                 add(
                     results,
-                    "fail",
-                    `OMP reports agent directory ${reportedAgentDir.stdout}, but Magic Context resolved ${getOmpAgentDir()}`,
+                    "info",
+                    `${version ? `Oh My Pi ${version}` : "Oh My Pi"} found; Magic Context is not installed there (run setup to add it)`,
                 );
+                repairPlan.installPlugin = true;
+            } else {
+                if (!version) {
+                    add(results, "fail", `OMP at ${omp.path} could not report its version`);
+                } else if (isOlderThan(version, MIN_OMP_VERSION)) {
+                    add(
+                        results,
+                        "fail",
+                        `OMP ${version} is older than tested minimum ${MIN_OMP_VERSION}`,
+                    );
+                } else add(results, "pass", `OMP ${version} detected at ${omp.path}`);
+
+                if (!plugin.enabled) {
+                    add(results, "fail", `${OMP_PLUGIN_PACKAGE} is installed but disabled in OMP`);
+                    repairPlan.installPlugin = true;
+                } else {
+                    add(results, "pass", `${OMP_PLUGIN_PACKAGE} ${plugin.version} is enabled`);
+                    const manifest = pluginDeclaresOmp(plugin.path);
+                    if (manifest === true)
+                        add(results, "pass", "Plugin exposes an OMP/Pi extension manifest");
+                    else if (manifest === false)
+                        add(results, "fail", "Installed plugin has no OMP/Pi extension manifest");
+                    else add(results, "warn", "Could not inspect the installed plugin manifest");
+                }
+
+                const compaction = options.deps.getOmpSetting(omp.path, "compaction.enabled");
+                if (compaction === false) add(results, "pass", "OMP native compaction is disabled");
+                else if (compaction === true) {
+                    add(
+                        results,
+                        "fail",
+                        "OMP native compaction is enabled and conflicts with Magic Context",
+                    );
+                    repairPlan.disableCompaction = true;
+                } else add(results, "fail", "Could not read OMP compaction.enabled");
+
+                const memory = options.deps.getOmpSetting(omp.path, "memory.backend");
+                if (memory === "off")
+                    add(results, "pass", "OMP automatic memory backend is disabled");
+                else if (typeof memory === "string") {
+                    add(
+                        results,
+                        "fail",
+                        `OMP memory.backend=${memory} duplicates Magic Context memory injection`,
+                    );
+                    repairPlan.disableMemory = true;
+                } else add(results, "fail", "Could not read OMP memory.backend");
+
+                for (const check of checkOmpHideSecrets(collectHideSecretsSources(options.cwd)))
+                    results.push(check);
+
+                const nonGlobalSources = getOmpNonGlobalConfigSources(options.cwd);
+                if (
+                    nonGlobalSources.length > 0 &&
+                    (repairPlan.disableCompaction || repairPlan.disableMemory)
+                ) {
+                    add(
+                        results,
+                        "warn",
+                        "OMP project/overlay config owns effective conflicting settings; automatic global repair is disabled: " +
+                            nonGlobalSources.join(", "),
+                    );
+                }
+
+                const reportedAgentDir = options.deps.runOmpCommand(
+                    omp.path,
+                    ["config", "path"],
+                    10_000,
+                );
+                if (!reportedAgentDir.ok) {
+                    add(results, "warn", "Could not verify OMP active agent directory");
+                } else {
+                    const reportedPath = resolve(reportedAgentDir.stdout);
+                    const expectedPath = resolve(getOmpAgentDir());
+                    if (reportedPath === expectedPath) {
+                        add(results, "pass", `OMP agent directory resolved to ${getOmpAgentDir()}`);
+                    } else {
+                        add(
+                            results,
+                            "fail",
+                            `OMP reports agent directory ${reportedAgentDir.stdout}, but Magic Context resolved ${getOmpAgentDir()}`,
+                        );
+                    }
+                }
             }
         }
     }
@@ -281,6 +313,13 @@ async function runHealthChecks(options: {
 
     const storage = getMagicContextStorageResolution();
     const dbPath = join(storage.path, "context.db");
+    if (isMagicContextStorageOutsideEngram(storage.path)) {
+        add(
+            results,
+            "warn",
+            `Magic Context storage is at ${storage.path}, outside the folder Engram backs up (~/.local/share/cortexkit/magic-context). It is not included in CortexKit backups.`,
+        );
+    }
     add(results, "info", `Shared storage: ${storage.path} (source: ${storage.source})`);
     if (!existsSync(dbPath)) add(results, "info", `Shared context DB will be created at ${dbPath}`);
     else {
@@ -338,6 +377,9 @@ async function runHealthChecks(options: {
     return {
         results,
         repairPlan,
+        pluginVersion,
+        ompVersion,
+        logFiles,
         pass: results.filter((result) => result.status === "pass").length,
         warn: results.filter((result) => result.status === "warn").length,
         fail: results.filter((result) => result.status === "fail").length,
@@ -404,18 +446,67 @@ function timestamp(date: Date): string {
         .replace(/\.\d{3}Z$/, "Z");
 }
 
-function ompIssueBody(description: string, report: HealthReport): string {
+function ompIssueBody(
+    description: string,
+    report: HealthReport,
+    logLines: string[],
+    sessionFilter: string | null,
+    cwd: string,
+): string {
+    const LOG_TAIL_LINES = 400;
+    const { privacy, recentLog, recentErrorLines } = prepareIssueReport(
+        report,
+        logLines,
+        sessionFilter,
+        [cwd],
+    );
+
     return [
         "## Description",
-        sanitizeDiagnosticText(description),
+        privacy.userText(description),
+        "",
+        privacy.notice,
+        "",
+        "## Environment",
+        `- Magic Context plugin: ${report.pluginVersion ? `v${privacy.report(report.pluginVersion, "pluginVersion")}` : "not installed"}`,
+        `- Oh My Pi: ${report.ompVersion ? privacy.report(report.ompVersion, "ompVersion") : "not detected"}`,
+        `- OS: ${process.platform} ${process.arch}`,
+        `- Runtime: Node.js ${process.version}`,
         "",
         "## OMP diagnostics",
-        `- Magic Context CLI: ${selfVersion()}`,
+        `- Magic Context CLI: v${selfVersion()}`,
         ...report.results.map(
             (result) =>
-                `- ${result.status.toUpperCase()}: ${sanitizeDiagnosticText(result.message)}`,
+                `- ${result.status.toUpperCase()}: ${result.issueMessage ?? privacy.healthMessage(result.message)}`,
         ),
+        "",
+        "## Recent errors (last 20, sanitized)",
+        recentErrorLines.length === 0
+            ? "_No error-shaped log lines found in recent history._"
+            : ["```", recentErrorLines.join("\n"), "```"].join("\n"),
+        "",
+        `## Log (last ${LOG_TAIL_LINES} lines, sanitized)`,
+        "```",
+        recentLog || "<no log output>",
+        "```",
     ].join("\n");
+}
+
+function writeOmpIssueReport(
+    path: string,
+    fullBodyMarkdown: string,
+): {
+    path: string;
+    bodyMarkdown: string;
+    fullPath?: string;
+    truncated: boolean;
+} {
+    const bodyMarkdown = capBodyToGithubLimit(fullBodyMarkdown);
+    const truncated = bodyMarkdown !== fullBodyMarkdown;
+    writeFileAtomic(path, `${bodyMarkdown}\n`);
+    const fullPath = truncated ? `${path}.full.md` : undefined;
+    if (fullPath) writeFileAtomic(fullPath, `${fullBodyMarkdown}\n`);
+    return { path, bodyMarkdown, ...(fullPath ? { fullPath } : {}), truncated };
 }
 
 function runGhCommandWithDeps(deps: DoctorDeps, args: string[]): GhCommandResult {
@@ -461,11 +552,21 @@ async function runIssueFlow(options: {
         const path = isAbsolute(options.reportPath)
             ? options.reportPath
             : join(options.cwd, options.reportPath);
-        writeFileAtomic(
+        const bundle = writeOmpIssueReport(
             path,
-            `${ompIssueBody("Generated non-interactively by `doctor --issue --report`.", report)}\n`,
+            ompIssueBody(
+                "Generated non-interactively by `doctor --issue --report`.",
+                report,
+                readLogLines(report.logFiles),
+                null,
+                options.cwd,
+            ),
         );
-        options.prompts.log.success(`Sanitized report written to ${path}`);
+        options.prompts.log.success(
+            bundle.fullPath
+                ? `Sanitized report written to ${bundle.path}; full report at ${bundle.fullPath}`
+                : `Sanitized report written to ${bundle.path}`,
+        );
         return 0;
     }
 
@@ -478,21 +579,47 @@ async function runIssueFlow(options: {
         validate: (value) => (value.trim() ? undefined : "Description is required"),
     });
     const report = await runHealthChecks({ ...options, quiet: true });
+    const logLines = readLogLines(report.logFiles);
+    const sessionIds = getLogSessionIds(logLines);
+    let sessionFilter: string | null = null;
+    if (sessionIds.length > 1) {
+        const choice = await options.prompts.selectOne(
+            "Which OMP session is this issue about? (filters log lines from other sessions)",
+            [
+                ...sessionIds.map((sessionId, index) => ({
+                    label: `${sessionId}${index === 0 ? " (most recent)" : ""}`,
+                    value: sessionId,
+                })),
+                { label: "All sessions (no filtering)", value: "__all__" },
+            ],
+        );
+        sessionFilter = choice === "__all__" ? null : choice;
+    }
+
     const path = join(options.cwd, `magic-context-omp-issue-${timestamp(options.deps.now())}.md`);
-    writeFileAtomic(path, `${ompIssueBody(description, report)}\n`);
-    options.prompts.log.success(`Sanitized report written to ${path}`);
+    const bundle = writeOmpIssueReport(
+        path,
+        ompIssueBody(description, report, logLines, sessionFilter, options.cwd),
+    );
+    options.prompts.log.success(
+        bundle.fullPath
+            ? `Sanitized report written to ${bundle.path}; full report at ${bundle.fullPath}`
+            : `Sanitized report written to ${bundle.path}`,
+    );
     if (await options.prompts.confirm("Submit this issue on GitHub now?", false)) {
-        const result = submitGithubIssue(`[omp] ${title}`, path, (args) =>
+        const result = submitGithubIssue(`[omp] ${title}`, bundle.path, (args) =>
             runGhCommandWithDeps(options.deps, args),
         );
         if (result.ok) {
             options.prompts.log.success(result.output);
         } else {
-            options.prompts.log.warn(formatGithubIssueFallback(result, path));
+            options.prompts.log.warn(
+                formatGithubIssueFallback(result, bundle.fullPath ?? bundle.path),
+            );
         }
     }
     options.prompts.log.info(
-        `Open https://github.com/cortexkit/magic-context/issues/new and drag ${path} into the issue`,
+        `Open https://github.com/cortexkit/magic-context/issues/new and drag ${bundle.fullPath ?? bundle.path} into the issue`,
     );
     return 0;
 }

@@ -3,7 +3,11 @@ import type { Memory } from "../../features/magic-context/memory/types";
 import { buildCompartmentAgentPrompt, COMPARTMENT_AGENT_SYSTEM_PROMPT } from "./compartment-prompt";
 import { calibrationForModelKey, providerMass } from "./decision-calibration";
 import { fitHistorianPrompt, type HistorianPromptFitArgs } from "./historian-prompt-fit";
-import { PRODUCER_WINDOW_REFUSAL_MARGIN, producerInputTokenLimit } from "./producer-window-guard";
+import {
+    PRODUCER_WINDOW_REFUSAL_MARGIN,
+    producerInputTokenLimit,
+    producerPromptFailureReason,
+} from "./producer-window-guard";
 import * as formatting from "./read-session-formatting";
 import { estimateTokens } from "./read-session-formatting";
 import { buildReferenceBlocks, type ReferenceCompartment } from "./reference-retrieval";
@@ -79,6 +83,68 @@ function limitOf(input: HistorianPromptFitArgs): number {
 }
 
 describe("fitHistorianPrompt", () => {
+    test("memory-on loads the lazy pool once and preserves the supplied-array fit", () => {
+        const memories = [memory(0), memory(1)];
+        const input = args({ memories });
+        let reads = 0;
+        const fit = fitHistorianPrompt({
+            ...input,
+            memories: () => {
+                reads += 1;
+                return memories;
+            },
+        });
+        expect(reads).toBe(1);
+        expect(fit).toEqual(fitHistorianPrompt(input));
+        if (!fit.ok) throw new Error(fit.reason);
+        expect(fit.projectMemory).toContain("Fact 0:");
+    });
+
+    test("memory-off never loads project memories for fitting, even with an unknown window", () => {
+        for (const window of [args({}).window, { maxOutputTokens: 8_000 }]) {
+            const fit = fitHistorianPrompt(
+                args({
+                    window,
+                    memoryEnabled: false,
+                    memories: () => {
+                        throw new Error("project memories were read");
+                    },
+                }),
+            );
+            if (!fit.ok) throw new Error(fit.reason);
+            expect(fit.projectMemory).toBe("");
+            expect(fit.kept.memories).toBe(0);
+        }
+    });
+
+    test("memory-off final prompt rejects a supplied project-memory block", () => {
+        const prompt = buildCompartmentAgentPrompt({
+            seedExamples: "seed examples",
+            sessionReferences: "session references",
+            projectMemory: "<project-memory>private memory</project-memory>",
+            inputSource: "session transcript",
+            memoryEnabled: false,
+        });
+        expect(prompt).not.toContain("private memory");
+        expect(prompt).not.toContain("<project-memory>");
+        expect(prompt).toContain("session transcript");
+    });
+
+    test("render review: memory-off historian request must not contain project memories", () => {
+        const input = args({ memoryEnabled: false, memories: [memory(0)] });
+        const fit = fitHistorianPrompt(input);
+        if (!fit.ok) throw new Error(fit.reason);
+        const prompt = buildCompartmentAgentPrompt({
+            seedExamples: fit.seedExamples,
+            sessionReferences: fit.sessionReferences,
+            projectMemory: fit.projectMemory,
+            inputSource: "Messages 61-62:\n\nA new task.",
+            memoryEnabled: false,
+        });
+        expect(prompt).not.toContain("Fact 0:");
+        expect(prompt).not.toContain("<project-memory>");
+    });
+
     test("fit drops diverse examples before recent, and oldest recent first", () => {
         const input = args({
             memories: [],
@@ -207,5 +273,100 @@ describe("fitHistorianPrompt", () => {
         expect(fit.ok && fit.guarded).toBe(false);
         expect(fit.ok && fit.chunkTokens).toBe(10_000);
         expect(fit.ok && fit.kept.memories).toBe(300);
+    });
+});
+
+/**
+ * The pre-send refusal each attempt applies, for a prompt carrying a chunk of
+ * exactly `fit.chunkTokens` local tokens.
+ */
+function refusalFor(
+    input: HistorianPromptFitArgs,
+    fit: ReturnType<typeof fitHistorianPrompt>,
+    window: HistorianPromptFitArgs["window"],
+): string | null {
+    if (!fit.ok) throw new Error(fit.reason);
+    const user = buildCompartmentAgentPrompt({
+        seedExamples: fit.seedExamples,
+        sessionReferences: fit.sessionReferences,
+        projectMemory: fit.projectMemory,
+        inputSource: `Messages ${input.chunkStart}-${input.lastOrdinal}:\n\n`,
+        memoryEnabled: input.memoryEnabled,
+    });
+    return producerPromptFailureReason({
+        sourceLocal: estimateTokens(user) + fit.chunkTokens,
+        systemLocal: estimateTokens(input.systemPrompt),
+        toolsLocal: 0,
+        modelKey: window.modelKey,
+        contextLimitTokens: window.contextLimitTokens,
+        inputLimitTokens: window.inputLimitTokens,
+        maxOutputTokens: window.maxOutputTokens,
+    });
+}
+
+describe("fitHistorianPrompt across the attempt chain", () => {
+    // A 200,000-token window with a 32,000-token output reserve and the 3%
+    // estimator margin leaves the small model an input limit of 162,960 tokens.
+    const small = {
+        modelKey: "opencode/small-free",
+        contextLimitTokens: 200_000,
+        maxOutputTokens: 32_000,
+    };
+    const large = {
+        modelKey: "google/large-flash",
+        contextLimitTokens: 1_000_000,
+        maxOutputTokens: 32_000,
+    };
+    // A chunk request the small window cannot hold.
+    const oversized = { requestedChunkTokens: 400_000, memories: [] };
+
+    test("a small primary gets a chunk that fits it ahead of a large fallback", () => {
+        const input = args({ ...oversized, window: small, fallbackWindows: [large] });
+        const fit = fitHistorianPrompt(input);
+        if (!fit.ok) throw new Error(fit.reason);
+        expect(limitOf(input)).toBe(162_960);
+        expect(fit.chunkTokens).toBeLessThan(400_000);
+        expect(refusalFor(input, fit, small)).toBeNull();
+        expect(refusalFor(input, fit, large)).toBeNull();
+    });
+
+    test("a large primary's chunk is also sized for a smaller fallback", () => {
+        const input = args({ ...oversized, window: large, fallbackWindows: [small] });
+        const fit = fitHistorianPrompt(input);
+        if (!fit.ok) throw new Error(fit.reason);
+        expect(fit.chunkTokens).toBeLessThan(400_000);
+        expect(refusalFor(input, fit, large)).toBeNull();
+        expect(refusalFor(input, fit, small)).toBeNull();
+        // Control: fitted for the primary alone, the fallback refuses the prompt.
+        const primaryOnly = fitHistorianPrompt({ ...input, fallbackWindows: [] });
+        expect(refusalFor(input, primaryOnly, small)).toContain("producer_prompt_exceeds_window");
+    });
+
+    test("a chain whose windows all hold the requested chunk keeps the fit unchanged", () => {
+        const input = args({ window: small, fallbackWindows: [large] });
+        expect(JSON.stringify(fitHistorianPrompt(input))).toBe(
+            JSON.stringify(fitHistorianPrompt({ ...input, fallbackWindows: undefined })),
+        );
+    });
+
+    test("a fallback too small for any prompt does not shrink the chunk", () => {
+        const tiny = { modelKey: "tiny/model", contextLimitTokens: 4_000, maxOutputTokens: 1_000 };
+        const input = args({ window: large, fallbackWindows: [tiny] });
+        expect(JSON.stringify(fitHistorianPrompt(input))).toBe(
+            JSON.stringify(fitHistorianPrompt({ ...input, fallbackWindows: [] })),
+        );
+    });
+
+    test("a known fallback window guards the chunk when the primary's window is unknown", () => {
+        const input = args({
+            ...oversized,
+            window: { modelKey: MODEL, maxOutputTokens: 8_000 },
+            fallbackWindows: [small],
+        });
+        const fit = fitHistorianPrompt(input);
+        if (!fit.ok) throw new Error(fit.reason);
+        expect(fit.guarded).toBe(true);
+        expect(fit.chunkTokens).toBeLessThan(400_000);
+        expect(refusalFor(input, fit, small)).toBeNull();
     });
 });

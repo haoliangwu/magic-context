@@ -19,7 +19,7 @@ import {
 } from "../src/features/magic-context/memory/project-identity";
 
 const repoRoot = resolve(dirname(import.meta.dir), "../..");
-const fixturePath = join(repoRoot, "docs/specs/git-dedup-goldens.json");
+const fixturePath = join(repoRoot, "packages/plugin/scripts/fixtures/git-dedup-goldens.json");
 const fixedEnvironment = {
     ...process.env,
     GIT_AUTHOR_NAME: "Magic Context Golden",
@@ -321,24 +321,22 @@ try {
     rmSync(tempRoot, { recursive: true, force: true });
 }
 
-// Cross-repo pin guard: the spec's "Fixture content pin" section must carry
-// the SHA-256 of the fixture this generator just wrote. A regeneration that
-// forgets to update the spec pin would let path-referenced consumers
-// (entorhinal) silently assert against a moved target, so the generator
-// fails loud on mismatch instead of relying on the rule being remembered.
+// Other repositories consume these golden bytes by path and pin their digest.
+// Keep an independently reviewed .sha256 beside the fixture so regeneration
+// cannot silently change that contract without also updating its content pin.
 import { createHash as __pinHash } from "node:crypto";
 import { readFileSync as __pinRead } from "node:fs";
 {
     const fixtureBytes = __pinRead(fixturePath);
     const actual = __pinHash("sha256").update(fixtureBytes).digest("hex");
-    const specPath = join(dirname(fixturePath), "git-dedup-heuristic.md");
-    const spec = __pinRead(specPath, "utf-8");
-    if (!spec.includes(actual)) {
+    const pinPath = join(dirname(fixturePath), "git-dedup-goldens.sha256");
+    const expected = __pinRead(pinPath, "utf-8").trim();
+    if (expected !== actual) {
         console.error(
-            `PIN MISMATCH: fixture sha256 ${actual} is not present in ${specPath}.\n` +
-                "Update the 'Fixture content pin' section in the same commit as this regeneration.",
+            `PIN MISMATCH: fixture sha256 ${actual} does not match ${pinPath}.\n` +
+                "Update the reviewed .sha256 pin in the same commit as this regeneration.",
         );
         process.exit(1);
     }
-    console.log(`pin verified: ${actual.slice(0, 16)}… present in spec`);
+    console.log(`pin verified: ${actual.slice(0, 16)}… matches committed .sha256`);
 }

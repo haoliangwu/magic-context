@@ -1,7 +1,6 @@
 import {
 	encodePiContentDecision,
 	freezePiContentDecision,
-	getPiContentDecisions,
 } from "@magic-context/core/features/magic-context/pi-content-decisions";
 import { getSourceContents } from "@magic-context/core/features/magic-context/storage-source";
 import type { TagEntry } from "@magic-context/core/features/magic-context/types";
@@ -11,6 +10,7 @@ import {
 	stripTagPrefix,
 } from "@magic-context/core/hooks/magic-context/tag-content-primitives";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import { readPiIdentityDecisions } from "./pi-tag-identity-repair";
 import { withoutPiLeadingTemporalMarker } from "./temporal-awareness-pi";
 
 interface ReminderTarget {
@@ -27,7 +27,10 @@ export function replayPiReminderStrips(args: {
 	legacyReminderTagNumbers: ReadonlySet<number>;
 	cacheBusting: boolean;
 }): Set<string> {
-	const decisions = getPiContentDecisions(args.db, args.sessionId);
+	// An unreadable ledger replays nothing and records nothing, so the damaged
+	// field is never overwritten (readPiIdentityDecisions logs it once).
+	const stored = readPiIdentityDecisions(args.db, args.sessionId);
+	const decisions = stored ?? new Set<string>();
 	const candidates = args.activeTags.map((tag) => {
 		const target = args.targets.get(tag.tagNumber);
 		const content = target?.getContent?.();
@@ -72,6 +75,7 @@ export function replayPiReminderStrips(args: {
 			args.legacyReminderTagNumbers.has(tag.tagNumber) || legacyTemporalOnly;
 		if (
 			!frozen &&
+			stored !== null &&
 			args.cacheBusting &&
 			legacyProjection &&
 			freezePiContentDecision(

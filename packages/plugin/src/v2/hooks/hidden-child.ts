@@ -15,6 +15,11 @@ import {
     type HiddenRunIdentity,
 } from "../../hooks/magic-context/compartment-runner-types";
 import { stripWellFormedLeadingTagPrefix } from "../../hooks/magic-context/tag-content-primitives";
+import {
+    needsBlockedRead,
+    TOOL_USE_DISABLED,
+    withBlockedReadInstruction,
+} from "../../shared/hidden-zen-read";
 import { log } from "../../shared/logger";
 import type { PromptArgs } from "../../shared/model-suggestion-retry";
 import type { SessionContext, V2AgentDomain } from "./types";
@@ -75,7 +80,7 @@ export interface HiddenPermissionRule {
 }
 
 /**
- * Deny everything, then allow exactly the agent's own tools.
+ * Deny everything, then expose the agent's model-specific tool surface.
  *
  * OpenCode 2 evaluates a tool call against the agent's rules followed by the
  * session's rules, and the LAST matching rule wins. Its config loader appends
@@ -85,10 +90,14 @@ export interface HiddenPermissionRule {
  * it is created: session rules come after every agent rule, which is the one
  * place where these rules are guaranteed to be evaluated last.
  */
-export function hiddenChildPermissions(agent: string): HiddenPermissionRule[] {
+export function hiddenChildPermissions(agent: string, providerID?: string): HiddenPermissionRule[] {
+    // Read must survive host filtering before the context hook can select it for
+    // Zen. It stays off the executable allowlist and is removed for other providers.
+    const tools = AGENT_TOOLS[agent] ?? [];
+    const visible = tools.length === 0 && needsBlockedRead(agent, providerID) ? ["read"] : tools;
     return [
         { action: "*", resource: "*", effect: "deny" },
-        ...(AGENT_TOOLS[agent] ?? []).map((tool) => ({
+        ...visible.map((tool) => ({
             action: tool,
             resource: "*",
             effect: "allow" as const,
@@ -115,7 +124,7 @@ export async function registerHiddenChildAgents(
                 // and the host's session request tool filtering; resource is "*".
                 // The host appends the user's own rules after these; see
                 // hiddenChildPermissions for where they are made to win.
-                config.permissions = hiddenChildPermissions(id);
+                config.permissions = hiddenChildPermissions(id, "opencode");
             });
         }
     });
@@ -143,6 +152,7 @@ export function hiddenToolCallRefusal(
             : undefined;
     }
     if (allowed.includes(call.tool)) return undefined;
+    if (owned && allowed.length === 0) return `${TOOL_USE_DISABLED}; ${call.tool} refused`;
     return `Magic Context hidden agent ${agent} may only use ${allowed.length > 0 ? allowed.join(", ") : "no tools"}; ${call.tool} refused`;
 }
 
@@ -541,7 +551,15 @@ export class HiddenChildHook {
             typeof selected.request.body.system === "string"
                 ? selected.request.body.system
                 : selected.identity.system;
-        draft.system = [{ type: "text", text: system }];
+        const blockedRead =
+            needsBlockedRead(selected.identity.agent, draft.model.providerID) &&
+            draft.tools.read !== undefined;
+        draft.system = [
+            {
+                type: "text",
+                text: blockedRead ? withBlockedReadInstruction(system, selected.identity) : system,
+            },
+        ];
         if (!selected.shaped) {
             draft.messages = [
                 { role: "user", content: this.calibratedParts(selected, draft, raw) },
@@ -579,7 +597,9 @@ export class HiddenChildHook {
         // Replaced wholesale, never merged: the carrier sends exactly the
         // authored options and never inherits the host's own generation defaults.
         draft.options = authoredOptions(selected);
-        const allowed = AGENT_TOOLS[hiddenAgentFor(selected.identity)] ?? [];
+        const allowed = blockedRead
+            ? ["read"]
+            : (AGENT_TOOLS[hiddenAgentFor(selected.identity)] ?? []);
         draft.tools = Object.fromEntries(
             allowed.flatMap((id) => (draft.tools[id] ? [[id, draft.tools[id]]] : [])),
         );

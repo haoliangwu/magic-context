@@ -19,6 +19,7 @@ import {
 } from "./memory";
 import { cosineSimilarity } from "./memory/cosine-similarity";
 import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./memory/embedding";
+import type { SynapseClientLike } from "./memory/embedding-synapse";
 import { relaxedFtsQuery, sanitizeFtsQuery } from "./memory/storage-memory-fts";
 import {
     MESSAGE_FTS_SESSION_FILTER_SQL,
@@ -26,6 +27,16 @@ import {
 } from "./message-fts-session-filter";
 import { getIndexedMessageCorpusSize } from "./message-index";
 import { recordShadowMeasurement } from "./search-measurement";
+import {
+    candidateTexts,
+    emptySearchLanes,
+    fuseSearchLanes,
+    isProseQuery,
+    logRerankFallback,
+    prepareReranker,
+    rerankSearchResults,
+    type SearchLanes,
+} from "./search-rerank";
 import { getNotes, type Note } from "./storage-notes";
 import { getActivePrimers, type Primer } from "./storage-primers";
 import {
@@ -122,6 +133,13 @@ export function createUnifiedSearchDiagnostics(): UnifiedSearchDiagnostics {
 
 export interface UnifiedSearchOptions {
     limit?: number;
+    /** Explicit searches alone may rerank; automatic hints never enter this path. */
+    rerank?: boolean;
+    rerankConnectionFile?: string;
+    /** Optional service for offline comparisons and protocol tests. Null explicitly represents an unavailable Synapse service. */
+    rerankClient?: SynapseClientLike | null;
+    /** Optional offline measurement sink, populated without repeating the original retrieval passes. */
+    captureRerankLanes?: (lanes: SearchLanes) => void;
     /** Earliest persisted source timestamp in epoch milliseconds (inclusive). */
     from?: number;
     /** Latest persisted source timestamp in epoch milliseconds (inclusive). */
@@ -184,6 +202,64 @@ export interface UnifiedSearchOptions {
     measurementDisabled?: boolean;
     embeddingModelIdOverride?: string;
     chunkModelIdOverride?: string;
+    /**
+     * Run the message-history lane somewhere other than the calling thread,
+     * typically a worker with its own read-only connection. It must answer with
+     * {@link searchMessageHistory} on the same store, so results and ranking are
+     * those of the in-process lane. Resolving null (no file-backed store, or the
+     * worker failed) runs the lane in process instead.
+     */
+    searchMessageHistory?: (
+        request: MessageHistorySearchRequest,
+    ) => Promise<MessageHistorySearchOutcome | null>;
+}
+
+/** Everything the message-history lane needs, in a form a worker can receive. */
+export interface MessageHistorySearchRequest {
+    sessionId: string;
+    query: string;
+    limit: number;
+    captureLimit?: number;
+    maxOrdinal?: number;
+    probes: string[];
+    relaxedRecall?: boolean;
+    /** The caller wants diagnostics; this also selects the diagnostic statements. */
+    collectDiagnostics: boolean;
+    dateRange: { from: number; to: number } | null;
+}
+
+export interface MessageHistorySearchOutcome {
+    results: MessageSearchResult[];
+    laneResults?: MessageSearchResult[];
+    suppressedLiveMessageMatches: number;
+}
+
+/** The message-history lane of {@link unifiedSearch}, callable from a worker. */
+export function searchMessageHistory(
+    db: Database,
+    request: MessageHistorySearchRequest,
+): MessageHistorySearchOutcome {
+    const diagnostics = request.collectDiagnostics ? createUnifiedSearchDiagnostics() : undefined;
+    const capture = request.captureLimit
+        ? { limit: request.captureLimit, results: [] as MessageSearchResult[] }
+        : undefined;
+    const results = searchMessages({
+        db,
+        sessionId: request.sessionId,
+        query: request.query,
+        limit: request.limit,
+        maxOrdinal: request.maxOrdinal,
+        probes: request.probes,
+        relaxedRecall: request.relaxedRecall,
+        diagnostics,
+        dateRange: request.dateRange,
+        capture,
+    });
+    return {
+        results,
+        laneResults: capture?.results,
+        suppressedLiveMessageMatches: diagnostics?.suppressedLiveMessageMatches ?? 0,
+    };
 }
 
 export interface MemorySearchResult {
@@ -846,6 +922,7 @@ function mergeMemoryResults(args: {
     limit: number;
     visibleMemoryIds?: Set<number> | null;
     sourceNameByMemoryId?: ReadonlyMap<number, string>;
+    singleSourcePenalty?: number;
 }): { results: MemorySearchResult[]; suppressedVisibleIds: number[] } {
     const memoryById = new Map(args.memories.map((memory) => [memory.id, memory]));
     const candidateIds = new Set<number>([...args.semanticScores.keys(), ...args.ftsScores.keys()]);
@@ -867,7 +944,7 @@ function mergeMemoryResults(args: {
             score = SEMANTIC_WEIGHT * semanticScore + FTS_WEIGHT * ftsScore;
             matchType = "hybrid";
         } else if (semanticScore !== undefined) {
-            score = semanticScore * SINGLE_SOURCE_PENALTY;
+            score = semanticScore * (args.singleSourcePenalty ?? SINGLE_SOURCE_PENALTY);
             matchType = "semantic";
         } else if (ftsScore !== undefined) {
             score = ftsScore * SINGLE_SOURCE_PENALTY;
@@ -924,6 +1001,7 @@ async function searchMemories(args: {
     visibleMemoryIds?: Set<number> | null;
     dateRange: InclusiveDateRange | null;
     backfillMemoryEmbeddings?: boolean;
+    lanes?: SearchLanes;
 }): Promise<{ results: MemorySearchResult[]; suppressedVisibleIds: number[] }> {
     if (!args.memoryEnabled) {
         return { results: [], suppressedVisibleIds: [] };
@@ -973,25 +1051,45 @@ async function searchMemories(args: {
         workspace: args.workspace,
     });
 
+    const sourceNameByMemoryId = sourceNamesForSearchMemories({
+        memories,
+        projectPath: args.projectPath,
+        workspace: args.workspace ?? {
+            identities: [args.projectPath],
+            expandedIdentities: [args.projectPath],
+            namesByIdentity: new Map(),
+            canonicalIdentityByStoredPath: new Map([[args.projectPath, args.projectPath]]),
+            ownIdentities: [args.projectPath],
+            shareCategories: null,
+            isWorkspaced: false,
+        },
+    });
+    if (args.lanes) {
+        args.lanes.memory_fts = mergeMemoryResults({
+            memories,
+            semanticScores: new Map(),
+            ftsScores,
+            sourceNameByMemoryId,
+            limit: 25,
+            visibleMemoryIds: args.visibleMemoryIds,
+        }).results;
+        args.lanes.memory_vector = mergeMemoryResults({
+            memories,
+            semanticScores,
+            ftsScores: new Map(),
+            sourceNameByMemoryId,
+            singleSourcePenalty: 1,
+            limit: 25,
+            visibleMemoryIds: args.visibleMemoryIds,
+        }).results;
+    }
     return mergeMemoryResults({
         memories,
         semanticScores,
         ftsScores,
         limit: args.limit,
         visibleMemoryIds: args.visibleMemoryIds,
-        sourceNameByMemoryId: sourceNamesForSearchMemories({
-            memories,
-            projectPath: args.projectPath,
-            workspace: args.workspace ?? {
-                identities: [args.projectPath],
-                expandedIdentities: [args.projectPath],
-                namesByIdentity: new Map(),
-                canonicalIdentityByStoredPath: new Map([[args.projectPath, args.projectPath]]),
-                ownIdentities: [args.projectPath],
-                shareCategories: null,
-                isWorkspaced: false,
-            },
-        }),
+        sourceNameByMemoryId,
     });
 }
 
@@ -1250,6 +1348,7 @@ function searchMessages(args: {
     relaxedRecall?: boolean;
     diagnostics?: UnifiedSearchDiagnostics;
     dateRange: InclusiveDateRange | null;
+    capture?: { limit: number; results: MessageSearchResult[] };
 }): MessageSearchResult[] {
     return withMessageFtsSessionFilter(args.db, args.sessionId, (sessionFirst) =>
         searchMessagesInSnapshot(args, sessionFirst),
@@ -1261,8 +1360,13 @@ function searchMessagesInSnapshot(
     sessionFirst: boolean,
 ): MessageSearchResult[] {
     const cutoff = args.maxOrdinal != null && args.maxOrdinal >= 0 ? args.maxOrdinal : null;
-    const fetchLimit =
-        args.maxOrdinal != null && args.maxOrdinal >= 0 ? args.limit * 3 : args.limit;
+    const baselineFetchLimit = cutoff !== null ? args.limit * 3 : args.limit;
+    const captureFetchLimit = args.capture
+        ? cutoff !== null
+            ? args.capture.limit * 3
+            : args.capture.limit
+        : 0;
+    const fetchLimit = Math.max(baselineFetchLimit, captureFetchLimit);
 
     const baseQuery = sanitizeFtsQuery(args.query.trim());
     const probes = args.probes ?? [];
@@ -1310,15 +1414,21 @@ function searchMessagesInSnapshot(
                       args.dateRange,
                       sessionFirst,
                   );
-        const filtered = rows.slice(0, args.limit);
-        return filtered.map((row, rank) => ({
-            source: "message" as const,
-            content: previewText(row.content),
-            score: linearDecayScore(rank, filtered.length),
-            messageOrdinal: row.messageOrdinal,
-            messageId: row.messageId,
-            role: row.role,
-        }));
+        const renderRows = (limit: number) => {
+            const filtered = rows.slice(0, limit);
+            return filtered.map(
+                (row, rank): MessageSearchResult => ({
+                    source: "message",
+                    content: previewText(row.content),
+                    score: linearDecayScore(rank, filtered.length),
+                    messageOrdinal: row.messageOrdinal,
+                    messageId: row.messageId,
+                    role: row.role,
+                }),
+            );
+        };
+        if (args.capture) args.capture.results = renderRows(args.capture.limit);
+        return renderRows(args.limit);
     }
 
     // Multi-probe: run the full query plus every literal probe as separate FTS
@@ -1384,54 +1494,57 @@ function searchMessagesInSnapshot(
         queryIndex += 1;
     });
 
-    const fused = new Map<string, { row: NormalizedMessageRow; score: number }>();
-    for (const list of queryLists) {
-        list.rows.forEach((row, rank) => {
-            const rrf = list.weight / (RRF_K + rank);
-            const existing = fused.get(row.messageId);
-            if (existing) {
-                existing.score += rrf;
-            } else {
-                fused.set(row.messageId, { row, score: rrf });
-            }
-        });
-    }
+    const rankProbeLists = (rowLimit: number, resultLimit: number) => {
+        const fused = new Map<string, { row: NormalizedMessageRow; score: number }>();
+        for (const list of queryLists) {
+            list.rows.slice(0, rowLimit).forEach((row, rank) => {
+                const rrf = list.weight / (RRF_K + rank);
+                const existing = fused.get(row.messageId);
+                if (existing) {
+                    existing.score += rrf;
+                } else {
+                    fused.set(row.messageId, { row, score: rrf });
+                }
+            });
+        }
 
-    // Verbatim boost: a message that literally contains a probe is exactly what
-    // a symbol/command lookup wants surfaced first. Worth one rank-0 appearance
-    // of the BEST (most discriminative) matching probe — rank-domain currency,
-    // so it reorders within the band instead of saturating the scale.
-    for (const entry of fused.values()) {
-        let best = 0;
-        for (const probe of probes) {
-            const weight = probeWeights.get(probe) ?? 0;
-            if (weight > best && containsProbeVerbatim(entry.row.content, [probe])) {
-                best = weight;
+        // Verbatim matches get one extra first-place contribution from their most
+        // discriminative probe, rather than a large fixed bonus that would flatten
+        // the differences between ranks.
+        for (const entry of fused.values()) {
+            let best = 0;
+            for (const probe of probes) {
+                const weight = probeWeights.get(probe) ?? 0;
+                if (weight > best && containsProbeVerbatim(entry.row.content, [probe])) {
+                    best = weight;
+                }
+            }
+            if (best > 0) {
+                entry.score += best * VERBATIM_RANK_BONUS;
             }
         }
-        if (best > 0) {
-            entry.score += best * VERBATIM_RANK_BONUS;
-        }
-    }
 
-    const ranked = [...fused.values()]
-        .sort((a, b) =>
-            b.score !== a.score ? b.score - a.score : a.row.messageOrdinal - b.row.messageOrdinal,
-        )
-        .slice(0, args.limit);
+        const ranked = [...fused.values()]
+            .sort((a, b) =>
+                b.score !== a.score
+                    ? b.score - a.score
+                    : a.row.messageOrdinal - b.row.messageOrdinal,
+            )
+            .slice(0, resultLimit);
 
-    // Map fused RRF scores into the same linear 0..1 band the single-query path
-    // emits (linearDecayScore), so the unified ranker sees comparable scales
-    // from both message paths and source boosts behave consistently. Rank is
-    // what RRF actually determines; the band keeps cross-source comparability.
-    return ranked.map((entry, rank) => ({
-        source: "message" as const,
-        content: previewText(entry.row.content),
-        score: linearDecayScore(rank, ranked.length),
-        messageOrdinal: entry.row.messageOrdinal,
-        messageId: entry.row.messageId,
-        role: entry.row.role,
-    }));
+        // Convert probe-fused message ranks to the same linear scores as ordinary
+        // message FTS results, preserving comparability with the other sources.
+        return ranked.map((entry, rank) => ({
+            source: "message" as const,
+            content: previewText(entry.row.content),
+            score: linearDecayScore(rank, ranked.length),
+            messageOrdinal: entry.row.messageOrdinal,
+            messageId: entry.row.messageId,
+            role: entry.row.role,
+        }));
+    };
+    if (args.capture) args.capture.results = rankProbeLists(captureFetchLimit, args.capture.limit);
+    return rankProbeLists(baselineFetchLimit, args.limit);
 }
 
 const NOTE_SEARCHABLE_STATUSES: Note["status"][] = ["active", "pending", "ready"];
@@ -1605,7 +1718,7 @@ function searchNotes(args: {
     }));
 }
 
-function searchCompartmentChunks(args: {
+async function searchCompartmentChunks(args: {
     db: Database;
     sessionId: string;
     projectPath: string;
@@ -1614,11 +1727,11 @@ function searchCompartmentChunks(args: {
     maxOrdinal?: number;
     modelId?: string | null;
     dateRange: InclusiveDateRange | null;
-}): CompartmentSearchResult[] {
+}): Promise<CompartmentSearchResult[]> {
     if (!args.queryEmbedding || args.limit <= 0 || !args.modelId || args.modelId === "off")
         return [];
     const cutoff = args.maxOrdinal != null && args.maxOrdinal >= 0 ? args.maxOrdinal : null;
-    const rows = loadCompartmentChunkEmbeddingsForSearch(
+    const rows = await loadCompartmentChunkEmbeddingsForSearch(
         args.db,
         args.sessionId,
         args.projectPath,
@@ -1631,7 +1744,12 @@ function searchCompartmentChunks(args: {
         number,
         { row: StoredCompartmentChunkEmbedding; score: number }
     >();
+    let sliceStarted = performance.now();
     for (const row of rows) {
+        if (performance.now() - sliceStarted >= 4) {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            sliceStarted = performance.now();
+        }
         if (cutoff !== null && row.endOrdinal > cutoff) {
             continue;
         }
@@ -1824,15 +1942,23 @@ function searchGitCommits(args: {
     queryEmbedding: Float32Array | null;
     queryModelId?: string | null;
     dateRange: InclusiveDateRange | null;
+    lanes?: SearchLanes;
 }): GitCommitSearchResult[] {
     if (args.limit <= 0) return [];
 
+    const lanes = args.lanes;
     const hits = searchGitCommitsSync(args.db, args.projectPath, args.query, {
         limit: args.limit,
         queryEmbedding: args.queryEmbedding,
         queryModelId: args.queryModelId,
         from: args.dateRange?.from,
         to: args.dateRange?.to,
+        captureLanes: lanes
+            ? (fts, vector) => {
+                  lanes.git_fts = fts.map(toGitCommitResult);
+                  lanes.git_vector = vector.map(toGitCommitResult);
+              }
+            : undefined,
     });
     return hits.map(toGitCommitResult);
 }
@@ -1850,6 +1976,7 @@ function searchPrimers(args: {
     queryEmbedding: Float32Array | null;
     queryModelId: string | null;
     dateRange: InclusiveDateRange | null;
+    lanes?: SearchLanes;
 }): PrimerSearchResult[] {
     const primers = getActivePrimers(args.db, args.projectPath).filter((primer) =>
         timestampIsInRange(primer.createdAt, args.dateRange),
@@ -1872,12 +1999,36 @@ function searchPrimers(args: {
                 ftsQuery,
                 args.projectPath,
                 ...(args.dateRange === null ? [] : [args.dateRange.from, args.dateRange.to]),
-                args.limit * 3,
+                args.lanes ? Math.max(args.limit * 3, 225) : args.limit * 3,
             ) as Array<{ id: number; rank: number }>;
-        rows.forEach((row, index) => {
-            ftsRanks.set(row.id, linearDecayScore(index, rows.length));
+        const baselineRows = rows.slice(0, args.limit * 3);
+        baselineRows.forEach((row, index) => {
+            ftsRanks.set(row.id, linearDecayScore(index, baselineRows.length));
         });
+        if (args.lanes) {
+            const byId = new Map(primers.map((primer) => [primer.id, primer]));
+            args.lanes.primer_fts = rows
+                .flatMap((row, index) => {
+                    const primer = byId.get(row.id);
+                    return primer
+                        ? [
+                              {
+                                  source: "primer" as const,
+                                  primerId: primer.id,
+                                  content: previewText(primerText(primer)),
+                                  question: primer.question,
+                                  support: primer.totalSupport,
+                                  lastObservedAt: primer.lastObservedAt,
+                                  matchType: "fts" as const,
+                                  score: linearDecayScore(index, rows.length),
+                              },
+                          ]
+                        : [];
+                })
+                .slice(0, 25);
+        }
     }
+    const vectorResults: PrimerSearchResult[] = [];
     const scored = primers
         .map((primer) => {
             const semantic =
@@ -1888,6 +2039,17 @@ function searchPrimers(args: {
                           cosineSimilarity(args.queryEmbedding, primer.questionEmbedding),
                       )
                     : 0;
+            if (args.lanes && semantic > 0)
+                vectorResults.push({
+                    source: "primer",
+                    primerId: primer.id,
+                    content: previewText(primerText(primer)),
+                    question: primer.question,
+                    support: primer.totalSupport,
+                    lastObservedAt: primer.lastObservedAt,
+                    matchType: "semantic",
+                    score: semantic,
+                });
             const fts = ftsRanks.get(primer.id) ?? 0;
             if (semantic <= 0 && fts <= 0) return null;
             const score =
@@ -1908,6 +2070,10 @@ function searchPrimers(args: {
         .filter((result): result is PrimerSearchResult => result !== null)
         .sort((a, b) => b.score - a.score || b.support - a.support || a.primerId - b.primerId)
         .slice(0, args.limit);
+    if (args.lanes)
+        args.lanes.primer_vector = vectorResults
+            .sort((a, b) => b.score - a.score || b.support - a.support || a.primerId - b.primerId)
+            .slice(0, 25);
     return scored;
 }
 
@@ -2042,6 +2208,16 @@ export async function unifiedSearch(
     }
 
     const limit = normalizeLimit(options.limit);
+    const reranker =
+        options.explicitSearch && options.rerank !== false && isProseQuery(trimmedQuery)
+            ? await prepareReranker(
+                  projectPath,
+                  sessionId,
+                  options.rerankConnectionFile,
+                  options.rerankClient,
+              )
+            : null;
+    const lanes = reranker || options.captureRerankLanes ? emptySearchLanes() : undefined;
     const dateRange = normalizeDateRange(options.from, options.to);
     const tierLimit = Math.max(limit * 3, DEFAULT_UNIFIED_SEARCH_LIMIT);
     if (options.diagnostics) {
@@ -2120,19 +2296,37 @@ export async function unifiedSearch(
     // Multi-probe recall is opt-in for explicit searches only. NL queries
     // yield no probes, so this is a no-op for them regardless of the flag.
     const messageProbes = options.explicitSearch ? extractLiteralProbes(trimmedQuery) : [];
-    const messageResults: MessageSearchResult[] = runMessages
-        ? searchMessages({
-              db,
-              sessionId,
-              query: trimmedQuery,
-              limit: tierLimit,
-              maxOrdinal: options.maxMessageOrdinal,
-              probes: messageProbes,
-              relaxedRecall: options.explicitSearch,
-              diagnostics: options.diagnostics,
-              dateRange,
-          })
-        : [];
+    let messageResults: MessageSearchResult[] = [];
+    if (runMessages) {
+        const messageRequest: MessageHistorySearchRequest = {
+            sessionId,
+            query: trimmedQuery,
+            limit: tierLimit,
+            captureLimit: lanes ? 75 : undefined,
+            maxOrdinal: options.maxMessageOrdinal,
+            probes: messageProbes,
+            relaxedRecall: options.explicitSearch,
+            collectDiagnostics: options.diagnostics !== undefined,
+            dateRange,
+        };
+        // Explicit searches with literal probes count every probe's matches
+        // across the session; a caller can move that work off its thread.
+        const delegated = options.searchMessageHistory
+            ? await options.searchMessageHistory(messageRequest).catch((error) => {
+                  log(
+                      `[search] off-thread message search failed: ${error instanceof Error ? error.message : String(error)}`,
+                  );
+                  return null;
+              })
+            : null;
+        if (delegated && options.signal?.aborted) return [];
+        const outcome = delegated ?? searchMessageHistory(db, messageRequest);
+        if (options.diagnostics) {
+            options.diagnostics.suppressedLiveMessageMatches = outcome.suppressedLiveMessageMatches;
+        }
+        messageResults = outcome.results;
+        if (lanes) lanes.message_fts = (outcome.laneResults ?? outcome.results).slice(0, 25);
+    }
 
     // Wait for the single embed call (if any) and then run the two
     // embedding-dependent searches in parallel using the same vector.
@@ -2157,20 +2351,21 @@ export async function unifiedSearch(
         options.chunkModelIdOverride ??
         embeddingSnapshot?.chunkModelId;
     const compartmentResults = runCompartmentChunks
-        ? searchCompartmentChunks({
+        ? await searchCompartmentChunks({
               db,
               sessionId,
               projectPath,
               queryEmbedding,
-              limit: tierLimit,
+              limit: lanes ? Math.max(tierLimit, 25) : tierLimit,
               maxOrdinal: options.maxMessageOrdinal,
               modelId: chunkModelId && chunkModelId !== "off" ? chunkModelId : null,
               dateRange,
           })
         : [];
+    if (lanes) lanes.chunk_vector = compartmentResults.slice(0, 25);
     const messageLikeResults = mergeMessageAndCompartmentResults({
         messages: messageResults,
-        compartments: compartmentResults,
+        compartments: compartmentResults.slice(0, tierLimit),
         limit: tierLimit,
     });
 
@@ -2188,6 +2383,7 @@ export async function unifiedSearch(
                   workspace,
                   visibleMemoryIds: options.visibleMemoryIds,
                   backfillMemoryEmbeddings: options.backfillMemoryEmbeddings,
+                  lanes,
                   dateRange,
               })
             : Promise.resolve({
@@ -2205,6 +2401,7 @@ export async function unifiedSearch(
                       queryModelId:
                           embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
                       dateRange,
+                      lanes,
                   }),
               )
             : Promise.resolve([] as GitCommitSearchResult[]),
@@ -2219,6 +2416,7 @@ export async function unifiedSearch(
                       queryModelId:
                           embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
                       dateRange,
+                      lanes,
                   }),
               )
             : Promise.resolve([] as PrimerSearchResult[]),
@@ -2229,7 +2427,7 @@ export async function unifiedSearch(
                       sessionId,
                       projectPath,
                       query: trimmedQuery,
-                      limit: tierLimit,
+                      limit: lanes ? Math.max(tierLimit, 25) : tierLimit,
                       probes: messageProbes,
                       dateRange,
                   }),
@@ -2240,7 +2438,7 @@ export async function unifiedSearch(
     if (options.diagnostics) {
         options.diagnostics.suppressedVisibleMemoryIds = memoryOutcome.suppressedVisibleIds;
     }
-    const results = [
+    let results = [
         ...memoryOutcome.results,
         ...primerResults,
         ...messageLikeResults,
@@ -2250,16 +2448,38 @@ export async function unifiedSearch(
         .sort(compareUnifiedResults)
         .slice(0, limit);
 
+    const originalResults = results;
+    const originalLatencyMs = Date.now() - measurementStartedAt;
+    if (lanes) {
+        lanes.notes = noteResults.slice(0, 25);
+        options.captureRerankLanes?.(lanes);
+    }
+    if (reranker && lanes) {
+        const pool = fuseSearchLanes(lanes);
+        try {
+            results = await rerankSearchResults(
+                reranker,
+                trimmedQuery,
+                results,
+                pool,
+                candidateTexts(db, sessionId, projectPath, pool),
+                limit,
+            );
+        } catch {
+            logRerankFallback("candidate_validation");
+        }
+    }
+
     if (!options.measurementDisabled) {
         void recordShadowMeasurement({
             db,
             sessionId,
             projectPath,
             query: trimmedQuery,
-            options,
-            primaryResults: results,
+            options: { ...options, rerank: false, captureRerankLanes: undefined },
+            primaryResults: originalResults,
             primaryQuery: queryContract,
-            primaryLatencyMs: Date.now() - measurementStartedAt,
+            primaryLatencyMs: originalLatencyMs,
             search: unifiedSearch,
         });
     }
@@ -2416,7 +2636,7 @@ export function formatSearchResults(
     if (diagnosticLines.length > 0) bodyParts.push(diagnosticLines.join("\n"));
     if (results.some((result) => result.source === "message" || result.source === "compartment")) {
         bodyParts.push(
-            "Use ctx_expand(start, end) with the range from any message result above to read the full conversation context.",
+            "Use ctx_expand(start, end) with the range from any message result above to read the conversation context. If the host no longer holds those messages, ctx_expand returns indexed text from the search archive only, with no surrounding messages or tool output.",
         );
     }
     if (

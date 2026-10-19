@@ -1,26 +1,35 @@
 /**
- * Shared helpers for building `doctor --issue` GitHub issue bodies across
- * both OpenCode and Pi.
- *
- * Two responsibilities live here:
- *
- *   1. Error-line extraction — pull the most-recent ERROR-shaped lines from
- *      a sanitized log so the issue body has a dedicated `## Recent errors`
- *      section that survives even when the main log tail needs aggressive
- *      truncation.
- *
- *   2. GitHub byte-budget capping — GitHub issue bodies have a hard ~64KB
- *      limit. When a rendered report exceeds the budget, shrink the main
- *      log block (the noise-heavy section) from the top, preserving the
- *      diagnostics / configuration / error sections that matter most.
- *
- * Both helpers are harness-agnostic — they operate on already-sanitized
- * markdown — so OpenCode and Pi share the same byte budget, the same
- * truncation marker text, and the same precision/false-positive tradeoff
- * on what counts as an "error" line.
+ * Shared public issue-report boundary for OpenCode, Pi and OMP. Select sessions
+ * and error records before removing private content, then cap the already-private
+ * markdown for GitHub without sacrificing recent errors to a noisy log tail.
  */
 
+import { IssuePrivacy } from "./issue-privacy";
 import { parseLogLine } from "./log-lines";
+
+/** Filter raw log records, then remove content for both the capped and full report. */
+export function prepareIssueReport<T>(
+    report: T,
+    lines: string[],
+    sessionFilter: string | null = null,
+    projectDirectories: string[] = [process.cwd()],
+) {
+    const privacy = new IssuePrivacy(report, projectDirectories);
+    const logLines = filterLogLinesBySession(lines, sessionFilter);
+    return {
+        privacy,
+        report: privacy.report(report),
+        logLines,
+        recentLog: logLines
+            .slice(-400)
+            .map((line) => privacy.logLine(line))
+            .join("\n")
+            .trim(),
+        recentErrorLines: extractRecentErrors(logLines.slice(-4000).join("\n"), 20).map((line) =>
+            privacy.logLine(line),
+        ),
+    };
+}
 
 /**
  * GitHub issue body byte budget. GitHub enforces ~64KB (65536 bytes); we
@@ -57,6 +66,10 @@ const ERROR_LOG_PATTERNS = [
     /\b(?:[A-Z][a-zA-Z]*)?Error:\s/,
     // Emergency abort path emits ALL CAPS marker:
     /\bEMERGENCY\b/,
+    // Magic Context turn refusals are actionable failures even when logged at INFO:
+    /could not safely prepare this turn/i,
+    /\bMC-H[A-Z0-9-]+\b/i,
+    /\brefused\s*\(/i,
     // Generic exception/throw text:
     /\bexception\b/i,
     // V8/JSC stack-trace frames (kept so the agent gets call-site context
@@ -79,7 +92,7 @@ function isErrorLogLine(line: string): boolean {
 }
 
 /**
- * Extract the most-recent error-shaped log lines from a sanitized log.
+ * Extract the most-recent error-shaped log lines for later privacy projection.
  * Returns them in chronological order (oldest match first → newest match
  * last) so the issue body reads naturally top-to-bottom.
  *
@@ -99,6 +112,47 @@ export function extractRecentErrors(sanitized: string, limit = 20): string[] {
         }
     }
     return matches.reverse();
+}
+
+/**
+ * Drop lines that refer to a different session. Shared runtime lines without a
+ * session reference stay in the report because they may explain the failure.
+ */
+export function filterLogLinesBySession(lines: string[], sessionId: string | null): string[] {
+    if (!sessionId) return lines;
+    const otherSessionPattern = /\bses_[A-Za-z0-9]{3,64}\b/g;
+    return lines.filter((line) => {
+        const parsed = parseLogLine(line);
+        if (parsed?.session && parsed.session !== sessionId) return false;
+        const matches =
+            parsed?.message.match(otherSessionPattern) ?? line.match(otherSessionPattern);
+        if (!matches) return true;
+        return matches.every((id) => id === sessionId);
+    });
+}
+
+/** Return session IDs in most-recent-first order for an issue-report picker. */
+export function getLogSessionIds(lines: string[]): string[] {
+    const otherSessionPattern = /\bses_[A-Za-z0-9]{3,64}\b/g;
+    const seen = new Set<string>();
+    const sessions: string[] = [];
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const line = lines[index];
+        const parsed = parseLogLine(line);
+        if (parsed?.session && !seen.has(parsed.session)) {
+            seen.add(parsed.session);
+            sessions.push(parsed.session);
+        }
+        const matches =
+            parsed?.message.match(otherSessionPattern) ?? line.match(otherSessionPattern);
+        for (const session of matches ?? []) {
+            if (!seen.has(session)) {
+                seen.add(session);
+                sessions.push(session);
+            }
+        }
+    }
+    return sessions;
 }
 
 /**

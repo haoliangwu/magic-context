@@ -32,6 +32,7 @@ import {
     resolveWrapupProtectedTailBoundary,
     type WrapupBoundaryPlan,
 } from "./protected-tail-boundary";
+import { prepareRawSessionOrdinals } from "./read-session-chunk";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import { setRecompStarting, setRecompTerminal } from "./recomp-orchestrator";
 import { sendStatusNotification } from "./send-session-notification";
@@ -213,19 +214,21 @@ async function runOneWrapupIteration(args: {
     const acquired = await acquireCompartmentLeaseForWrapup(ctx, sessionId, args.renewWrapupMarker);
     if (!acquired.ok) return { ran: false, reason: acquired.reason };
     const leaseHolderId = acquired.holderId;
-    const renewal = setInterval(() => {
-        try {
-            if (!renewCompartmentLease(ctx.db, sessionId, leaseHolderId)) {
-                sessionLog(sessionId, "wrapup: compartment lease renewal failed");
+    const renewal = inRootAsyncContext(() =>
+        setInterval(() => {
+            try {
+                if (!renewCompartmentLease(ctx.db, sessionId, leaseHolderId)) {
+                    sessionLog(sessionId, "wrapup: compartment lease renewal failed");
+                }
+            } catch (err) {
+                // A missed renewal is safe because the compartment lease has a five-minute TTL.
+                sessionLog(
+                    sessionId,
+                    `wrapup: compartment lease renewal threw; continuing (${err instanceof Error ? err.message : String(err)})`,
+                );
             }
-        } catch (err) {
-            // A missed renewal is safe because the compartment lease has a five-minute TTL.
-            sessionLog(
-                sessionId,
-                `wrapup: compartment lease renewal threw; continuing (${err instanceof Error ? err.message : String(err)})`,
-            );
-        }
-    }, COMPARTMENT_LEASE_RENEWAL_MS);
+        }, COMPARTMENT_LEASE_RENEWAL_MS),
+    );
     const runCompartmentAgentForWrapup = ctx.runCompartmentAgentForWrapup ?? runCompartmentAgent;
     const runnerPromise = runCompartmentAgentForWrapup({
         client: ctx.client,
@@ -235,6 +238,7 @@ async function runOneWrapupIteration(args: {
         sessionId,
         historianChunkTokens: ctx.historianChunkTokens,
         historianTimeoutMs: ctx.historianTimeoutMs,
+        historianMaxOutputTokens: ctx.historianMaxOutputTokens,
         boundarySnapshot: plan.snapshot,
         currentContextLimit: ctx.contextLimit,
         directory: ctx.directory,
@@ -251,6 +255,7 @@ async function runOneWrapupIteration(args: {
         // the scheduled review-user-memories task enables collection. Dropping the
         // flag here silently suppressed observations that the module lane persists.
         experimentalUserMemories: ctx.userMemoriesEnabled,
+        userObservationsRequested: ctx.userObservationsRequested,
         ensureProjectRegistered: ctx.ensureProjectRegistered,
         getNotificationParams: () => ctx.getNotificationParams(sessionId),
         preserveInjectionCacheUntilConsumed: true,
@@ -293,6 +298,15 @@ export async function runManagedWrapup(
     const messagesToKeep = Math.max(1, Math.floor(options.messagesToKeep));
     setRecompStarting(ctx.liveSessionState, sessionId, "Estimating wrapup…", "wrapup");
     try {
+        if (!(await prepareRawSessionOrdinals(sessionId))) {
+            setRecompTerminal(
+                ctx.liveSessionState,
+                sessionId,
+                "failed",
+                "Session ordinals are warming; retry wrapup shortly.",
+            );
+            return "Wrapup deferred while session ordinals warm in the background. Retry shortly.";
+        }
         return await runStartedWrapup(ctx, sessionId, messagesToKeep);
     } catch (error) {
         // Every normal exit sets a terminal progress state. A throw (planning, the
@@ -375,20 +389,22 @@ async function runStartedWrapup(
         }
         return true;
     };
-    const markerRenewal = setInterval(() => {
-        try {
-            renewWrapupMarker({
-                lastCompartmentEnd: getLastCompartmentEndMessage(ctx.db, sessionId),
-                chunkIndex,
-            });
-        } catch (err) {
-            // A missed renewal is safe because the wrapup marker has a five-minute TTL.
-            sessionLog(
-                sessionId,
-                `wrapup: marker renewal threw; continuing (${err instanceof Error ? err.message : String(err)})`,
-            );
-        }
-    }, 60_000);
+    const markerRenewal = inRootAsyncContext(() =>
+        setInterval(() => {
+            try {
+                renewWrapupMarker({
+                    lastCompartmentEnd: getLastCompartmentEndMessage(ctx.db, sessionId),
+                    chunkIndex,
+                });
+            } catch (err) {
+                // A missed renewal is safe because the wrapup marker has a five-minute TTL.
+                sessionLog(
+                    sessionId,
+                    `wrapup: marker renewal threw; continuing (${err instanceof Error ? err.message : String(err)})`,
+                );
+            }
+        }, 60_000),
+    );
     (markerRenewal as { unref?: () => void }).unref?.();
 
     try {
@@ -570,3 +586,5 @@ async function runStartedWrapup(
     setRecompTerminal(ctx.liveSessionState, sessionId, "done", message);
     return message;
 }
+
+import { inRootAsyncContext } from "../../shared/sqlite";

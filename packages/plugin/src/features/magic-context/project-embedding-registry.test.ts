@@ -385,7 +385,7 @@ describe("project embedding registry", () => {
         });
 
         expect(outcome).toMatchObject({ status: "stalled", embedded: 1, failed: 1 });
-        const rows = loadCompartmentChunkEmbeddingsForSearch(
+        const rows = await loadCompartmentChunkEmbeddingsForSearch(
             db,
             sessionId,
             projectIdentity,
@@ -1034,7 +1034,7 @@ describe("project embedding registry", () => {
         ).toBe(2);
     });
 
-    it("keeps memory, commit, and chunk embeddings coexisting per model", () => {
+    it("keeps memory, commit, and chunk embeddings coexisting per model", async () => {
         const db = useTempDb();
         const projectIdentity = "git:coexist";
         const memory = insertMemory(db, {
@@ -1110,7 +1110,7 @@ describe("project embedding registry", () => {
             ),
         ).toBe(2);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
+            await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-coexist",
                 projectIdentity,
@@ -1118,7 +1118,7 @@ describe("project embedding registry", () => {
             ),
         ).toHaveLength(1);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
+            await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-coexist",
                 projectIdentity,
@@ -1137,7 +1137,7 @@ describe("project embedding registry", () => {
         expect(loadAllEmbeddings(db, projectIdentity, restored.modelId).has(memory.id)).toBe(true);
     });
 
-    it("garbage-collects only stale inactive embedding identities after the grace window", () => {
+    it("garbage-collects only stale inactive embedding identities after the grace window", async () => {
         const db = useTempDb();
         const projectIdentity = "git:gc";
         const memory = insertMemory(db, {
@@ -1209,7 +1209,7 @@ describe("project embedding registry", () => {
         expect(loadAllEmbeddings(db, projectIdentity, second.modelId).size).toBe(1);
         expect(countEmbeddedCommits(db, projectIdentity, second.modelId)).toBe(1);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
+            await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-gc",
                 projectIdentity,
@@ -1529,7 +1529,7 @@ describe("project embedding registry", () => {
         );
 
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
+            await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-wipe",
                 "git:wipe",
@@ -1537,7 +1537,12 @@ describe("project embedding registry", () => {
             ),
         ).toHaveLength(0);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(db, "ses-wipe", "git:wipe", "stale:model"),
+            await loadCompartmentChunkEmbeddingsForSearch(
+                db,
+                "ses-wipe",
+                "git:wipe",
+                "stale:model",
+            ),
         ).toHaveLength(1);
     });
 
@@ -1566,7 +1571,7 @@ describe("project embedding registry", () => {
         const first = await sweepAllRegisteredProjects(db, 5);
         expect(first.chunksEmbedded).toBe(1);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
+            await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-backfill",
                 "git:backfill",
@@ -1646,7 +1651,7 @@ describe("project embedding registry", () => {
         }
 
         // And the compartment is fully embedded (one row per window, all persisted).
-        const rows = loadCompartmentChunkEmbeddingsForSearch(
+        const rows = await loadCompartmentChunkEmbeddingsForSearch(
             db,
             "ses-huge",
             "git:huge",
@@ -1678,7 +1683,7 @@ describe("project embedding registry", () => {
 
         expect(embedded).toBe(1);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
+            await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-project-a",
                 "git:project-a",
@@ -1686,7 +1691,7 @@ describe("project embedding registry", () => {
             ),
         ).toHaveLength(1);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
+            await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-project-b",
                 "git:project-a",
@@ -1694,7 +1699,7 @@ describe("project embedding registry", () => {
             ),
         ).toHaveLength(0);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
+            await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-project-b",
                 "git:project-b",
@@ -1772,10 +1777,20 @@ describe("project embedding registry", () => {
         recordSessionProjectIdentity(db, "ses-repair", "git:right");
 
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(db, "ses-repair", "git:wrong", "chunk:model"),
+            await loadCompartmentChunkEmbeddingsForSearch(
+                db,
+                "ses-repair",
+                "git:wrong",
+                "chunk:model",
+            ),
         ).toHaveLength(0);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(db, "ses-repair", "git:right", "chunk:model"),
+            await loadCompartmentChunkEmbeddingsForSearch(
+                db,
+                "ses-repair",
+                "git:right",
+                "chunk:model",
+            ),
         ).toHaveLength(1);
     });
 
@@ -1900,7 +1915,7 @@ describe("project embedding registry", () => {
         expect(result.chunksEmbedded).toBe(1);
         expect(result.memoriesEmbedded).toBe(0);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
+            await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-memory-off",
                 "git:off",
@@ -1984,7 +1999,7 @@ describe("project embedding registry", () => {
         const first = await embedSessionCompartmentChunks(db, "git:window", "ses-window");
         expect(first.status).toBe("done");
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
+            await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-window",
                 "git:window",
@@ -2002,7 +2017,7 @@ describe("project embedding registry", () => {
 
         expect(getStoredModelId(db, "git:window")).toBe(firstSnapshot.modelId);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
+            await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-window",
                 "git:window",
@@ -2010,7 +2025,7 @@ describe("project embedding registry", () => {
             ),
         ).toHaveLength(0);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
+            await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-window",
                 "git:window",
@@ -2022,7 +2037,7 @@ describe("project embedding registry", () => {
         expect(second.status).toBe("done");
         expect(second.embedded).toBe(1);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
+            await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-window",
                 "git:window",
@@ -2073,7 +2088,7 @@ describe("project embedding registry", () => {
         expect(await embedUnembeddedCompartmentChunksForProject(db, "git:unmapped")).toBe(0);
         expect(providerCalls).toBe(0);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
+            await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-unmapped",
                 "git:unmapped",
@@ -2112,15 +2127,17 @@ describe("project embedding registry", () => {
         // Progress is monotonic and ends at total; the only session embedded is ses-embed.
         expect(progress.at(-1)).toEqual({ embedded: 3, total: 3 });
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
-                db,
-                "ses-embed",
-                "git:embed",
-                currentChunkModelId("git:embed"),
+            (
+                await loadCompartmentChunkEmbeddingsForSearch(
+                    db,
+                    "ses-embed",
+                    "git:embed",
+                    currentChunkModelId("git:embed"),
+                )
             ).length,
         ).toBeGreaterThanOrEqual(3);
         expect(
-            loadCompartmentChunkEmbeddingsForSearch(
+            await loadCompartmentChunkEmbeddingsForSearch(
                 db,
                 "ses-other",
                 "git:embed",

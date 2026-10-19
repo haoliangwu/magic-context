@@ -119,23 +119,11 @@ export interface V2TuiContext {
     };
 }
 
-/**
- * A slot claim's `render` runs inside the host's component tree; `app` is the
- * always-mounted root slot, which is where `keymap.layer()` can be called from
- * when plugin `setup()` runs outside the keymap provider (see index.ts).
- */
-export type V2SlotClaim =
-    | {
-          readonly append: "sidebar.content";
-          readonly render: (input: { readonly sessionID: string }) => unknown;
-      }
-    | {
-          readonly append: "app";
-          readonly render: (input: Readonly<Record<string, never>>) => unknown;
-      };
-
-/** The layer object `context.keymap.layer()` accepts, derived from the context type. */
-export type V2KeymapLayer = ReturnType<Parameters<V2TuiContext["keymap"]["layer"]>[0]>;
+/** The sidebar slot used by the OpenCode 2 TUI. */
+export type V2SlotClaim = {
+    readonly append: "sidebar.content";
+    readonly render: (input: { readonly sessionID: string }) => unknown;
+};
 
 export interface V2SidebarState {
     snapshots: Record<string, SidebarSnapshot | undefined>;

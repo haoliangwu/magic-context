@@ -15,6 +15,7 @@ import {
 import { createTagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { requestPendingMaterialization } from "./pending-materialization";
 import { createTransform } from "./transform";
 
 type TextPart = { type: "text"; text: string };
@@ -291,7 +292,7 @@ describe("createTransform index staleness regressions", () => {
         // The processed-image strip first-fires only on a cache-busting (execute)
         // pass, which freezes its id; afterwards it replays on every defer pass.
         shouldExecute.mockImplementationOnce(() => "execute");
-        pendingMaterializationSessions.add(sessionId);
+        requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
         const bustPass = buildMessages();
         await transform({}, { messages: bustPass });
         expect(bustPass[0].parts[1]).toEqual({ type: "text", text: "" });
@@ -369,7 +370,7 @@ describe("createTransform index staleness regressions", () => {
 
         updateTagStatus(db, sessionId, dropTag.tagNumber, "dropped");
         queuePendingOp(db, sessionId, messageDropTag.tagNumber, "drop");
-        pendingMaterializationSessions.add(sessionId);
+        requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
         shouldExecute.mockImplementation(() => "execute");
 
         const secondPass: TestMessage[] = [

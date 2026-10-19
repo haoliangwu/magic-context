@@ -106,6 +106,7 @@ fn main() {
             commands::get_user_memories,
             commands::get_user_memory_candidates,
             commands::dismiss_user_memory,
+            commands::restore_user_memory,
             commands::delete_user_memory,
             commands::update_user_memory_content,
             commands::delete_user_memory_candidate,

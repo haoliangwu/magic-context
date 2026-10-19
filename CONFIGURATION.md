@@ -70,7 +70,6 @@ Keys listed below apply from the next historian or dreamer run (or dream-timer t
 - `memory.git_commit_indexing.enabled`
 - `memory.git_commit_indexing.max_commits`
 - `memory.git_commit_indexing.since_days`
-- `mural.model`
 - `toast_duration_ms`
 <!-- LIVE-CONFIG-KEYS-END -->
 
@@ -653,7 +652,7 @@ Dreamer scheduling and agent metadata remain at `dreamer`, while task execution 
 | `dreamer.tasks.review-user-memories`, `dreamer.tasks.promote-primers` | `schedule`, `promotion_threshold` | Task-specific promotion metadata. |
 | `dreamer.temperature`, `top_p`, `prompt`, `tools`, `disable`, `description`, `mode`, `color`, `maxSteps`, `permission`, `maxTokens`, `inject_docs` | metadata | Retained at `dreamer`; these fields never move into a harness block. |
 
-To disable the dreamer entirely, set `dreamer.disable: true`. To disable a single task, set its top-level `dreamer.tasks.<task>.schedule` to `""`; it can still be run on demand via `/ctx-dream <task>`.
+To disable the dreamer entirely, set `dreamer.disable: true`. This also turns off smart notes (`ctx_note` no longer offers `surface_condition`, whatever `smart_notes.enabled` says) and stops the historian from collecting user observations for `review-user-memories`; `dreamer.inject_docs` still applies. Each task follows the setting it serves: memory tasks need `memory.enabled: true`, `evaluate-smart-notes` needs `smart_notes.enabled`, `maintain-docs` and `review-user-memories` need only their schedule. Magic Context logs one `config note` line at startup for each such setting that has no effect. To disable a single task, set its top-level `dreamer.tasks.<task>.schedule` to `""`; it can still be run on demand via `/ctx-dream <task>`.
 
 ### The tasks
 
@@ -738,10 +737,10 @@ Cross-session memory settings. All memories are scoped to the current project (i
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | `boolean` | `true` | Enable cross-session memory. When `false`, the `ctx_memory` tool is hidden, no `<project-memory>` block is injected, and historian/recomp do not promote any session facts to project memories. The `ctx_search` tool stays available but its memory source returns no results, and no memory rows are embedded. Session history is still embedded automatically and silently for semantic `ctx_search` whenever an embedding provider is configured; set `embedding.provider: "off"` to stop all embedding. |
+| `enabled` | `boolean` | `true` | Enable cross-session memory. When `false`, the `ctx_memory` tool is hidden, no `<project-memory>` block is injected, and historian/recomp do not promote any session facts to project memories. The `ctx_search` tool stays available but its memory source returns no results, and no memory rows are embedded. Session history is still embedded automatically and silently for semantic `ctx_search` whenever an embedding provider is configured; set `embedding.provider: "off"` to stop all embedding. While `false`, the dreamer's project-memory tasks (`map-memories`, `verify`, `verify-broad`, `curate`, `compress-cues`, `classify-memories`, `retrospective`, `promote-primers`, `refresh-primers`) run neither on schedule nor through `/ctx-dream`; `maintain-docs`, `evaluate-smart-notes` and `review-user-memories` still run. `memory.auto_search` and `memory.git_commit_indexing` do not depend on it. |
 | `injection_budget_tokens` | `number` (500–20000) | `4000` | Token budget for memory injection into `<session-history>`. |
 | `auto_promote` | `boolean` | `true` | Promote eligible session facts to project memories automatically after historian or `/ctx-recomp` runs. When `false`, historian and recomp do not write any new memories — agents can still create memories explicitly via `ctx_memory write`, and existing memories continue to be injected and searched normally. |
-| `retrieval_count_promotion_threshold` | `number` | `3` | Retrievals needed before a memory is auto-promoted to permanent. |
+| `retrieval_count_promotion_threshold` | `number` | `3` | Currently has no effect: no code reads it, and memories are not promoted to permanent by retrieval count. Kept so existing configs stay valid. |
 
 ---
 
@@ -750,7 +749,7 @@ Cross-session memory settings. All memories are scoped to the current project (i
 
 In Dreamer v2 the former `user_memories` sub-feature block became a first-class scheduled task: **`review-user-memories`** (see the `dreamer.tasks` table above). The `doctor` command migrates a legacy `dreamer.user_memories` config to the equivalent task entry automatically, preserving your enable/disable state and tuning values. (A legacy `dreamer.pin_key_files` block is dropped — key-files pinning has moved out of Magic Context.)
 
-- **`review-user-memories`** (was `user_memories`): set its `schedule` to enable, `""` to disable. Carries `promotion_threshold` (2–20, default 3). When scheduled, the historian extracts behavioral observations and this task promotes recurring patterns to stable user memories injected via `<user-profile>`. Privacy-sensitive — only runs when scheduled.
+- **`review-user-memories`** (was `user_memories`): set its `schedule` to enable, `""` to disable. Carries `promotion_threshold` (2–20, default 3). When scheduled and the dreamer is runnable (`dreamer.disable` not `true`), the historian extracts behavioral observations and this task promotes recurring patterns to stable user memories injected via `<user-profile>`. Privacy-sensitive — only runs when scheduled.
 
 ## History & Recall Features
 

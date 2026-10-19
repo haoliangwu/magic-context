@@ -25,6 +25,7 @@ import type { ContextDatabase } from "@magic-context/core/features/magic-context
 import { startDreamScheduleTimer as defaultStartDreamScheduleTimer } from "@magic-context/core/plugin/dream-timer";
 import { log } from "@magic-context/core/shared/logger";
 import type { ModelHarness } from "@magic-context/core/shared/model-resolution";
+import { isRecord } from "@magic-context/core/shared/record-type-guard";
 import type { CompletedSubagentToolCall } from "@magic-context/core/shared/subagent-runner";
 import { HiddenAgentStepLimit } from "@magic-context/core/v2/hooks/hidden-child";
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
@@ -44,7 +45,7 @@ export interface PiDreamerOptions {
 	modelRegistry?: { find(provider: string, modelId: string): unknown };
 	sampleDreamRun?: () => {
 		dreamerConfig?: DreamerConfig;
-		mural?: { enabled: boolean; model?: string };
+		mural?: { enabled: boolean };
 		gitCommitIndexing?: PiDreamerOptions["gitCommitIndexing"];
 	};
 	/** Active Pi-compatible host used to select per-harness model configuration. */
@@ -65,7 +66,8 @@ export interface PiDreamerOptions {
 	 */
 	memoryEnabled: boolean;
 	retinaHandoff?: boolean;
-	mural?: { enabled: boolean; model?: string };
+	smartNotesEnabled?: boolean;
+	mural?: { enabled: boolean };
 	language?: string;
 	gitCommitIndexing: {
 		enabled: boolean;
@@ -155,7 +157,19 @@ export function validatePiDreamerModels(
 			let available = resolved.get(model);
 			if (available === undefined) {
 				available = isPiModelRegistered(model, registry, harness);
-				resolved.set(model, available);
+				// Positives only. OMP hydrates discovery-backed providers such as
+				// `litellm` from a fire-and-forget boot refresh that the startup
+				// path never awaits (config/model-registry.ts
+				// `#refreshRuntimeDiscoveries`, main.ts `refreshInBackground`), and
+				// extension `registerProvider` calls are themselves queued until
+				// after extension loading -- so a miss during registration usually
+				// means "not yet", not "absent". Remembering the miss pinned the
+				// historian off for the whole process even after the model became
+				// visible; OMP's own consumers re-check after awaiting instead
+				// (session/agent-session.ts `#retryInactiveAdvisorAfterModelDiscovery`).
+				// A genuinely absent model costs one extra `find()` per re-resolution,
+				// which happens per transform pass.
+				if (available) resolved.set(model, available);
 			}
 			if (available) return true;
 			if (!warnedUnknownModels.has(model)) {
@@ -227,7 +241,6 @@ let startDreamScheduleTimerFn: typeof defaultStartDreamScheduleTimer =
 export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 	const directory = resolve(opts.projectDir);
 	if (
-		opts.config.disable === true ||
 		// A directory the identity resolver refuses (home, or a folder inside a
 		// dotfiles repository rooted at home) arrives with an empty identity.
 		// It is not a project, so nothing may be scheduled under that key.
@@ -306,6 +319,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		memoryEnabled: opts.memoryEnabled,
 		embeddingConfig: opts.embeddingConfig,
 		retinaHandoff: opts.retinaHandoff,
+		smartNotesEnabled: opts.smartNotesEnabled,
 		mural: opts.mural,
 		ensureRegistered: ensureProjectRegisteredFromPiDirectory,
 		// Pi retrospectives read JSONL messages and context.db activity, not
@@ -353,6 +367,11 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		}
 		const sampled = manualOpts.sampleDreamRun?.();
 		const dreamerConfig = sampled?.dreamerConfig ?? manualOpts.config;
+		if (dreamerConfig.disable === true) {
+			throw new Error(
+				`Pi dreamer is disabled for project ${opts.projectIdentity}`,
+			);
+		}
 		const mural = sampled?.mural ?? manualOpts.mural;
 		const manualClient = createPiDreamerClient(
 			manualOpts,
@@ -366,13 +385,15 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		const manualRun = runManualDream({
 			db: manualOpts.db,
 			projectIdentity: manualOpts.projectIdentity,
+			projectMemoryEnabled: manualOpts.memoryEnabled,
+			smartNotesEnabled: manualOpts.smartNotesEnabled,
 			tasks: manualOpts.modelRegistry
 				? validatePiDreamerModels(
 						buildDreamTaskRuntimeConfigs(
 							dreamerConfig,
 							manualOpts.harness,
 							manualOpts.language,
-							mural?.model,
+							manualOpts.smartNotesEnabled,
 						),
 						manualOpts.modelRegistry,
 						manualOpts.harness,
@@ -381,7 +402,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 						dreamerConfig,
 						manualOpts.harness,
 						manualOpts.language,
-						mural?.model,
+						manualOpts.smartNotesEnabled,
 					),
 			executor: createDreamTaskExecutor({
 				client: manualClient as never,
@@ -396,6 +417,7 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 				ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 				language: manualOpts.language,
 				retinaHandoff: manualOpts.retinaHandoff,
+				smartNotesEnabled: manualOpts.smartNotesEnabled,
 				mural,
 			}),
 			task,
@@ -626,6 +648,30 @@ function createPiDreamerClient(
 					});
 				}
 				assertRegistrationOwnerActive();
+				const mappingMessages = result.meta?.mappingMessages;
+				if (budgetTask === "map-memories" && Array.isArray(mappingMessages)) {
+					// Retain decisions before raising a step/timeout error; the shared
+					// mapper reads this session to bank closed memory elements.
+					dreamSession.messages = mappingMessages
+						.filter(isRecord)
+						.filter((message) => message.role === "assistant")
+						.map((message) =>
+							makeMessage(
+								"assistant",
+								Array.isArray(message.content)
+									? message.content
+											.filter(isRecord)
+											.flatMap((part): SyntheticPart[] =>
+												part.type === "text" && typeof part.text === "string"
+													? [{ type: "text", text: part.text }]
+													: part.type === "toolCall"
+														? syntheticToolParts(1)
+														: [],
+											)
+									: [],
+							),
+						);
+				}
 				if (!result.ok) {
 					if (result.reason === "token_budget") {
 						throw new DreamTokenBudgetExceeded(
@@ -650,21 +696,22 @@ function createPiDreamerClient(
 					}
 					throw error;
 				}
-				dreamSession.messages = [
-					makeMessage("user", [{ type: "text", text: userMessage }]),
-					makeMessage("assistant", [
-						// Synthetic tool parts first so investigationToolCallCount
-						// (refresh-primers grounding gate) sees the agent's tool use,
-						// then the final answer text when the runner produced one.
-						...syntheticToolParts(
-							result.toolCallCount ?? 0,
-							result.completedToolCalls,
-						),
-						...(result.assistantText
-							? [{ type: "text" as const, text: result.assistantText }]
-							: []),
-					]),
-				];
+				if (!(budgetTask === "map-memories" && Array.isArray(mappingMessages)))
+					dreamSession.messages = [
+						makeMessage("user", [{ type: "text", text: userMessage }]),
+						makeMessage("assistant", [
+							// Synthetic tool parts first so investigationToolCallCount
+							// (refresh-primers grounding gate) sees the agent's tool use,
+							// then the final answer text when the runner produced one.
+							...syntheticToolParts(
+								result.toolCallCount ?? 0,
+								result.completedToolCalls,
+							),
+							...(result.assistantText
+								? [{ type: "text" as const, text: result.assistantText }]
+								: []),
+						]),
+					];
 				// G5: fire conservatively after every successful dreamer task. Many
 				// dreamer tasks (verify, curate, docs) don't touch the system-
 				// prompt adjuncts, but improve / maintain-docs / user-memory-review

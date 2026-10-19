@@ -55,12 +55,22 @@ test("only a completed managed result survives ownership change for decision att
 	expect(() => budget.assertDecisionPublication()).toThrow("superseded");
 	budget.completed = true;
 	expect(() => budget.assertDecisionPublication()).not.toThrow();
-	now = 25000;
+	// The row is resolved by the next pass, often well after this pass's
+	// outcome window; a result that completed inside the window keeps it.
+	now = 30000;
+	expect(() => budget.assertDecisionPublication()).not.toThrow();
+	// A refused dispatch abandons the pass: its request never went out.
+	budget.abandoned = true;
 	expect(() => budget.assertDecisionPublication()).toThrow(
 		PiContextDeadlineError,
 	);
-	now = 0;
-	budget.abandoned = true;
+});
+
+test("an unfinished pass cannot publish its decision once its outcome deadline passes", () => {
+	let now = 0;
+	const budget = new PiContextBudget(0, () => now);
+	expect(() => budget.assertDecisionPublication()).not.toThrow();
+	now = 25000;
 	expect(() => budget.assertDecisionPublication()).toThrow(
 		PiContextDeadlineError,
 	);

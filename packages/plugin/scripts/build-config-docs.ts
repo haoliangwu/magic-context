@@ -116,7 +116,9 @@ function collectLeaves(schema: JsonSchema, prefix: string, rows: LeafRow[]): voi
     }
 }
 
-const SECTION_ORDER: Array<{ keys: string[]; title: string; intro: string }> = [
+// `outro` is prose rendered after the section's table, for guidance that
+// belongs to the section as a whole rather than to one key.
+const SECTION_ORDER: Array<{ keys: string[]; title: string; intro: string; outro?: string }> = [
     {
         keys: [
             "enabled",
@@ -169,6 +171,7 @@ const SECTION_ORDER: Array<{ keys: string[]; title: string; intro: string }> = [
         keys: ["dreamer"],
         title: "Background agents",
         intro: "Off-hours maintenance through Dreamer.",
+        outro: "On Pi and Oh My Pi, historian and dreamer models, including `fallback_models` and per-task model overrides, must use provider names that host serves. `opencode/*` models are served only by OpenCode's own provider, so Pi and Oh My Pi drop them at startup and log `dropping Pi model not found: <model>`. If every fallback is an `opencode/*` model, only the primary model is left. To see valid names, run `omp models` on Oh My Pi or `pi --list-models` on Pi. `/ctx-status` warns when a dreamer task or the historian has no usable model left.",
     },
     {
         keys: [
@@ -240,7 +243,10 @@ export function buildConfigDocs(): string {
             }
         }
         if (rows.length > 0) {
-            sections.push(`## ${section.title}\n\n${section.intro}\n\n${renderTable(rows)}`);
+            const outro = section.outro ? `\n\n${section.outro}` : "";
+            sections.push(
+                `## ${section.title}\n\n${section.intro}\n\n${renderTable(rows)}${outro}`,
+            );
         }
     }
 

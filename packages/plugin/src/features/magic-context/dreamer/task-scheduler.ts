@@ -29,6 +29,7 @@ import {
     type DreamTaskBacklog,
     type DreamTaskBacklogMap,
     type DreamTaskName,
+    dreamTaskAllowedBySettings,
     leaseKeyFor,
     leaseKindFor,
 } from "./task-registry";
@@ -104,9 +105,28 @@ export interface RunDueTasksDeps {
     now?: number;
     /**
      * The host's `memory.enabled` for this project. `false` means this caller
-     * schedules nothing (existing rows are kept); omitted means on.
+     * leaves the project-memory tasks alone (their existing rows are kept) and
+     * still runs the tasks that serve other settings; omitted means on.
      */
     projectMemoryEnabled?: boolean;
+    /** The host's `smart_notes.enabled`. `false` drops evaluate-smart-notes; omitted means on. */
+    smartNotesEnabled?: boolean;
+}
+
+/**
+ * The caller's tasks that the project's settings allow: projectMemoryEnabled
+ * gates the project-memory tasks and smartNotesEnabled gates
+ * evaluate-smart-notes (see dreamTaskAllowedBySettings). A task left out here
+ * is not seeded, run or advanced, so its schedule rows stay untouched for any
+ * other worktree or host whose caller shares the same project identity.
+ */
+function tasksAllowedBySettings(deps: RunDueTasksDeps): readonly DreamTaskRuntimeConfig[] {
+    return deps.tasks.filter((config) =>
+        dreamTaskAllowedBySettings(config.task, {
+            projectMemoryEnabled: deps.projectMemoryEnabled,
+            smartNotesEnabled: deps.smartNotesEnabled,
+        }),
+    );
 }
 
 /** First-seed a task's schedule row if absent. next_due_at from cron(after now);
@@ -574,16 +594,20 @@ export async function runManualDream(
     };
 
     if (!isUsableProjectIdentity(deps.projectIdentity)) return result;
+    // The same per-task settings gate as scheduled runs: a forced project-memory
+    // task still honors the project's memory opt-out, while docs, smart-note and
+    // user-memory tasks stay available with memory off.
+    const allowed = tasksAllowedBySettings(deps);
     let selected: readonly DreamTaskRuntimeConfig[];
     let forceGate = false;
     if (deps.task) {
-        const cfg = deps.tasks.find((t) => t.task === deps.task);
+        const cfg = allowed.find((t) => t.task === deps.task);
         if (!cfg) return result;
         selected = [cfg];
         forceGate = true; // explicit single-task run ignores the activity gate
     } else {
         // All enabled tasks (schedule != ""); disabled tasks stay off even manually.
-        selected = deps.tasks.filter((t) => t.schedule.trim() !== "");
+        selected = allowed.filter((t) => t.schedule.trim() !== "");
     }
     if (selected.length === 0) return result;
 
@@ -679,15 +703,17 @@ export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<numb
     // A blank identity is an unresolved directory, not a project; running tasks
     // for it would read and write project-scoped rows under the key "".
     if (!isUsableProjectIdentity(deps.projectIdentity)) return 0;
-    // Project memory is off for this caller: schedule nothing and leave the
-    // rows alone. A `git:` identity is shared by every worktree and host of the
+    // Each task follows the setting of what it serves. With project memory off
+    // the memory tasks are neither seeded, run nor advanced and their rows are
+    // left alone: a `git:` identity is shared by every worktree and host of the
     // repository, and one with memory on keeps using those rows and the progress
     // they record (retrospective watermark, open verify-broad cycle, curate
     // rotation). An identity with no memories and nothing else to do loses its
     // rows to the daily idle prune instead.
-    if (deps.projectMemoryEnabled === false) return 0;
+    const tasks = tasksAllowedBySettings(deps);
+    if (tasks.length === 0) return 0;
     const now = deps.now ?? Date.now();
-    const due = planDueTasks(deps.db, deps.projectIdentity, deps.tasks, now);
+    const due = planDueTasks(deps.db, deps.projectIdentity, tasks, now);
     if (due.length === 0) return 0;
 
     // Pre-lease gate: cheap filter so we don't even acquire a lease for a task

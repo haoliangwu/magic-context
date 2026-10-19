@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync } from "node:fs";
-const base = process.argv[2] ?? "docs/reports/issue-582-self-tag";
+const base = process.argv[2] ?? ".cortexkit/internal-docs/investigations/reports/issue-582-self-tag";
 const phases = ["live", "supplement", "pilot", "supplement-failed"];
 const result: any = { responseModels: [], variants: {}, buckets: [], spend: {}, phases: [] };
 const benchmarkRows: any[] = [];

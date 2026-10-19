@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { processedImagePng } from "../../src/processed-image-fixture";
 import { OpenCode } from "@opencode/client";
 import { Database } from "../../../plugin/src/shared/sqlite";
 import { gaDatabasePath, V2StoreReader } from "../../../plugin/src/v2/store-reader";
@@ -47,7 +48,7 @@ const baseConfig = {
 };
 
 /** One host plus a turn driver whose first turn makes the model read pixel.png. */
-async function readImageSession(options: OpenCode2SpawnOptions) {
+async function readImageSession(options: OpenCode2SpawnOptions, imageData = PNG_BASE64) {
 	let host = await spawnOpencode2({ visionModel: true, magicContextConfig: baseConfig, ...options });
 	const mock = host.mock;
 	const connect = () =>
@@ -62,7 +63,7 @@ async function readImageSession(options: OpenCode2SpawnOptions) {
 	});
 	if (options.includeMagicContext !== false) await waitForPluginActive(client, host.cwd);
 	const png = join(host.cwd, "pixel.png");
-	writeFileSync(png, Buffer.from(PNG_BASE64, "base64"));
+	writeFileSync(png, Buffer.from(imageData, "base64"));
 	let issued = false;
 	mock.addMatcher((body) => {
 		if (body.model !== "mock-model")
@@ -84,9 +85,9 @@ async function readImageSession(options: OpenCode2SpawnOptions) {
 	});
 	mock.setDefault({ text: "ok", usage: { input_tokens: 100, output_tokens: 20 } });
 	/** Run one user turn; returns the session model's requests that carry its text. */
-	const turn = async (text: string): Promise<Body[]> => {
+	const turn = async (text: string, files?: Array<{ uri: string; name: string }>): Promise<Body[]> => {
 		const before = mock.requests().length;
-		await client.session.prompt({ sessionID: session.id, text });
+		await client.session.prompt({ sessionID: session.id, text, ...(files ? { files } : {}) });
 		await client.session.wait({ sessionID: session.id }, { signal: AbortSignal.timeout(60_000) });
 		const listed = (await client.message.list({ sessionID: session.id })) as { data: Row[] };
 		expect({ text, outcome: listed.data.find((row) => row.type === "idle")?.outcome }).toEqual({
@@ -249,3 +250,119 @@ for (const arm of ["same-process", "after-restart"] as const) {
 		}
 	}, 240_000);
 }
+
+
+test("issue 699 OpenCode 2 strips aged read images on a rewrite and replays the non-empty tool result", async () => {
+    const data = processedImagePng().toString("base64");
+    const run = await readImageSession({ magicContextConfig: { ...baseConfig, protected_tokens: 4000 } }, data);
+    try {
+        const first = (await run.turn("READ-IMAGE inspect pixel.png")).at(-1)!;
+        expect(imageBlock(first)).toContain(data);
+        const before = (await run.turn("IMAGE-DEFER-BEFORE")).at(-1)!;
+        expect(imageBlock(before)).toBe(imageBlock(first));
+        let aged = false;
+        const paths = Array.from({ length: 3 }, (_, i) => join(run.host().cwd, `ballast-${i}.txt`));
+        for (const path of paths) writeFileSync(path, "context ".repeat(12).concat("\n").repeat(500));
+        run.mock.addMatcher((body) => {
+            if (aged || !JSON.stringify(body).includes("IMAGE-AGE-TOOLS")) return null;
+            aged = true;
+            return { openaiOutput: paths.map((path, i) => ({ type: "function_call", id: `fc_ballast_${i}`, call_id: `ballast_${i}`, name: "read", arguments: JSON.stringify({ path }) })), usage: { input_tokens: 100, output_tokens: 20 } };
+        });
+        await run.turn("IMAGE-AGE-TOOLS read the three ballast files");
+        expect(aged).toBe(true);
+        await run.turn("IMAGE-DROP-TAG");
+        const mc = new Database(join(run.host().env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db"));
+        try {
+            mc.exec("PRAGMA busy_timeout = 5000");
+            const tag = mc.prepare("SELECT MAX(tag_number) AS n FROM tags WHERE session_id = ? AND type = 'message'").get(run.session.id) as { n: number };
+            expect(tag.n).toBeGreaterThan(0);
+            mc.prepare("UPDATE tags SET status = 'dropped' WHERE session_id = ? AND tag_number = ?").run(run.session.id, tag.n);
+            mc.prepare("UPDATE session_meta SET cached_m0_system_hash = 'stale' WHERE session_id = ?").run(run.session.id);
+            const rewritten = (await run.turn("IMAGE-REWRITE")).at(-1)!;
+            expect(imageBlock(rewritten)).toBeUndefined();
+            expect(JSON.stringify(readResult(rewritten))).toContain("[image stripped]");
+            const replay = (await run.turn("IMAGE-DEFER-AFTER")).at(-1)!;
+            expect(readResult(replay)).toEqual(readResult(rewritten));
+            expect(imageBlock(replay)).toBeUndefined();
+            console.log(JSON.stringify({ host: "2.0.22", watermark: tag.n, toolImageBytes: [first, before, rewritten, replay].map((body) => imageBlock(body)?.length ?? 0) }));
+        } finally { mc.close(); }
+    } catch (error) { console.error(run.host().stderr().slice(-4000)); throw error; }
+    finally { await run.host().stop(); }
+}, 240_000);
+
+
+test("issue 699 OpenCode 2 native user assets strip to text without invalidating host schemas", async () => {
+    const run = await readImageSession({});
+    const data = processedImagePng().toString("base64");
+    try {
+        const first = (await run.turn("NATIVE-USER-IMAGE inspect this", [{ uri: `data:image/png;base64,${data}`, name: "pixel.png" }])).at(-1)!;
+        expect(JSON.stringify(first)).toContain(data);
+        await run.turn("NATIVE-USER-AGE");
+        const mc = new Database(join(run.host().env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db"));
+        try {
+            mc.exec("PRAGMA busy_timeout = 5000");
+            const tag = mc.prepare("SELECT MAX(tag_number) AS n FROM tags WHERE session_id = ? AND type = 'message'").get(run.session.id) as { n: number };
+            expect(tag.n).toBeGreaterThan(0);
+            mc.prepare("UPDATE tags SET status = 'dropped' WHERE session_id = ? AND tag_number = ?").run(run.session.id, tag.n);
+            mc.prepare("UPDATE session_meta SET cached_m0_system_hash = 'stale' WHERE session_id = ?").run(run.session.id);
+            const rewritten = (await run.turn("NATIVE-USER-REWRITE")).at(-1)!;
+            expect(JSON.stringify(rewritten)).not.toContain(data);
+            expect(JSON.stringify(rewritten)).toContain("[image stripped]");
+            const replay = (await run.turn("NATIVE-USER-DEFER")).at(-1)!;
+            expect(JSON.stringify(replay)).not.toContain(data);
+            expect(replay.input!.slice(0, rewritten.input!.length)).toEqual(rewritten.input!);
+        } finally { mc.close(); }
+    } finally { await run.host().stop(); }
+}, 240_000);
+
+test("independent frozen user and tool images survive an OC2 checkpoint and process restart", async () => {
+    const data = processedImagePng().toString("base64");
+    const run = await readImageSession({ modelContextLimit: 16_000, modelOutputLimit: 1024 }, data);
+    const userImageRow = (body: Body) => body.input?.find((item) => JSON.stringify(item).includes("READ-IMAGE inspect both carriers"));
+    try {
+        const first = (await run.turn("READ-IMAGE inspect both carriers", [{ uri: `data:image/png;base64,${data}`, name: "user.png" }])).at(-1)!;
+        expect(JSON.stringify(first)).toContain(data);
+        expect(imageBlock(first)).toContain(data);
+        const host = run.host();
+        const reader = new V2StoreReader(gaDatabasePath(host.env.XDG_DATA_HOME!, "latest", host.env));
+        let ids: string[];
+        try {
+            const history = reader.history(run.session.id);
+            const user = history.find((row) => row.type === "user" && JSON.stringify(row.data).includes("READ-IMAGE inspect both carriers"));
+            const tool = history.find((row) => row.type === "assistant" && JSON.stringify(row.data).includes(CALL_ID));
+            expect(user).toBeDefined();
+            expect(tool).toBeDefined();
+            ids = [user!.id, tool!.id];
+        } finally { reader.close(); }
+        // Seed an already committed non-empty freeze to isolate replay from new
+        // discovery. The host's raw store still contains both original images.
+        const mc = new Database(join(host.env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db"));
+        try {
+            mc.exec("PRAGMA busy_timeout = 5000");
+            mc.prepare("UPDATE session_meta SET processed_image_stripped_ids = ? WHERE session_id = ?")
+                .run(JSON.stringify({ ids, textMarkerIds: ids }), run.session.id);
+        } finally { mc.close(); }
+        const frozen = (await run.turn("FROZEN-BEFORE-CHECKPOINT")).at(-1)!;
+        expect(JSON.stringify(frozen)).not.toContain(data);
+        expect(JSON.stringify(readResult(frozen))).toContain("[image stripped]");
+        expect(JSON.stringify(userImageRow(frozen))).toContain("[image stripped]");
+        run.mock.setDefault({ text: "pressure answer", usage: { input_tokens: 15_000, output_tokens: 10 } });
+        await run.turn("FROZEN-PRESSURE");
+        run.mock.setDefault({ text: "ok", usage: { input_tokens: 100, output_tokens: 20 } });
+        const after = [(await run.turn("FROZEN-AFTER-CHECKPOINT")).at(-1)!];
+        await run.restart();
+        after.push((await run.turn("FROZEN-AFTER-RESTART")).at(-1)!);
+        const restored = new V2StoreReader(gaDatabasePath(run.host().env.XDG_DATA_HOME!, "latest", run.host().env));
+        try {
+            const cut = restored.latestCompaction(run.session.id);
+            expect(cut?.data.status).toBe("completed");
+            for (const id of ids) expect(restored.sequenceForId(run.session.id, id)!).toBeLessThan(cut!.seq);
+        } finally { restored.close(); }
+        for (const body of after) {
+            expect(JSON.stringify(body)).not.toContain(data);
+            expect(readResult(body)).toEqual(readResult(frozen));
+            expect(userImageRow(body)).toEqual(userImageRow(frozen));
+        }
+    } catch (error) { console.error(run.host().stderr().slice(-4000)); throw error; }
+    finally { await run.host().stop(); }
+}, 240_000);

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -14,6 +14,7 @@ import {
     getOpenCodeStorageDir,
     getProjectMagicContextDir,
     getProjectMagicContextHistorianDir,
+    isMagicContextStorageOutsideEngram,
 } from "./data-path";
 import { createTestTempDirFromPath } from "./test-temp-dir";
 
@@ -108,10 +109,43 @@ describe("data-path", () => {
             expect(getMagicContextStorageDir()).toBe(
                 path.join(os.homedir(), ".local", "share", "cortexkit", "magic-context"),
             );
+            expect(isMagicContextStorageOutsideEngram()).toBe(false);
         } finally {
             if (savedTestDir !== undefined) process.env.MAGIC_CONTEXT_TEST_DATA_DIR = savedTestDir;
             if (savedNodeEnv !== undefined) process.env.NODE_ENV = savedNodeEnv;
         }
+    });
+
+    test("an external storage override is outside the Engram backup folder", () => {
+        const root = createTestTempDirFromPath(path.join(os.tmpdir(), "mc-storage-backup-"));
+        process.env.MAGIC_CONTEXT_STORAGE_DIR = path.join(root, "external-store");
+
+        expect(isMagicContextStorageOutsideEngram()).toBe(true);
+    });
+
+    test("storage below the Engram backup folder is considered inside it", () => {
+        const root = createTestTempDirFromPath(path.join(os.tmpdir(), "mc-storage-backup-"));
+        const backupDir = path.join(root, "default", "magic-context");
+
+        expect(isMagicContextStorageOutsideEngram(path.join(backupDir, "nested"), backupDir)).toBe(
+            false,
+        );
+    });
+
+    test("a storage symlink into the default folder is considered inside it", () => {
+        const root = createTestTempDirFromPath(path.join(os.tmpdir(), "mc-storage-backup-"));
+        const backupDir = path.join(root, "default", "magic-context");
+        const storageLink = path.join(root, "storage-link");
+        mkdirSync(backupDir, { recursive: true });
+        symlinkSync(backupDir, storageLink, "dir");
+
+        expect(isMagicContextStorageOutsideEngram(storageLink, backupDir)).toBe(false);
+    });
+
+    test("an unset storage override keeps the platform default inside the backup folder", () => {
+        expect(process.env.MAGIC_CONTEXT_STORAGE_DIR).toBeUndefined();
+        expect(process.env.XDG_DATA_HOME).toBeUndefined();
+        expect(isMagicContextStorageOutsideEngram()).toBe(false);
     });
 
     test("getMagicContextStorageDir backstops to a temp dir under NODE_ENV=test with no guard set", () => {

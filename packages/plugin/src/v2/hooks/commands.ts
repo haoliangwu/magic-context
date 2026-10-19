@@ -161,6 +161,16 @@ function buildV2Commands(rpc: MagicContextRpcServer, directory: string): V2Comma
                         typeof reply.error === "string" ? reply.error : "dream request failed";
                     throw new Error(`Magic Context could not start the dream run: ${error}`);
                 }
+                // The run outlives this command callback; report acceptance now and
+                // leave the eventual summary to the dream handler's notification.
+                pushNotification(
+                    "toast",
+                    {
+                        message: "Dream run started; the summary appears when it finishes",
+                        variant: "info",
+                    },
+                    input.sessionID,
+                );
             },
         },
         {
@@ -168,6 +178,10 @@ function buildV2Commands(rpc: MagicContextRpcServer, directory: string): V2Comma
             execute: async (input) => {
                 const reply = await rpc.dispatch("flush", { sessionId: input.sessionID });
                 reportRpcReply(input.sessionID, "Flush", reply, "Flush started");
+                if (reply.ok === true) {
+                    // Flush removes queued rows; update the TUI's sidebar snapshot now.
+                    pushNotification("action", { action: "refresh-sidebar" }, input.sessionID);
+                }
             },
         },
         {
@@ -179,9 +193,7 @@ function buildV2Commands(rpc: MagicContextRpcServer, directory: string): V2Comma
                         input.sessionID,
                         "Usage: /ctx-embed (status), /ctx-embed start, or /ctx-embed pause",
                     );
-                    throw new Error(
-                        "Usage: /ctx-embed (status), /ctx-embed start, or /ctx-embed pause",
-                    );
+                    return;
                 }
                 const reply = await rpc.dispatch("embed", {
                     sessionId: input.sessionID,
@@ -204,13 +216,13 @@ function buildV2Commands(rpc: MagicContextRpcServer, directory: string): V2Comma
                     const usage =
                         "Usage: /ctx-wrapup [messages_to_keep] where messages_to_keep is a positive integer";
                     reportUsage(input.sessionID, usage);
-                    throw new Error(usage);
+                    return;
                 }
                 const messagesToKeep = argument === "" ? 20 : Number.parseInt(argument, 10);
                 if (messagesToKeep <= 0) {
                     const usage = "messages_to_keep must be a positive integer";
                     reportUsage(input.sessionID, usage);
-                    throw new Error(usage);
+                    return;
                 }
                 const reply = await rpc.dispatch("wrapup", {
                     sessionId: input.sessionID,

@@ -137,9 +137,11 @@ export function fitAtomicHistorianSourceToProducerWindow(args: {
         args.inputLimitTokens,
     );
     const originalTokens = estimateTokens(args.text);
+    // A prompt fitted to the attempt chain can carry a source room even when this
+    // model's own window is unknown; that room still bounds the source.
     const target =
         producerInputLimitTokens === undefined
-            ? undefined
+            ? args.maxSourceTokens
             : Math.min(producerInputLimitTokens, args.maxSourceTokens ?? Infinity);
     if (target === undefined || originalTokens < target || target <= 0) {
         return { text: args.text, producerInputLimitTokens, removedTokens: 0 };

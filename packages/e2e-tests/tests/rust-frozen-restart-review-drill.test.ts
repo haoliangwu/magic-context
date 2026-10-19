@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 /**
- * REVIEW FINDING DRILLS (slice A re-review, docs/reports/slice-a-review-r2.md).
+ * Frozen recovery drills: a restart must not admit a known-over replay.
  *
  * The frozen last-known-good replay plan asked for two hermetic drills that were
  * never written: a host restart during a freeze, and a refusal during a freeze.

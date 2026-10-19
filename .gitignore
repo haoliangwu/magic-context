@@ -42,16 +42,12 @@ packages/plugin/docs/animation[0-9]*/
 
 .pi/
 
-# Local agent task outputs, scratch state, and MC's own dogfooding runtime
-# artifacts (historian dumps, fenced .gitignore) — local state, never source.
-# Selectively expose .cortexkit/alfonso/release-notes/ — CI reads it for the
-# release body + Discord announcement. Must use `dir/*` rather than `dir/` so
-# git descends into the directory and can re-include nested paths.
-.cortexkit/*
-.cortexkit/magic-context/
-!.cortexkit/alfonso/
-.cortexkit/alfonso/*
-!.cortexkit/alfonso/release-notes/
+# Only public release notes and shareable agent skills/rules belong in Git.
+# Internal documents and tool state stay on disk and are backed up by Engram.
+/.cortexkit/*
+!/.cortexkit/release-notes/
+!/.cortexkit/skills/
+!/.cortexkit/rules/
 
 # Prompt/model experiment harnesses (model-dispatch, replay, migration validation).
 # Kept on disk for reuse but excluded from git + CI typecheck: they intentionally
@@ -73,8 +69,7 @@ packages/plugin/scripts/test-historian-prompt.ts
 # Local scratch directories — checkouts dropped here for one-off lookups
 .tmp-*/
 
-# Private design drafts and internal migration notes on a public repo; the
-# tracked specs and fixtures under docs/specs are public and read by scripts.
+# Public documentation lives in docs/; private drafts stay local.
 docs/private/
 
 # Rust workspace build output

@@ -418,7 +418,8 @@ impl<'a> PreparedDecay<'a> {
         slot.get_or_insert_with(|| {
             let text = render_one_compartment(self.compartments[index], tier);
             let start = std::time::Instant::now();
-            let (final_count, continued_count) = mc_tokenizer::history_paragraph_counts(&text);
+            let (final_count, continued_count) =
+                mc_tokenizer::history_render_paragraph_counts(&text);
             self.tokenize_ms += start.elapsed().as_secs_f64() * 1000.0;
             PreparedTier {
                 text,

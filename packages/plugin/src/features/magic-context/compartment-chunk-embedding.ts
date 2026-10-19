@@ -36,6 +36,9 @@ interface ExistingChunkHashRow {
 }
 
 interface SearchChunkRow {
+    rowId: number;
+    startTime: number | null;
+    endTime: number | null;
     compartmentId: number;
     sessionId: string;
     title: string;
@@ -52,14 +55,47 @@ interface SearchChunkRow {
 
 interface SearchPoolProbeRow {
     rowCount: number;
-    maxRowId: number | null;
+    maxRowId: number;
+    rowIdSum: number;
+    metadata: Map<number, SearchScopeMetadataRow>;
+    ids: readonly number[];
 }
+
+interface SearchScopeMetadataRow {
+    readonly [column: string]: number | string | null;
+    readonly rowId: number;
+}
+
+const SEARCH_SCOPE_METADATA_FIELDS = [
+    "rowId",
+    "compartmentId",
+    "sessionId",
+    "projectPath",
+    "harness",
+    "windowIndex",
+    "windowStart",
+    "windowEnd",
+    "chunkHash",
+    "modelId",
+    "dims",
+    "createdAt",
+    "vectorBytes",
+    "compartmentSessionId",
+    "title",
+    "compartmentStart",
+    "compartmentEnd",
+    "startTime",
+    "endTime",
+] as const;
 
 interface DecodedSearchPoolEntry {
     pool: Map<string, DecodedSearchPoolEntry>;
     key: string;
     rowCount: number;
     maxRowId: number;
+    rowIdSum: number;
+    metadata: Map<number, SearchScopeMetadataRow>;
+    ids: readonly number[];
     rows: StoredCompartmentChunkEmbedding[];
     byteSize: number;
 }
@@ -123,7 +159,13 @@ export const MESSAGE_FTS_CHUNK_LOAD_SQL = `SELECT map.message_ordinal AS message
  ORDER BY map.message_ordinal ASC`;
 
 const loadFtsRowsStatements = new WeakMap<Database, PreparedStatement>();
-const searchPoolCompartmentStatements = new WeakMap<Database, PreparedStatement>();
+const searchPoolDates = new WeakMap<
+    StoredCompartmentChunkEmbedding,
+    {
+        startTime: number | null;
+        endTime: number | null;
+    }
+>();
 const existingHashStatements = new WeakMap<Database, PreparedStatement>();
 const existingHashByProjectStatements = new WeakMap<Database, PreparedStatement>();
 const deleteByCompartmentStatements = new WeakMap<Database, PreparedStatement>();
@@ -131,8 +173,8 @@ const insertEmbeddingStatements = new WeakMap<Database, PreparedStatement>();
 const renumberEmbeddingWindowStatements = new WeakMap<Database, PreparedStatement>();
 const searchRowsStatements = new WeakMap<Database, PreparedStatement>();
 const searchRowsByModelStatements = new WeakMap<Database, PreparedStatement>();
-const datedSearchRowsByModelStatements = new WeakMap<Database, PreparedStatement>();
 const searchPoolProbeStatements = new WeakMap<Database, PreparedStatement>();
+const pendingSearchPools = new WeakMap<Database, Map<string, Promise<void>>>();
 const backfillCandidateStatements = new WeakMap<Database, PreparedStatement>();
 const shadowBackfillCandidateStatements = new WeakMap<Database, PreparedStatement>();
 
@@ -140,6 +182,13 @@ const DECODED_SEARCH_POOL_CACHE_MAX_BYTES = 256 * 1024 * 1024;
 const decodedSearchPools = new WeakMap<Database, Map<string, DecodedSearchPoolEntry>>();
 const decodedSearchPoolLru = new Map<DecodedSearchPoolEntry, true>();
 let decodedSearchPoolBytes = 0;
+const searchPoolStats = { fullRebuilds: 0, appends: 0, probes: 0, probeMs: 0, probePages: 0 };
+
+export function _getCompartmentChunkSearchCacheStatsForTests(): typeof searchPoolStats & {
+    bytes: number;
+} {
+    return { ...searchPoolStats, bytes: decodedSearchPoolBytes };
+}
 
 function getLoadFtsRowsStatement(db: Database): PreparedStatement {
     let stmt = loadFtsRowsStatements.get(db);
@@ -181,6 +230,9 @@ function getDeleteByCompartmentStatement(db: Database): PreparedStatement {
 function getInsertEmbeddingStatement(db: Database): PreparedStatement {
     let stmt = insertEmbeddingStatements.get(db);
     if (!stmt) {
+        // Vectors/dims are immutable at a rowid: refresh by deleting and inserting
+        // new rows. In-place window_index/project_path/harness repairs are
+        // observed by the search scope probe. The writer guard enforces this rule.
         stmt = db.prepare(
             `INSERT INTO compartment_chunk_embeddings (
                 compartment_id, session_id, project_path, harness, window_index,
@@ -211,70 +263,147 @@ function getRenumberEmbeddingWindowStatement(db: Database): PreparedStatement {
 function getSearchPoolProbeStatement(db: Database): PreparedStatement {
     let stmt = searchPoolProbeStatements.get(db);
     if (!stmt) {
-        // idx_cce_project_model bounds this to one project/model pool, with the
-        // session predicate applied before aggregation. Excluding vector keeps
-        // steady-state searches from reading or decoding blobs.
+        // Existing session and project/model indexes bound the scan; neither
+        // covers all scope fields and metadata. length(BLOB) skips overflow payload.
         stmt = db.prepare(
-            `SELECT COUNT(*) AS rowCount, MAX(id) AS maxRowId
-             FROM compartment_chunk_embeddings
-             WHERE session_id = ? AND project_path = ? AND model_id = ?`,
+            `SELECT e.id AS rowId, e.compartment_id AS compartmentId,
+                    e.session_id AS sessionId, e.project_path AS projectPath, e.harness AS harness,
+                    e.window_index AS windowIndex, e.start_ordinal AS windowStart,
+                    e.end_ordinal AS windowEnd, e.chunk_hash AS chunkHash,
+                    e.model_id AS modelId, e.dims AS dims, e.created_at AS createdAt,
+                    length(e.vector) AS vectorBytes,
+                    c.session_id AS compartmentSessionId, c.title AS title,
+                    c.start_message AS compartmentStart, c.end_message AS compartmentEnd,
+                    start_map.message_time_ms AS startTime, end_map.message_time_ms AS endTime
+             FROM compartment_chunk_embeddings e
+             LEFT JOIN compartments c ON c.id = e.compartment_id
+             LEFT JOIN message_fts_rowid_map start_map
+               ON start_map.session_id = c.session_id AND start_map.message_ordinal = c.start_message
+             LEFT JOIN message_fts_rowid_map end_map
+               ON end_map.session_id = c.session_id AND end_map.message_ordinal = c.end_message
+             WHERE e.session_id = ? AND e.project_path = ? AND e.model_id = ? AND e.id > ?
+             ORDER BY e.id ASC LIMIT 512`,
         );
         searchPoolProbeStatements.set(db, stmt);
     }
     return stmt;
 }
 
-/** Current title and range of every compartment in one decoded search pool. */
-function getSearchPoolCompartmentStatement(db: Database): PreparedStatement {
-    let stmt = searchPoolCompartmentStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(
-            `SELECT id, title, start_message AS startOrdinal, end_message AS endOrdinal
-             FROM compartments
-             WHERE id IN (
-                 SELECT compartment_id FROM compartment_chunk_embeddings
-                 WHERE session_id = ? AND project_path = ? AND model_id = ?
-             )`,
-        );
-        searchPoolCompartmentStatements.set(db, stmt);
+function sameScopeMetadata(left: SearchScopeMetadataRow, right: SearchScopeMetadataRow): boolean {
+    for (let index = 0; index < SEARCH_SCOPE_METADATA_FIELDS.length; index++) {
+        const key = SEARCH_SCOPE_METADATA_FIELDS[index];
+        if (left[key] !== right[key]) return false;
     }
-    return stmt;
+    return true;
 }
 
-/**
- * The decoded pool is validated against the embedding rows only, but each row
- * also carries its compartment's title and range, which a coordinate rebase
- * rewrites in place without touching embeddings. Re-read those few columns on
- * every cache hit so expansion pointers and the ordinal cutoff use the stored
- * ranges, and drop rows whose compartment no longer exists.
- */
-function refreshPoolCompartmentFields(
+async function probeSearchScope(
     db: Database,
     sessionId: string,
     projectPath: string,
     modelId: string,
-    rows: StoredCompartmentChunkEmbedding[],
-): StoredCompartmentChunkEmbedding[] {
-    const current = new Map<number, { title: string; startOrdinal: number; endOrdinal: number }>();
-    for (const row of getSearchPoolCompartmentStatement(db).all(
-        sessionId,
-        projectPath,
-        modelId,
-    ) as { id: number; title: string; startOrdinal: number; endOrdinal: number }[]) {
-        current.set(row.id, row);
-    }
-    let missing = false;
-    for (const row of rows) {
-        const compartment = current.get(row.compartmentId);
-        if (!compartment) {
-            missing = true;
-            continue;
+    previous?: SearchPoolProbeRow,
+): Promise<SearchPoolProbeRow> {
+    const started = performance.now();
+    searchPoolStats.probes++;
+    const probe: SearchPoolProbeRow = {
+        rowCount: 0,
+        maxRowId: 0,
+        rowIdSum: 0,
+        metadata: previous?.metadata ?? new Map(),
+        ids: previous?.ids ?? [],
+    };
+    let copied = previous === undefined;
+    let oldIndex = 0;
+    // Reuse unchanged records and the map itself. A warm probe must not allocate
+    // another full metadata pool and force a large main-thread garbage collection.
+    const writable = () => {
+        if (!copied) {
+            probe.metadata = new Map(probe.metadata);
+            copied = true;
         }
-        row.title = compartment.title;
-        row.startOrdinal = compartment.startOrdinal;
-        row.endOrdinal = compartment.endOrdinal;
+        return probe.metadata;
+    };
+    await yieldSearchPool();
+    for (;;) {
+        const rows = getSearchPoolProbeStatement(db).all(
+            sessionId,
+            projectPath,
+            modelId,
+            probe.maxRowId,
+        ) as SearchScopeMetadataRow[];
+        searchPoolStats.probePages++;
+        if (rows.length === 0) {
+            if (previous) {
+                while (oldIndex < previous.ids.length) writable().delete(previous.ids[oldIndex++]);
+            }
+            if (copied) probe.ids = [...probe.metadata.keys()].sort((a, b) => a - b);
+            searchPoolStats.probeMs += performance.now() - started;
+            return probe;
+        }
+        for (const row of rows) {
+            probe.rowCount++;
+            probe.maxRowId = row.rowId;
+            probe.rowIdSum += row.rowId;
+            if (previous) {
+                while (oldIndex < previous.ids.length && previous.ids[oldIndex] < row.rowId) {
+                    writable().delete(previous.ids[oldIndex++]);
+                }
+            }
+            if (previous && previous.ids[oldIndex] === row.rowId) {
+                const old = previous.metadata.get(row.rowId);
+                if (!old || !sameScopeMetadata(old, row)) {
+                    writable().set(row.rowId, row);
+                }
+                oldIndex++;
+            } else writable().set(row.rowId, row);
+        }
+        await yieldSearchPool();
     }
-    return missing ? rows.filter((row) => current.has(row.compartmentId)) : rows;
+}
+
+function sameSearchScope(left: SearchPoolProbeRow, right: SearchPoolProbeRow): boolean {
+    return (
+        left.rowCount === right.rowCount &&
+        left.maxRowId === right.maxRowId &&
+        left.rowIdSum === right.rowIdSum &&
+        (left.metadata === right.metadata ||
+            [...left.metadata].every(([id, value]) => right.metadata.get(id) === value))
+    );
+}
+
+function scopeOnlyAppended(cached: SearchPoolProbeRow, probe: SearchPoolProbeRow): boolean {
+    if (probe.rowCount <= cached.rowCount) return false;
+    let addedCount = 0;
+    let addedSum = 0;
+    for (const [id, fingerprint] of probe.metadata) {
+        if (id > cached.maxRowId) {
+            addedCount++;
+            addedSum += id;
+        } else if (cached.metadata.get(id) !== fingerprint) return false;
+    }
+    return (
+        addedCount === probe.rowCount - cached.rowCount &&
+        cached.rowIdSum + addedSum === probe.rowIdSum
+    );
+}
+
+/** Missing endpoint mappings and SQL NULL times cannot satisfy an inclusive overlap. */
+function filterSearchPoolDates(
+    rows: StoredCompartmentChunkEmbedding[],
+    dateRange: { from: number; to: number } | null,
+): StoredCompartmentChunkEmbedding[] {
+    if (dateRange === null) return rows;
+    return rows.filter((row) => {
+        const compartment = searchPoolDates.get(row);
+        return (
+            compartment !== undefined &&
+            compartment.startTime !== null &&
+            compartment.endTime !== null &&
+            compartment.startTime <= dateRange.to &&
+            compartment.endTime >= dateRange.from
+        );
+    });
 }
 
 function getSearchRowsStatement(db: Database, withModel: boolean): PreparedStatement {
@@ -282,7 +411,8 @@ function getSearchRowsStatement(db: Database, withModel: boolean): PreparedState
     let stmt = map.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            `SELECT e.compartment_id AS compartmentId,
+            `SELECT e.id AS rowId, e.compartment_id AS compartmentId,
+                    start_map.message_time_ms AS startTime, end_map.message_time_ms AS endTime,
                     e.session_id AS sessionId,
                     c.title AS title,
                     c.start_message AS compartmentStart,
@@ -295,51 +425,20 @@ function getSearchRowsStatement(db: Database, withModel: boolean): PreparedState
                     e.dims AS dims,
                     e.vector AS vector
              FROM compartment_chunk_embeddings e
-             JOIN compartments c ON c.id = e.compartment_id
+              JOIN compartments c ON c.id = e.compartment_id
+              LEFT JOIN message_fts_rowid_map start_map
+                ON start_map.session_id = c.session_id AND start_map.message_ordinal = c.start_message
+              LEFT JOIN message_fts_rowid_map end_map
+                ON end_map.session_id = c.session_id AND end_map.message_ordinal = c.end_message
              WHERE e.session_id = ?
                AND e.project_path = ?
-               ${withModel ? "AND e.model_id = ?" : ""}
-             ORDER BY e.compartment_id ASC, e.window_index ASC`,
+                ${withModel ? "AND e.model_id = ?" : ""}
+                AND e.id > ? AND e.id <= ?
+              ORDER BY e.id ASC LIMIT 16`,
         );
         map.set(db, stmt);
     }
     return stmt;
-}
-
-function getDatedSearchRowsByModelStatement(db: Database): PreparedStatement {
-    let statement = datedSearchRowsByModelStatements.get(db);
-    if (!statement) {
-        statement = db.prepare(
-            `SELECT e.compartment_id AS compartmentId,
-                    e.session_id AS sessionId,
-                    c.title AS title,
-                    c.start_message AS compartmentStart,
-                    c.end_message AS compartmentEnd,
-                    e.window_index AS windowIndex,
-                    e.start_ordinal AS windowStart,
-                    e.end_ordinal AS windowEnd,
-                    e.chunk_hash AS chunkHash,
-                    e.model_id AS modelId,
-                    e.dims AS dims,
-                    e.vector AS vector
-               FROM compartment_chunk_embeddings e
-               JOIN compartments c ON c.id = e.compartment_id
-               JOIN message_fts_rowid_map AS start_map
-                 ON start_map.session_id = c.session_id
-                AND start_map.message_ordinal = c.start_message
-               JOIN message_fts_rowid_map AS end_map
-                 ON end_map.session_id = c.session_id
-                AND end_map.message_ordinal = c.end_message
-              WHERE e.session_id = ?
-                AND e.project_path = ?
-                AND e.model_id = ?
-                AND start_map.message_time_ms <= ?
-                AND end_map.message_time_ms >= ?
-              ORDER BY e.compartment_id ASC, e.window_index ASC`,
-        );
-        datedSearchRowsByModelStatements.set(db, statement);
-    }
-    return statement;
 }
 
 function getBackfillCandidateStatement(db: Database): PreparedStatement {
@@ -425,11 +524,11 @@ function touchDecodedSearchPoolEntry(entry: DecodedSearchPoolEntry): void {
 function estimateDecodedSearchPoolBytes(rows: readonly StoredCompartmentChunkEmbedding[]): number {
     let bytes = 0;
     for (const row of rows) {
-        // Vectors dominate, but include a conservative allowance for the row
-        // object and UTF-16 metadata so the process-wide budget remains real.
+        // Include row/vector wrappers, endpoint timestamp metadata and UTF-16
+        // strings as well as payload bytes in the process-wide memory budget.
         bytes +=
             row.vector.byteLength +
-            256 +
+            384 +
             2 *
                 (row.sessionId.length +
                     row.title.length +
@@ -442,8 +541,7 @@ function estimateDecodedSearchPoolBytes(rows: readonly StoredCompartmentChunkEmb
 function cacheDecodedSearchPool(
     pool: Map<string, DecodedSearchPoolEntry>,
     key: string,
-    rowCount: number,
-    maxRowId: number,
+    probe: SearchPoolProbeRow,
     rows: StoredCompartmentChunkEmbedding[],
 ): void {
     const existing = pool.get(key);
@@ -452,11 +550,18 @@ function cacheDecodedSearchPool(
     const entry: DecodedSearchPoolEntry = {
         pool,
         key,
-        rowCount,
-        maxRowId,
+        ...probe,
         rows,
         byteSize: estimateDecodedSearchPoolBytes(rows),
     };
+    entry.byteSize += probe.ids.length * 8;
+    for (const metadata of probe.metadata.values()) {
+        entry.byteSize += 320;
+        for (const key of SEARCH_SCOPE_METADATA_FIELDS) {
+            const value = metadata[key];
+            if (typeof value === "string") entry.byteSize += 2 * value.length;
+        }
+    }
     pool.set(key, entry);
     decodedSearchPoolLru.set(entry, true);
     decodedSearchPoolBytes += entry.byteSize;
@@ -470,18 +575,6 @@ function cacheDecodedSearchPool(
     }
 }
 
-function invalidateDecodedSearchPools(
-    db: Database,
-    predicate: (keyParts: readonly [string, string, string]) => boolean,
-): void {
-    const pool = decodedSearchPools.get(db);
-    if (!pool) return;
-    for (const [key, entry] of [...pool.entries()]) {
-        const parsed = JSON.parse(key) as [string, string, string];
-        if (predicate(parsed)) removeDecodedSearchPoolEntry(entry);
-    }
-}
-
 /** Clear process-level decoded vectors between isolated test cases. */
 export function _resetCompartmentChunkSearchCacheForTests(): void {
     for (const entry of [...decodedSearchPoolLru.keys()]) {
@@ -489,6 +582,13 @@ export function _resetCompartmentChunkSearchCacheForTests(): void {
     }
     decodedSearchPoolLru.clear();
     decodedSearchPoolBytes = 0;
+    Object.assign(searchPoolStats, {
+        fullRebuilds: 0,
+        appends: 0,
+        probes: 0,
+        probeMs: 0,
+        probePages: 0,
+    });
 }
 
 function isFinitePositiveInteger(value: unknown): value is number {
@@ -976,115 +1076,150 @@ export function replaceCompartmentChunkEmbeddings(
             );
         }
     }).immediate();
-    invalidateDecodedSearchPools(
-        db,
-        ([sessionId, projectPath, cachedModelId]) =>
-            sessionId === rows[0].sessionId &&
-            projectPath === rows[0].projectPath &&
-            cachedModelId === modelId,
-    );
 }
 
-export function loadCompartmentChunkEmbeddingsForSearch(
+const yieldSearchPool = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+function searchPoolInTransaction(db: Database): boolean {
+    const connection = db as unknown as { inTransaction?: boolean; isTransaction?: boolean };
+    return connection.inTransaction === true || connection.isTransaction === true;
+}
+
+async function refreshDecodedSearchPool(
+    db: Database,
+    sessionId: string,
+    projectPath: string,
+    modelId: string,
+): Promise<StoredCompartmentChunkEmbedding[]> {
+    const key = searchPoolKey(sessionId, projectPath, modelId);
+    const pool = getDecodedSearchPool(db);
+    for (;;) {
+        const inTransaction = searchPoolInTransaction(db);
+        const previous = pool.get(key);
+        const probe = await probeSearchScope(db, sessionId, projectPath, modelId, previous);
+        const rowCount = probe.rowCount;
+        const maxRowId = probe.maxRowId;
+        // Another scope may evict the snapshot while the probe yields. Re-read
+        // the retained entry before touching the LRU or reusing cached vectors.
+        const cached = pool.get(key);
+        if (!inTransaction && cached && sameSearchScope(cached, probe)) {
+            touchDecodedSearchPoolEntry(cached);
+            return cached.rows;
+        }
+
+        // Vectors/dims are immutable at a rowid: refreshes delete/insert new rows.
+        // In-place writers change window_index/project_path/harness, all covered
+        // by the exact metadata probe (and protected by the writer guard test).
+        // No database-wide commit/change counter participates in certification.
+        const append = !inTransaction && cached && scopeOnlyAppended(cached, probe);
+        if (append) searchPoolStats.appends++;
+        else searchPoolStats.fullRebuilds++;
+        let afterId = append ? cached.maxRowId : 0;
+        const added: StoredCompartmentChunkEmbedding[] = [];
+        let appendedCount = 0;
+        // Yield before the first read as well: callers must never pay a cold
+        // synchronous full-pool allocation before receiving their Promise.
+        await yieldSearchPool();
+        for (;;) {
+            const rows = getSearchRowsStatement(db, true).all(
+                sessionId,
+                projectPath,
+                modelId,
+                afterId,
+                maxRowId,
+            ) as SearchChunkRow[];
+            if (rows.length === 0) break;
+            afterId = rows[rows.length - 1].rowId;
+            appendedCount += rows.length;
+            for (const row of rows) {
+                if (
+                    typeof row.compartmentId !== "number" ||
+                    typeof row.sessionId !== "string" ||
+                    typeof row.title !== "string" ||
+                    typeof row.compartmentStart !== "number" ||
+                    typeof row.compartmentEnd !== "number" ||
+                    typeof row.windowIndex !== "number" ||
+                    typeof row.windowStart !== "number" ||
+                    typeof row.windowEnd !== "number" ||
+                    typeof row.chunkHash !== "string" ||
+                    typeof row.modelId !== "string" ||
+                    typeof row.dims !== "number" ||
+                    !(row.vector instanceof Uint8Array || row.vector instanceof ArrayBuffer)
+                )
+                    continue;
+                added.push({
+                    compartmentId: row.compartmentId,
+                    sessionId: row.sessionId,
+                    title: row.title,
+                    startOrdinal: row.compartmentStart,
+                    endOrdinal: row.compartmentEnd,
+                    windowIndex: row.windowIndex,
+                    windowStartOrdinal: row.windowStart,
+                    windowEndOrdinal: row.windowEnd,
+                    chunkHash: row.chunkHash,
+                    modelId: row.modelId,
+                    dims: row.dims,
+                    vector: toFloat32Array(row.vector),
+                });
+                searchPoolDates.set(added[added.length - 1], {
+                    startTime: row.startTime,
+                    endTime: row.endTime,
+                });
+            }
+            await yieldSearchPool();
+        }
+        const endProbe = await probeSearchScope(db, sessionId, projectPath, modelId, probe);
+        if (!sameSearchScope(probe, endProbe) || searchPoolInTransaction(db) !== inTransaction) {
+            // No transaction spans a yield on this shared connection. Discard a
+            // raced read and retry rather than publishing a mixed/partial pool.
+            continue;
+        }
+        if (append && appendedCount !== rowCount - cached.rowCount) {
+            // Explicit low-id inserts are not an append, even if the total row
+            // count grew. Rebuild to include them in the original SQL order.
+            removeDecodedSearchPoolEntry(cached);
+            continue;
+        }
+        const decoded = append ? cached.rows.concat(added) : added;
+        decoded.sort((a, b) => a.compartmentId - b.compartmentId || a.windowIndex - b.windowIndex);
+        // A transaction-local snapshot must not become a reusable cache entry
+        // after its transaction ends or rolls back.
+        if (!inTransaction) cacheDecodedSearchPool(pool, key, probe, decoded);
+        return decoded;
+    }
+}
+
+export async function loadCompartmentChunkEmbeddingsForSearch(
     db: Database,
     sessionId: string,
     projectPath: string,
     modelId: string,
     dateRange: { from: number; to: number } | null = null,
-): StoredCompartmentChunkEmbedding[] {
+): Promise<StoredCompartmentChunkEmbedding[]> {
     if (!modelId) {
         throw new Error("loadCompartmentChunkEmbeddingsForSearch requires a current model id");
     }
-    if (dateRange !== null) {
-        const rows = getDatedSearchRowsByModelStatement(db).all(
-            sessionId,
-            projectPath,
-            modelId,
-            dateRange.to,
-            dateRange.from,
-        ) as SearchChunkRow[];
-        return rows
-            .filter(
-                (row) =>
-                    typeof row.compartmentId === "number" &&
-                    typeof row.sessionId === "string" &&
-                    typeof row.title === "string" &&
-                    typeof row.compartmentStart === "number" &&
-                    typeof row.compartmentEnd === "number" &&
-                    typeof row.windowIndex === "number" &&
-                    typeof row.windowStart === "number" &&
-                    typeof row.windowEnd === "number" &&
-                    typeof row.chunkHash === "string" &&
-                    typeof row.modelId === "string" &&
-                    typeof row.dims === "number" &&
-                    (row.vector instanceof Uint8Array || row.vector instanceof ArrayBuffer),
-            )
-            .map((row) => ({
-                compartmentId: row.compartmentId,
-                sessionId: row.sessionId,
-                title: row.title,
-                startOrdinal: row.compartmentStart,
-                endOrdinal: row.compartmentEnd,
-                windowIndex: row.windowIndex,
-                windowStartOrdinal: row.windowStart,
-                windowEndOrdinal: row.windowEnd,
-                chunkHash: row.chunkHash,
-                modelId: row.modelId,
-                dims: row.dims,
-                vector: toFloat32Array(row.vector),
-            }));
-    }
     const key = searchPoolKey(sessionId, projectPath, modelId);
-    const pool = getDecodedSearchPool(db);
-    const probe = getSearchPoolProbeStatement(db).get(sessionId, projectPath, modelId) as
-        | SearchPoolProbeRow
-        | undefined;
-    const rowCount = typeof probe?.rowCount === "number" ? probe.rowCount : 0;
-    const maxRowId = typeof probe?.maxRowId === "number" ? probe.maxRowId : 0;
-    const cached = pool.get(key);
-    if (cached && cached.rowCount === rowCount && cached.maxRowId === maxRowId) {
-        touchDecodedSearchPoolEntry(cached);
-        return refreshPoolCompartmentFields(db, sessionId, projectPath, modelId, cached.rows);
+    let pending = pendingSearchPools.get(db);
+    if (!pending) {
+        pending = new Map();
+        pendingSearchPools.set(db, pending);
     }
-    if (cached) removeDecodedSearchPoolEntry(cached);
-
-    const rows = getSearchRowsStatement(db, true).all(
-        sessionId,
-        projectPath,
-        modelId,
-    ) as SearchChunkRow[];
-    const decodedRows = rows
-        .filter(
-            (row) =>
-                typeof row.compartmentId === "number" &&
-                typeof row.sessionId === "string" &&
-                typeof row.title === "string" &&
-                typeof row.compartmentStart === "number" &&
-                typeof row.compartmentEnd === "number" &&
-                typeof row.windowIndex === "number" &&
-                typeof row.windowStart === "number" &&
-                typeof row.windowEnd === "number" &&
-                typeof row.chunkHash === "string" &&
-                typeof row.modelId === "string" &&
-                typeof row.dims === "number" &&
-                (row.vector instanceof Uint8Array || row.vector instanceof ArrayBuffer),
-        )
-        .map((row) => ({
-            compartmentId: row.compartmentId,
-            sessionId: row.sessionId,
-            title: row.title,
-            startOrdinal: row.compartmentStart,
-            endOrdinal: row.compartmentEnd,
-            windowIndex: row.windowIndex,
-            windowStartOrdinal: row.windowStart,
-            windowEndOrdinal: row.windowEnd,
-            chunkHash: row.chunkHash,
-            modelId: row.modelId,
-            dims: row.dims,
-            vector: toFloat32Array(row.vector),
-        }));
-    cacheDecodedSearchPool(pool, key, rowCount, maxRowId, decodedRows);
-    return decodedRows;
+    for (;;) {
+        while (pending.has(key)) await pending.get(key);
+        const operation = refreshDecodedSearchPool(db, sessionId, projectPath, modelId);
+        const completion = operation.then(() => {});
+        pending.set(key, completion);
+        try {
+            const rows = await operation;
+            return filterSearchPoolDates(rows, dateRange);
+        } finally {
+            pending.delete(key);
+            // The result promise carries errors to the caller; the coordination
+            // promise must also be handled when there are no concurrent waiters.
+            void completion.catch(() => {});
+        }
+    }
 }
 
 export function loadUnembeddedCompartmentChunkCandidates(
@@ -1522,13 +1657,6 @@ function renumberOneBasedChunkWindows(
             );
         }
     }).immediate();
-    invalidateDecodedSearchPools(
-        db,
-        ([sessionId, cachedProjectPath, cachedModelId]) =>
-            sessionId === candidate.sessionId &&
-            cachedProjectPath === projectPath &&
-            cachedModelId === modelId,
-    );
 }
 
 /** Classify one compartment against the transcript bytes the current model would embed. */

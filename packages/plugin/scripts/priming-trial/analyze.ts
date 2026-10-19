@@ -289,7 +289,7 @@ export function trajectory(root: string, label: string): string {
     const lines = [
         `# Trajectory: ${label}`,
         "",
-        "One run of the issue 563 priming trial (see docs/reports/issue-563-priming-trial.md). Each turn lists the scripted user prompt and every model call made while answering it.",
+        "One run of the issue 563 priming trial. Each turn lists the scripted user prompt and every model call made while answering it.",
         "",
         "- Assistant text is verbatim from the provider stream, including the `§N§` tag Magic Context's guidance asks the model to write at the start of a reply. Tool results carry the tags Magic Context assigned.",
         "- `visible max tag`: the highest tag at the start of any message in the request; a correct reply tag is one more.",

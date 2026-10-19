@@ -83,12 +83,27 @@ struct CachedDetail {
     inserted: u64,
 }
 
+#[derive(Default)]
+struct EntryTimeCache {
+    entries: HashMap<PathBuf, CachedEntryTimes>,
+    clock: u64,
+}
+
+struct CachedEntryTimes {
+    stamp: FileStamp,
+    /// `None` records a requested ID that was absent, avoiding another scan.
+    requested: HashMap<String, Option<i64>>,
+    last_used: u64,
+}
+
 /// A shared detail with the (file, stamp) pairs it was built from.
 type DetailWithChain = (Arc<PiSessionDetail>, Vec<(PathBuf, FileStamp)>);
 
 /// Details of sessions recently viewed. Each can hold tens of thousands of
 /// messages with their raw JSON, so only a handful are kept.
 const MAX_CACHED_DETAILS: usize = 16;
+const MAX_CACHED_ENTRY_TIME_FILES: usize = 8;
+const MAX_CACHED_ENTRY_TIME_IDS_PER_FILE: usize = 8_192;
 
 impl DetailCache {
     fn fresh(&self, path: &Path) -> Option<DetailWithChain> {
@@ -144,6 +159,7 @@ struct OmpEnvironment {
 
 static META_CACHE: OnceLock<RwLock<MetaCache>> = OnceLock::new();
 static DETAIL_CACHE: OnceLock<RwLock<DetailCache>> = OnceLock::new();
+static ENTRY_TIME_CACHE: OnceLock<RwLock<EntryTimeCache>> = OnceLock::new();
 static TEST_ROOT: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
 
 #[cfg(test)]
@@ -158,6 +174,10 @@ fn meta_cache() -> &'static RwLock<MetaCache> {
 
 fn detail_cache() -> &'static RwLock<DetailCache> {
     DETAIL_CACHE.get_or_init(|| RwLock::new(DetailCache::default()))
+}
+
+fn entry_time_cache() -> &'static RwLock<EntryTimeCache> {
+    ENTRY_TIME_CACHE.get_or_init(|| RwLock::new(EntryTimeCache::default()))
 }
 
 fn test_root() -> &'static RwLock<Option<PathBuf>> {
@@ -607,6 +627,131 @@ pub fn read_pi_session_meta(path: &Path) -> Option<PiSessionMeta> {
 pub fn read_pi_session_detail(path: &Path) -> Option<Arc<PiSessionDetail>> {
     read_pi_session_detail_cached(detail_cache(), path, &mut HashSet::new())
         .map(|(detail, _)| detail)
+}
+
+/// Resolve only the compartment boundary IDs for this file. Keeping requested
+/// IDs rather than every transcript ID bounds memory even for very long logs.
+pub fn read_pi_entry_times(path: &Path, message_ids: &[String]) -> HashMap<String, i64> {
+    let wanted: HashSet<String> = message_ids
+        .iter()
+        .filter(|id| !id.starts_with("pi-msg-"))
+        .cloned()
+        .collect();
+    if wanted.is_empty() {
+        return HashMap::new();
+    }
+    let Some(stamp) = file_stamp(path) else {
+        return HashMap::new();
+    };
+
+    let mut unresolved = wanted.clone();
+    let mut resolved = HashMap::new();
+    if let Ok(mut cache) = entry_time_cache().write() {
+        cache.clock = cache.clock.wrapping_add(1);
+        let used = cache.clock;
+        if let Some(cached) = cache.entries.get_mut(path) {
+            if cached.stamp == stamp {
+                cached.last_used = used;
+                for id in &wanted {
+                    if let Some(timestamp) = cached.requested.get(id) {
+                        if let Some(timestamp) = timestamp {
+                            resolved.insert(id.clone(), *timestamp);
+                        }
+                        unresolved.remove(id);
+                    }
+                }
+            }
+        }
+    }
+    if unresolved.is_empty() {
+        return resolved;
+    }
+
+    let newly_resolved = read_requested_entry_times(path, &unresolved);
+    for (id, timestamp) in &newly_resolved {
+        resolved.insert(id.clone(), *timestamp);
+    }
+
+    // An unusually compartment-heavy session can exceed this cap. It is still
+    // fully resolved for this request, but not retained between page opens.
+    if wanted.len() > MAX_CACHED_ENTRY_TIME_IDS_PER_FILE {
+        return resolved;
+    }
+
+    if let Ok(mut cache) = entry_time_cache().write() {
+        let existing_ids = cache
+            .entries
+            .get(path)
+            .filter(|cached| cached.stamp == stamp)
+            .map_or(0, |cached| cached.requested.len());
+        if existing_ids + unresolved.len() > MAX_CACHED_ENTRY_TIME_IDS_PER_FILE {
+            return resolved;
+        }
+        cache.clock = cache.clock.wrapping_add(1);
+        let used = cache.clock;
+        if !cache
+            .entries
+            .get(path)
+            .is_some_and(|cached| cached.stamp == stamp)
+        {
+            if cache.entries.len() >= MAX_CACHED_ENTRY_TIME_FILES {
+                if let Some(oldest) = cache
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, cached)| cached.last_used)
+                    .map(|(path, _)| path.clone())
+                {
+                    cache.entries.remove(&oldest);
+                }
+            }
+            cache.entries.insert(
+                path.to_path_buf(),
+                CachedEntryTimes {
+                    stamp,
+                    requested: HashMap::new(),
+                    last_used: used,
+                },
+            );
+        }
+        if let Some(cached) = cache.entries.get_mut(path) {
+            cached.last_used = used;
+            for id in unresolved {
+                cached
+                    .requested
+                    .insert(id.clone(), newly_resolved.get(&id).copied());
+            }
+        }
+    }
+    resolved
+}
+
+fn read_requested_entry_times(path: &Path, wanted: &HashSet<String>) -> HashMap<String, i64> {
+    let Ok(file) = File::open(path) else {
+        return HashMap::new();
+    };
+    entry_times_from_reader(BufReader::new(file), wanted)
+}
+
+fn entry_times_from_reader<R: BufRead>(
+    reader: R,
+    wanted: &HashSet<String>,
+) -> HashMap<String, i64> {
+    let mut times = HashMap::new();
+    for line in reader.lines().map_while(Result::ok) {
+        let Some(entry) = parse_json_line(&line) else {
+            continue;
+        };
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !wanted.contains(id) || id.starts_with("pi-msg-") {
+            continue;
+        }
+        if let Some(timestamp) = parse_ts_ms(entry.get("timestamp")) {
+            times.insert(id.to_string(), timestamp);
+        }
+    }
+    times
 }
 
 fn read_pi_session_detail_cached(
@@ -1102,6 +1247,28 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_time_map_resolves_ids_and_ignores_missing_and_fallback_ids() {
+        let wanted = [
+            "message-1".to_string(),
+            "absent-message".to_string(),
+            "pi-msg-42".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let fixture = concat!(
+            "{\"type\":\"message\",\"id\":\"message-1\",\"timestamp\":1700000000123}\n",
+            "{\"type\":\"message\",\"timestamp\":1700000000456}\n",
+            "{\"type\":\"message\",\"id\":\"pi-msg-42\",\"timestamp\":1700000000789}\n"
+        );
+
+        let times = entry_times_from_reader(std::io::Cursor::new(fixture), &wanted);
+
+        assert_eq!(times.get("message-1"), Some(&1_700_000_000_123));
+        assert!(!times.contains_key("absent-message"));
+        assert!(!times.contains_key("pi-msg-42"));
+    }
+
+    #[test]
     fn environment_paths_are_trimmed_and_blank_values_are_ignored() {
         assert_eq!(
             trimmed_env_path(Some("  /tmp/omp-agent  ".into())),
@@ -1164,6 +1331,9 @@ mod tests {
         };
         {
             let _guard = set_test_omp_environment(environment.clone());
+            let pi_session_root = home.path().join("isolated-pi-sessions");
+            fs::create_dir_all(&pi_session_root).unwrap();
+            set_test_root_for_tests(pi_session_root);
             assert!(scan_omp_session_dir().is_empty());
             assert!(scan_pi_compatible_session_dir()
                 .iter()

@@ -23,6 +23,10 @@ export interface OpenCode2TestHarnessOptions {
     /** Absolute path to a second plugin, loaded after Magic Context so its own
      * session hooks observe the draft Magic Context hands back to the host. */
     probePlugin?: string;
+    /** Pin the historian to a second mock-backed provider (see OpenCode2SpawnOptions). */
+    historianProvider?: { providerID: string; modelID: string; package: string };
+    /** models.dev catalogue copied into the throwaway host cache. */
+    modelsCatalog?: string;
 }
 
 const DEFAULT_MOCK_RESPONSE: MockResponse = {
@@ -74,6 +78,8 @@ export class OpenCode2TestHarness implements HostHarness {
             // reserve the same number of output tokens on every host.
             modelOutputLimit: 8192,
             providerID: "anthropic",
+            historianProvider: options.historianProvider,
+            modelsCatalog: options.modelsCatalog,
             mockResponse: options.mockDefault ?? DEFAULT_MOCK_RESPONSE,
             probePlugin: options.probePlugin,
         };
@@ -315,10 +321,13 @@ export class OpenCode2TestHarness implements HostHarness {
 
     assertHistorianRequestsUseMock(): void {
         if (this.hasContextDb()) {
+            const pinned = this.spawnOptions.historianProvider;
             assertHistorianMockRouting(
                 this.contextDb(),
                 this.harnessId,
-                `${this.spawnOptions.providerID ?? "openai"}/${this.spawnOptions.defaultModelID ?? "mock-model"}`,
+                pinned
+                    ? `${pinned.providerID}/${pinned.modelID}`
+                    : `${this.spawnOptions.providerID ?? "openai"}/${this.spawnOptions.defaultModelID ?? "mock-model"}`,
             );
         }
     }

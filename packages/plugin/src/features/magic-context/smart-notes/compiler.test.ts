@@ -13,6 +13,7 @@ import {
     normalizeManifest,
     parseCompilerOutput,
 } from "./compiler";
+import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./compiler-prompt";
 import { runCompiledSmartNoteCheck } from "./sandbox-runner";
 import { SmartNoteNetworkError } from "./types";
 
@@ -191,5 +192,12 @@ describe("smart-note compiler output bounds", () => {
             }).signals,
         ).toHaveLength(64);
         expect(() => normalizeCron("*".repeat(257))).toThrow(/256 characters/);
+    });
+
+    test("requires frequent crons and keeps future dates in the compiled check", () => {
+        expect(SMART_NOTE_COMPILER_SYSTEM_PROMPT).toContain("fires at least once every 24 hours");
+        expect(SMART_NOTE_COMPILER_SYSTEM_PROMPT).toContain(
+            "put date conditions inside check(cap)",
+        );
     });
 });

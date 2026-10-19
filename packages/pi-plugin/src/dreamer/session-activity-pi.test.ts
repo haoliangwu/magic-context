@@ -32,7 +32,7 @@ test("Pi/OMP message feed and JSONL entry backfill use message timestamps", asyn
 				}),
 			].join("\n"),
 		);
-		expect(latestPiMessageTime(path)).toBe(200);
+		expect(await latestPiMessageTime(path)).toBe(200);
 		for (const harness of ["pi", "omp"]) {
 			db.prepare(
 				"INSERT INTO session_projects VALUES (?, ?, '/repo', 900)",

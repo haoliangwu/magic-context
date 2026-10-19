@@ -102,22 +102,24 @@ function startLeaseRenewal(
     deps: HiddenCompartmentRunnerDeps,
     holderId: string,
 ): ReturnType<typeof setInterval> {
-    return setInterval(() => {
-        try {
-            if (!renewCompartmentLease(deps.db, deps.sessionId, holderId)) {
+    return inRootAsyncContext(() =>
+        setInterval(() => {
+            try {
+                if (!renewCompartmentLease(deps.db, deps.sessionId, holderId)) {
+                    sessionLog(
+                        deps.sessionId,
+                        "compartment lease renewal failed; publish will be skipped if holder is stale",
+                    );
+                }
+            } catch (err) {
+                // A missed renewal is safe because the compartment lease has a five-minute TTL.
                 sessionLog(
                     deps.sessionId,
-                    "compartment lease renewal failed; publish will be skipped if holder is stale",
+                    `compartment lease renewal threw; publish will be skipped if holder is stale (${err instanceof Error ? err.message : String(err)})`,
                 );
             }
-        } catch (err) {
-            // A missed renewal is safe because the compartment lease has a five-minute TTL.
-            sessionLog(
-                deps.sessionId,
-                `compartment lease renewal threw; publish will be skipped if holder is stale (${err instanceof Error ? err.message : String(err)})`,
-            );
-        }
-    }, COMPARTMENT_LEASE_RENEWAL_MS);
+        }, COMPARTMENT_LEASE_RENEWAL_MS),
+    );
 }
 
 /** Historian work and its lease timers remain background work even when a pass starts them. */
@@ -361,3 +363,5 @@ export async function executeContextRecomp(
 
 export { runCompartmentAgent } from "./compartment-runner-incremental";
 export type { PartialRecompRange } from "./compartment-runner-partial-recomp";
+
+import { inRootAsyncContext } from "../../shared/sqlite";

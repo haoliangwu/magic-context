@@ -95,7 +95,7 @@
         }
       }
     ],
-    "acknowledgment": "Queued: drop §1§.",
+    "acknowledgment": "1 tag stamped.",
     "ledgerBefore": "active",
     "ledgerAfter": "dropped",
     "queued": [

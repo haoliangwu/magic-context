@@ -226,12 +226,94 @@ function runnerOver(
     return { runner, logs };
 }
 
-/** Let the loop's own promise chain settle without advancing any timer. */
+/** Yield an event-loop turn so the runner's report and session-slot cleanup promises finish. */
 async function settle(): Promise<void> {
-    for (let i = 0; i < 12; i += 1) await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 describe("historian host runner", () => {
+    it("forwards every failed and fallback model attempt with provider usage", async () => {
+        const lane = new FakeClaimLane();
+        lane.queue({
+            runId: "accounted",
+            sessionId: "ses-a",
+            modelChain: ["prov/broken", "other/good"],
+        });
+        const executor: HiddenCompletionExecutor = {
+            capabilities: { tools: false, harness: "opencode2" },
+            open: async () => ({ id: "child" }),
+            attempt: async (_handle, request) => {
+                if (request.body?.model?.modelID === "broken")
+                    throw new Error("provider unavailable");
+            },
+            collect: async () => ({
+                text: "<compartments/>",
+                lengthCapped: false,
+                providerId: "other",
+                modelId: "good",
+                usage: { input: 120, output: 40, cacheRead: 80, cacheWrite: 10 },
+            }),
+            close: async () => {},
+        };
+        const { runner } = runnerOver(lane, { executors: new Map([["ses-a", executor]]) });
+        await runner.pump("ses-a");
+        await settle();
+        expect(lane.reports).toHaveLength(1);
+        expect(lane.reports[0]?.body.invocations).toEqual([
+            expect.objectContaining({
+                provider_id: "prov",
+                model_id: "broken",
+                status: "failed",
+                error: "provider unavailable",
+            }),
+            expect.objectContaining({
+                provider_id: "other",
+                model_id: "good",
+                status: "completed",
+                input_tokens: 120,
+                output_tokens: 40,
+                cache_read_tokens: 80,
+                cache_write_tokens: 10,
+                error: null,
+            }),
+        ]);
+    });
+
+    it("forwards an empty attempt before the terminal provider failure", async () => {
+        const lane = new FakeClaimLane();
+        lane.queue({
+            runId: "empty",
+            sessionId: "ses-a",
+            modelChain: ["prov/empty", "other/broken"],
+        });
+        const executor: HiddenCompletionExecutor = {
+            capabilities: { tools: false, harness: "opencode" },
+            open: async () => ({ id: "child" }),
+            attempt: async (_handle, request) => {
+                if (request.body?.model?.modelID === "broken")
+                    throw new Error("provider unavailable");
+            },
+            collect: async () => ({
+                text: "",
+                lengthCapped: false,
+                usage: { input: 5, output: 0, cacheRead: 0, cacheWrite: 0 },
+            }),
+            close: async () => {},
+        };
+        const { runner } = runnerOver(lane, { executors: new Map([["ses-a", executor]]) });
+        await runner.pump("ses-a");
+        await settle();
+        expect(lane.reports[0]?.body.invocations).toEqual([
+            expect.objectContaining({ model_id: "empty", status: "empty", input_tokens: 5 }),
+            expect.objectContaining({
+                model_id: "broken",
+                status: "failed",
+                error: "provider unavailable",
+            }),
+        ]);
+        expect(lane.reports[0]?.body.error).toBeDefined();
+    });
+
     it("claims a queued run and reports the completion the module can publish", async () => {
         const lane = new FakeClaimLane();
         lane.queue({ runId: "run-a", sessionId: "ses-a" });
@@ -480,6 +562,45 @@ describe("historian host runner", () => {
         const error = lane.reports[0]?.body.error as { code: string; message: string };
         expect(error.code).toBe("run_failed");
         expect(error.message).toContain("provider refused");
+    });
+
+    it("sends each chain model's configured variant, for the head model and its fallback", async () => {
+        const lane = new FakeClaimLane();
+        lane.queue({
+            runId: "run-a",
+            sessionId: "ses-a",
+            modelChain: ["anthropic/claude-sonnet-5-5", "prov/fallback"],
+        });
+        const { executor, script } = scriptedExecutor();
+        const bodies: Array<{ model?: unknown; variant?: unknown }> = [];
+        let attempts = 0;
+        executor.attempt = async (_handle, request) => {
+            bodies.push({ model: request.body?.model, variant: request.body?.variant });
+            attempts += 1;
+            // The head model fails so the fallback is attempted too.
+            if (attempts === 1) throw new Error("provider refused");
+        };
+        const variants: Record<string, string> = {
+            "anthropic/claude-sonnet-5-5": "medium",
+            "prov/fallback": "high",
+        };
+        const { runner } = runnerOver(lane, {
+            executors: new Map([["ses-a", executor]]),
+            resolveVariant: (model) => variants[model],
+        });
+
+        await runner.pump("ses-a");
+        for (let i = 0; i < 40 && bodies.length < 2; i += 1) await Bun.sleep(5);
+        script.settle({ text: "<compartments>fold</compartments>" });
+        await settle();
+
+        expect(bodies).toEqual([
+            {
+                model: { providerID: "anthropic", modelID: "claude-sonnet-5-5" },
+                variant: "medium",
+            },
+            { model: { providerID: "prov", modelID: "fallback" }, variant: "high" },
+        ]);
     });
 
     it("gives each model the host's historian_timeout_ms, not the whole await budget", async () => {

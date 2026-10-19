@@ -4,7 +4,7 @@ import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
@@ -55,11 +55,16 @@ import type { ContextUsage } from "../../features/magic-context/types";
 import { getWindowReportsPath } from "../../features/magic-context/window-report-ledger";
 import { createEventHandler as createPluginEventHandler } from "../../plugin/event";
 import {
+    forgetUnpublishedAutoSearchNoHint,
+    getUnpublishedAutoSearchNoHint,
+    rememberUnpublishedAutoSearchNoHint,
+} from "../../shared/auto-search-lifecycle";
+import {
     clearModelsDevCache,
     refreshModelLimitsFromApi,
     resetAuthRewarmLatchForTest,
 } from "../../shared/models-dev-cache";
-import { clearWindowOverlayCacheForTest, setWindowOverlayPath } from "../../shared/window-geometry";
+import { clearWindowGeometryLogForTest } from "../../shared/window-geometry";
 import { describeContextLimitChange } from "./context-limit-resolution";
 import { createEventHandler } from "./event-handler";
 import { resolveContextLimit as resolveLimitForTest } from "./event-resolvers";
@@ -85,8 +90,7 @@ afterEach(() => {
     transformDecisionLogTest.reset();
     closeDatabase();
     clearModelsDevCache();
-    setWindowOverlayPath(undefined);
-    clearWindowOverlayCacheForTest();
+    clearWindowGeometryLogForTest();
     if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = originalXdgDataHome;
 
@@ -251,8 +255,8 @@ describe("provider-measured proven floor", () => {
     });
 });
 
-// Captured 400 body for Claude Fable 5.1 and Claude Opus 5.5 (identical on both),
-// from docs/reports/anthropic-thinking-binding.md section 2.
+// The provider's binding-error body identifies lowered wire-array positions,
+// not host message ids, so recovery cannot infer a single offending host row.
 const LIVE_BINDING_400_BODY = {
     type: "error",
     error: {
@@ -827,34 +831,8 @@ describe("createEventHandler", () => {
         );
     });
 
-    it("treats provider usage above an overlay-backed window as real pressure on every reading", async () => {
+    it("counts provider usage beyond a catalog window as pressure on every reading", async () => {
         useTempDataHome("context-event-above-window-usage-");
-        const overlayPath = join(makeTempDir("context-event-overlay-"), "window-overlay.json");
-        writeFileSync(
-            overlayPath,
-            JSON.stringify({
-                schema: "fusiform-window-overlay/v1",
-                generated_at: "2026-09-11T00:00:00Z",
-                minted_provider_ids: [],
-                cells: [
-                    {
-                        provider_id: "test-provider",
-                        model_id: "test-model",
-                        facts: {
-                            "window.enforced": {
-                                value: { kind: "stated", value: 272_000 },
-                                grade: "measured",
-                                units: "provider",
-                                boundary: "Observed",
-                                source_ref: "session regression fixture",
-                                observed_at: "2026-09-11T00:00:00Z",
-                            },
-                        },
-                    },
-                ],
-            }),
-        );
-        setWindowOverlayPath(overlayPath);
         await refreshModelLimitsFromApi({
             config: {
                 providers: async () => ({
@@ -864,7 +842,7 @@ describe("createEventHandler", () => {
                                 id: "test-provider",
                                 models: {
                                     "test-model": {
-                                        limit: { context: 272_000, output: 128_000 },
+                                        limit: { context: 272_000, output: 32_000 },
                                     },
                                 },
                             },
@@ -897,31 +875,26 @@ describe("createEventHandler", () => {
         recordDetectedContextLimit(deps.db, "ses-impossible-usage", 200_000);
         await reading(291_680, 8_320);
 
-        // The provider accepted a 300K prompt on a model configured at 272K.
-        // It is the real prompt size, measured against the configured usable
-        // limit, so pressure is past the emergency line.
+        // Catalog metadata can be disproved by an accepted request. This 300K
+        // request raises the usable input limit to 300K while its usage is still
+        // counted as pressure, not discarded as impossible.
         let meta = getOrCreateSessionMeta(deps.db, "ses-impossible-usage");
         expect(meta.lastInputTokens).toBe(300_000);
-        expect(meta.lastUsageContextLimit).toBe(240_000);
-        expect(meta.lastContextPercentage).toBeCloseTo((300_000 / 240_000) * 100, 5);
+        expect(meta.lastUsageContextLimit).toBe(300_000);
+        expect(meta.lastContextPercentage).toBe(100);
         expect(contextUsageMap.get("ses-impossible-usage")?.usage.inputTokens).toBe(300_000);
         // The limit learned from an earlier overflow error is disproved by the
         // accepted request and cleared.
         expect(getOverflowState(deps.db, "ses-impossible-usage").detectedContextLimit).toBe(0);
-        // The configured window stays the user's limit: the reading is pressure,
-        // not a proven capacity that would widen the window. (Recording the
-        // learned limit above reset the proven floor to 0.)
-        expect(meta.observedSafeInputTokens).toBe(0);
+        expect(meta.observedSafeInputTokens).toBe(300_000);
 
-        // Staying above the configured window keeps counting on every reading.
+        // After the accepted 300K input raises the usable limit, accepted 310K
+        // input is also counted as pressure.
         await reading(310_000, 0);
         meta = getOrCreateSessionMeta(deps.db, "ses-impossible-usage");
         expect(meta.lastInputTokens).toBe(310_000);
-        expect(meta.lastContextPercentage).toBeCloseTo((310_000 / 240_000) * 100, 5);
-        expect(contextUsageMap.get("ses-impossible-usage")?.usage.percentage).toBeCloseTo(
-            (310_000 / 240_000) * 100,
-            5,
-        );
+        expect(meta.lastContextPercentage).toBe(100);
+        expect(contextUsageMap.get("ses-impossible-usage")?.usage.percentage).toBe(100);
     });
 
     it("clears a stale unkeyed detected limit on the first successful event after restart", async () => {
@@ -1892,6 +1865,8 @@ describe("createEventHandler", () => {
         useTempDataHome("context-event-message-removed-note-");
         const deps = createDeps(new Map());
         const handler = createEventHandler(deps);
+        rememberUnpublishedAutoSearchNoHint("ses-note", "msg-note", "error");
+        rememberUnpublishedAutoSearchNoHint("ses-note", "msg-other", "error");
 
         appendNoteNudgeAnchor(deps.db, "ses-note", "msg-note", "Remember this");
         appendNoteNudgeAnchor(deps.db, "ses-note", "msg-other", "Keep this");
@@ -1916,6 +1891,9 @@ describe("createEventHandler", () => {
         expect(getNoteNudgeAnchors(openDatabase(), "ses-note")).toEqual([
             { messageId: "msg-other", text: "Keep this" },
         ]);
+        expect(getUnpublishedAutoSearchNoHint("ses-note", "msg-note")).toBeUndefined();
+        expect(getUnpublishedAutoSearchNoHint("ses-note", "msg-other")).toBe("error");
+        forgetUnpublishedAutoSearchNoHint("ses-note", "msg-other");
         expect(getAutoSearchHintDecisions(openDatabase(), "ses-note")).toEqual([
             { messageId: "msg-other", decision: "no-hint", reason: "empty" },
         ]);

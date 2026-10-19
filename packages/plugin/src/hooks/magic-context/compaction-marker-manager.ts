@@ -88,6 +88,7 @@ export type MarkerUpdateOutcome =
           markerOrdinal: number;
       }
     | { kind: "already-current" }
+    | { kind: "deferred"; reason: "candidate-preparation" }
     | {
           kind: "stale-skip";
           reason: "compartment-removed" | "target-superseded" | "partial-message-boundary";
@@ -106,6 +107,7 @@ export type MarkerUpdateOutcome =
 export function markerUpdateDefinitelyDidNotCut(outcome: MarkerUpdateOutcome): boolean {
     return (
         outcome.kind === "already-current" ||
+        outcome.kind === "deferred" ||
         outcome.kind === "stale-skip" ||
         (outcome.kind === "retryable-failure" && outcome.cut === "definitely-no-cut")
     );
@@ -404,6 +406,8 @@ export function applyDeferredCompactionMarker(
             resolvedBoundary: boundary,
         });
         endStep("replace");
+        if (replacement.kind === "deferred")
+            return { kind: "deferred", reason: "candidate-preparation" };
         if (replacement.kind !== "committed") {
             return {
                 kind: "retryable-failure",

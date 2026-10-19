@@ -23,6 +23,7 @@
 import {
     cleanUserText,
     visitRawSessionMessages,
+    visitRawSessionMessagesAsync,
 } from "../../../hooks/magic-context/read-session-chunk";
 import {
     estimateTokens,
@@ -31,6 +32,7 @@ import {
     hasMeaningfulUserText,
     normalizeText,
 } from "../../../hooks/magic-context/read-session-formatting";
+import type { RawMessage } from "../../../hooks/magic-context/read-session-raw";
 import type { Database } from "../../../shared/sqlite";
 import { getPrimerCandidatesByIds, type Primer, type PrimerCandidate } from "../storage-primers";
 
@@ -76,14 +78,19 @@ function renderUserAndToolOrientation(
     endOrdinal: number,
     capTokens: number,
 ): string | null {
+    const renderer = orientationRenderer(capTokens);
+    visitRawSessionMessages(sessionId, startOrdinal, endOrdinal, renderer.visit, {
+        summary: true,
+    });
+    return renderer.result();
+}
+
+function orientationRenderer(capTokens: number) {
     const lines: string[] = [];
     let tokens = 0;
     let sawMessage = false;
-    visitRawSessionMessages(
-        sessionId,
-        startOrdinal,
-        endOrdinal,
-        (msg) => {
+    return {
+        visit: (msg: RawMessage) => {
             sawMessage = true;
             const out: string[] = [];
             if (msg.role === "user" && hasMeaningfulUserText(msg.parts)) {
@@ -110,9 +117,8 @@ function renderUserAndToolOrientation(
             }
             return true;
         },
-        { summary: true },
-    );
-    return sawMessage ? lines.join("\n") : null;
+        result: () => (sawMessage ? lines.join("\n") : null),
+    };
 }
 
 /**
@@ -182,14 +188,56 @@ function closedBookOriginP1(
  * registered for the session; Pi never falls back to OpenCode's store.
  */
 export function buildPrimerSeed(db: Database, primer: Primer): PrimerSeed {
-    // Most-recent occurrence drives the seed (freshest code context).
+    return buildPrimerSeedUsing(
+        db,
+        selectPrimerOriginCandidate(db, primer),
+        renderUserAndToolOrientation,
+    );
+}
+
+/** Await historical messages, render U:/TC: orientation, and fall back to compartment P1 if absent. */
+export async function buildPrimerSeedAsync(db: Database, primer: Primer): Promise<PrimerSeed> {
     const mostRecent = selectPrimerOriginCandidate(db, primer);
+    let orientation: string | null = null;
+    if (
+        mostRecent &&
+        typeof mostRecent.sourceCompartmentStart === "number" &&
+        typeof mostRecent.sourceCompartmentEnd === "number"
+    ) {
+        try {
+            const renderer = orientationRenderer(PRIMER_SEED_CAP_TOKENS);
+            await visitRawSessionMessagesAsync(
+                mostRecent.sessionId,
+                mostRecent.sourceCompartmentStart,
+                mostRecent.sourceCompartmentEnd,
+                renderer.visit,
+                { summary: true },
+            );
+            orientation = renderer.result();
+        } catch {
+            orientation = null;
+        }
+    }
+    return buildPrimerSeedUsing(db, mostRecent, () => orientation);
+}
+
+function buildPrimerSeedUsing(
+    db: Database,
+    mostRecent: PrimerCandidate | undefined,
+    render: typeof renderUserAndToolOrientation,
+): PrimerSeed {
+    // Most-recent occurrence drives the seed (freshest code context).
     if (
         !mostRecent ||
         typeof mostRecent.sourceCompartmentStart !== "number" ||
         typeof mostRecent.sourceCompartmentEnd !== "number"
     ) {
-        return { kind: "closed-book", orientation: "", prePost: "", sessionId: null };
+        return {
+            kind: "closed-book",
+            orientation: "",
+            prePost: "",
+            sessionId: null,
+        };
     }
 
     const sessionId = mostRecent.sessionId;
@@ -198,7 +246,7 @@ export function buildPrimerSeed(db: Database, primer: Primer): PrimerSeed {
 
     let orientation: string | null = null;
     try {
-        orientation = renderUserAndToolOrientation(sessionId, start, end, PRIMER_SEED_CAP_TOKENS);
+        orientation = render(sessionId, start, end, PRIMER_SEED_CAP_TOKENS);
     } catch {
         orientation = null;
     }

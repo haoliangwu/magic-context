@@ -64,7 +64,7 @@ export async function checkProtectedToolHold(
                   } as never);
             if (spec.agent_self_stamp) {
                 expect(text).toBe(
-                    `§${spec.drop}§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.`,
+                    "1 was a ctx_reduce call; leave those alone, they are cleaned up automatically.",
                 );
                 expect(getPendingOps(db, sessionId)).toHaveLength(0);
                 expect(
@@ -73,7 +73,7 @@ export async function checkProtectedToolHold(
                 ).toBe("active");
                 return;
             }
-            expect(text).toContain(`Held: §${spec.drop} is inside the protected working set`);
+            expect(text).toBe("1 tag stamped.");
         }
         expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([spec.drop]);
         const status = () =>

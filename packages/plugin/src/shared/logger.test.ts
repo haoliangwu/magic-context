@@ -129,6 +129,28 @@ if (scenario === "retry") {
         predecessorMode: fs.statSync(predecessorPath).mode & 0o777,
         files: fs.readdirSync(path.dirname(logPath)).filter((name) => name.startsWith("magic-context.log")).sort(),
     }));
+} else if (scenario === "stale-rotation") {
+    const maxLogBytes = 32 * 1024 * 1024;
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.writeFileSync(logPath, Buffer.alloc(maxLogBytes - 200, "o"));
+    fs.chmodSync(logPath, 0o600);
+    // This process now caches a size just under the bound.
+    logger.log("cached size");
+    logger.flushLogger();
+
+    // Another process sharing the file rotates it: the full log becomes the
+    // predecessor and the current file starts over.
+    fs.copyFileSync(logPath, logPath + ".1");
+    fs.writeFileSync(logPath, "written by the other process\\n");
+
+    // A line that crosses the bound only by this process's stale cached size.
+    logger.log("x".repeat(400));
+    logger.flushLogger();
+    console.log(JSON.stringify({
+        current: fs.readFileSync(logPath, "utf8"),
+        predecessorFirstByte: fs.readFileSync(logPath + ".1")[0],
+        predecessorSize: fs.statSync(logPath + ".1").size,
+    }));
 } else if (scenario === "hot-path") {
     for (let index = 0; index < 20; index++) {
         logger.log("hot-path-" + index);
@@ -182,6 +204,7 @@ async function runLoggerScenario<T>(
         | "recovery"
         | "diagnostics"
         | "rotation"
+        | "stale-rotation"
         | "hot-path"
         | "retry"
         | "bounded"
@@ -267,6 +290,21 @@ describe("logger", () => {
             expect(result.currentMode).toBe(0o600);
             expect(result.predecessorMode).toBe(0o600);
         }
+    });
+
+    test("a stale cached size does not rotate a file another process already rotated", async () => {
+        const result = await runLoggerScenario<{
+            current: string;
+            predecessorFirstByte: number;
+            predecessorSize: number;
+        }>("stale-rotation");
+
+        // The other process's full predecessor survives, and the new line joins
+        // the restarted current file instead of replacing that predecessor.
+        expect(result.predecessorFirstByte).toBe("o".charCodeAt(0));
+        expect(result.predecessorSize).toBeGreaterThan(32 * 1024 * 1024 - 1024);
+        expect(result.current).toContain("written by the other process");
+        expect(result.current).toContain("x".repeat(400));
     });
 
     test("uses cached size between periodic rotation checks", async () => {

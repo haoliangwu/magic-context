@@ -31,6 +31,8 @@ export interface HiddenSingleShotArgs<T> {
     privacySensitive?: boolean;
     /** The curation task can finish after completed memory updates without a final text response. */
     allowEmpty?: boolean;
+    /** Read completed per-memory XML entries before closing a failed hidden session. */
+    onFailureOutput?: (completion: HiddenCompletion) => void;
     /**
      * Turn the complete assistant text into the caller's result. Throwing here
      * rejects this model's answer and advances to the next configured fallback.
@@ -48,9 +50,10 @@ export interface HiddenSingleShotResult<T> {
  * Run one Dreamer prompt through a hidden completion carrier and hand the
  * caller the parsed answer. The carrier owns any tool steps for its agent.
  *
- * Every task routed through here answers with one self-contained document
- * (a JSON object or an XML manifest), so a partial answer is never safe to
- * apply. Two guards make that fail closed, matching what the memory classifier
+ * Tasks normally answer with one self-contained document (JSON or XML), so
+ * incomplete output is rejected. Mapping alone can recover closed per-memory
+ * entries through onFailureOutput. Two guards keep normal completion fail-closed,
+ * matching what the memory classifier
  * already does on this same transport:
  *  - a completion the provider cut short at the output limit is rejected before
  *    the parser sees it, so a truncated prefix can never be applied; and
@@ -125,6 +128,26 @@ export async function runHiddenSingleShotPrompt<T>(
         );
         promptSettled = true;
         return { validated: run.validated, completion: run.output, childSessionId: handle.id };
+    } catch (error) {
+        if (args.onFailureOutput) {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+                const completion = await Promise.race([
+                    args.executor.collect(handle, 200),
+                    new Promise<null>((resolve) => {
+                        timer = setTimeout(() => resolve(null), 5_000);
+                    }),
+                ]);
+                if (completion) args.onFailureOutput(completion);
+            } catch (readError) {
+                log(
+                    `${args.callContext}: failed to collect interrupted output: ${String(readError)}`,
+                );
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+        throw error;
     } finally {
         await args.executor.close(handle, {
             promptSettled,

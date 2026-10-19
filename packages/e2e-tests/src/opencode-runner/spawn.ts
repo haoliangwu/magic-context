@@ -22,6 +22,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { hostExtractCache } from '../host-extract-cache';
+import { seedModelsCatalog } from "../models-catalog";
 import { prepareContextDatabase } from "../prepare-context-db";
 import { assertMockEndpoint, assertMockProviders, pinMockAgents } from "../mock-routing";
 import {
@@ -155,6 +156,17 @@ export interface SpawnOptions {
      * per-suite file). Merged last, overriding inherited values.
      */
     extraEnv?: Record<string, string>;
+    /**
+     * models.dev catalogue copied into the host cache before boot. Fetching is then
+     * disabled so the host's model metadata comes from this file alone.
+     */
+    modelsCatalog?: string;
+    /**
+     * Register this provider/model on the mock (Anthropic wire) next to the session
+     * model and pin the historian to it, so the historian can use a real provider id
+     * while the session keeps the default mock model.
+     */
+    historianProviderModel?: { providerID: string; modelID: string };
 }
 
 /**
@@ -345,6 +357,14 @@ export function writeConfigs(
         compaction: { auto: false, prune: false },
         provider: {
             [mockProviderID]: providerConfig(mockProviderAPI, mockModelID, true),
+            ...(opts.historianProviderModel
+                ? {
+                      [opts.historianProviderModel.providerID]: providerConfig(
+                          "@ai-sdk/anthropic",
+                          opts.historianProviderModel.modelID,
+                      ),
+                  }
+                : {}),
             ...(mockProviderAPI === "@ai-sdk/openai"
                 ? {
                       "mock-anthropic-setup": providerConfig(
@@ -385,7 +405,13 @@ export function writeConfigs(
             opts.magicContextConfig,
             `${mockProviderID}/${mockModelID}`,
             "opencode",
-            historianModel ? { historian: `${mockProviderID}/${historianModel.id}` } : {},
+            opts.historianProviderModel
+                ? {
+                      historian: `${opts.historianProviderModel.providerID}/${opts.historianProviderModel.modelID}`,
+                  }
+                : historianModel
+                  ? { historian: `${mockProviderID}/${historianModel.id}` }
+                  : {},
         ),
     };
     if (opts.userSubcConnectionFile) {
@@ -672,6 +698,7 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
 
         if (resolvedOpts.prepareContextDatabase !== false) prepareContextDatabase(env.dataDir);
         writeConfigs(env, resolvedOpts.mockProviderURL, resolvedOpts);
+        if (resolvedOpts.modelsCatalog) seedModelsCatalog(env.cacheDir, resolvedOpts.modelsCatalog);
 
         // Explicitly strip any inherited OPENCODE_SERVER_PASSWORD from the parent shell —
         // our tests run unsecured on a random localhost port, and inherited auth would
@@ -723,6 +750,7 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
         // Caller overrides (e.g. MAGIC_CONTEXT_LOG_PATH pointing the plugin log at a
         // per-suite file so Rust-mode scenarios can assert on transform decisions).
         // Merged last so an explicit override wins over the inherited value.
+        if (resolvedOpts.modelsCatalog) childEnv.OPENCODE_DISABLE_MODELS_FETCH = "1";
         for (const [key, value] of Object.entries(resolvedOpts.extraEnv ?? {})) {
             childEnv[key] = value;
         }

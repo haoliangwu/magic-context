@@ -13,6 +13,19 @@
 
 export const TEXT_TAG_IDENTITY_MARKER = ":mc-text-v1:";
 
+// SQLite LIKE folds ASCII case, but its binary ownership indexes cannot seek
+// that prefix. Enumerate the 32 spellings so range seeks retain LIKE's matches
+// without building a second index over every persisted tag.
+export const PI_FALLBACK_PREFIXES_JSON = JSON.stringify(
+    [..."pi-msg-"].reduce<string[]>(
+        (prefixes, char) =>
+            prefixes.flatMap((prefix) =>
+                /[a-z]/.test(char) ? [prefix + char, prefix + char.toUpperCase()] : [prefix + char],
+            ),
+        [""],
+    ),
+);
+
 const POSITIONAL_CONTENT_SUFFIX = /:(?:p|file)\d+$/;
 const CONTENT_DERIVED_TEXT_SUFFIX = /:mc-text-v1:[0-9a-f]+:[0-9a-f]+:o\d+$/;
 

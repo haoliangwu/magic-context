@@ -27,6 +27,15 @@ export const PI_CONTEXT_BUDGET = {
 
 export class PiContextDeadlineError extends Error {}
 
+export class PiContextSupersededError extends Error {
+	constructor(
+		message: string,
+		readonly origin = "context ownership",
+	) {
+		super(message);
+	}
+}
+
 /** One cooperative clock shared by preparation, admission, normal work and recovery. */
 export class PiContextBudget {
 	sideTurn = false;
@@ -35,6 +44,27 @@ export class PiContextBudget {
 	abandoned = false;
 	completed = false;
 	failureReason?: string;
+	signal?: AbortSignal;
+	private cancelled = false;
+	isCancelled(error?: unknown): boolean {
+		// Older hosts do not expose the run signal. Their AbortError is the only
+		// cancellation evidence; with a signal, require the run itself to be aborted.
+		return (
+			this.cancelled ||
+			this.signal?.aborted === true ||
+			(!this.signal &&
+				typeof error === "object" &&
+				error !== null &&
+				"name" in error &&
+				error.name === "AbortError")
+		);
+	}
+	cancel(): void {
+		this.cancelled = true;
+		this.abandoned = true;
+		this.completed = false;
+		this.failureReason = undefined;
+	}
 	assertOwner: () => void = () => {};
 	constructor(
 		readonly startedAt = performance.now(),
@@ -43,9 +73,9 @@ export class PiContextBudget {
 	elapsed(): number {
 		return this.now() - this.startedAt;
 	}
-	remainingWork(): number {
+	remainingWork = (): number => {
 		return Math.max(0, PI_CONTEXT_BUDGET.workMs - this.elapsed());
-	}
+	};
 	remainingOutcome = (): number =>
 		Math.max(0, PI_CONTEXT_BUDGET.outcomeMs - this.elapsed());
 	writerAllowance(): number {
@@ -59,6 +89,7 @@ export class PiContextBudget {
 	}
 	assertOutcome = (): void => {
 		this.assertOwner();
+		this.signal?.throwIfAborted();
 		if (this.abandoned || this.elapsed() >= PI_CONTEXT_BUDGET.outcomeMs)
 			throw new PiContextDeadlineError(this.diagnostic());
 	};
@@ -70,9 +101,22 @@ export class PiContextBudget {
 	// A returned managed result can be attributed to the next assistant, even
 	// after a new pass takes ownership. An unfinished or refused result cannot.
 	// The resolving pass supplies its own owner guard around the queued write.
+	//
+	// The outcome deadline fences only a pass that is still running. A completed
+	// pass already finished inside it (waitMandatory checks the deadline after
+	// the handler returns), and its row is written later, when the next pass
+	// names the assistant that answered. Measuring elapsed time then would
+	// measure when the next pass started, and dropped the row of every reclaim
+	// whose next turn began 25 s or more after it. A refused dispatch marks the
+	// pass abandoned, so a completed result whose request never went out still
+	// records nothing.
 	assertDecisionPublication = (): void => {
+		this.signal?.throwIfAborted();
 		if (!this.completed) this.assertOwner();
-		if (this.abandoned || this.elapsed() >= PI_CONTEXT_BUDGET.outcomeMs)
+		if (
+			this.abandoned ||
+			(!this.completed && this.elapsed() >= PI_CONTEXT_BUDGET.outcomeMs)
+		)
 			throw new PiContextDeadlineError(this.diagnostic());
 	};
 	diagnostic(): string {
@@ -83,11 +127,29 @@ export class PiContextBudget {
 		assert: () => void,
 		remaining: () => number,
 	): Promise<T> => {
-		assert();
+		try {
+			assert();
+		} catch (error) {
+			// Callers start the work before passing its promise here. Even when the
+			// entry guard rejects the wait, own that promise's eventual rejection.
+			void pending.catch(() => {});
+			throw error;
+		}
 		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
 		try {
 			return await Promise.race([
 				pending,
+				...(this.signal
+					? [
+							new Promise<never>((_, reject) => {
+								onAbort = () => reject(this.signal?.reason);
+								this.signal?.addEventListener("abort", onAbort, {
+									once: true,
+								});
+							}),
+						]
+					: []),
 				new Promise<never>((_, reject) => {
 					timer = setTimeout(
 						() => reject(new PiContextDeadlineError(this.diagnostic())),
@@ -97,6 +159,7 @@ export class PiContextBudget {
 			]);
 		} finally {
 			clearTimeout(timer);
+			if (onAbort) this.signal?.removeEventListener("abort", onAbort);
 			assert();
 		}
 	};

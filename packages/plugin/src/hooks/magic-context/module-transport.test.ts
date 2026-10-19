@@ -2,7 +2,7 @@ import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { SingleStoreMigrationRequiredError } from "./single-store-refusal";
 /// <reference types="bun-types" />
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import { chmodSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
@@ -844,6 +844,24 @@ describe("SubcModuleTransport", () => {
     });
 
     it("fails a completed-series deadline without reconnecting or retrying", async () => {
+        let now = 1_000;
+        const clock = spyOn(Date, "now").mockImplementation(() => now);
+        const scheduled = Promise.withResolvers<void>();
+        let expire!: () => void;
+        const realTimeout = globalThis.setTimeout;
+        const schedule = ((
+            callback: (...args: unknown[]) => void,
+            ms?: number,
+            ...args: unknown[]
+        ) => {
+            if (ms !== 25) return realTimeout(callback, ms, ...args);
+            expire = () => callback(...args);
+            scheduled.resolve();
+            const handle = realTimeout(() => {}, 0);
+            clearTimeout(handle);
+            return handle;
+        }) as typeof setTimeout;
+        const timer = spyOn(globalThis, "setTimeout").mockImplementation(schedule);
         const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
         const route = { channel: 8, epoch: 88 } as RouteHandle;
         let requestCount = 0;
@@ -874,8 +892,8 @@ describe("SubcModuleTransport", () => {
             generation: 0,
         });
 
-        await expect(
-            transport.call({
+        try {
+            const pending = transport.call({
                 sessionId: "session-execute-timeout",
                 projectRoot: "/workspace/project",
                 method: "transform",
@@ -883,11 +901,20 @@ describe("SubcModuleTransport", () => {
                 generationSensitive: true,
                 attemptClass: "transform_series_execute",
                 timeoutMs: 25,
-            }),
-        ).rejects.toMatchObject({ code: "ETIMEDOUT" });
-        expect(requestCount).toBe(1);
-        expect(closeCount).toBe(0);
-        expect(internals.client).toBe(client);
+            });
+            void pending.catch(() => {});
+            await scheduled.promise;
+            expect(requestCount).toBe(1);
+            now += 25;
+            expire();
+            await expect(pending).rejects.toMatchObject({ code: "ETIMEDOUT" });
+            expect(requestCount).toBe(1);
+            expect(closeCount).toBe(0);
+            expect(internals.client).toBe(client);
+        } finally {
+            timer.mockRestore();
+            clock.mockRestore();
+        }
     });
 
     it.each([
@@ -1789,8 +1816,18 @@ it("attributes encode, route, request issue, response wait and settlement on one
     const transport = new SubcModuleTransport("unused");
     const route = { channel: 7, epoch: 77 } as RouteHandle;
     const samples: import("./module-transport").ModuleCallTimings[] = [];
+    let now = 0;
+    let resolveResponse!: (response: { ok: boolean }) => void;
+    let signalRequestIssued!: () => void;
+    const requestIssued = new Promise<void>((resolve) => {
+        signalRequestIssued = resolve;
+    });
     const client = {
-        request: async (_route: RouteHandle, body: unknown, options: { binary?: boolean }) => {
+        request: (_route: RouteHandle, body: unknown, options: { binary?: boolean }) => {
+            const response = new Promise<{ ok: boolean }>((resolve) => {
+                resolveResponse = resolve;
+            });
+            signalRequestIssued();
             expect(body).toBeInstanceOf(Uint8Array);
             expect(options.binary).not.toBe(true);
             expect(decodedBody(body)).toEqual({
@@ -1798,8 +1835,7 @@ it("attributes encode, route, request issue, response wait and settlement on one
                 text: "🚀",
                 accept_reply_pages: true,
             });
-            await Bun.sleep(20);
-            return { ok: true };
+            return response;
         },
     } as unknown as SubcClient;
     const internals = transport as unknown as {
@@ -1813,32 +1849,37 @@ it("attributes encode, route, request issue, response wait and settlement on one
     };
     internals.client = client;
     internals.ensureRoute = async () => {
-        await Bun.sleep(10);
+        now += 10;
         return { client, route, routeKey: "timing", generation: 0 };
     };
-    const start = performance.now();
-    expect(
-        await transport.call({
+    __moduleTransportTest.setMonotonicClockForTests(() => now);
+    const startedAt = now;
+    try {
+        const pending = transport.call({
             sessionId: "timing",
             projectRoot: ".",
             method: "transform",
             body: { method: "transform", text: "🚀" },
             onTimings: (timings) => samples.push(timings),
-        }),
-    ).toEqual({ ok: true });
-    const elapsed = performance.now() - start;
-    expect(samples).toHaveLength(1);
-    expect(samples[0].route).toBeGreaterThanOrEqual(8);
-    expect(samples[0].responseWait).toBeGreaterThanOrEqual(18);
-    expect(Object.keys(samples[0]).sort()).toEqual([
-        "encode",
-        "issue",
-        "lane",
-        "responseWait",
-        "route",
-        "settle",
-    ]);
-    const sum = Object.values(samples[0]).reduce((a, b) => a + b, 0);
-    expect(sum).toBeLessThanOrEqual(elapsed);
-    expect(elapsed - sum).toBeLessThan(10);
+        });
+        await requestIssued;
+        now += 20;
+        resolveResponse({ ok: true });
+        expect(await pending).toEqual({ ok: true });
+
+        const elapsed = now - startedAt;
+        expect(samples).toHaveLength(1);
+        expect(samples[0]).toEqual({
+            lane: 0,
+            route: 10,
+            encode: 0,
+            issue: 0,
+            responseWait: 20,
+            settle: 0,
+        });
+        const sum = Object.values(samples[0]).reduce((a, b) => a + b, 0);
+        expect(sum).toBe(elapsed);
+    } finally {
+        __moduleTransportTest.setMonotonicClockForTests(null);
+    }
 });

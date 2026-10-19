@@ -72,7 +72,13 @@ export function pinMockAgents(
 }
 
 /** Check recorded attempts, not just mock captures: a failed external call can fall back successfully. */
-export function assertHistorianMockRouting(db: Database, harness: string, model: string): void {
+export function assertHistorianMockRouting(
+  db: Database,
+  harness: string,
+  model: string,
+  /** Other spellings of the same model, such as the canonical id the ledger may record. */
+  aliases: string[] = [],
+): void {
   const attempts = db
     .prepare(
       "SELECT subagent, provider_id, model_id FROM subagent_invocations WHERE harness = ? AND subagent IN ('historian', 'historian_editor', 'recomp', 'dreamer')",
@@ -84,7 +90,7 @@ export function assertHistorianMockRouting(db: Database, harness: string, model:
   }>;
   for (const attempt of attempts) {
     const actual = `${attempt.provider_id}/${attempt.model_id}`;
-    if (actual !== model) {
+    if (actual !== model && !aliases.includes(actual)) {
       throw new Error(`Off-mock ${attempt.subagent} request: ${actual}; expected ${model}`);
     }
   }

@@ -30,8 +30,9 @@ import {
     clearLkgMeasuredRequest,
     noteLkgProviderResponse,
 } from "../hooks/magic-context/lkg-measured-request";
+import { saveLkgSlotToDb } from "../hooks/magic-context/lkg-persist";
 import { captureLkgSlot } from "../hooks/magic-context/lkg-replay";
-import { dropSlot } from "../hooks/magic-context/lkg-slot";
+import { dropSlot, getSlot } from "../hooks/magic-context/lkg-slot";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
 import { StorageBusyRefusalError } from "../hooks/magic-context/storage-busy-refusal";
 import { finalizeMessageRepresentation } from "../hooks/magic-context/transform-postprocess-phase";
@@ -95,6 +96,9 @@ describe("TypeScript wrapper measured LKG admission", () => {
                     providerKey: model.providerID,
                     systemPromptTokens: 100,
                 }),
+            ).toBe(true);
+            expect(
+                saveLkgSlotToDb(db, sessionId, getSlot(sessionId)!, undefined, { rebuild: true }),
             ).toBe(true);
             if (inputTokens)
                 noteLkgProviderResponse({

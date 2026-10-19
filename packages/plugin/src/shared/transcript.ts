@@ -78,6 +78,13 @@ export interface TranscriptPart {
     /** Discriminator for filter logic. Stable across mutations. */
     readonly kind: TranscriptPartKind;
 
+    /** Host provenance, retained so control notices cannot masquerade as user turns. */
+    readonly synthetic?: boolean;
+    readonly ignored?: boolean;
+
+    /** Visual token mass using the host's normal request estimator. */
+    imageTokens?(): number;
+
     /** True when the host marks this tool result as carrying a user's answer. */
     hasUserAnswer?(): boolean;
 

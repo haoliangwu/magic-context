@@ -121,10 +121,10 @@ try {
 
     const writer = new Database(dbPath);
     writer.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=50");
-    // A BEGIN inside a transform pass waits up to 250 ms for another writer
-    // (the async admission retries, not this synchronous attempt, cover longer
-    // holds). A 120 ms hold must be waited out; a 650 ms hold must surface as
-    // SqliteAcquisitionBusyError so the pass can replay or refuse.
+    // A BEGIN inside a transform pass waits up to 2 s in total for another
+    // writer (the async admission retries, not this synchronous attempt, cover
+    // longer holds). A 1 s hold must be waited out; a 2.5 s hold must surface
+    // as SqliteAcquisitionBusyError so the pass can replay or refuse.
     const holdLock = (holdMs: number) => {
         const locker = spawn(process.execPath, ["--input-type=module", "-e", `
             import { DatabaseSync } from 'node:sqlite';
@@ -145,7 +145,20 @@ try {
         return { exited, locked };
     };
     {
-        const { exited, locked } = holdLock(650);
+        const { exited, locked } = holdLock(1000);
+        await locked;
+        let threw = "";
+        try {
+            withSqliteTransformPass(() => {
+                writer.transaction(() => writer.prepare("INSERT INTO t(v,flag) VALUES(?,?)").run("one-second-hold", 1)).immediate();
+            });
+        } catch (error) {
+            threw = error instanceof Error ? error.name : String(error);
+        } finally { await exited; }
+        check("in-pass acquisition waits out a 1 s writer", threw === "");
+    }
+    {
+        const { exited, locked } = holdLock(2500);
         await locked;
         let threw = "";
         try {

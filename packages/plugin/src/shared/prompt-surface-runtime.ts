@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 
@@ -61,6 +62,17 @@ export function promptSurfaceHashMaterial(
     return preset === "full"
         ? systemContent
         : `${systemContent}\n\0magic-context-prompt-surface:${preset}`;
+}
+
+/**
+ * Hash system text after the caller resolves guidance and freezes host date lines.
+ * Keep the legacy MD5 hex encoding so existing cached heads retain their identity.
+ */
+export function systemPromptFingerprint(
+    systemContent: string,
+    preset: PromptSurfacePreset = "full",
+): string {
+    return createHash("md5").update(promptSurfaceHashMaterial(systemContent, preset)).digest("hex");
 }
 
 const PROMPT_SURFACE_TOOL_ID_SET = new Set<string>(ACTIVE_TOOL_IDS);

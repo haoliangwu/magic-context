@@ -63,7 +63,10 @@ export function checkProtectedToolsCase(
         else if (spec.lane === "supersession")
             selected = buildSupersessionReclaimOps(input).map((op) => op.tagId);
         else if (spec.lane === "edit")
-            selected = buildEditSupersessionReclaim(input).ops.map((op) => op.tagId);
+            selected = buildEditSupersessionReclaim({
+                ...input,
+                watermark: Number.MAX_SAFE_INTEGER,
+            }).ops.map((op) => op.tagId);
         else {
             (piCleanup ?? applyHeuristicCleanup)(sessionId, db, targets, new Map([[message, 4]]), {
                 protectedTools: spec.protected_tools,

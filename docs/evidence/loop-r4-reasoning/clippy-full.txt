@@ -1,3 +1,0 @@
-    Checking mc-module v0.1.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/pool-258/crates/mc-module)
-    Checking subc-core v0.17.22 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/subconscious/crates/subc-core)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.15s

@@ -25,7 +25,10 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { findBoundaryUserMessage } from "../../features/magic-context/compaction-marker";
+import {
+    findBoundaryUserMessage,
+    prepareCompactionMarkerCandidates,
+} from "../../features/magic-context/compaction-marker";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
 import {
@@ -40,10 +43,10 @@ import * as logger from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
-    applyDeferredCompactionMarker,
+    applyDeferredCompactionMarker as applyDeferredOriginal,
     closeCompactionMarkerConnection,
     MARKER_SUMMARY_TEXT,
-    updateCompactionMarkerAfterPublication,
+    updateCompactionMarkerAfterPublication as updateOriginal,
 } from "./compaction-marker-manager";
 import {
     prepareCompartmentInjection,
@@ -56,6 +59,16 @@ import {
 } from "./transform-postprocess-phase";
 
 const tempDirs: string[] = [];
+// Production prepares summary IDs on a worker when rebuilding context history,
+// before attempting these synchronous marker writes. Fixtures do the same.
+async function applyDeferredCompactionMarker(...args: Parameters<typeof applyDeferredOriginal>) {
+    await prepareCompactionMarkerCandidates(args[1]);
+    return applyDeferredOriginal(...args);
+}
+async function updateCompactionMarkerAfterPublication(...args: Parameters<typeof updateOriginal>) {
+    await prepareCompactionMarkerCandidates(args[1]);
+    return updateOriginal(...args);
+}
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 function useTempDataHome(prefix: string): string {
@@ -210,7 +223,7 @@ afterEach(() => {
 });
 
 describe("applyDeferredCompactionMarker — outcomes", () => {
-    function checkRetainedPartial() {
+    async function checkRetainedPartial() {
         const home = useTempDataHome("r2-retained-partial-");
         const sid = "ses-r2-retained";
         const oc = createOpenCodeDb(home);
@@ -238,7 +251,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         ]);
         db.prepare("INSERT INTO session_meta(session_id) VALUES (?)").run(sid);
         expect(
-            applyDeferredCompactionMarker(
+            await applyDeferredCompactionMarker(
                 db,
                 sid,
                 makePending({ ordinal: 8, endMessageId: "partial" }),
@@ -260,7 +273,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         ]);
         oc.close();
         expect(
-            applyDeferredCompactionMarker(
+            await applyDeferredCompactionMarker(
                 db,
                 sid,
                 makePending({ ordinal: 20, endMessageId: "target" }),
@@ -272,11 +285,11 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         "r2 proof: a retained partial at the prior target ordinal still vetoes the next cut",
         checkRetainedPartial,
     );
-    it("lock-contention diagnostics promise the next cache-busting pass, not the next ordinary pass", () => {
+    it("lock-contention diagnostics promise the next cache-busting pass, not the next ordinary pass", async () => {
         expect(RUST_MARKER_LOCK_SKIP_LOG).toContain("next cache-busting pass retries");
         expect(RUST_MARKER_LOCK_SKIP_LOG).not.toContain("next pass retries");
     });
-    it("does not let already-cut indexed ends behind the current marker veto an advance", () => {
+    it("does not let already-cut indexed ends behind the current marker veto an advance", async () => {
         const dataHome = useTempDataHome("marker-old-gap-");
         const oc = createOpenCodeDb(dataHome);
         insertMessage(oc, "gone-end", "ses-old-gap", 8, "assistant");
@@ -317,7 +330,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         setPersistedCompactionMarkerState(db, "ses-old-gap", marker);
         oc.close();
         expect(
-            applyDeferredCompactionMarker(
+            await applyDeferredCompactionMarker(
                 db,
                 "ses-old-gap",
                 makePending({ ordinal: 20, endMessageId: "target" }),
@@ -326,7 +339,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         ).toEqual({ kind: "applied", markerOrdinal: 20 });
     });
 
-    it("unknown canonical order of an older endpoint stays protected rather than trusting its target ordinal", () => {
+    it("unknown canonical order of an older endpoint stays protected rather than trusting its target ordinal", async () => {
         const home = useTempDataHome("marker-unknown-old-order-");
         const sid = "ses-unknown-old-order";
         const oc = createOpenCodeDb(home);
@@ -366,7 +379,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         setPersistedCompactionMarkerState(db, sid, state);
         oc.close();
         expect(
-            applyDeferredCompactionMarker(
+            await applyDeferredCompactionMarker(
                 db,
                 sid,
                 makePending({ ordinal: 20, endMessageId: "target" }),
@@ -376,7 +389,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         expect(getPersistedCompactionMarkerState(db, sid)?.boundaryMessageId).toBe("old-user");
     });
 
-    it("sparse certificates and retained partial turns survive newly eligible cuts", () => {
+    it("sparse certificates and retained partial turns survive newly eligible cuts", async () => {
         // Read-only context.db coordinates, 2026-10-05: three gaps are already
         // behind marker 121728. No raw OpenCode store or live content is copied.
         const gaps = [
@@ -471,7 +484,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
                 },
             ]);
             oc.close();
-            const outcome = applyDeferredCompactionMarker(
+            const outcome = await applyDeferredCompactionMarker(
                 db,
                 sessionId,
                 makePending({ ordinal: 134815, endMessageId: "target" }),
@@ -487,9 +500,9 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
                 gapFlag !== true ? 121728 : 134815,
             );
         }
-        checkRetainedPartial();
+        await checkRetainedPartial();
     });
-    it("advances past an indexed end covered by the next ordinal", () => {
+    it("advances past an indexed end covered by the next ordinal", async () => {
         const dataHome = useTempDataHome("partial-adjacent-marker-");
         const opencodeDb = createOpenCodeDb(dataHome);
         insertUserMessage(opencodeDb, "msg-boundary", "ses-partial-adjacent", 1_000);
@@ -512,7 +525,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
             },
         ]);
         db.prepare("INSERT INTO session_meta(session_id) VALUES ('ses-partial-adjacent')").run();
-        const outcome = applyDeferredCompactionMarker(
+        const outcome = await applyDeferredCompactionMarker(
             db,
             "ses-partial-adjacent",
             makePending({ ordinal: 11, endMessageId: "msg-next" }),
@@ -524,7 +537,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         ).toBe("msg-next");
     });
 
-    it("keeps a partial published end and its tool turn raw with and without a Rust fence", () => {
+    it("keeps a partial published end and its tool turn raw with and without a Rust fence", async () => {
         const dataHome = useTempDataHome("partial-block-marker-");
         const opencodeDb = createOpenCodeDb(dataHome);
         insertUserMessage(opencodeDb, "msg-user", "ses-partial", 1_000);
@@ -540,7 +553,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
             undefined,
             { ordinal: 10, endMessageId: "msg-boundary", rowVersion: 1 },
         ]) {
-            const outcome = applyDeferredCompactionMarker(
+            const outcome = await applyDeferredCompactionMarker(
                 db,
                 "ses-partial",
                 makePending(),
@@ -554,7 +567,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         }
     });
 
-    it("still blocks an older indexed end with an uncovered remainder before the user cut", () => {
+    it("still blocks an older indexed end with an uncovered remainder before the user cut", async () => {
         const dataHome = useTempDataHome("partial-gap-marker-");
         const opencodeDb = createOpenCodeDb(dataHome);
         insertUserMessage(opencodeDb, "msg-user", "ses-gap", 1_000);
@@ -580,16 +593,18 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         ]);
         db.prepare("INSERT INTO session_meta(session_id) VALUES ('ses-gap')").run();
         expect(
-            applyDeferredCompactionMarker(db, "ses-gap", makePending(), dataHome, {
+            await applyDeferredCompactionMarker(db, "ses-gap", makePending(), dataHome, {
                 ordinal: 10,
                 endMessageId: "msg-boundary",
                 rowVersion: 1,
             }),
         ).toEqual({ kind: "stale-skip", reason: "partial-message-boundary" });
-        expect(updateCompactionMarkerAfterPublication(db, "ses-gap", 10, dataHome)).toBe(false);
+        expect(await updateCompactionMarkerAfterPublication(db, "ses-gap", 10, dataHome)).toBe(
+            false,
+        );
         expect(getPersistedCompactionMarkerState(db, "ses-gap")).toBeNull();
     });
-    it("returns `applied` on the happy path (no existing marker)", () => {
+    it("returns `applied` on the happy path (no existing marker)", async () => {
         const dataHome = useTempDataHome("apply-deferred-applied-");
         const opencodeDb = createOpenCodeDb(dataHome);
         insertUserMessage(opencodeDb, "msg-boundary", "ses-1", 1_000);
@@ -600,7 +615,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         // Seed session_meta row so the manager can write boundary state into it.
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-1");
 
-        const outcome = applyDeferredCompactionMarker(db, "ses-1", makePending(), dataHome);
+        const outcome = await applyDeferredCompactionMarker(db, "ses-1", makePending(), dataHome);
 
         expect(outcome.kind).toBe("applied");
         if (outcome.kind === "applied") {
@@ -612,7 +627,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         expect(persisted?.boundaryOrdinal).toBe(10);
     });
 
-    it("retries a post-insert state failure without minting duplicate marker rows", () => {
+    it("retries a post-insert state failure without minting duplicate marker rows", async () => {
         const dataHome = useTempDataHome("apply-deferred-post-insert-retry-");
         const opencodeDb = createOpenCodeDb(dataHome);
         insertUserMessage(opencodeDb, "msg-boundary", "ses-retry", 1_000);
@@ -659,13 +674,13 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         insertCompartment(db, "ses-retry", 10, "msg-boundary");
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-retry");
         db.exec(`CREATE TRIGGER fail_marker_state_persist
-            BEFORE UPDATE OF compaction_marker_state ON session_meta
-            WHEN NEW.compaction_marker_state <> ''
-            BEGIN
-                SELECT RAISE(ABORT, 'simulated marker state persist failure');
-            END`);
+        BEFORE UPDATE OF compaction_marker_state ON session_meta
+        WHEN NEW.compaction_marker_state <> ''
+        BEGIN
+            SELECT RAISE(ABORT, 'simulated marker state persist failure');
+        END`);
 
-        const first = applyDeferredCompactionMarker(db, "ses-retry", makePending(), dataHome);
+        const first = await applyDeferredCompactionMarker(db, "ses-retry", makePending(), dataHome);
         expect(first.kind).toBe("retryable-failure");
         expect(first).toMatchObject({ cut: "uncertain" });
 
@@ -680,7 +695,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         closeQuietly(inspectAfterCrash);
 
         db.exec("DROP TRIGGER fail_marker_state_persist");
-        const retry = applyDeferredCompactionMarker(db, "ses-retry", makePending(), dataHome);
+        const retry = await applyDeferredCompactionMarker(db, "ses-retry", makePending(), dataHome);
         expect(retry.kind).toBe("applied");
 
         const inspectAfterRetry = new Database(join(dataHome, "opencode", "opencode.db"));
@@ -703,7 +718,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         closeQuietly(inspectAfterRetry);
         insertCompartment(db, "ses-clean", 10, "clean-boundary");
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-clean");
-        const clean = applyDeferredCompactionMarker(
+        const clean = await applyDeferredCompactionMarker(
             db,
             "ses-clean",
             makePending({ endMessageId: "clean-boundary" }),
@@ -717,7 +732,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         );
     });
 
-    it("returns `already-current` when persisted boundary >= pending ordinal", () => {
+    it("returns `already-current` when persisted boundary >= pending ordinal", async () => {
         const dataHome = useTempDataHome("apply-deferred-current-");
         const opencodeDb = createOpenCodeDb(dataHome);
         insertUserMessage(opencodeDb, "msg-boundary", "ses-1", 1_000);
@@ -736,7 +751,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
             targetEndMessageId: "msg-boundary",
         });
 
-        const outcome = applyDeferredCompactionMarker(
+        const outcome = await applyDeferredCompactionMarker(
             db,
             "ses-1",
             makePending({ ordinal: 10 }),
@@ -749,7 +764,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         expect(persisted?.boundaryMessageId).toBe("msg-boundary");
     });
 
-    it("returns `stale-skip / compartment-removed` when raw OpenCode message is gone", () => {
+    it("returns `stale-skip / compartment-removed` when raw OpenCode message is gone", async () => {
         const dataHome = useTempDataHome("apply-deferred-msg-gone-");
         const opencodeDb = createOpenCodeDb(dataHome);
         // Intentionally do NOT insert msg-boundary — simulates revert/cleanup
@@ -759,7 +774,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         insertCompartment(db, "ses-1", 10, "msg-boundary");
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-1");
 
-        const outcome = applyDeferredCompactionMarker(db, "ses-1", makePending(), dataHome);
+        const outcome = await applyDeferredCompactionMarker(db, "ses-1", makePending(), dataHome);
 
         expect(outcome.kind).toBe("stale-skip");
         if (outcome.kind === "stale-skip") {
@@ -767,7 +782,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         }
     });
 
-    it("returns `stale-skip / compartment-removed` when local compartment row is gone", () => {
+    it("returns `stale-skip / compartment-removed` when local compartment row is gone", async () => {
         const dataHome = useTempDataHome("apply-deferred-compart-gone-");
         const opencodeDb = createOpenCodeDb(dataHome);
         insertUserMessage(opencodeDb, "msg-boundary", "ses-1", 1_000);
@@ -777,7 +792,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         // No compartment inserted — simulates a recomp that wiped local state
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-1");
 
-        const outcome = applyDeferredCompactionMarker(db, "ses-1", makePending(), dataHome);
+        const outcome = await applyDeferredCompactionMarker(db, "ses-1", makePending(), dataHome);
 
         expect(outcome.kind).toBe("stale-skip");
         if (outcome.kind === "stale-skip") {
@@ -785,7 +800,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         }
     });
 
-    it("returns `stale-skip / target-superseded` when compartment ordinal advanced past pending", () => {
+    it("returns `stale-skip / target-superseded` when compartment ordinal advanced past pending", async () => {
         const dataHome = useTempDataHome("apply-deferred-superseded-");
         const opencodeDb = createOpenCodeDb(dataHome);
         insertUserMessage(opencodeDb, "msg-boundary", "ses-1", 1_000);
@@ -799,7 +814,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         insertCompartment(db, "ses-1", 20, "msg-boundary");
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-1");
 
-        const outcome = applyDeferredCompactionMarker(
+        const outcome = await applyDeferredCompactionMarker(
             db,
             "ses-1",
             makePending({ ordinal: 10 }),
@@ -812,7 +827,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         }
     });
 
-    it("returns `retryable-failure` when injectCompactionMarker cannot find a boundary message", () => {
+    it("returns `retryable-failure` when injectCompactionMarker cannot find a boundary message", async () => {
         // Trigger this by giving the validator a compartment that points to a
         // raw msg with NO user role / no time_created < boundary — but with
         // the boundary message itself missing AFTER validation. Easier path:
@@ -841,7 +856,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         insertCompartment(db, "ses-1", 10, "msg-boundary");
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-1");
 
-        const outcome = applyDeferredCompactionMarker(db, "ses-1", makePending(), dataHome);
+        const outcome = await applyDeferredCompactionMarker(db, "ses-1", makePending(), dataHome);
 
         // No user message exists at or before the boundary → inject returns
         // null → retryable-failure.
@@ -851,7 +866,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         expect(persisted).toBeNull();
     });
 
-    it("returns `retryable-failure` on raw OpenCode DB access errors", () => {
+    it("returns `retryable-failure` on raw OpenCode DB access errors", async () => {
         // Don't create the opencode dir at all — this makes the writable
         // OpenCode DB handle fail to open, which throws inside
         // getOpenCodeMessageById and trips the outer try/catch.
@@ -865,12 +880,12 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         insertCompartment(db, "ses-1", 10, "msg-boundary");
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-1");
 
-        const outcome = applyDeferredCompactionMarker(db, "ses-1", makePending(), dataHome);
+        const outcome = await applyDeferredCompactionMarker(db, "ses-1", makePending(), dataHome);
 
         expect(outcome.kind).toBe("retryable-failure");
     });
 
-    it("preserves an existing marker when the new target has no user boundary", () => {
+    it("preserves an existing marker when the new target has no user boundary", async () => {
         const dataHome = useTempDataHome("apply-deferred-no-boundary-preserve-");
         const opencodeDb = createOpenCodeDb(dataHome);
         insertMessage(opencodeDb, "msg-boundary", "ses-1", 1_000, "assistant");
@@ -889,7 +904,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         insertCompartment(db, "ses-1", 10, "msg-boundary");
         setPersistedCompactionMarkerState(db, "ses-1", oldState);
 
-        const outcome = applyDeferredCompactionMarker(db, "ses-1", makePending(), dataHome);
+        const outcome = await applyDeferredCompactionMarker(db, "ses-1", makePending(), dataHome);
 
         expect(outcome.kind).toBe("retryable-failure");
         expect(getPersistedCompactionMarkerState(db, "ses-1")?.summaryMessageId).toBe(
@@ -897,7 +912,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         );
     });
 
-    it("keeps the old marker when BEGIN IMMEDIATE cannot acquire the host-store lock", () => {
+    it("keeps the old marker when BEGIN IMMEDIATE cannot acquire the host-store lock", async () => {
         const dataHome = useTempDataHome("apply-deferred-atomic-lock-");
         const opencodeDb = createOpenCodeDb(dataHome);
         insertUserMessage(opencodeDb, "msg-old-boundary", "ses-lock", 500);
@@ -923,7 +938,12 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         const logged = spyOn(logger, "log").mockImplementation(() => {});
         try {
             const startedAt = Date.now();
-            const outcome = applyDeferredCompactionMarker(db, "ses-lock", makePending(), dataHome);
+            const outcome = await applyDeferredCompactionMarker(
+                db,
+                "ses-lock",
+                makePending(),
+                dataHome,
+            );
             expect(outcome.kind).toBe("retryable-failure");
             expect(outcome).toMatchObject({ cut: "definitely-no-cut" });
             // Marker publication is retryable; a busy host must not stall the
@@ -957,13 +977,13 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         expect(getPersistedCompactionMarkerState(db, "ses-lock")).toEqual(oldState);
         // Releasing the competing writer allows the unchanged request to heal
         // on the next pass, rather than losing the marker publication.
-        expect(applyDeferredCompactionMarker(db, "ses-lock", makePending(), dataHome).kind).toBe(
-            "applied",
-        );
+        expect(
+            (await applyDeferredCompactionMarker(db, "ses-lock", makePending(), dataHome)).kind,
+        ).toBe("applied");
         expect(getPersistedCompactionMarkerState(db, "ses-lock")?.boundaryOrdinal).toBe(10);
     }, 10_000);
 
-    it("rolls direct publication replacement back when insertion fails", () => {
+    it("rolls direct publication replacement back when insertion fails", async () => {
         const dataHome = useTempDataHome("direct-marker-atomic-rollback-");
         const opencodeDb = createOpenCodeDb(dataHome);
         insertUserMessage(opencodeDb, "msg-old-boundary", "ses-direct", 500);
@@ -978,8 +998,8 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         };
         insertMarkerRows(opencodeDb, "ses-direct", oldState);
         opencodeDb.exec(`CREATE TRIGGER reject_new_marker BEFORE INSERT ON message
-            WHEN NEW.id <> 'msg-old-summary'
-            BEGIN SELECT RAISE(ABORT, 'simulated insert failure'); END`);
+        WHEN NEW.id <> 'msg-old-summary'
+        BEGIN SELECT RAISE(ABORT, 'simulated insert failure'); END`);
         closeQuietly(opencodeDb);
 
         const db = openDatabase();
@@ -987,7 +1007,9 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-direct");
         setPersistedCompactionMarkerState(db, "ses-direct", oldState);
 
-        expect(updateCompactionMarkerAfterPublication(db, "ses-direct", 10, dataHome)).toBe(false);
+        expect(await updateCompactionMarkerAfterPublication(db, "ses-direct", 10, dataHome)).toBe(
+            false,
+        );
         const inspect = new Database(join(dataHome, "opencode", "opencode.db"));
         expect(
             inspect
@@ -1003,7 +1025,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         expect(getPersistedCompactionMarkerState(db, "ses-direct")).toEqual(oldState);
     });
 
-    it("repairs an equal-ordinal marker whose boundary is after the target endMessageId", () => {
+    it("repairs an equal-ordinal marker whose boundary is after the target endMessageId", async () => {
         const dataHome = useTempDataHome("apply-deferred-repair-overextended-");
         const opencodeDb = createOpenCodeDb(dataHome);
         insertUserMessage(opencodeDb, "msg_009_prior_user", "ses-1", 900);
@@ -1024,7 +1046,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         insertCompartment(db, "ses-1", 10, "msg_010_target");
         setPersistedCompactionMarkerState(db, "ses-1", corruptState);
 
-        const outcome = applyDeferredCompactionMarker(
+        const outcome = await applyDeferredCompactionMarker(
             db,
             "ses-1",
             makePending({ endMessageId: "msg_010_target" }),
@@ -1037,7 +1059,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         expect(repaired?.targetEndMessageId).toBe("msg_010_target");
     });
 
-    it("direct publication path resolves the compartment endMessageId instead of ordinal", () => {
+    it("direct publication path resolves the compartment endMessageId instead of ordinal", async () => {
         const dataHome = useTempDataHome("direct-marker-end-id-");
         const opencodeDb = createOpenCodeDb(dataHome);
         insertUserMessage(opencodeDb, "msg_001_deleted_user", "ses-1", 100);
@@ -1056,7 +1078,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         insertCompartment(db, "ses-1", 4, "msg_004_target");
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-1");
 
-        expect(updateCompactionMarkerAfterPublication(db, "ses-1", 4, dataHome)).toBe(true);
+        expect(await updateCompactionMarkerAfterPublication(db, "ses-1", 4, dataHome)).toBe(true);
 
         const persisted = getPersistedCompactionMarkerState(db, "ses-1");
         expect(persisted?.boundaryMessageId).toBe("msg_003_prior_user");
@@ -1064,7 +1086,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         expect(persisted?.targetEndMessageId).toBe("msg_004_target");
     });
 
-    it("no-ops (success) on the pi harness without touching opencode.db", () => {
+    it("no-ops (success) on the pi harness without touching opencode.db", async () => {
         // Pi reaches this function through the recompilation runners both
         // harnesses share. On a Pi-only install there is no opencode.db (often
         // not even its parent directory), and the pre-fix behavior was an
@@ -1080,7 +1102,9 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
 
         setHarness("pi");
         try {
-            expect(updateCompactionMarkerAfterPublication(db, "ses-pi", 4, dataHome)).toBe(true);
+            expect(await updateCompactionMarkerAfterPublication(db, "ses-pi", 4, dataHome)).toBe(
+                true,
+            );
         } finally {
             _resetHarnessForTesting();
         }
@@ -1089,7 +1113,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         expect(existsSync(join(dataHome, "opencode", "opencode.db"))).toBe(false);
     });
 
-    it("fails loud without creating a junk opencode.db when the file is missing on opencode", () => {
+    it("fails loud without creating a junk opencode.db when the file is missing on opencode", async () => {
         // Defense-in-depth: even if an OpenCode-harness call somehow runs with
         // opencode.db missing, the open must throw a diagnosable error instead
         // of creating an empty database and failing later with `no such table`.
@@ -1101,7 +1125,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         insertCompartment(db, "ses-2", 4, "msg_004_target");
         db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-2");
 
-        expect(() => updateCompactionMarkerAfterPublication(db, "ses-2", 4, dataHome)).toThrow(
+        expect(() => updateOriginal(db, "ses-2", 4, dataHome)).toThrow(
             /OpenCode database not found/,
         );
         expect(existsSync(join(dataHome, "opencode", "opencode.db"))).toBe(false);
@@ -1109,7 +1133,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
 });
 
 describe("assistant-ended marker seam geometry", () => {
-    it("selects exactly the rows between the required user marker and trim boundary", () => {
+    it("selects exactly the rows between the required user marker and trim boundary", async () => {
         const dataHome = useTempDataHome("assistant-ended-marker-seam-");
         const sessionId = "ses-assistant-ended-marker-seam";
         const opencodeDb = createOpenCodeDb(dataHome);

@@ -68,6 +68,13 @@ if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?
   exit 1
 fi
 
+TAG="dashboard-v$VERSION"
+DEFAULT_NOTES="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)/.cortexkit/release-notes/$TAG.md"
+# Preserve explicit --notes-file overrides and the interactive fallback.
+if [[ -z "$NOTES_FILE" && -r "$DEFAULT_NOTES" ]]; then
+  NOTES_FILE="$DEFAULT_NOTES"
+fi
+
 if [[ -n "$NOTES_FILE" ]]; then
   if [[ ! -r "$NOTES_FILE" ]]; then
     echo "Error: notes file '$NOTES_FILE' is not readable"
@@ -79,7 +86,6 @@ if [[ -n "$NOTES_FILE" ]]; then
   fi
 fi
 
-TAG="dashboard-v$VERSION"
 TAURI_CONF="packages/dashboard/src-tauri/tauri.conf.json"
 
 # Check if tag already exists

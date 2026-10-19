@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { eligible, hash, isolate, MODEL, removeMemory, trialRoot, type Memory } from "./core";
 
+const reportPath = process.argv[3];
+if (!reportPath) throw new Error("Usage: validate.ts <trial-root> <report-path>; the report is an explicit offline input");
 const root = trialRoot(process.argv[2]);
 isolate(root);
 const { parseCompartmentOutput } = await import("../../src/hooks/magic-context/compartment-parser");
@@ -43,7 +45,7 @@ for (let i = 0; i < rows.length; i++) {
     facts += candidates.facts.length;
 }
 db.close();
-const report = readFileSync(join(import.meta.dir, "../../../..", "docs/reports/historian-merge-turn-trial.md"), "utf8");
+const report = readFileSync(reportPath, "utf8");
 const ledger = readFileSync(join(root, "judgment-ledger.md"), "utf8");
 if (!report.includes(ledger)) throw new Error("Report decision ledger differs from reviewed annotations");
 const insertions = readFileSync(join(root, "insertion-ledger.md"), "utf8");

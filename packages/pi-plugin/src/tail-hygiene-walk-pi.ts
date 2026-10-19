@@ -2,6 +2,7 @@ import { protectedToolTagNumbers } from "@magic-context/core/features/magic-cont
 import type { TagEntry } from "@magic-context/core/features/magic-context/types";
 import { estimateImageTokensFromDataUrl } from "@magic-context/core/hooks/magic-context/image-token-estimate";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
+import { rememberCurrentToolOutputCount } from "@magic-context/core/hooks/magic-context/tail-hygiene-output-count";
 import {
 	compareMeasuredTailPrefix,
 	freezeTailHygieneMeasurement,
@@ -12,6 +13,11 @@ import {
 	type TailHygienePartMeasurement,
 	type TailHygienePrefixMismatch,
 } from "@magic-context/core/hooks/magic-context/tail-hygiene-walk";
+import {
+	piJsonHash,
+	TailHygieneJsonMemo,
+} from "@magic-context/core/shared/tail-hygiene-json";
+import { providerVisiblePiPart } from "./provider-visible-parts-pi";
 import { isPiSystemEntry } from "./system-entry-pi";
 
 const TAG_PREFIX = /^§(\d+)§\s*/;
@@ -46,7 +52,11 @@ const FNV1A_32_PRIME = 0x01000193;
 
 export interface PiTailHygieneWalkInput {
 	messages: readonly unknown[];
+	/** Active request API, not the API recorded on an older assistant message. */
+	providerApi?: string;
 	tags: readonly TagEntry[];
+	/** Reuse the same key object for one connection/session lifetime, with canonical immutable row snapshots only. */
+	tagCacheKey?: object;
 	/**
 	 * Canonical protection-window membership derived from persisted row mass and the
 	 * snapshotted floor. Coordinate space: tag-number. An empty set is an empty window.
@@ -75,6 +85,7 @@ interface DraftPart {
 	key: string;
 	kind: TailHygienePartKind;
 	content: string;
+	contentHash?: string;
 	tokens: number;
 	tag?: TagEntry;
 }
@@ -361,6 +372,141 @@ function collectToolArcs(input: PiTailHygieneWalkInput): {
 	return { arcs, arcByPart, messageIds };
 }
 
+interface PiTagAttribution {
+	tags: readonly TagEntry[];
+	messageTags: Map<string, TagEntry>;
+	tagsByNumber: Map<number, TagEntry>;
+	exactToolTags: Map<string, TagEntry>;
+	orphanTagsByCall: Map<string, TagEntry[]>;
+	boundsByOwner: Map<string, { min: number; max: number }>;
+	rowsByOwner: Map<string, Set<TagEntry>>;
+	simple: boolean;
+}
+
+const tagAttributions = new WeakMap<object, PiTagAttribution>();
+
+function tagAttribution(input: PiTailHygieneWalkInput): PiTagAttribution {
+	const cacheable = input.tagCacheKey;
+	let cached = cacheable
+		? tagAttributions.get(input.tagCacheKey as object)
+		: undefined;
+	const wasSimple = cached?.simple === true;
+	const added: TagEntry[] = [];
+	const removed: TagEntry[] = [];
+	if (cached) {
+		if (cached.tags === input.tags) return cached;
+		// Snapshot arrays have canonical tag-number order and stable unchanged
+		// row objects. Merge their deltas without rebuilding historical maps.
+		let oldIndex = 0;
+		let newIndex = 0;
+		while (oldIndex < cached.tags.length || newIndex < input.tags.length) {
+			const old = cached.tags[oldIndex];
+			const next = input.tags[newIndex];
+			if (old && (!next || old.tagNumber < next.tagNumber)) {
+				removed.push(old);
+				oldIndex++;
+			} else if (next && (!old || next.tagNumber < old.tagNumber)) {
+				added.push(next);
+				newIndex++;
+			} else {
+				if (old !== next) {
+					if (old) removed.push(old);
+					if (next) added.push(next);
+				}
+				oldIndex++;
+				newIndex++;
+			}
+		}
+		// Duplicate-number or duplicate-key legacy stores retain the original
+		// last-row-wins full projection on edits; a simple delta cannot prove it.
+		if (!cached.simple && (removed.length || added.length)) cached = undefined;
+	}
+	if (!cached) {
+		removed.length = 0;
+		added.length = 0;
+		added.push(...input.tags);
+		cached = {
+			tags: input.tags,
+			messageTags: new Map(),
+			tagsByNumber: new Map(),
+			exactToolTags: new Map(),
+			orphanTagsByCall: new Map(),
+			boundsByOwner: new Map(),
+			rowsByOwner: new Map(),
+			simple: true,
+		};
+	}
+	const dirtyOwners = new Set<string>();
+	for (const tag of removed) {
+		cached.tagsByNumber.delete(tag.tagNumber);
+		if (tag.type !== "tool") cached.messageTags.delete(tag.messageId);
+		else if (tag.toolOwnerMessageId !== null)
+			cached.exactToolTags.delete(
+				`${tag.toolOwnerMessageId}\0${tag.messageId}`,
+			);
+		else {
+			const rows =
+				cached.orphanTagsByCall
+					.get(tag.messageId)
+					?.filter((row) => row !== tag) ?? [];
+			if (rows.length) cached.orphanTagsByCall.set(tag.messageId, rows);
+			else cached.orphanTagsByCall.delete(tag.messageId);
+		}
+		const owner = messageIdForTag(tag);
+		if (owner !== null) {
+			cached.rowsByOwner.get(owner)?.delete(tag);
+			dirtyOwners.add(owner);
+		}
+	}
+	for (const tag of added) {
+		if (cached.tagsByNumber.has(tag.tagNumber)) cached.simple = false;
+		cached.tagsByNumber.set(tag.tagNumber, tag);
+		if (tag.type === "tool") {
+			if (tag.toolOwnerMessageId === null) {
+				const rows = cached.orphanTagsByCall.get(tag.messageId) ?? [];
+				rows.push(tag);
+				cached.orphanTagsByCall.set(tag.messageId, rows);
+			} else {
+				const key = `${tag.toolOwnerMessageId}\0${tag.messageId}`;
+				if (cached.exactToolTags.has(key)) cached.simple = false;
+				cached.exactToolTags.set(key, tag);
+			}
+		} else {
+			if (cached.messageTags.has(tag.messageId)) cached.simple = false;
+			cached.messageTags.set(tag.messageId, tag);
+		}
+		const owner = messageIdForTag(tag);
+		if (owner === null) continue;
+		const rows = cached.rowsByOwner.get(owner) ?? new Set();
+		rows.add(tag);
+		cached.rowsByOwner.set(owner, rows);
+		dirtyOwners.add(owner);
+	}
+	for (const owner of dirtyOwners) {
+		const rows = cached.rowsByOwner.get(owner);
+		if (!rows?.size) {
+			cached.rowsByOwner.delete(owner);
+			cached.boundsByOwner.delete(owner);
+			continue;
+		}
+		let min = Infinity;
+		let max = -Infinity;
+		for (const row of rows) {
+			min = Math.min(min, row.tagNumber);
+			max = Math.max(max, row.tagNumber);
+		}
+		cached.boundsByOwner.set(owner, { min, max });
+	}
+	// A lower-number newcomer can collide with an unchanged higher-number key.
+	// The incremental insertion order is not canonical; rebuild on the first
+	// transition to duplicate keys so the last canonical row still wins.
+	if (wasSimple && !cached.simple)
+		cached = tagAttribution({ ...input, tagCacheKey: undefined });
+	cached.tags = input.tags;
+	if (cacheable) tagAttributions.set(input.tagCacheKey as object, cached);
+	return cached;
+}
+
 function attributeTags(
 	input: PiTailHygieneWalkInput,
 	arcs: readonly PiToolArc[],
@@ -369,10 +515,13 @@ function attributeTags(
 	messageTags: ReadonlyMap<string, TagEntry>;
 	tagsByNumber: ReadonlyMap<number, TagEntry>;
 } {
-	const messageTags = new Map<string, TagEntry>();
-	const tagsByNumber = new Map<number, TagEntry>();
-	const exactToolTags = new Map<string, TagEntry>();
-	const orphanTagsByCall = new Map<string, TagEntry[]>();
+	const {
+		messageTags,
+		tagsByNumber,
+		exactToolTags,
+		orphanTagsByCall,
+		boundsByOwner,
+	} = tagAttribution(input);
 	const messageIndexById = new Map<string, number>();
 	for (let index = 0; index < messageIds.length; index += 1) {
 		const id = input.stableId?.(input.messages[index], index);
@@ -380,28 +529,9 @@ function attributeTags(
 	}
 	const boundsByMessageIndex = new Map<number, { min: number; max: number }>();
 
-	for (const tag of input.tags) {
-		tagsByNumber.set(tag.tagNumber, tag);
-		if (tag.type === "tool") {
-			if (tag.toolOwnerMessageId === null) {
-				const rows = orphanTagsByCall.get(tag.messageId) ?? [];
-				rows.push(tag);
-				orphanTagsByCall.set(tag.messageId, rows);
-			} else {
-				exactToolTags.set(`${tag.toolOwnerMessageId}\0${tag.messageId}`, tag);
-			}
-		} else {
-			messageTags.set(tag.messageId, tag);
-		}
-		const ownerId = messageIdForTag(tag);
-		const messageIndex =
-			ownerId === null ? undefined : messageIndexById.get(ownerId);
-		if (messageIndex === undefined) continue;
-		const current = boundsByMessageIndex.get(messageIndex);
-		boundsByMessageIndex.set(messageIndex, {
-			min: current ? Math.min(current.min, tag.tagNumber) : tag.tagNumber,
-			max: current ? Math.max(current.max, tag.tagNumber) : tag.tagNumber,
-		});
+	for (const [ownerId, index] of messageIndexById) {
+		const bounds = boundsByOwner.get(ownerId);
+		if (bounds) boundsByMessageIndex.set(index, bounds);
 	}
 
 	const orphanCandidates = new Map<string, Map<string, PiToolArc[]>>();
@@ -455,11 +585,36 @@ function attributeTags(
 	return { messageTags, tagsByNumber };
 }
 
-function excludedDraft(key: string, value: unknown): DraftPart {
+const partJsonMemo = new TailHygieneJsonMemo();
+let excludedViews = new WeakMap<object, unknown>();
+
+function excludedDraftForApi(
+	key: string,
+	value: unknown,
+	providerApi?: string,
+): DraftPart {
+	let view =
+		value !== null && typeof value === "object"
+			? excludedViews.get(value)
+			: undefined;
+	if (view === undefined) {
+		view = providerVisiblePiPart(value, providerApi);
+		if (value !== null && typeof value === "object")
+			excludedViews.set(value, view);
+	}
 	return {
 		key,
 		kind: "excluded",
-		content: typeof value === "string" ? value : safeStableStringify(value),
+		content: "",
+		contentHash: partJsonMemo.get(
+			key,
+			view,
+			() =>
+				typeof view === "string"
+					? partHash("excluded", view)
+					: piJsonHash(view, () => safeStableStringify(view)),
+			true,
+		),
 		tokens: 0,
 	};
 }
@@ -502,7 +657,7 @@ function finalizeParts(
 		u += uTokens;
 		return {
 			key: draft.key,
-			contentHash: partHash(draft.kind, draft.content),
+			contentHash: draft.contentHash ?? partHash(draft.kind, draft.content),
 			kind: draft.kind,
 			tokens,
 			uTokens,
@@ -529,11 +684,33 @@ function finalizeParts(
 
 export function measurePiTailHygiene(
 	input: PiTailHygieneWalkInput,
-): TailHygieneMeasurement {
+): TailHygieneMeasurement & { realUserTurnCount: number } {
+	partJsonMemo.beginPass();
+	excludedViews = new WeakMap();
+	// Standalone walk/refresh callers can omit providerApi. The context handler
+	// supplies ctx.model.api so a model switch uses the active request converter,
+	// not the API recorded on an older assistant message.
+	let providerApi = input.providerApi;
+	if (providerApi === undefined) {
+		for (let index = input.messages.length - 1; index >= 0; index--) {
+			const message = input.messages[index];
+			if (
+				isRecord(message) &&
+				message.role === "assistant" &&
+				typeof message.api === "string"
+			) {
+				providerApi = message.api;
+				break;
+			}
+		}
+	}
+	const excludedDraft = (key: string, value: unknown): DraftPart =>
+		excludedDraftForApi(key, value, providerApi);
 	const { arcs, arcByPart, messageIds } = collectToolArcs(input);
 	const { messageTags, tagsByNumber } = attributeTags(input, arcs, messageIds);
 	const drafts: DraftPart[] = [];
 	let newestMessagePartStart = 0;
+	let realUserTurnCount = 0;
 
 	for (
 		let messageIndex = 0;
@@ -553,6 +730,7 @@ export function measurePiTailHygiene(
 			continue;
 		}
 		const role = raw.role;
+		if (role === "user") realUserTurnCount++;
 		if (role !== "user" && role !== "assistant" && role !== "toolResult") {
 			drafts.push(excludedDraft(`${messageKey}\0excluded-role`, raw));
 			continue;
@@ -665,7 +843,9 @@ export function measurePiTailHygiene(
 					drafts.push(excludedDraft(`${key}\0toolInput`, part));
 					continue;
 				}
-				const content = safeStableStringify(part.arguments);
+				const content = partJsonMemo.get(`${key}\0input`, part.arguments, () =>
+					safeStableStringify(part.arguments),
+				);
 				if (!content) {
 					drafts.push(excludedDraft(`${key}\0toolInput`, part));
 				} else {
@@ -682,13 +862,16 @@ export function measurePiTailHygiene(
 			drafts.push(excludedDraft(`${key}\0excluded`, part));
 		}
 	}
-	return finalizeParts(
-		drafts,
-		input.pendingDropTagNumbers ?? new Set<number>(),
-		input.protectedTagNumbers,
-		newestMessagePartStart,
-		input.protectedToolTags,
-	);
+	return {
+		...finalizeParts(
+			drafts,
+			input.pendingDropTagNumbers ?? new Set<number>(),
+			input.protectedTagNumbers,
+			newestMessagePartStart,
+			input.protectedToolTags,
+		),
+		realUserTurnCount,
+	};
 }
 
 export function refreshPiTailHygieneBaseline(
@@ -700,7 +883,7 @@ export function refreshPiTailHygieneBaseline(
 		hygieneUnitsVersion?: number;
 		now?: number;
 	},
-): TailHygieneBaseline {
+): TailHygieneBaseline & { realUserTurnCount: number } {
 	const protectedToolsPolicy = adoptedProtectedToolsPolicy(
 		input.protectedTools,
 		input.previous?.protectedToolsPolicy,
@@ -746,20 +929,25 @@ export function refreshPiTailHygieneBaseline(
 	const now = input.now ?? Date.now();
 	const refrozen = (
 		mismatch?: TailHygienePrefixMismatch,
-	): TailHygieneBaseline => ({
-		...freezeTailHygieneMeasurement(measured),
-		protectedToolsPolicy,
-		hygieneUnitsVersion: frozenCalibration.hygieneUnitsVersion,
-		toolsRatio: frozenCalibration.toolsRatio,
-		proseRatio: frozenCalibration.proseRatio,
-		baselineGeneration: (input.previous?.baselineGeneration ?? 0) + 1,
-		computedAt: now,
-		evaluable: true,
-		generationInvalidated: false,
-		contentSignature: measured.contentSignature,
-		channel1PostReduceGrace: input.previous?.channel1PostReduceGrace,
-		lastPrefixMismatch: mismatch,
-	});
+	): TailHygieneBaseline & { realUserTurnCount: number } =>
+		rememberCurrentToolOutputCount(
+			{
+				...freezeTailHygieneMeasurement(measured),
+				protectedToolsPolicy,
+				hygieneUnitsVersion: frozenCalibration.hygieneUnitsVersion,
+				toolsRatio: frozenCalibration.toolsRatio,
+				proseRatio: frozenCalibration.proseRatio,
+				baselineGeneration: (input.previous?.baselineGeneration ?? 0) + 1,
+				computedAt: now,
+				evaluable: true,
+				generationInvalidated: false,
+				contentSignature: measured.contentSignature,
+				channel1PostReduceGrace: input.previous?.channel1PostReduceGrace,
+				lastPrefixMismatch: mismatch,
+				realUserTurnCount: rawMeasured.realUserTurnCount,
+			},
+			measured,
+		);
 	if (input.cacheBusting || !input.previous) return refrozen();
 
 	const prefix = compareMeasuredTailPrefix(
@@ -787,16 +975,20 @@ export function refreshPiTailHygieneBaseline(
 		if (part.kind !== "toolOutput" || !part.protected)
 			turnDeltaU += part.uTokens;
 	}
-	return {
-		...input.previous,
-		protectedToolsPolicy,
-		turnDeltaU,
-		turnDeltaT,
-		evaluable: true,
-		generationInvalidated: false,
-		contentSignature: measured.contentSignature,
-		lastPrefixMismatch: undefined,
-	};
+	return rememberCurrentToolOutputCount(
+		{
+			...input.previous,
+			protectedToolsPolicy,
+			turnDeltaU,
+			turnDeltaT,
+			evaluable: true,
+			generationInvalidated: false,
+			contentSignature: measured.contentSignature,
+			lastPrefixMismatch: undefined,
+			realUserTurnCount: rawMeasured.realUserTurnCount,
+		},
+		measured,
+	);
 }
 
 export function effectivePiTailHygiene(

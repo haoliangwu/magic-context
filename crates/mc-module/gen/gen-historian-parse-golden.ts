@@ -1,3 +1,4 @@
+import "./quiet-live-log";
 /**
  * Generate the historian OUTPUT PARSER parity golden for the Rust mc-module port.
  *

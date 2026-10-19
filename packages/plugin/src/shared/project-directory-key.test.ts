@@ -13,6 +13,7 @@ import {
     __setCanonicalDirectoryRealpathForTests,
     canonicalProjectDirectory,
     projectDirectoryKey,
+    sameProjectDirectory,
 } from "./project-directory-key";
 import { projectHash, rpcPortDirsForLookup } from "./rpc-utils";
 import { createTestTempDirFromPath } from "./test-temp-dir";
@@ -107,5 +108,63 @@ describe("one discovery directory per project directory", () => {
         const dirs = rpcPortDirsForLookup("/storage", "C:\\Users\\A\\Proj\\");
         expect(dirs).toHaveLength(2);
         expect(dirs[0]).toBe(join("/storage", "rpc", projectHash("C:\\Users\\A\\Proj\\")));
+    });
+});
+
+/**
+ * Background-session code compares a session's recorded directory with the
+ * plugin's own. OpenCode 2 on Windows records `D:/coding/app` while the plugin
+ * knows `D:\coding\app`; both must count as one directory, and a different
+ * directory must never be taken for this one.
+ */
+describe("sameProjectDirectory", () => {
+    for (const [name, left, right] of WINDOWS_PAIRS) {
+        test(`Windows ${name} is the same directory`, () => {
+            expect(sameProjectDirectory(left, right)).toBe(true);
+            expect(sameProjectDirectory(right, left)).toBe(true);
+        });
+    }
+
+    test("Windows forward slashes against backslashes, as OpenCode 2 stores them", () => {
+        expect(
+            sameProjectDirectory(
+                "D:/coding/siac/wt/migracion-asincrona",
+                "D:\\coding\\siac\\wt\\migracion-asincrona",
+            ),
+        ).toBe(true);
+    });
+
+    test("Windows `.` and `..` segments and a trailing forward slash", () => {
+        expect(
+            sameProjectDirectory("C:\\Users\\dev\\.\\work\\tmp\\..\\app", "C:/Users/dev/work/app/"),
+        ).toBe(true);
+    });
+
+    test("POSIX trailing slash and `..` segments", () => {
+        expect(sameProjectDirectory("/work/app/", "/work/app")).toBe(true);
+        expect(sameProjectDirectory("/work/tmp/../app", "/work/app")).toBe(true);
+    });
+
+    test("different directories are refused", () => {
+        expect(
+            sameProjectDirectory(
+                "D:/coding/siac/wt/notificaciones-pui",
+                "D:\\coding\\siac\\wt\\migracion-asincrona",
+            ),
+        ).toBe(false);
+        // A sibling whose name extends this one, a parent, and another drive.
+        expect(sameProjectDirectory("C:/Users/dev/app-worktree", "C:\\Users\\dev\\app")).toBe(
+            false,
+        );
+        expect(sameProjectDirectory("C:/Users/dev", "C:\\Users\\dev\\app")).toBe(false);
+        expect(sameProjectDirectory("D:/Users/dev/app", "C:\\Users\\dev\\app")).toBe(false);
+        // POSIX paths are case-sensitive.
+        expect(sameProjectDirectory("/work/App", "/work/app")).toBe(false);
+    });
+
+    test("an empty directory matches nothing, not even the process's working directory", () => {
+        expect(sameProjectDirectory("", process.cwd())).toBe(false);
+        expect(sameProjectDirectory(process.cwd(), "")).toBe(false);
+        expect(sameProjectDirectory("", "")).toBe(false);
     });
 });

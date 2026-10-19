@@ -54,13 +54,13 @@ type GoldSource =
 	| "primer"
 	| "note";
 
-interface ProjectFixture {
+export interface ProjectFixture {
 	label: string;
 	projectPath: string;
 	sessionId: string;
 }
 
-interface GoldTarget {
+export interface GoldTarget {
 	source: GoldSource;
 	id: number | string;
 	label: string;
@@ -73,23 +73,25 @@ interface GoldTarget {
 	date?: string;
 }
 
-interface QueryFixture {
+export interface QueryFixture {
 	id: string;
 	class: QueryClass;
 	style: string;
 	project: string;
 	query: string;
+	shape?: "prose" | "identifier" | "path" | "exact";
 	controlQuery?: string;
 	expectedFilter?: string;
 	gold: GoldTarget[];
 }
 
-interface Fixture {
+export interface Fixture {
 	version: number;
 	asOf: string;
 	description: string;
 	projects: Record<string, ProjectFixture>;
 	queries: QueryFixture[];
+	rerankSupplementQueries?: QueryFixture[];
 }
 
 type QueryInstructionMode = "config" | "on" | "off";
@@ -105,7 +107,7 @@ interface CliArgs {
 	queryInstructionMode: QueryInstructionMode;
 }
 
-interface SafeHit {
+export interface SafeHit {
 	source: string;
 	id: number | string;
 	score: number;
@@ -278,6 +280,9 @@ Options:
   --opencode-db PATH Live opencode.db path (opened via file: URI mode=ro)
   --skip-p1          Skip the on-the-fly P1-summary probe
   --compare-spaces   Compare qwen primary and Synapse shadow end-to-end
+  --compare-rerank   Paired A/B/C/D spike; requires offline stores under local-ignore
+  --connection-file PATH  subc connection file for the rerank spike
+  --deadline-ms N    Rerank deadline (default 3000)
   --query-instruction on|off
                      Force the model-family query recipe on or off
   --help             Show this help`);
@@ -312,7 +317,7 @@ function applyQueryInstructionMode(
 ): ReturnType<typeof loadPluginConfig> {
 	if (mode === "config" || config.embedding.provider !== "openai-compatible")
 		return config;
-	const embedding = { ...config.embedding } as EmbeddingConfig;
+	const embedding = { ...config.embedding };
 	if (mode === "off") {
 		embedding.query_instruction = false;
 	} else {
@@ -330,12 +335,15 @@ function queryRecipeCacheKey(config: EmbeddingConfig): string {
 	).queryPrefix;
 }
 
-function openReadOnly(path: string): DatabaseType {
+export function openReadOnly(path: string, immutable = false): DatabaseType {
 	if (!existsSync(path)) throw new Error(`Database does not exist: ${path}`);
-	return new Database(`file:${path}?mode=ro`, { readonly: true });
+	// Linux's Bun SQLite build rejects URI filenames, so use its readonly flag with a plain path.
+	// Other builds can mark an offline backup immutable to avoid creating WAL sidecars.
+	const filename = process.platform === "linux" ? path : `file:${path}?mode=ro${immutable ? "&immutable=1" : ""}`;
+	return new Database(filename, { readonly: true });
 }
 
-function loadFixture(path: string): Fixture {
+export function loadFixture(path: string): Fixture {
 	const fixture = JSON.parse(readFileSync(path, "utf8")) as Fixture;
 	if (fixture.version !== 1)
 		throw new Error(`Unsupported fixture version: ${fixture.version}`);
@@ -343,7 +351,7 @@ function loadFixture(path: string): Fixture {
 		throw new Error(`Expected 40-60 queries, found ${fixture.queries.length}`);
 	}
 	const ids = new Set<string>();
-	for (const query of fixture.queries) {
+	for (const query of [...fixture.queries, ...(fixture.rerankSupplementQueries ?? [])]) {
 		if (ids.has(query.id)) throw new Error(`Duplicate query id: ${query.id}`);
 		ids.add(query.id);
 		if (!fixture.projects[query.project]) {
@@ -569,7 +577,7 @@ function auditCoverage(db: DatabaseType, asOf: string): ProjectCoverage[] {
 	);
 }
 
-function validateGolds(
+export function validateGolds(
 	db: DatabaseType,
 	openCodeDb: DatabaseType,
 	fixture: Fixture,
@@ -684,7 +692,7 @@ function validateGolds(
 	return { transcriptChecked, rawMessagesChecked };
 }
 
-function safeResult(result: UnifiedSearchResult): SafeHit {
+export function safeResult(result: UnifiedSearchResult): SafeHit {
 	switch (result.source) {
 		case "compartment":
 			return {
@@ -734,7 +742,7 @@ function safeResult(result: UnifiedSearchResult): SafeHit {
 	}
 }
 
-function resultMatchesGold(result: SafeHit, golds: GoldTarget[]): boolean {
+export function resultMatchesGold(result: SafeHit, golds: GoldTarget[]): boolean {
 	return golds.some((gold) => {
 		if (result.source === gold.source && String(result.id) === String(gold.id))
 			return true;
@@ -779,15 +787,15 @@ function normalizeCosine(score: number): number {
 	return Math.max(0, Math.min(1, (score + 1) / 2));
 }
 
-function rawChunkSearch(
+async function rawChunkSearch(
 	db: DatabaseType,
 	project: ProjectFixture,
 	modelId: string,
 	vector: Float32Array,
 	maxOrdinal: number,
 	limit = 50,
-): RawChunkHit[] {
-	const rows = loadCompartmentChunkEmbeddingsForSearch(
+): Promise<RawChunkHit[]> {
+	const rows = await loadCompartmentChunkEmbeddingsForSearch(
 		db,
 		project.sessionId,
 		project.projectPath,
@@ -1554,7 +1562,7 @@ async function runSpaceComparison(args: {
 			);
 			laneResults[`${space}_memory_hybrid`] = memory.map(safeResult);
 			laneResults[`${space}_commit`] = commits.map(safeResult);
-			laneResults[`${space}_chunk_vector`] = rawChunkSearch(
+			laneResults[`${space}_chunk_vector`] = await rawChunkSearch(
 				db,
 				project,
 				captured.chunkModelId,
@@ -1634,6 +1642,11 @@ async function runSpaceComparison(args: {
 }
 
 async function main(): Promise<void> {
+	if (process.argv.includes("--compare-rerank")) {
+		const { runRerankSpike } = await import("./ctx-search-rerank");
+		await runRerankSpike();
+		return;
+	}
 	const args = parseArgs();
 	const fixture = loadFixture(args.fixturePath);
 	const db = openReadOnly(args.contextDbPath);
@@ -1835,7 +1848,7 @@ async function main(): Promise<void> {
 			const notes = await run(query.query, { sources: ["note"] });
 			const captured = await embedOnce(query.project, query.query);
 			if (!captured) throw new Error(`Query embedding failed for ${query.id}`);
-			const chunkRaw = rawChunkSearch(
+			const chunkRaw = await rawChunkSearch(
 				db,
 				project,
 				snapshot.chunkModelId,
@@ -1847,7 +1860,7 @@ async function main(): Promise<void> {
 				? await embedOnce(query.project, query.controlQuery)
 				: null;
 			const controlChunk = controlCaptured
-				? rawChunkSearch(
+				? await rawChunkSearch(
 						db,
 						project,
 						snapshot.chunkModelId,
@@ -1988,7 +2001,7 @@ async function main(): Promise<void> {
 	}
 }
 
-await main();
+if (import.meta.main) await main();
 // The shared subc client intentionally stays connected for plugin processes.
 // A one-shot comparison has no later work, so terminate after all finally blocks close its databases.
-if (process.argv.includes("--compare-spaces")) process.exit(0);
+if (import.meta.main && (process.argv.includes("--compare-spaces") || process.argv.includes("--compare-rerank"))) process.exit(0);

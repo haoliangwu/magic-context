@@ -24,6 +24,11 @@ use serde_json::{json, Value};
 use subc_client_rs::{CallOptions, ConsumerOptions, RetryBackoff, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
 
+#[path = "support/daemon_checkout.rs"]
+mod daemon_checkout;
+#[path = "support/executable.rs"]
+mod executable_staging;
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const MODULE_ID: &str = "magic-context";
@@ -90,6 +95,9 @@ async fn cereb_full_sync_through_real_daemon() {
     let fixture =
         fs::read(std::env::var("MC_SYNC_PROBE_FIXTURE").expect("fixture required")).unwrap();
     let workspace = workspace_root();
+    if !daemon_checkout::available(&workspace) {
+        return;
+    }
     let daemon_bin = ensure_daemon_binary(&workspace);
     let module_bin = ensure_module_binary();
     let temp_root = TempRoot(unique_temp_dir("mc-full-sync-probe"));
@@ -161,6 +169,9 @@ async fn mc_transform_spine_through_real_daemon() {
     std::env::remove_var(subc_os::LAUNCH_NONCE_FD_ENV);
 
     let workspace = workspace_root();
+    if !daemon_checkout::available(&workspace) {
+        return;
+    }
     // Reuse the lock-pinned daemon and the module Cargo built for this test target.
     let daemon_bin = ensure_daemon_binary(&workspace);
     let module_bin = ensure_module_binary();
@@ -982,6 +993,9 @@ fn daemon_artifacts_are_built_and_copied_once() {
     use std::os::unix::fs::MetadataExt;
 
     let workspace = workspace_root();
+    if !daemon_checkout::available(&workspace) {
+        return;
+    }
     let first = ensure_daemon_build(&workspace);
     let daemon_inode = fs::metadata(&first.daemon).unwrap().ino();
     let cli_inode = fs::metadata(&first.cli).unwrap().ino();
@@ -1058,32 +1072,18 @@ fn dev_named_binary(path: &Path) -> PathBuf {
 
 fn dev_named_binary_as(path: &Path, suffix: &str) -> PathBuf {
     assert!(path.is_file(), "expected binary at {}", path.display());
-    let dev_dir = std::env::temp_dir()
-        .join("magic-context/mc-module-test-binaries")
-        .join(std::process::id().to_string());
-    fs::create_dir_all(&dev_dir).expect("create isolated binary staging directory");
-    let dev_path = dev_dir.join(format!("ckdev-{suffix}"));
-    if path == dev_path.as_path() {
-        return dev_path;
-    }
-    let _ = fs::remove_file(&dev_path);
-    // A copy, never a hard link: on macOS a daemon exec'd through a hard link to
-    // cargo's output was occasionally SIGKILLed at startup, while a copy never was.
-    fs::copy(path, &dev_path)
-        .map(|_| ())
+    let filename = path.file_name().and_then(|name| name.to_str()).unwrap();
+    let identifier = filename
+        .strip_prefix("ckdev-")
+        .map(|name| format!("ck-{}", name.split('-').next().unwrap_or(name)))
+        .unwrap_or_else(|| filename.to_string());
+    executable_staging::stage_executable(path, &format!("ckdev-{suffix}"), &identifier)
         .unwrap_or_else(|error| {
             panic!(
-                "failed to stage test binary {} as {}: {error}",
-                path.display(),
-                dev_path.display()
+                "failed to stage test binary {} as ckdev-{suffix}: {error}",
+                path.display()
             )
-        });
-    assert!(
-        fs::read(path).unwrap() == fs::read(&dev_path).unwrap(),
-        "staged binary must be byte-identical to {}",
-        path.display()
-    );
-    dev_path
+        })
 }
 
 fn workspace_root() -> PathBuf {
@@ -1117,6 +1117,9 @@ async fn mc_pipe_only_supervision_through_real_daemon() {
     };
 
     let workspace = workspace_root();
+    if !daemon_checkout::available(&workspace) {
+        return;
+    }
     let daemon_bin = ensure_daemon_binary(&workspace);
     let module_bin = ensure_module_binary();
     let ck_bin = ensure_daemon_build(&workspace).cli.clone();
@@ -1314,9 +1317,18 @@ impl subc_client_rs::ModuleHandler for CensusRunner {
             .get(&ctx.route_handle().channel)
             .cloned()
             .unwrap();
-        self.observed
-            .send((principal, serde_json::from_slice(&body).unwrap()))
-            .unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // The historian asks the runner which session policies it supports
+        // before it sends. Answer with no optional policies so the following
+        // session.send is the request this census observes.
+        if request["method"] == "role.describe" {
+            return subc_client_rs::HandlerOutcome::Response(
+                serde_json::to_vec(&json!({ "result": {} })).unwrap(),
+            );
+        }
+        // The test stops reading after the first send; later requests from a
+        // retrying historian have no reader and are simply not recorded.
+        let _ = self.observed.send((principal, request));
         // The received request and its daemon-supplied principal prove the
         // route was accepted; no completion or external provider is needed.
         subc_client_rs::HandlerOutcome::Response(
@@ -1364,6 +1376,9 @@ impl Drop for StopSupervisedModule<'_> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hostless_store_init_first_transform_through_real_daemon() {
     let workspace = workspace_root();
+    if !daemon_checkout::available(&workspace) {
+        return;
+    }
     let daemon_bin = ensure_daemon_binary(&workspace);
     let module_bin = ensure_module_binary();
     let parent = std::env::temp_dir().join("magic-context/store-init");

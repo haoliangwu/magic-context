@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+    existsSync,
+    lstatSync,
+    mkdirSync,
+    readFileSync,
+    readlinkSync,
+    realpathSync,
+    writeFileSync,
+} from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getHarness, type HarnessId } from "./harness";
@@ -251,6 +259,54 @@ export function getMagicContextStorageResolution(): MagicContextStorageResolutio
 
 export function getMagicContextStorageDir(): string {
     return getMagicContextStorageResolution().path;
+}
+
+function canonicalizeStoragePath(value: string, seen = new Set<string>()): string {
+    const absolute = path.resolve(value);
+    if (seen.has(absolute)) return absolute;
+    seen.add(absolute);
+
+    try {
+        return realpathSync.native(absolute);
+    } catch {
+        try {
+            if (lstatSync(absolute).isSymbolicLink()) {
+                const target = readlinkSync(absolute);
+                const resolvedTarget = path.isAbsolute(target)
+                    ? target
+                    : path.resolve(path.dirname(absolute), target);
+                return canonicalizeStoragePath(resolvedTarget, seen);
+            }
+        } catch {
+            // The path may not exist yet; resolve the nearest existing parent below.
+        }
+
+        const parent = path.dirname(absolute);
+        if (parent === absolute) return absolute;
+        const resolvedParent = canonicalizeStoragePath(parent, seen);
+        return path.resolve(resolvedParent, path.basename(absolute));
+    }
+}
+
+/** Whether the resolved store is outside the default CortexKit backup directory. */
+export function isMagicContextStorageOutsideEngram(
+    storageDir = getMagicContextStorageDir(),
+    backupDir = path.join(os.homedir(), ".local", "share", "cortexkit", "magic-context"),
+): boolean {
+    const resolvedStorageDir = canonicalizeStoragePath(storageDir);
+    const resolvedBackupDir = canonicalizeStoragePath(backupDir);
+    const relative = path.relative(resolvedBackupDir, resolvedStorageDir);
+    return path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`);
+}
+
+const STORAGE_BACKUP_WARNING_CHECKED = Symbol.for("magic-context.storage-backup-warning-checked");
+
+/** Claim the process-wide startup check so multiple host entries log at most once. */
+export function claimStorageBackupWarningCheck(): boolean {
+    const processState = globalThis as unknown as { [key: symbol]: boolean | undefined };
+    if (processState[STORAGE_BACKUP_WARNING_CHECKED]) return false;
+    processState[STORAGE_BACKUP_WARNING_CHECKED] = true;
+    return true;
 }
 
 let testBackstopStorageDir: string | null = null;

@@ -12,6 +12,19 @@ export function isDreamerRunnable(config: { dreamer?: { disable?: boolean } | nu
     return !!config.dreamer && config.dreamer.disable !== true;
 }
 
+/**
+ * Whether smart notes can work at all: `smart_notes.enabled` is not false AND
+ * the dreamer, which evaluates every smart-note condition, is runnable. A smart
+ * note written without a runnable dreamer would stay parked forever, so the
+ * ctx_note tool definition advertises `surface_condition` only when this holds.
+ */
+export function isSmartNoteSurfaceAvailable(config: {
+    dreamer?: { disable?: boolean } | null;
+    smart_notes?: { enabled?: boolean } | null;
+}): boolean {
+    return config.smart_notes?.enabled !== false && isDreamerRunnable(config);
+}
+
 export function isHistorianRunnable(config: { historian?: { disable?: boolean } | null }): boolean {
     return config.historian?.disable !== true;
 }

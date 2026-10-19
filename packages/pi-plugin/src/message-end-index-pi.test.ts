@@ -1,11 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-session-raw";
-import type { Database } from "@magic-context/core/shared/sqlite";
 import { schedulePiAssistantIndexOnMessageEnd } from "./message-end-index-pi";
 import {
 	convertEntriesToRawMessages,
 	convertPiAssistantEntryById,
 } from "./read-session-pi";
+import { createTestDb } from "./test-utils.test";
 
 type Source =
 	| RawMessage
@@ -21,7 +21,7 @@ function harness() {
 	];
 	const scheduled: Array<{ messageId: string; source: Source }> = [];
 	const schedule = ((
-		_db: Database,
+		_db: unknown,
 		_sessionId: string,
 		messageId: string,
 		source: Source,
@@ -101,7 +101,7 @@ describe("schedulePiAssistantIndexOnMessageEnd", () => {
 		};
 
 		schedulePiAssistantIndexOnMessageEnd(
-			{} as Database,
+			createTestDb(),
 			"ses",
 			ended,
 			session,
@@ -127,7 +127,7 @@ describe("schedulePiAssistantIndexOnMessageEnd", () => {
 		entries.push({ type: "message", id: "entry-assistant", message: ended });
 
 		schedulePiAssistantIndexOnMessageEnd(
-			{} as Database,
+			createTestDb(),
 			"ses",
 			ended,
 			session,
@@ -144,7 +144,7 @@ describe("schedulePiAssistantIndexOnMessageEnd", () => {
 		const { scheduled, schedule, session } = harness();
 
 		schedulePiAssistantIndexOnMessageEnd(
-			{} as Database,
+			createTestDb(),
 			"ses",
 			{ role: "toolResult", toolCallId: "c1", content: [] },
 			session,

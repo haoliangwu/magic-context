@@ -103,6 +103,10 @@ pub fn resolve_log_paths() -> Vec<PathBuf> {
             paths.push(path);
         }
     }
+    let dashboard = std::env::temp_dir().join("dashboard/magic-context/magic-context.log");
+    if !paths.contains(&dashboard) {
+        paths.push(dashboard);
+    }
     if let Some(storage_dir) = resolve_storage_dir() {
         let logs = storage_dir.join("logs");
         for name in [

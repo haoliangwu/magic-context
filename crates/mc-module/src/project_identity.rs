@@ -199,6 +199,210 @@ fn git_root_commit(canonical: &Path) -> Option<String> {
         .min()
 }
 
+/// Environment variables that move or limit where git looks for the repository. With any
+/// of them set, the `.git` found by walking up may not be the one git uses.
+const GIT_LOCATION_ENV_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_CEILING_DIRECTORIES",
+];
+
+/// What one metadata path holds, following symlinks.
+#[derive(PartialEq, Eq)]
+enum EntryKind {
+    File,
+    Directory,
+    Other,
+    Missing,
+    Error,
+}
+
+fn entry_kind(entry: &Path) -> EntryKind {
+    match std::fs::metadata(entry) {
+        Ok(metadata) if metadata.is_file() => EntryKind::File,
+        Ok(metadata) if metadata.is_dir() => EntryKind::Directory,
+        Ok(_) => EntryKind::Other,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => EntryKind::Missing,
+        Err(_) => EntryKind::Error,
+    }
+}
+
+/// A metadata file's text: `Ok(None)` when it does not exist, `Err` when it cannot be read.
+fn read_metadata_text(file: &Path) -> Result<Option<String>, ()> {
+    match std::fs::read(file) {
+        Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| ()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+/// Drop one trailing line ending, as git does when it reads these one-line files.
+fn strip_line_ending(text: &str) -> &str {
+    text.strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(text)
+}
+
+/// A branch name git itself would accept after `refs/heads/`. Anything stranger is left to
+/// git (reftable repositories, for instance, point HEAD at `refs/heads/.invalid`).
+fn is_plain_branch_name(name: &str) -> bool {
+    if name.is_empty() || name.ends_with('/') || name.ends_with('.') {
+        return false;
+    }
+    if name.contains("..") || name.contains("//") || name.contains("@{") {
+        return false;
+    }
+    // Git refuses control characters, spaces, DEL and these punctuation marks in ref names.
+    if name
+        .chars()
+        .any(|c| (c as u32) <= 0x20 || c == '\u{7f}' || "~^:?*[\\".contains(c))
+    {
+        return false;
+    }
+    name.split('/')
+        .all(|component| !component.starts_with('.') && !component.ends_with(".lock"))
+}
+
+/// The nearest `.git` at or above `start`: a `.git` directory as is, or the directory a
+/// `.git` file (linked worktrees, submodules) names on its single `gitdir: <path>` line.
+fn find_git_directory(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    loop {
+        let dot_git = current.join(".git");
+        match entry_kind(&dot_git) {
+            EntryKind::Directory => return Some(dot_git),
+            EntryKind::File => {
+                let text = read_metadata_text(&dot_git).ok()??;
+                let value = strip_line_ending(&text).strip_prefix("gitdir: ")?;
+                if value.is_empty() || value.contains(['\n', '\r']) {
+                    return None;
+                }
+                return Some(node_path_resolve(&current.join(value)));
+            }
+            EntryKind::Missing => {}
+            EntryKind::Other | EntryKind::Error => return None,
+        }
+        let parent = current.parent()?.to_path_buf();
+        if parent == current {
+            return None;
+        }
+        current = parent;
+    }
+}
+
+/// Whether `packed-refs` text lists `reference`; `None` when it has a line this reader
+/// does not understand.
+fn packed_refs_list(text: &str, reference: &str) -> Option<bool> {
+    for raw_line in text.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+            continue;
+        }
+        let (hash, name) = line.split_once(' ')?;
+        let hash_ok = (40..=64).contains(&hash.len())
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !hash_ok || name.is_empty() || name.chars().any(char::is_whitespace) {
+            return None;
+        }
+        if name == reference {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Whether the repository around `directory` (already its real path) has an unborn HEAD,
+/// read from its metadata files without starting git. The host's `isUnbornHeadInLayout`
+/// (`packages/plugin/src/features/magic-context/memory/unborn-head.ts`) applies the same
+/// rules, and `testdata/unborn-head-parity.json` holds the cases both must agree on.
+/// `true` only for the plain layout `git init` leaves: HEAD names a branch under
+/// `refs/heads/` that has no loose ref file and no `packed-refs` line. Anything unusual (a
+/// detached HEAD, reftable or other configured ref storage, unreadable or malformed files)
+/// is `false`, which leaves the question to git.
+fn unborn_head_in_layout(directory: &Path) -> bool {
+    let Some(git_directory) = find_git_directory(directory) else {
+        return false;
+    };
+    // Linked worktrees keep HEAD in their own git directory and share branches, objects
+    // and configuration through the directory named in `commondir`.
+    let common_directory = match read_metadata_text(&git_directory.join("commondir")) {
+        Ok(Some(text)) => {
+            let value = strip_line_ending(&text);
+            if value.is_empty() || value.contains('\n') {
+                return false;
+            }
+            node_path_resolve(&git_directory.join(value))
+        }
+        Ok(None) => git_directory.clone(),
+        Err(()) => return false,
+    };
+
+    // Git only accepts a directory as a repository when it has HEAD, objects and refs.
+    if entry_kind(&git_directory.join("HEAD")) != EntryKind::File
+        || entry_kind(&common_directory.join("objects")) != EntryKind::Directory
+        || entry_kind(&common_directory.join("refs")) != EntryKind::Directory
+    {
+        return false;
+    }
+
+    // Branches stored somewhere other than loose files and packed-refs cannot be read here.
+    if entry_kind(&common_directory.join("reftable")) != EntryKind::Missing {
+        return false;
+    }
+    match read_metadata_text(&common_directory.join("config")) {
+        Ok(Some(text)) if text.to_ascii_lowercase().contains("refstorage") => return false,
+        Ok(_) => {}
+        Err(()) => return false,
+    }
+
+    let Ok(Some(head)) = read_metadata_text(&git_directory.join("HEAD")) else {
+        return false;
+    };
+    let Some(reference) = head.trim_end().strip_prefix("ref: ") else {
+        return false;
+    };
+    let Some(branch) = reference.strip_prefix("refs/heads/") else {
+        return false;
+    };
+    if !is_plain_branch_name(branch) {
+        return false;
+    }
+
+    // Any entry at the branch's loose ref path (a commit id, or something unexpected) is
+    // left to git. Both directories are checked because per-worktree refs live beside HEAD.
+    for base in [&common_directory, &git_directory] {
+        let mut loose = base.clone();
+        loose.extend(reference.split('/'));
+        if entry_kind(&loose) != EntryKind::Missing {
+            return false;
+        }
+    }
+
+    match read_metadata_text(&common_directory.join("packed-refs")) {
+        Ok(Some(text)) => packed_refs_list(&text, reference) == Some(false),
+        Ok(None) => true,
+        Err(()) => false,
+    }
+}
+
+/// Whether `directory` sits in a repository with no commits yet, decided from the
+/// metadata files alone; `false` means "ask git". Asking git first made a slow git start
+/// (a timeout) pause memory for a freshly initialized repository instead of giving it
+/// its directory identity.
+fn unborn_head_on_disk(directory: &Path) -> bool {
+    if GIT_LOCATION_ENV_VARS
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+    {
+        return false;
+    }
+    // Git discovers the repository from the physical working directory.
+    realpath(directory).is_some_and(|real| unborn_head_in_layout(&real))
+}
+
 /// Whether `canonical` is a readable repository whose HEAD has no commit yet, the one git
 /// failure the host answers with a `dir:` identity. The host's test (`hasUnbornHead`):
 /// `git rev-parse --git-dir` succeeds, and `git rev-parse --verify --quiet HEAD` exits 1
@@ -471,6 +675,12 @@ impl ProjectIdentityResolver {
             return Ok(self
                 .remembered(resolved)
                 .unwrap_or_else(|| directory_fallback(resolved)));
+        }
+        if unborn_head_on_disk(resolved) {
+            // Recognized from the metadata files before any git process starts, so a slow
+            // git cannot turn a fresh repository into an unavailable identity. The answer
+            // matches the `has_unborn_head` branch below.
+            return Ok(directory_fallback(resolved));
         }
         if let Some(root) = git_root_commit(resolved) {
             let identity = format!("git:{root}");
@@ -748,6 +958,72 @@ mod tests {
         std::fs::write(repo.join(".git").join("HEAD"), "garbage\n").unwrap();
         let second = ProjectIdentityResolver::with_sidecar_dir(sidecars);
         assert_eq!(second.resolve(&repo.join("sub")).unwrap(), expected);
+    }
+
+    /// Checks this module's unborn-HEAD reading against the repository layouts in
+    /// `testdata/unborn-head-parity.json`, which the host's TypeScript check
+    /// (`isUnbornHeadInLayout`) is tested on too. Both must call the same layouts unborn;
+    /// otherwise a fresh repository would get a `dir:` identity from one side and a
+    /// `git:` identity or a refusal from the other.
+    #[test]
+    fn the_unborn_head_check_matches_the_hosts_parity_cases() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../testdata/unborn-head-parity.json"))
+                .unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert!(cases.len() > 10, "parity cases present");
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let root = realpath(dir.path()).unwrap();
+            for (key, text) in case["entries"].as_object().unwrap() {
+                let mut target = root.clone();
+                target.extend(key.split('/').filter(|part| !part.is_empty()));
+                if key.ends_with('/') {
+                    std::fs::create_dir_all(&target).unwrap();
+                    continue;
+                }
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                let text = text
+                    .as_str()
+                    .unwrap_or_default()
+                    .replace("{root}", &root.to_string_lossy());
+                std::fs::write(&target, text).unwrap();
+            }
+            let mut probe = root.clone();
+            probe.extend(case["probe"].as_str().unwrap().split('/'));
+            assert_eq!(
+                unborn_head_in_layout(&probe),
+                case["unborn"].as_bool().unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    /// A fresh `git init` is read as unborn from its files on disk. Once the first commit
+    /// exists, the files no longer say unborn, so the identity is resolved through git and
+    /// named by the root commit.
+    #[test]
+    fn a_fresh_repository_is_read_as_unborn_until_its_first_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        assert!(unborn_head_on_disk(&repo));
+        let resolver = ProjectIdentityResolver::default();
+        assert_eq!(resolver.resolve(&repo).unwrap(), directory_fallback(&repo));
+        std::fs::write(repo.join("README"), "golden\n").unwrap();
+        git(&repo, &["add", "README"]);
+        git(&repo, &["commit", "-q", "-m", "golden root"]);
+        assert!(!unborn_head_on_disk(&repo));
+        assert_eq!(
+            resolver.resolve(&repo).unwrap(),
+            format!("git:{GOLDEN_ROOT_COMMIT}")
+        );
+        // A branch held only in packed-refs is born.
+        git(&repo, &["pack-refs", "--all"]);
+        assert!(!repo.join(".git/refs/heads/main").exists());
+        assert!(!unborn_head_on_disk(&repo));
     }
 
     #[test]

@@ -103,6 +103,26 @@ const TOOL_HISTORY_GUIDANCE_LIGHT = `Older work is filed off the desk into \`<se
 
 const SMART_NOTE_GUIDANCE_LIGHT = `; a \`surface_condition\` leaves the note with an outside checker that returns it when the condition holds`;
 
+/** Remove smart-note clauses and sections from user guidance when the capability is unavailable. */
+function withoutSmartNoteGuidance(text: string): string {
+    let smartSectionLevel = 0;
+    return text
+        .replace(` ${SMART_NOTE_GUIDANCE}`, "")
+        .replace(SMART_NOTE_GUIDANCE_LIGHT, "")
+        .split("\n")
+        .filter((line) => {
+            const mentionsSmartNotes = /smart[-_ ]notes?|surface_condition|outside checker/i.test(
+                line,
+            );
+            const heading = /^\s*(#{1,6})\s/.exec(line);
+            if (heading && (!smartSectionLevel || heading[1].length <= smartSectionLevel)) {
+                smartSectionLevel = mentionsSmartNotes ? heading[1].length : 0;
+            }
+            return !smartSectionLevel && !mentionsSmartNotes;
+        })
+        .join("\n");
+}
+
 const TEMPORAL_AWARENESS_GUIDANCE_LIGHT = `, \`<!-- +Xm -->\` (time since your last reply)`;
 
 const BASE_INTRO_LIGHT = (
@@ -169,7 +189,9 @@ export function buildMagicContextSection(
     memoryEnabled = true,
     preset: PromptSurfacePreset = "full",
     primaryOverride?: string,
+    smartNotesEnabled = true,
 ): string {
+    dreamerEnabled = dreamerEnabled && smartNotesEnabled;
     // Subagent sessions: minimal §N§ + ctx_reduce mechanics only. Bypasses the
     // long-term-partner frame, memory/search/note guidance, and the reduction
     // taxonomy — none of which apply to a bounded single-task child. Only
@@ -191,10 +213,13 @@ export function buildMagicContextSection(
     const languageGuidance = languageDirective ? `\n\n${languageDirective}` : "";
 
     if (primaryOverride !== undefined) {
-        // A user override owns the complete primary section. Runtime clauses stay
+        // A user override owns primary prose, except for unavailable smart-note clauses. Runtime clauses stay
         // composer-owned so an override cannot suppress temporal guidance, the
         // warning against overly compressed prose, or the language directive.
-        return `${primaryOverride}${temporalOverrideGuidance}${cavemanWarning}${languageGuidance}`;
+        const primary = smartNotesEnabled
+            ? primaryOverride
+            : withoutSmartNoteGuidance(primaryOverride);
+        return `${primary}${temporalOverrideGuidance}${cavemanWarning}${languageGuidance}`;
     }
 
     if (!ctxReduceCallable) {

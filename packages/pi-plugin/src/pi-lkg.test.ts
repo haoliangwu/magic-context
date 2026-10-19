@@ -633,3 +633,31 @@ it("serializes custom output accessors exactly once", () => {
 		harness.coordinator.replay(harness.coordinator.beginPass(args)),
 	).toEqual({ ok: true, messages: [{ role: "user", content: "read-1" }] });
 });
+
+it("LKG own-slot digest reuse stops at a same-id same-length input rewrite", () => {
+	const harness = createHarness();
+	databases.push(harness.db);
+	const capture = (text: string) => {
+		const messages = [message("prefix"), message(text)];
+		const snapshot = harness.coordinator.beginPass({
+			sessionId: "own-digest-rewrite",
+			messages,
+			entryIds: ["one", "two"],
+			modelKey: "test/model",
+			providerKey: "test",
+		});
+		harness.coordinator.captureAppliedPass({
+			snapshot,
+			outputMessages: messages,
+			outputEntryIds: ["one", "two"],
+			cacheBusting: false,
+		});
+		harness.flushCapture();
+		return getSlot("own-digest-rewrite")?.inputContentDigests;
+	};
+	const before = capture("alpha");
+	const after = capture("bravo");
+	expect(before?.length).toBe(2);
+	expect(after?.[0]).toBe(before?.[0] as string);
+	expect(after?.[1]).not.toBe(before?.[1] as string);
+});

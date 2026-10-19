@@ -14,20 +14,18 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      pull-requests: write
+      issues: write
     steps:
-      # Only the trusted base checkout runs; the token can update advisory comments.
+      # Only the trusted base checkout runs. Under pull_request_target the job's own
+      # token gets the write permissions declared above even for fork PRs, so the
+      # advisory comment needs no App key; that key stays private-repo only.
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
           node-version: "24"
-      - name: Mint advisory token
-        id: app_token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
       - name: Check conventional harness twins
         continue-on-error: true
         run: node scripts/harness-coverage-check.mjs
         env:
-          GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}

@@ -28,7 +28,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
+import { noteRawSessionSummaryRowWritten } from "../../hooks/magic-context/read-session-raw";
 import { harnessOwnsOpenCodeStore } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import {
@@ -37,6 +38,14 @@ import {
 } from "../../shared/opencode-db-path";
 import { Database, withoutSqliteTransformPass } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import {
+    invalidateMarkerCandidateBasis,
+    isMarkerCandidateBasisCurrent,
+    type MarkerCandidateBasis,
+    type MarkerCandidatePreparationOptions,
+    prepareMarkerCandidateBasis,
+    readMarkerCandidateBasis,
+} from "./compaction-marker-candidates";
 
 // ── ID Generation ────────────────────────────────────────────────
 
@@ -106,6 +115,7 @@ function runMarkerRemovalTransaction<T>(db: Database, operation: () => T): T {
 /** Time the outer host-store lock, including COMMIT/rollback but not a nested savepoint. */
 function runMarkerWriteTransaction<T>(db: Database, site: string, operation: () => T): T {
     if (db.inTransaction) return db.transaction(operation).immediate();
+    const walBefore = markerWalPages(db);
     const startedAt = performance.now();
     let acquiredAt: number | undefined;
     let workFinishedAt: number | undefined;
@@ -135,9 +145,28 @@ function runMarkerWriteTransaction<T>(db: Database, site: string, operation: () 
             log(
                 `[magic-context] sqlite writer site=${site} db=opencode acquire_ms=${Math.round(acquireMs)} hold_ms=${Math.round(holdMs)} work_ms=${Math.round(workMs)} end_ms=${Math.round(endMs)} outcome=${acquiredAt === undefined ? "not_acquired" : committed ? "committed" : "failed"}`,
             );
+            if (finishedAt - startedAt > 100) {
+                const autoCheckpoint = db.prepare("PRAGMA wal_autocheckpoint").get() as {
+                    wal_autocheckpoint: number;
+                };
+                log(
+                    `[magic-context] compaction-marker slow writer site=${site} acquire_ms=${acquireMs.toFixed(1)} statements_ms=${workMs.toFixed(1)} ${committed ? "commit" : "rollback"}_ms=${endMs.toFixed(1)} wal_autocheckpoint=${autoCheckpoint.wal_autocheckpoint} wal_pages_before=${walBefore ?? "unknown"} wal_pages_after=${markerWalPages(db) ?? "unknown"}`,
+                );
+            }
         } catch {
             // A diagnostic must not turn a committed marker into a failed retry.
         }
+    }
+}
+
+/** Physical WAL frames, not a checkpoint PRAGMA (which would itself backfill). */
+function markerWalPages(db: Database): number | null {
+    try {
+        const row = db.prepare("PRAGMA page_size").get() as { page_size: number };
+        const bytes = statSync(`${getOpenCodeDbPath()}-wal`).size;
+        return Math.max(0, Math.floor((bytes - 32) / (row.page_size + 24)));
+    } catch {
+        return null;
     }
 }
 
@@ -258,6 +287,9 @@ function getWritableOpenCodeDb(purpose: "publication" | "removal" = "publication
         purpose === "removal" ? MARKER_REMOVAL_BUSY_TIMEOUT_MS : MARKER_BUSY_TIMEOUT_MS;
     db.exec(`PRAGMA busy_timeout=${timeoutMs}`);
     db.exec("PRAGMA journal_mode=WAL");
+    // OpenCode owns this WAL and checkpoints it on its own writer. A marker's
+    // three-row commit must not synchronously backfill OpenCode's accumulated WAL.
+    db.exec("PRAGMA wal_autocheckpoint=0");
     if (purpose === "removal") cachedRemovalDb = { path: dbPath, db };
     else cachedWriteDb = { path: dbPath, db };
     return db;
@@ -491,36 +523,38 @@ export interface InjectCompactionMarkerArgs {
     resolvedBoundary?: BoundaryUserMessage;
 }
 
+export const LEGACY_MARKER_LINEAGE_SQL = `SELECT m.id
+    FROM message m
+    WHERE +m.session_id = ? AND m.id IN (SELECT value FROM json_each(?)) AND m.id <> ?
+      AND COALESCE(json_extract(m.data, '$.summary'), 0) = 1
+      AND COALESCE(json_extract(m.data, '$.finish'), '') = 'stop'
+      AND COALESCE(json_extract(m.data, '$.parentID'), '') = ?
+      AND EXISTS (SELECT 1 FROM part p
+        WHERE +p.session_id = m.session_id AND p.message_id = m.id
+          AND COALESCE(json_extract(p.data, '$.type'), '') = 'text'
+          AND COALESCE(json_extract(p.data, '$.text'), '') = ?)`;
+
 function removeLegacyMarkerLineageRows(
     db: Database,
     args: {
         sessionId: string;
         boundaryMessageId: string;
+        candidateIds: readonly string[];
         summaryText: string;
         summaryMessageId: string;
         compactionPartId: string;
     },
 ): void {
+    // Earlier injectCompactionMarker implementations wrote the summary's
+    // time_created as boundaryTime + 1, but imported or rewritten legacy rows
+    // can be skewed or lack a timestamp.
+    // Discover summary IDs off-thread and probe their primary keys; timestamp
+    // causality is not a deletion predicate.
     const legacySummaries = db
-        .prepare(
-            `SELECT m.id
-             FROM message m
-             WHERE m.session_id = ?
-               AND m.id <> ?
-               AND COALESCE(json_extract(m.data, '$.summary'), 0) = 1
-               AND COALESCE(json_extract(m.data, '$.finish'), '') = 'stop'
-               AND COALESCE(json_extract(m.data, '$.parentID'), '') = ?
-               AND EXISTS (
-                   SELECT 1
-                   FROM part p
-                   WHERE +p.session_id = m.session_id
-                     AND p.message_id = m.id
-                     AND COALESCE(json_extract(p.data, '$.type'), '') = 'text'
-                     AND COALESCE(json_extract(p.data, '$.text'), '') = ?
-               )`,
-        )
+        .prepare(LEGACY_MARKER_LINEAGE_SQL)
         .all(
             args.sessionId,
+            JSON.stringify(args.candidateIds),
             args.summaryMessageId,
             args.boundaryMessageId,
             args.summaryText,
@@ -557,6 +591,39 @@ function removeLegacyMarkerLineageRows(
  */
 export function injectCompactionMarker(
     args: InjectCompactionMarkerArgs,
+): CompactionMarkerState | null {
+    return injectCompactionMarkerFromBasis(args);
+}
+
+/** Prepare summary IDs for marker cleanup independently of message-number lookup.
+ * If discovery is unavailable or the store changes during it, return false:
+ * callers keep the existing marker but can still serve the rebuilt history. */
+export async function prepareCompactionMarkerCandidates(
+    sessionId: string,
+    options: MarkerCandidatePreparationOptions = {},
+): Promise<boolean> {
+    if (!harnessOwnsOpenCodeStore()) return true;
+    try {
+        return await prepareMarkerCandidateBasis(getWritableOpenCodeDb(), sessionId, options);
+    } catch (error) {
+        log(
+            `[magic-context] compaction-marker: deferred candidate preparation for ${sessionId}: ${error instanceof Error ? error.message : String(error)}; marker unchanged`,
+        );
+        return false;
+    }
+}
+
+/** Return every summary ID discovered for this session, only while the store is
+ * unchanged. Cleanup probes these primary keys; diagnostics can inspect them. */
+export function getPreparedCompactionMarkerSummaryIds(
+    sessionId: string,
+): readonly string[] | undefined {
+    return readMarkerCandidateBasis(getWritableOpenCodeDb(), sessionId)?.ids;
+}
+
+function injectCompactionMarkerFromBasis(
+    args: InjectCompactionMarkerArgs,
+    validatedBasis?: MarkerCandidateBasis,
 ): CompactionMarkerState | null {
     // Verify OpenCode's schema still matches what our INSERTs expect BEFORE we
     // try to write. If OpenCode shipped a breaking schema change, bail cleanly
@@ -603,12 +670,23 @@ export function injectCompactionMarker(
     });
 
     try {
+        const basis = validatedBasis ?? readMarkerCandidateBasis(db, args.sessionId);
+        if (!basis) return null;
         runMarkerWriteTransaction(db, "compaction-marker-inject", () => {
+            // Candidate IDs were read before acquiring the host writer lock.
+            // Recheck their snapshot before cleanup. Atomic replacement already
+            // checked it before deleting its old marker rows, so its supplied
+            // candidate set is still complete except for those known deletions.
+            if (!validatedBasis && !isMarkerCandidateBasisCurrent(db, basis))
+                throw new Error(
+                    "host store changed after marker candidate preparation; marker unchanged",
+                );
             // A committed insert can outlive a failed context-state write. Remove
             // any stale lineage in the transaction that writes the canonical rows.
             removeLegacyMarkerLineageRows(db, {
                 sessionId: args.sessionId,
                 boundaryMessageId: boundary.id,
+                candidateIds: basis.ids,
                 summaryText: args.summaryText,
                 summaryMessageId: summaryMsgId,
                 compactionPartId,
@@ -643,6 +721,10 @@ export function injectCompactionMarker(
                      time_updated = excluded.time_updated,
                      data = excluded.data`,
             ).run(summaryMsgId, args.sessionId, boundaryTime + 1, boundaryTime + 1, summaryMsgData);
+            // The upsert can turn an existing row into a summary in place, which the
+            // canonical ordinal count does not detect by itself.
+            noteRawSessionSummaryRowWritten(args.sessionId, summaryMsgId);
+            invalidateMarkerCandidateBasis(db, args.sessionId);
 
             db.prepare(
                 `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
@@ -688,7 +770,10 @@ export function injectCompactionMarker(
  */
 export type CompactionMarkerReplacementOutcome =
     | { kind: "committed"; marker: CompactionMarkerState }
+    | { kind: "deferred"; error: Error }
     | { kind: "definitely-no-cut" | "uncertain"; error: Error };
+
+class MarkerCandidateUnavailableError extends Error {}
 
 export function replaceCompactionMarker(
     existing: CompactionMarkerState | null,
@@ -700,14 +785,25 @@ export function replaceCompactionMarker(
     try {
         const db = getWritableOpenCodeDb();
         connection = db;
+        const basis = readMarkerCandidateBasis(db, args.sessionId);
+        if (!basis) {
+            return {
+                kind: "deferred",
+                error: new Error("marker candidate preparation pending; marker unchanged"),
+            };
+        }
         const marker = runMarkerWriteTransaction(db, "compaction-marker-replace", () => {
             entered = true;
+            if (!isMarkerCandidateBasisCurrent(db, basis))
+                throw new MarkerCandidateUnavailableError(
+                    "host store changed after marker candidate preparation; marker unchanged",
+                );
             if (existing) {
                 db.prepare("DELETE FROM part WHERE id = ?").run(existing.summaryPartId);
                 db.prepare("DELETE FROM message WHERE id = ?").run(existing.summaryMessageId);
                 db.prepare("DELETE FROM part WHERE id = ?").run(existing.compactionPartId);
             }
-            const replacement = injectCompactionMarker(args);
+            const replacement = injectCompactionMarkerFromBasis(args, basis);
             if (!replacement) {
                 throw new Error(
                     `failed to inject replacement marker at ordinal ${args.endOrdinal}`,
@@ -718,6 +814,9 @@ export function replaceCompactionMarker(
         });
         return { kind: "committed", marker };
     } catch (error) {
+        // Detect an outdated summary-candidate list before any DELETE. Defer the
+        // marker replacement without discarding the otherwise servable request.
+        if (error instanceof MarkerCandidateUnavailableError) return { kind: "deferred", error };
         log(
             `[magic-context] compaction-marker: atomic replacement failed: ${error instanceof Error ? error.message : String(error)}`,
         );

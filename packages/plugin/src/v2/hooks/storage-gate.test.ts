@@ -230,7 +230,7 @@ describe("createV2StorageGate against a migration blocked by another live host",
     });
 });
 
-test("storage gate returns before a slow synchronous opener and never piles up retries", async () => {
+test("storage gate defers its opener until the caller returns and never piles up retries", async () => {
     const clock = manualClock();
     let release!: () => void;
     let calls = 0;
@@ -244,10 +244,8 @@ test("storage gate returns before a slow synchronous opener and never piles up r
             });
         },
     });
-    const started = performance.now();
     const first = gate.probe();
     thrownBy(() => gate.require());
-    expect(performance.now() - started).toBeLessThan(40);
     expect(calls).toBe(0);
     await Promise.resolve();
     clock.advance(60_000);

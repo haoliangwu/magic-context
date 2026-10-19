@@ -142,10 +142,11 @@ export function recordChildInvocation(input: ChildInvocationRecordInput): number
     // subagent that was only trying to log its token usage.
     if (!input.db) return null;
     const tokens = input.tokens ?? sumTokensFromChildMessages(input.messages ?? []);
-    const model =
-        input.providerId !== undefined || input.modelId !== undefined
-            ? { providerId: input.providerId ?? null, modelId: input.modelId ?? null }
-            : findLastAssistantModel(input.messages ?? []);
+    const observedModel = findLastAssistantModel(input.messages ?? []);
+    const model = {
+        providerId: input.providerId ?? observedModel.providerId,
+        modelId: input.modelId ?? observedModel.modelId,
+    };
     try {
         return recordSubagentInvocation(input.db, {
             sessionId: input.parentSessionId,

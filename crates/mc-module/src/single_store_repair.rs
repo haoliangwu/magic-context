@@ -763,6 +763,9 @@ fn apply_session(
         }
     }
 
+    // Vector/dims payloads are immutable at a rowid: refreshes delete/insert rows,
+    // while in-place repairs change window_index/project_path/harness. Restore the
+    // backup payload with INSERT rather than updating an existing vector in place.
     let embedding_columns = shared_columns(conn, "compartment_chunk_embeddings")?;
     let embedding_values = embedding_columns
         .iter()

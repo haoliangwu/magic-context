@@ -31,6 +31,7 @@ import {
     getOverflowState,
     getPendingCompactionMarkerState,
     getPendingOps,
+    getStrippedPlaceholderIds,
     getTagById,
     getTagsBySession,
     incrementHistorianFailure,
@@ -48,11 +49,14 @@ import {
     updateTagStatus,
 } from "../../features/magic-context/storage";
 import {
+    appendAutoSearchHintDecision,
     getEmergencyInputSample,
+    getNoteNudgeAnchors,
     type getPersistedCompactionMarkerState,
     setEmergencyDropSample,
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
+import { addNote } from "../../features/magic-context/storage-notes";
 import { createTagger } from "../../features/magic-context/tagger";
 import { recordToolDefinition } from "../../features/magic-context/tool-definition-tokens";
 import {
@@ -71,6 +75,8 @@ import { getActiveCompartmentRun, registerActiveCompartmentRun } from "./compart
 import { createToolExecuteAfterHook } from "./hook-handlers";
 import { injectM0M1 } from "./inject-compartments";
 import { captureSlot, getSlot, resetLkgSlotsForTest } from "./lkg-slot";
+import { onNoteTrigger } from "./note-nudger";
+import { requestPendingMaterialization } from "./pending-materialization";
 import { __ignoredNotificationTest } from "./send-session-notification";
 import { clearMessageTokensCache, createTransform } from "./transform";
 
@@ -108,6 +114,12 @@ type TestMessage = {
     };
     parts: TestPart[];
 };
+
+function userFlushSessions(sessionId: string): Set<string> {
+    const sessions = new Set<string>();
+    requestPendingMaterialization(sessions, sessionId, "user_flush");
+    return sessions;
+}
 
 const tempDirs: string[] = [];
 
@@ -1753,7 +1765,7 @@ describe("createTransform", () => {
         // postprocess `isExplicitFlush`) — that's what gates heuristic
         // execution and `isCacheBustingPass`.
         const flushedHistory = new Set<string>(["ses-compartment-dropped-carrier"]);
-        const flushedMaterialization = new Set<string>(["ses-compartment-dropped-carrier"]);
+        const flushedMaterialization = userFlushSessions("ses-compartment-dropped-carrier");
         replaceAllCompartments(db, "ses-compartment-dropped-carrier", [
             {
                 sequence: 0,
@@ -2219,7 +2231,7 @@ describe("createTransform", () => {
             ]),
             db: openDatabase(),
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>([sessionId]),
+            pendingMaterializationSessions: userFlushSessions(sessionId),
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: 0,
@@ -2316,9 +2328,9 @@ describe("createTransform", () => {
             });
         }
         queuePendingOp(db, "ses-1", 1, "drop");
-        pendingMaterializationSessions.add("ses-1");
+        requestPendingMaterialization(pendingMaterializationSessions, "ses-1", "user_flush");
         queuePendingOp(db, "ses-1", 2, "drop");
-        pendingMaterializationSessions.add("ses-1");
+        requestPendingMaterialization(pendingMaterializationSessions, "ses-1", "user_flush");
         shouldExecute.mockImplementation(() => "execute");
 
         const secondPass: TestMessage[] = [
@@ -2402,7 +2414,7 @@ describe("createTransform", () => {
         // Three-set refactor: flush simulation now seeds the persistent
         // pending-materialization signal (read by postprocess as
         // isExplicitFlush) plus history-refresh (consumed by transform).
-        pendingMaterializationSessions.add("ses-1");
+        requestPendingMaterialization(pendingMaterializationSessions, "ses-1", "user_flush");
         historyRefreshSessions.add("ses-1");
 
         const secondPass: TestMessage[] = [
@@ -2700,7 +2712,7 @@ describe("createTransform", () => {
 
         await transform({}, { messages: firstPass });
         queuePendingOp(db, "ses-sub-drop", 2, "drop", Date.now());
-        pendingMaterializationSessions.add("ses-sub-drop");
+        requestPendingMaterialization(pendingMaterializationSessions, "ses-sub-drop", "user_flush");
 
         const secondPass: TestMessage[] = [
             {
@@ -2989,7 +3001,7 @@ describe("createTransform", () => {
         );
         expect(firstTag?.tagNumber).toBe(1);
         queuePendingOp(db, sessionId, 1, "drop");
-        pendingMaterializationSessions.add(sessionId);
+        requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
 
         decision = "execute";
         await transform({}, { messages });
@@ -3022,7 +3034,7 @@ describe("createTransform", () => {
             ]),
             db,
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>(["ses-primary-once"]),
+            pendingMaterializationSessions: userFlushSessions("ses-primary-once"),
             lastHeuristicsTurnId,
             clearReasoningAge: 50,
             protectedTokens: 0,
@@ -3175,7 +3187,7 @@ describe("createTransform", () => {
 
         const db = openDatabase();
         queuePendingOp(db, "ses-multi", 1, "drop");
-        pendingMaterializationSessions.add("ses-multi");
+        requestPendingMaterialization(pendingMaterializationSessions, "ses-multi", "user_flush");
 
         const secondPass: TestMessage[] = [
             {
@@ -3241,7 +3253,7 @@ describe("createTransform", () => {
         const db = openDatabase();
         const assistantTextTag = 2;
         queuePendingOp(db, "ses-think", assistantTextTag, "drop");
-        pendingMaterializationSessions.add("ses-think");
+        requestPendingMaterialization(pendingMaterializationSessions, "ses-think", "user_flush");
         shouldExecute.mockImplementation(() => "execute");
 
         const secondPass: TestMessage[] = [
@@ -4793,7 +4805,7 @@ describe("live transform protected-token window", () => {
             ]),
             db,
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set([options.sessionId]),
+            pendingMaterializationSessions: userFlushSessions(options.sessionId),
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: options.protectedTokens,
@@ -5024,11 +5036,8 @@ for (const generation of ["v1", "v2"] as const) {
                 updatedAt: Date.now(),
                 hasUsageTokens: true,
             });
-            // The trailing output was legally reclaimable at 95%. A later
-            // signed block now freezes that output too, leaving no safe drop.
-            // Holding the unsafe drop never refuses the turn on its own: the
-            // unchanged turn is served, because only a proven final-wire
-            // overflow refuses a request.
+            // The wall cannot reclaim in front of kept signatures. It first
+            // omits every signed block, then applies the queued reduction.
             raw.push({
                 info: {
                     id: "last-thought",
@@ -5040,9 +5049,12 @@ for (const generation of ["v1", "v2"] as const) {
                 parts: [{ type: "reasoning", text: "last immutable thought" }],
             });
             const held = await pass();
-            expect(JSON.stringify(held.slice(0, baseline.length))).toBe(JSON.stringify(baseline));
-            expect(held.at(-1)?.parts).toEqual(raw.at(-1)?.parts);
-            expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toContain(tag.tagNumber);
+            expect(
+                held
+                    .flatMap((message) => message.parts)
+                    .filter((part) => part.type === "reasoning"),
+            ).toHaveLength(0);
+            expect(getPendingOps(db, sessionId)).toHaveLength(0);
             raw.push({
                 info: { id: "next", role: "user", sessionID: sessionId },
                 parts: [{ type: "text", text: "Next real user" }],
@@ -5077,6 +5089,7 @@ for (const { modelID, prefixBound } of [
         const pendingMaterializationSessions = new Set<string>();
         const transform = createTransform({
             db,
+            directory: makeTempDir("primary-thinking-hold-"),
             tagger: createTagger(),
             scheduler: createScheduler({ executeThresholdPercentage: 65 }),
             liveModelBySession: new Map([[sessionId, model]]),
@@ -5133,8 +5146,12 @@ for (const { modelID, prefixBound } of [
             );
         const status = (tag: number) =>
             getTagsBySession(db, sessionId).find((t) => t.tagNumber === tag)?.status;
+        const logs = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
         try {
+            // Cache m[0]/m[1] before signed thinking enters the tool loop.
+            await transform({}, { messages: structuredClone(raw.slice(0, 1)) });
             const baseline = await pass();
+            expect(getOrCreateSessionMeta(db, sessionId).cachedM0Bytes).not.toBeNull();
             const tools = getTagsBySession(db, sessionId)
                 .filter((t) => t.type === "tool")
                 .sort((a, b) => a.tagNumber - b.tagNumber);
@@ -5142,21 +5159,28 @@ for (const { modelID, prefixBound } of [
             const [oldTag, activeTag] = [tools[0]!.tagNumber, tools[1]!.tagNumber];
             queuePendingOp(db, sessionId, oldTag, "drop");
             queuePendingOp(db, sessionId, activeTag, "drop");
+            updateSessionMeta(db, sessionId, { systemPromptHash: "system-after-held-execute" });
             usage.set(sessionId, {
-                usage: { percentage: 76, inputTokens: 76_000 },
+                usage: { percentage: 66, inputTokens: 66_000 },
                 updatedAt: Date.now(),
                 hasUsageTokens: true,
             });
             // A primary applies queued drops on a cache-busting pass; request one.
-            pendingMaterializationSessions.add(sessionId);
+            requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
             const executed = await pass();
             // Either way, the active turn's thinking reaches the provider unchanged.
             expect(activeThinking(executed)).toBe(activeThinking(baseline));
             if (prefixBound) {
-                // Any earlier output edit would invalidate the later signed blocks of
-                // the active turn on this model, so every queued drop waits. (The
-                // busting pass may still trim the oldest thinking gap-free, which
-                // leaves the active blocks valid; that existing behavior is unchanged.)
+                // At 66%, the unfinished thinking turn postpones every prefix edit,
+                // including old thinking removal, until the next real user request.
+                expect(JSON.stringify(executed)).toBe(JSON.stringify(baseline));
+                expect(JSON.stringify(await pass())).toBe(JSON.stringify(baseline));
+                const holds = logs.mock.calls.filter((call) =>
+                    String(call[1]).includes("m[0]/m[1] frozen:"),
+                );
+                expect(holds.map((call) => call[1])).toEqual([
+                    "m[0]/m[1] frozen: active thinking turn (prefix-bound model); replaying the frozen prefix and deferring any rebuild",
+                ]);
                 expect(JSON.stringify(executed)).toContain("OLD-SPENT");
                 expect(JSON.stringify(executed)).toContain("ACTIVE-SPENT");
                 expect(
@@ -5177,12 +5201,34 @@ for (const { modelID, prefixBound } of [
                 info: { id: "prompt-3", role: "user", sessionID: sessionId },
                 parts: [{ type: "text", text: "third task" }],
             });
-            pendingMaterializationSessions.add(sessionId);
+            requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
             const released = await pass();
             expect(JSON.stringify(released)).not.toContain("OLD-SPENT");
             expect(JSON.stringify(released)).not.toContain("ACTIVE-SPENT");
             expect(getPendingOps(db, sessionId)).toHaveLength(0);
+            expect(getOrCreateSessionMeta(db, sessionId).cachedM0SystemHash).toBe(
+                "system-after-held-execute",
+            );
+            if (prefixBound) {
+                raw.push(step("next-turn-thinking", 6, "NEW"));
+                await pass();
+                await pass();
+                expect(
+                    logs.mock.calls.filter((call) => String(call[1]).includes("m[0]/m[1] frozen:")),
+                ).toHaveLength(2);
+                await transform.clearRustSession(sessionId);
+                await pass();
+                expect(
+                    logs.mock.calls.filter((call) => String(call[1]).includes("m[0]/m[1] frozen:")),
+                ).toHaveLength(3);
+                transform.clearSessionLogState(sessionId);
+                await pass();
+                expect(
+                    logs.mock.calls.filter((call) => String(call[1]).includes("m[0]/m[1] frozen:")),
+                ).toHaveLength(4);
+            }
         } finally {
+            logs.mockRestore();
             closeQuietly(db);
         }
     });
@@ -5249,4 +5295,563 @@ it("OpenCode spent drain budget keeps served defer bytes unchanged without histo
     } finally {
         start.mockRestore();
     }
+});
+
+it("a flush in a held signed turn is parked through execute and defer passes and consumed by one release bust", async () => {
+    useTempDataHome("held-flush-standing-permission-");
+    const db = openDatabase();
+    const sessionId = "held-flush-live-sequence";
+    getOrCreateSessionMeta(db, sessionId);
+    updateSessionMeta(db, sessionId, {
+        systemPromptHash: "before",
+        lastResponseTime: Date.now(),
+        cacheTtl: "13h",
+    });
+    const flush = new Set<string>();
+    const usage = new Map([
+        [
+            sessionId,
+            {
+                usage: { percentage: 20, inputTokens: 40000 },
+                updatedAt: Date.now(),
+                hasUsageTokens: true,
+            },
+        ],
+    ]);
+    const transform = createTransform({
+        db,
+        tagger: createTagger(),
+        directory: makeTempDir("held-flush-project-"),
+        scheduler: createScheduler({ executeThresholdPercentage: 65 }),
+        contextUsageMap: usage,
+        liveModelBySession: new Map([
+            [sessionId, { providerID: "anthropic", modelID: "claude-opus-5-5" }],
+        ]),
+        historyRefreshSessions: new Set(),
+        pendingMaterializationSessions: flush,
+        lastHeuristicsTurnId: new Map(),
+        protectedTokens: 4000,
+        clearReasoningAge: 1,
+        keepReasoningTokens: 1,
+        historianRunnable: false,
+    });
+    const source: TestMessage[] = [
+        {
+            info: { id: "old-user", role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "old work" }],
+        },
+    ];
+    const serve = async () => {
+        const messages = structuredClone(source);
+        await transform({}, { messages });
+        return messages;
+    };
+    const logs = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+    try {
+        await serve();
+        for (let n = 0; n < 402; n++)
+            source.push({
+                info: {
+                    id: `old-${n}`,
+                    role: "assistant",
+                    sessionID: sessionId,
+                    providerID: "anthropic",
+                    modelID: "claude-opus-5-5",
+                },
+                parts: [
+                    { type: "reasoning", text: `old signed reasoning ${n}` },
+                    { type: "text", text: `OLD_BODY_${n} `.repeat(4) },
+                ],
+            });
+        source.push(
+            {
+                info: { id: "held-placeholder", role: "assistant", sessionID: sessionId },
+                parts: [{ type: "text", text: "[dropped §903§]" }],
+            },
+            {
+                info: { id: "active-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "continue" }],
+            },
+            {
+                info: {
+                    id: "active-signed",
+                    role: "assistant",
+                    sessionID: sessionId,
+                    providerID: "anthropic",
+                    modelID: "claude-opus-5-5",
+                },
+                parts: [
+                    { type: "reasoning", text: "kept signed thinking" },
+                    { type: "text", text: "current work" },
+                ],
+            },
+        );
+        const baseline = JSON.stringify(await serve());
+        const old = getTagsBySession(db, sessionId).filter(
+            (tag) =>
+                tag.type === "message" &&
+                tag.messageId.startsWith("old-") &&
+                !tag.messageId.startsWith("old-user"),
+        );
+        expect(old).toHaveLength(402);
+        for (const tag of old.slice(0, 33)) queuePendingOp(db, sessionId, tag.tagNumber, "drop");
+        // The placeholder is visible but has no persisted neutralization. Both
+        // held execute and a later explicit-flush defer must leave it that way.
+        expect(getStrippedPlaceholderIds(db, sessionId).has("held-placeholder")).toBe(false);
+        const start = logs.mock.calls.length;
+        usage.set(sessionId, {
+            usage: { percentage: 75.1, inputTokens: 150200 },
+            updatedAt: Date.now(),
+            hasUsageTokens: true,
+        });
+        expect(JSON.stringify(await serve())).toBe(baseline);
+        expect(getPendingOps(db, sessionId)).toHaveLength(33);
+        expect(
+            getTagsBySession(db, sessionId)
+                .filter((tag) =>
+                    old.slice(0, 33).some((pending) => pending.tagNumber === tag.tagNumber),
+                )
+                .filter((tag) => tag.status === "active"),
+        ).toHaveLength(33);
+        expect(getStrippedPlaceholderIds(db, sessionId).has("held-placeholder")).toBe(false);
+        requestPendingMaterialization(flush, sessionId, "user_flush");
+        updateSessionMeta(db, sessionId, { systemPromptHash: "after" });
+        expect(JSON.stringify(await serve())).toBe(baseline);
+        expect(getPendingOps(db, sessionId)).toHaveLength(33);
+        for (const tag of old.slice(33, 401)) queuePendingOp(db, sessionId, tag.tagNumber, "drop");
+        usage.set(sessionId, {
+            usage: { percentage: 40, inputTokens: 80000 },
+            updatedAt: Date.now(),
+            hasUsageTokens: true,
+        });
+        for (let pass = 0; pass < 3; pass++) {
+            expect(JSON.stringify(await serve())).toBe(baseline);
+            expect(getPendingOps(db, sessionId)).toHaveLength(401);
+            expect(getStrippedPlaceholderIds(db, sessionId).has("held-placeholder")).toBe(false);
+        }
+        expect(flush.has(sessionId)).toBe(true);
+        const heldLogs = logs.mock.calls.slice(start).map((args) => String(args[1]));
+        expect(
+            heldLogs.some((line) =>
+                /WILL APPLY|WILL RUN|reasoning removal: froze|proactive thinking strip:|neutralized \d+ dropped/.test(
+                    line,
+                ),
+            ),
+        ).toBe(false);
+        expect(
+            logs.mock.calls.filter((args) =>
+                String(args[1]).includes("m[0]/m[1] frozen: active thinking turn"),
+            ),
+        ).toHaveLength(1);
+        source.push({
+            info: { id: "next-user", role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "next task" }],
+        });
+        const released = JSON.stringify(await serve());
+        expect(released).not.toBe(baseline);
+        expect(getPendingOps(db, sessionId)).toHaveLength(0);
+        expect(flush.has(sessionId)).toBe(false);
+        expect(getStrippedPlaceholderIds(db, sessionId).has("held-placeholder")).toBe(true);
+        for (let pass = 0; pass < 3; pass++) expect(JSON.stringify(await serve())).toBe(released);
+        expect(
+            logs.mock.calls
+                .slice(start)
+                .filter((args) =>
+                    String(args[1]).includes(
+                        "pending ops WILL APPLY — reason=pending_materialization",
+                    ),
+                ),
+        ).toHaveLength(1);
+    } finally {
+        logs.mockRestore();
+        db.close();
+    }
+}, 30_000);
+
+for (const trigger of ["wall", "final fit"] as const)
+    for (const outcome of ["fits", "still too large"] as const) {
+        it(`OpenCode ${trigger} strips kept thinking before emergency reclaim and ${outcome}`, async () => {
+            const fitModel = "unit-opus-5-5";
+            useTempDataHome("signed-emergency-fit-");
+            const db = openDatabase();
+            const sessionId = `signed-fit-${trigger}-${outcome}`;
+            getOrCreateSessionMeta(db, sessionId);
+            updateSessionMeta(db, sessionId, { cacheTtl: "13h", lastResponseTime: Date.now() });
+            const usage = new Map([
+                [
+                    sessionId,
+                    {
+                        usage: { percentage: 20, inputTokens: 20000 },
+                        updatedAt: Date.now(),
+                        hasUsageTokens: true,
+                    },
+                ],
+            ]);
+            const source: TestMessage[] = [
+                {
+                    info: { id: "u0", role: "user", sessionID: sessionId },
+                    parts: [{ type: "text", text: "start" }],
+                },
+            ];
+            const transform = createTransform({
+                db,
+                tagger: createTagger(),
+                directory: makeTempDir("signed-fit-dir-"),
+                scheduler: createScheduler({ executeThresholdPercentage: 65 }),
+                contextUsageMap: usage,
+                historyRefreshSessions: new Set(),
+                pendingMaterializationSessions: new Set(),
+                lastHeuristicsTurnId: new Map(),
+                liveModelBySession: new Map([
+                    [sessionId, { providerID: "anthropic", modelID: fitModel }],
+                ]),
+                clearReasoningAge: 999,
+                protectedTokens: 4000,
+                protectedTools: { read: 0 },
+                historianRunnable: false,
+            });
+            const serve = async () => {
+                const messages = structuredClone(source);
+                await transform({}, { messages });
+                return messages;
+            };
+            try {
+                await serve();
+                source.push({
+                    info: {
+                        id: "old-tool",
+                        role: "assistant",
+                        sessionID: sessionId,
+                        providerID: "anthropic",
+                        modelID: fitModel,
+                    },
+                    parts: [
+                        {
+                            type: "tool",
+                            tool: "read",
+                            callID: "old-call",
+                            state: { status: "completed", output: "small result" },
+                        },
+                    ],
+                });
+                await serve();
+                const tag = getTagsBySession(db, sessionId).find((tag) => tag.type === "tool")!;
+                (source[1].parts[0] as ToolPart).state.output = "RECLAIMABLE ".repeat(60000);
+                source.push(
+                    {
+                        info: { id: "active-user", role: "user", sessionID: sessionId },
+                        parts: [
+                            {
+                                type: "text",
+                                text:
+                                    outcome === "fits"
+                                        ? "continue"
+                                        : "MANDATORY_USER ".repeat(90000),
+                            },
+                        ],
+                    },
+                    {
+                        info: {
+                            id: "active",
+                            role: "assistant",
+                            sessionID: sessionId,
+                            providerID: "anthropic",
+                            modelID: fitModel,
+                        },
+                        parts: [{ type: "reasoning", text: "kept signed thinking" }],
+                    },
+                );
+                queuePendingOp(db, sessionId, tag.tagNumber, "drop");
+                const percentage = trigger === "wall" ? 96 : 75;
+                usage.set(sessionId, {
+                    usage: { percentage, inputTokens: percentage * 1000 },
+                    updatedAt: Date.now(),
+                    hasUsageTokens: true,
+                });
+                if (outcome === "fits") {
+                    const output = await serve();
+                    expect(JSON.stringify(output)).not.toContain("kept signed thinking");
+                    expect(JSON.stringify(output)).not.toContain("RECLAIMABLE");
+                } else
+                    await expect(serve()).rejects.toMatchObject({
+                        name: "EmergencyFailClosedError",
+                    });
+                expect(getPendingOps(db, sessionId)).toHaveLength(0);
+                expect(
+                    getTagsBySession(db, sessionId).find((row) => row.tagNumber === tag.tagNumber)
+                        ?.status,
+                ).toBe("dropped");
+            } finally {
+                db.close();
+            }
+        }, 30_000);
+    }
+
+describe("sticky nudge request-byte stability", () => {
+    async function fixture(sessionId: string) {
+        useTempDataHome(`sticky-bytes-${sessionId}-`);
+        const db = openDatabase()!;
+        getOrCreateSessionMeta(db, sessionId);
+        const usage = new Map<
+            string,
+            { usage: ContextUsage; updatedAt: number; hasUsageTokens: boolean }
+        >();
+        const directory = makeTempDir("sticky-bytes-project-");
+        const pendingMaterializationSessions = new Set<string>();
+        const transform = createTransform({
+            db,
+            directory,
+            memoryConfig: { enabled: true, injectionBudgetTokens: 500, autoPromote: true },
+            tagger: createTagger(),
+            scheduler: createScheduler({ executeThresholdPercentage: 65 }),
+            liveModelBySession: new Map([
+                [sessionId, { providerID: "anthropic", modelID: "claude-opus-5-5" }],
+            ]),
+            contextUsageMap: usage,
+            clearReasoningAge: 1000,
+            protectedTokens: 0,
+            historyRefreshSessions: new Set(),
+            pendingMaterializationSessions,
+            lastHeuristicsTurnId: new Map(),
+        });
+        const raw: TestMessage[] = [
+            {
+                info: { id: "warm-user", role: "user", sessionID: sessionId },
+                parts: [{ type: "text", text: "Warm the cached prefix" }],
+            },
+        ];
+        const serve = async () => {
+            const messages = structuredClone(raw);
+            await transform({}, { messages });
+            return messages;
+        };
+        await serve();
+        const anchor = "turn-user";
+        raw.push({
+            info: { id: anchor, role: "user", sessionID: sessionId },
+            parts: [{ type: "text", text: "Continue the long task" }],
+        });
+        const hint = "\n\n<ctx-search-hint>saved related fragments</ctx-search-hint>";
+        const saveHint = () =>
+            appendAutoSearchHintDecision(db, sessionId, {
+                messageId: anchor,
+                decision: "hint",
+                text: hint,
+            });
+        const trigger = () => {
+            addNote(db, "session", { sessionId, content: "Resume deferred phone work" });
+            onNoteTrigger(db, sessionId, "historian_complete");
+        };
+        const force = (percentage = 85.2, inputTokens = 742989) =>
+            usage.set(sessionId, {
+                usage: { percentage, inputTokens },
+                updatedAt: Date.now(),
+                hasUsageTokens: true,
+            });
+        return {
+            db,
+            raw,
+            anchor,
+            serve,
+            saveHint,
+            trigger,
+            force,
+            directory,
+            pendingMaterializationSessions,
+        };
+    }
+
+    it("force pass with 224 thinking-held drops cannot first-append a nudge 150 steps back", async () => {
+        const f = await fixture("held-nudge-prefix");
+        const logs = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+        try {
+            f.saveHint();
+            await f.serve();
+            for (let n = 0; n < 150; n++) {
+                f.raw.push({
+                    info: {
+                        id: `loop-${n}`,
+                        role: "assistant",
+                        sessionID: "held-nudge-prefix",
+                        providerID: "anthropic",
+                        modelID: "claude-opus-5-5",
+                    },
+                    parts: [
+                        {
+                            type: "reasoning",
+                            text: `signed thinking ${n}`,
+                            ...{ metadata: { anthropic: { signature: `signature-${n}` } } },
+                        },
+                        ...Array.from({ length: n < 74 ? 2 : 1 }, (_, k) => ({
+                            type: "text" as const,
+                            text: `distinct output ${n}-${k}`,
+                        })),
+                        {
+                            type: "tool",
+                            tool: "read",
+                            callID: `call-${n}`,
+                            state: { status: "completed", output: `result ${n}` },
+                        },
+                    ],
+                });
+            }
+            const baseline = await f.serve();
+            const tools = getTagsBySession(f.db, "held-nudge-prefix").filter(
+                (t) => t.type === "message" && t.messageId.startsWith("loop-"),
+            );
+            expect(tools).toHaveLength(224);
+            for (const tag of tools)
+                queuePendingOp(f.db, "held-nudge-prefix", tag.tagNumber, "drop");
+            for (let note = 0; note < 12; note++)
+                addNote(f.db, "session", {
+                    sessionId: "held-nudge-prefix",
+                    content: `Other deferred item ${note}`,
+                });
+            f.trigger();
+            f.force();
+            const first = await f.serve();
+            f.force(78.6, 685633);
+            const second = await f.serve();
+            expect(getPendingOps(f.db, "held-nudge-prefix")).toHaveLength(224);
+            expect(
+                logs.mock.calls.some((call) => String(call[1]).includes("active_thinking:224")),
+            ).toBe(true);
+            expect(first.find((m) => m.info.id === f.anchor)).toEqual(
+                baseline.find((m) => m.info.id === f.anchor),
+            );
+            expect(JSON.stringify(first)).toBe(JSON.stringify(baseline));
+            expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+            expect(getNoteNudgeAnchors(f.db, "held-nudge-prefix")).toHaveLength(0);
+        } finally {
+            logs.mockRestore();
+            closeQuietly(f.db);
+        }
+    });
+
+    it("first delivery and replay share one order when a hint already occupies the anchor", async () => {
+        const f = await fixture("same-anchor-order");
+        try {
+            f.saveHint();
+            f.trigger();
+            const first = await f.serve();
+            expect(JSON.stringify(first)).toContain("deferred_notes");
+            expect(JSON.stringify(first)).toContain("ctx-search-hint");
+            expect(JSON.stringify(await f.serve())).toBe(JSON.stringify(first));
+        } finally {
+            closeQuietly(f.db);
+        }
+    });
+
+    it("an empty force opportunity cannot rewrite an older user even without signed thinking", async () => {
+        const f = await fixture("empty-force-note");
+        try {
+            f.saveHint();
+            f.raw.push({
+                info: { id: "unsigned-step", role: "assistant", sessionID: "empty-force-note" },
+                parts: [{ type: "text", text: "Still working" }],
+            });
+            const baseline = await f.serve();
+            f.trigger();
+            f.force();
+            expect(JSON.stringify(await f.serve())).toBe(JSON.stringify(baseline));
+            expect(JSON.stringify(await f.serve())).toBe(JSON.stringify(baseline));
+            expect(getNoteNudgeAnchors(f.db, "empty-force-note")).toHaveLength(0);
+        } finally {
+            closeQuietly(f.db);
+        }
+    });
+
+    it("an actual head rewrite can carry a late nudge on an already-served anchor", async () => {
+        const f = await fixture("rewritten-head-note");
+        try {
+            f.saveHint();
+            const baseline = await f.serve();
+            f.trigger();
+            replaceAllCompartments(f.db, "rewritten-head-note", [
+                {
+                    sequence: 0,
+                    startMessage: 0,
+                    endMessage: 0,
+                    startMessageId: "",
+                    endMessageId: "",
+                    title: "Published history",
+                    content: "Newly published context",
+                },
+            ]);
+            insertMemory(f.db, {
+                projectPath: resolveProjectIdentity(f.directory),
+                category: "USER_DIRECTIVES",
+                content: "Distinct newly published project directive",
+            });
+            updateSessionMeta(f.db, "rewritten-head-note", {
+                lastResponseTime: Date.now() - 2 * 60 * 60 * 1000,
+                cacheTtl: "5m",
+            });
+            requestPendingMaterialization(
+                f.pendingMaterializationSessions,
+                "rewritten-head-note",
+                "user_flush",
+            );
+            f.force();
+            const rewritten = await f.serve();
+            expect(JSON.stringify(rewritten[0])).toContain(
+                "Distinct newly published project directive",
+            );
+            expect(rewritten[0]).not.toEqual(baseline[0]);
+            expect(JSON.stringify(rewritten.find((m) => m.info.id === f.anchor))).toContain(
+                "deferred_notes",
+            );
+            expect(JSON.stringify(await f.serve())).toBe(JSON.stringify(rewritten));
+        } finally {
+            closeQuietly(f.db);
+        }
+    });
+
+    it("seeded differential keeps repeated nudge and hint requests byte-identical", async () => {
+        let seed = 0x5eed;
+        const next = () => {
+            seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+            return seed >>> 8;
+        };
+        for (let sample = 0; sample < 12; sample++) {
+            const f = await fixture(`random-sticky-${sample}`);
+            try {
+                if (next() % 3 !== 0) f.saveHint();
+                else
+                    appendAutoSearchHintDecision(f.db, `random-sticky-${sample}`, {
+                        messageId: f.anchor,
+                        decision: "no-hint",
+                        reason: "below-threshold",
+                    });
+                f.trigger();
+                const first = await f.serve();
+                expect(JSON.stringify(first)).toContain("deferred_notes");
+                const steps = 1 + (next() % 8);
+                for (let n = 0; n < steps; n++)
+                    f.raw.push({
+                        info: {
+                            id: `random-${n}`,
+                            role: "assistant",
+                            sessionID: `random-sticky-${sample}`,
+                            providerID: "anthropic",
+                            modelID: "claude-opus-5-5",
+                        },
+                        parts: [
+                            { type: "reasoning", text: `signed ${next()}` },
+                            { type: "text", text: `step ${next()}` },
+                        ],
+                    });
+                if (next() % 2) f.force();
+                const grown = await f.serve();
+                expect(grown.find((m) => m.info.id === f.anchor)).toEqual(
+                    first.find((m) => m.info.id === f.anchor),
+                );
+                for (let replay = 0; replay < 3; replay++) {
+                    expect(JSON.stringify(await f.serve())).toBe(JSON.stringify(grown));
+                }
+            } finally {
+                closeQuietly(f.db);
+            }
+        }
+    }, 30000);
 });

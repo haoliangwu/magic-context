@@ -86,8 +86,6 @@ It records the real upstream status but returns a local HTTP 400 to the host to
 avoid the subscription plugin sleeping/retrying on 429. Locally refused retries
 are counted separately; they consume no model calls.
 
-The first live attempt is documented in
-[`live-opus-55-trim-only-2026-10-04.md`](../../../../docs/reports/live-opus-55-trim-only-2026-10-04.md).
 Both authorized accounts were rate-limited before thinking generation: acceptance,
 trim-only behavior, mixed-edit stripping and cache reads remain **unverified live**.
 
@@ -175,9 +173,7 @@ evidence in `results.json`.
 
 `completed` means every one-shot cell and the restore check were reached, **not**
 that all memory claims were validated. Inspect per-variant status/request IDs and
-transformation diagnostics, particularly the unchanged control. The Oct 7 quota
-block and the Oct 8 insufficient-seed runs are recorded in
-[`live-thinking-trim-opus-5-5.md`](../../../../docs/reports/live-thinking-trim-opus-5-5.md).
+transformation diagnostics, particularly the unchanged control.
 
 ## Local verification
 

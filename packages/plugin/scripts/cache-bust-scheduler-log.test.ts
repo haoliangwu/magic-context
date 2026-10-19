@@ -17,12 +17,12 @@ const log = `[2026-09-20T12:47:52.749Z] [magic-context][${session}] transform sc
 [2026-09-20T12:48:20.605Z] [magic-context][${session}] transform scheduler: percentage=50.8% inputTokens=443412 cacheTtl=never lastResponseTime=1789908499627 decision=defer
 `;
 const execute: CacheBustDecisionAttribution = { timestampMs: Date.parse("2026-09-20T12:47:54.609Z"), decision: "execute", materialized: true, materializeReason: "pressure_refold", emergency: false, droppedTokens: 100, droppedCount: 366, inputTokens: 655813, flush: false, source: "transform_decisions" };
-function fixture() {
+function fixture(marker = true) {
     const dir = mkdtempSync(join(tmpdir(), "scheduler-attribution-")); dirs.push(dir);
     const logPath = join(dir, "mc.log"); writeFileSync(logPath, log);
     for (const [index, timestamp] of [aTime, bTime].entries()) {
         const stem = `${new Date(timestamp).toISOString().replaceAll(":", "-").replace(".", "-")}-00000${index}-${session}`;
-        const messages = [{ role: "user", content: [{ type: "text", text: "[Compacted by magic-context — session history is managed by the plugin]" }] }, { role: "assistant", content: [{ type: "text", text: index ? "rewritten tail" : "old tail", cache_control: { type: "ephemeral" } }] }];
+        const messages = [{ role: "user", content: [{ type: "text", text: marker ? "[Compacted by magic-context — session history is managed by the plugin]" : "stable context" }] }, { role: "assistant", content: [{ type: "text", text: index ? "rewritten tail" : "old tail", cache_control: { type: "ephemeral" } }] }];
         writeFileSync(join(dir, `${stem}.meta.json`), JSON.stringify({ session, createdAt: new Date(timestamp).toISOString() }));
         writeFileSync(join(dir, `${stem}.body.json`), JSON.stringify({ system: [{ type: "text", text: `x-anthropic-billing-header: attempt=${index}` }], messages }));
         writeFileSync(join(dir, `${stem}.response.json`), JSON.stringify({ status: 200, usage: { input_tokens: 2, cache_read_input_tokens: index ? 255750 : 443410, cache_creation_input_tokens: index ? 189320 : 0 } }));
@@ -202,3 +202,23 @@ test("the served execute pass raises no sentinel wake for its window", async () 
     // The window is accounted, so the sentinel emits no wake event at all.
     expect(events).toEqual([]);
 });
+
+for (const released of [true, false]) {
+    test(`Rust safety-release evidence reaches analyzer and sentinel (released=${released})`, async () => {
+        const { dir, logPath } = fixture(false);
+        const reason = released ? "lkg_frozen_release:lkg_unsafe_seam;first_changed=historical#2;materialize_reason=model_change" : "none";
+        writeFileSync(logPath, `[2026-09-20T12:48:24.000Z] [magic-context][${session}] rust pass: decision=${released ? "HARD" : "DEFER"} reason=${reason} in=20 out=20 applied=true\n`);
+        const result = analyzeOpenCodeCacheBustSession({ sessionId: session, anthropicDir: dir, openaiDir: join(dir, "missing"), mcLogPath: logPath });
+        const expected = released ? "accounted_lkg_frozen_release" : "unaccounted_defer_pass";
+        expect(result.requests[1]?.divergenceClass).toBe(expected);
+        const joined = withSchedulerLogFallback([], session, logPath);
+        if (released) expect(joined[0]?.lkgFrozenReleaseReason).toBe("lkg_unsafe_seam;first_changed=historical#2");
+        const events: string[] = [];
+        await runSentinelOnce({ once: true, send: false, intervalMs: 60_000, lookbackMs: 120_000, stateFile: join(dir, "state.json"), databasePath: join(dir, "absent.db"), rustStorePath: join(dir, "absent-rust.db"), connectionFile: join(dir, "absent.json"), wakeModuleId: "prefrontal-core", wakeAgentId: "fixture", wakeFromAgent: "fixture", anthropicDir: dir, openaiDir: join(dir, "missing"), mcLogPath: logPath }, {
+            now: () => bTime + 1000,
+            listActiveSessions: () => [{ sessionId: session, harness: "opencode", projectPath: "fixture", directory: dir, activityMs: bTime }],
+            loadDecisions: () => [], stdout: (line) => events.push(line),
+        });
+        expect(events.some((line) => line.includes('"divergence_class":"unaccounted_defer_pass"'))).toBe(!released);
+    });
+}

@@ -169,6 +169,34 @@ describe("runManagedWrapup", () => {
             closeQuietly(db);
         }
     });
+    it.each([
+        { label: "configured", cap: 65_536, expected: 65_536 },
+        { label: "unset", cap: undefined, expected: undefined },
+    ])("passes the $label historian output cap to wrapup runs", async ({ cap, expected }) => {
+        const db = createDb();
+        const sessionId = `ses-wrapup-output-cap-${String(expected ?? "unset")}`;
+        try {
+            const ctx = baseCtx(db);
+            ctx.historianMaxOutputTokens = cap;
+            const seenCaps: Array<number | undefined> = [];
+            ctx.runCompartmentAgentForWrapup = mock(async (deps) => {
+                seenCaps.push(deps.historianMaxOutputTokens);
+                const start = getLastCompartmentEndMessage(db, sessionId) + 1;
+                appendRange(db, sessionId, start, deps.boundarySnapshot.eligibleEndOrdinal - 1);
+                deps.onCompartmentStatePublished?.(sessionId);
+            });
+
+            const result = await withProvider(sessionId, 6, () =>
+                runManagedWrapup(ctx, sessionId, { messagesToKeep: 2 }),
+            );
+
+            expect(result).toContain("Wrapped up 4 messages into 1 compartment");
+            expect(seenCaps).toEqual([expected]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     it("promotes facts from every non-final wrapup window and skips only the final window", async () => {
         const db = createDb();
         try {

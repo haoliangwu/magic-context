@@ -64,6 +64,15 @@
         "input": {}
     },
     {
+        "class": "accounted_tag_identity_repair",
+        "decision": {
+            "decision": "execute",
+            "canonicalDecision": "execute",
+            "materializeReason": "tag_identity_repair"
+        },
+        "input": {}
+    },
+    {
         "class": "accounted_ctx_reduce",
         "decision": { "decision": "defer", "droppedCount": 2 },
         "input": { "contentEvidence": "assistant tool name=ctx_reduce" }
@@ -131,6 +140,15 @@
         "input": { "precedingDisruption": null }
     },
     {
+        "class": "accounted_lkg_frozen_release",
+        "decision": {
+            "decision": "defer",
+            "canonicalDecision": "defer",
+            "lkgFrozenReleaseReason": "lkg_unsafe_seam"
+        },
+        "input": {}
+    },
+    {
         "class": "unaccounted_defer_pass",
         "decision": { "decision": "defer", "canonicalDecision": "defer" },
         "input": {}
@@ -154,5 +172,38 @@
         "class": "unaccounted_rewrite",
         "decision": { "decision": "unknown", "canonicalDecision": "unknown" },
         "input": { "divergenceIndex": 2, "previousMessageCount": 10 }
+    },
+    {
+        "class": "provider_short_read_after_reclaim",
+        "decision": { "decision": "defer", "canonicalDecision": "defer" },
+        "input": {
+            "providerShortReadWithIdenticalPrefix": true,
+            "previousBustClass": "accounted_execute_published_history"
+        }
+    },
+    {
+        "class": "double_bust_after_reclaim",
+        "decision": { "decision": "defer", "droppedCount": 2 },
+        "input": { "previousBustClass": "accounted_hard_marker_drain" }
+    },
+    {
+        "class": "idle_cache_expiry",
+        "decision": { "decision": "execute", "canonicalDecision": "execute" },
+        "input": {
+            "idleCacheExpiry": true,
+            "missingBreakpointAfterRead": true,
+            "previousBustClass": "accounted_hard_marker_drain"
+        }
+    },
+    {
+        "class": "missing_breakpoint_after_read",
+        "decision": { "decision": "execute", "canonicalDecision": "execute" },
+        "input": {
+            "missingBreakpointAfterRead": true,
+            "providerShortReadWithIdenticalPrefix": true,
+            "providerComparableRead": 47083,
+            "directInput": 474788,
+            "previousTotal": 521668
+        }
     }
 ]

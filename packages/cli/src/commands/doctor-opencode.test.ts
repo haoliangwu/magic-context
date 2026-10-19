@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { gzipSync } from "node:zlib";
 import { REMOVED_AGENT_CONFIG_WARNING } from "@magic-context/core/config/removed-agent-config";
 import {
@@ -30,13 +31,14 @@ import {
     describeOpenCodeDatabaseDoctorCheck,
     findUndeclaredConfiguredVariants,
     formatSharedDbRowCounts,
+    getOpenCodePluginHostStatus,
     getUserNpmrcPath,
     isPinnedOpenCodePluginSpecifier,
     migrateLegacyAgentEnabledConfigForDoctor,
     parseOpenCodeModelCatalog,
     resolveNpmRegistryUrl,
 } from "./doctor-opencode";
-import { clearPluginCache } from "./doctor-opencode-cache";
+import { clearPluginCache, readOpenCodePluginConfigUse } from "./doctor-opencode-cache";
 
 function migrate(input: Record<string, unknown>) {
     const logs: Array<{ level: "success" | "warn"; message: string }> = [];
@@ -59,6 +61,53 @@ describe("OpenCode model catalog parsing", () => {
                 catalog,
             ),
         ).toEqual([{ agent: "historian", model: "provider/model", variant: "medium" }]);
+    });
+    it("checks variants on host catalog models whose IDs contain slashes", () => {
+        const catalog = [
+            { providerID: "openrouter", id: "openrouter/free", variants: { high: {} } },
+        ];
+        expect(
+            findUndeclaredConfiguredVariants(
+                [
+                    { agent: "historian", model: "openrouter/openrouter/free", variant: "medium" },
+                    { agent: "dreamer", model: "openrouter/openrouter/free", variant: "high" },
+                ],
+                catalog,
+            ),
+        ).toEqual([{ agent: "historian", model: "openrouter/openrouter/free", variant: "medium" }]);
+    });
+    it("matches v2 host catalog entries whose model IDs contain slashes, as OpenRouter serves them", () => {
+        const warnings: string[] = [];
+        checkConfiguredVariantCatalog(
+            {
+                historian: { model: "openrouter/openrouter/free" },
+                dreamer: { model: "openrouter/dots-studio/dots-3-note-preview:free" },
+            },
+            "v2",
+            (message) => warnings.push(message),
+            () => ({
+                stdout: JSON.stringify({
+                    location: { directory: "/tmp/project" },
+                    data: [
+                        {
+                            id: "openrouter/free",
+                            modelID: "openrouter/free",
+                            providerID: "openrouter",
+                            variants: [],
+                        },
+                        {
+                            id: "dots-studio/dots-3-note-preview:free",
+                            modelID: "dots-studio/dots-3-note-preview:free",
+                            providerID: "openrouter",
+                            variants: [],
+                        },
+                    ],
+                }),
+                status: 0,
+            }),
+            "/tmp/project",
+        );
+        expect(warnings).toEqual([]);
     });
     it("checks real v2 model.list variant IDs for both missing and declared variants", () => {
         // Captured from OpenCode 2.0.12 in an isolated root with a dummy API key.
@@ -733,6 +782,104 @@ describe("doctor OpenCode 1 plugin cache while OpenCode runs", () => {
     });
 });
 
+describe("doctor OpenCode 1 plugin cache against the config", () => {
+    /** A local Magic Context checkout and an OpenCode config dir, both in a temp tree. */
+    function devCheckout(root: string): { configDir: string; fileUrl: string } {
+        const checkout = join(root, "magic-context", "packages", "plugin");
+        mkdirSync(checkout, { recursive: true });
+        writeFileSync(
+            join(checkout, "package.json"),
+            `${JSON.stringify({ name: OPENCODE_PLUGIN_NAME, version: "0.47.0" })}\n`,
+        );
+        const configDir = join(root, "config");
+        mkdirSync(configDir, { recursive: true });
+        return { configDir, fileUrl: pathToFileURL(checkout).href };
+    }
+
+    it("leaves a stale cache unused, without probing, when the config loads a file:// checkout", async () => {
+        const cacheRoot = makeTempDir("mc-opencode-cache-");
+        originalXdgCacheHome = process.env.XDG_CACHE_HOME;
+        process.env.XDG_CACHE_HOME = cacheRoot;
+        const pluginCachePath = createCachedOpenCodePlugin(cacheRoot, "0.31.2");
+        const { configDir, fileUrl } = devCheckout(cacheRoot);
+        const use = readOpenCodePluginConfigUse(
+            { plugin: [fileUrl, "other-plugin@latest"] },
+            configDir,
+        );
+        expect(use.referencedSpecs.opencode1.size).toBe(0);
+        expect(use.loadedFrom).toEqual({ opencode1: fileUrl, opencode2: fileUrl });
+
+        let probed = false;
+        const result = await clearPluginCache(
+            {
+                force: true,
+                latestVersion: "0.47.0",
+                referencedSpecs: use.referencedSpecs.opencode1,
+            },
+            {
+                probe: () => {
+                    probed = true;
+                    return { status: "in_use", pids: [4242] };
+                },
+            },
+        );
+
+        expect(result).toEqual({
+            action: "unused",
+            path: pluginCachePath,
+            paths: [pluginCachePath],
+            cached: "0.31.2",
+        });
+        expect(probed).toBe(false);
+        expect(existsSync(pluginCachePath)).toBe(true);
+    });
+
+    it("still treats a stale cache as in use when the config loads @latest", async () => {
+        const cacheRoot = makeTempDir("mc-opencode-cache-");
+        originalXdgCacheHome = process.env.XDG_CACHE_HOME;
+        process.env.XDG_CACHE_HOME = cacheRoot;
+        const pluginCachePath = createCachedOpenCodePlugin(cacheRoot, "0.31.2");
+        const use = readOpenCodePluginConfigUse(
+            { plugin: [[OPENCODE_PLUGIN_ENTRY_WITH_VERSION, {}]] },
+            cacheRoot,
+        );
+
+        const result = await clearPluginCache(
+            { latestVersion: "0.47.0", referencedSpecs: use.referencedSpecs.opencode1 },
+            { probe: () => ({ status: "in_use", pids: [4242] }) },
+        );
+
+        expect(result).toMatchObject({ action: "in_use", path: pluginCachePath, cached: "0.31.2" });
+    });
+
+    it("treats the @latest cache as unused when the entry pins a version", async () => {
+        const cacheRoot = makeTempDir("mc-opencode-cache-");
+        originalXdgCacheHome = process.env.XDG_CACHE_HOME;
+        process.env.XDG_CACHE_HOME = cacheRoot;
+        createCachedOpenCodePlugin(cacheRoot, "0.31.2");
+        const use = readOpenCodePluginConfigUse(
+            { plugin: [`${OPENCODE_PLUGIN_NAME}@0.45.0`] },
+            cacheRoot,
+        );
+        expect([...use.referencedSpecs.opencode1]).toEqual(["0.45.0"]);
+
+        const result = await clearPluginCache(
+            { latestVersion: "0.47.0", referencedSpecs: use.referencedSpecs.opencode1 },
+            { probe: noOpenCodeRunning },
+        );
+        expect(result.action).toBe("unused");
+    });
+
+    it("counts only the plugin array for OpenCode 1, and both arrays for OpenCode 2", () => {
+        const use = readOpenCodePluginConfigUse(
+            { plugins: [{ package: OPENCODE_PLUGIN_NAME, options: {} }] },
+            tmpdir(),
+        );
+        expect(use.referencedSpecs.opencode1.size).toBe(0);
+        expect([...use.referencedSpecs.opencode2]).toEqual(["latest"]);
+    });
+});
+
 describe("doctor OpenCode pinned plugin schema fence", () => {
     function configurePinnedPlugin(
         root: string,
@@ -1051,6 +1198,19 @@ it("names the installed OpenCode host and minimum native session API version", (
     expect(describeOpenCode2SessionAPIRequirement("2.0.21")).toBe(
         "OpenCode host 2.0.21; Magic Context requires OpenCode 2.0.22 or newer with session.remove and session.compact.",
     );
+});
+
+it("treats an absent plugin as informational and fails an old installed OpenCode host", () => {
+    expect(getOpenCodePluginHostStatus("OpenCode 2.0.21", "2.0.21", false)).toEqual({
+        status: "info",
+        message:
+            "OpenCode 2.0.21 found; Magic Context is not installed there (run setup to add it)",
+    });
+    expect(getOpenCodePluginHostStatus("OpenCode 2.0.21", "2.0.21", true)).toEqual({
+        status: "fail",
+        message: describeOpenCode2SessionAPIRequirement("2.0.21"),
+    });
+    expect(getOpenCodePluginHostStatus("OpenCode 2.0.22", "2.0.22", true)).toBeNull();
 });
 
 describe("doctor CLI version comparison", () => {

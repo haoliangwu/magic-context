@@ -12,9 +12,10 @@ import { isCoveredBy, OMITTED_BY_DESIGN, RENDERED_PREFIXES } from "./config-fiel
 // drift out of sync again (the bug that left `experimental.*` rendering for a
 // full release after it was graduated).
 //
-// Resolution is intentionally manual: a new schema field must be classified as
-// either RENDERED (add a widget) or OMITTED_BY_DESIGN (raw-JSONC only, with a
-// reason). The test only enforces that the decision was made.
+// Resolution is intentionally manual for active settings: a new schema field
+// must be classified as either RENDERED (add a widget) or OMITTED_BY_DESIGN
+// (raw-JSONC only, with a reason). Schema-deprecated fields stay out of the form
+// without requiring a dashboard-specific coverage entry.
 
 const SCHEMA_PATH = resolve(import.meta.dir, "../../../../../assets/magic-context.schema.json");
 
@@ -52,10 +53,12 @@ function deprecatedSchemaPaths(node: JsonSchemaNode, prefix = ""): string[] {
 }
 
 const OMITTED_PREFIXES = Object.keys(OMITTED_BY_DESIGN);
+const DEPRECATED_PATHS = deprecatedSchemaPaths(loadSchema());
 
 function classify(leaf: string): "rendered" | "omitted" | "uncovered" {
   if (RENDERED_PREFIXES.some((p) => isCoveredBy(leaf, p))) return "rendered";
   if (OMITTED_PREFIXES.some((p) => isCoveredBy(leaf, p))) return "omitted";
+  if (DEPRECATED_PATHS.includes(leaf)) return "omitted";
   return "uncovered";
 }
 
@@ -95,6 +98,8 @@ describe("ConfigEditor ⇄ schema parity", () => {
     const deprecated = deprecatedSchemaPaths(loadSchema());
     expect(deprecated).toContain("protected_tags");
     expect(deprecated).toContain("smart_drops");
+    expect(deprecated).toContain("mural.model");
+    expect(deprecated).toContain("models.window_overlay_path");
     expect(
       deprecated.filter((leaf) =>
         RENDERED_PREFIXES.some((prefix) => isCoveredBy(leaf, prefix) || isCoveredBy(prefix, leaf)),

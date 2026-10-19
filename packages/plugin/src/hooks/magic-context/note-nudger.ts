@@ -36,7 +36,7 @@ export type NoteNudgeTrigger = "historian_complete" | "commit_detected" | "todos
 
 export interface NoteNudgeDeliveryEligibility {
     isFirstServe: boolean;
-    isCacheBustingPass: boolean;
+    prefixRewriteCoversAnchor: boolean;
 }
 
 // A cold observer cannot prove that its input was never served by an earlier
@@ -52,7 +52,9 @@ export function observeNoteNudgeServe(args: {
     userMessageIds: readonly string[];
     anchorMessageId: string | null;
     isLiveTail: boolean;
-    isCacheBustingPass: boolean;
+    /** Already changing provider-visible bytes at or before the target user message,
+     * without invalidating any signed thinking the request must retain. */
+    prefixRewriteCoversAnchor: boolean;
 }): NoteNudgeDeliveryEligibility {
     let sessions = observedUsers.get(args.db);
     if (!sessions) {
@@ -69,7 +71,7 @@ export function observeNoteNudgeServe(args: {
     sessions.set(args.sessionId, seen);
     return {
         isFirstServe: warm && args.isLiveTail && firstServe,
-        isCacheBustingPass: args.anchorMessageId !== null && args.isCacheBustingPass,
+        prefixRewriteCoversAnchor: args.anchorMessageId !== null && args.prefixRewriteCoversAnchor,
     };
 }
 
@@ -128,7 +130,7 @@ export function onNoteTrigger(db: Database, sessionId: string, trigger: NoteNudg
  * Does NOT clear triggerPending — call markNoteNudgeDelivered() after successful placement.
  *
  * @param currentUserMessageId - The user message that will receive the nudge.
- * @param eligibility - Hosts must supply first-serve/cache-bust permission from
+ * @param eligibility - Hosts must supply first-serve/covering-rewrite evidence from
  *   observeNoteNudgeServe on every pass. Trigger-time deferral is retained only
  *   for legacy callers that do not have a wire window.
  * @param projectIdentity - Project identity for resolving ready smart notes.
@@ -156,7 +158,7 @@ export function peekNoteNudgeText(
     // Trigger-time identity is not evidence of first serve. In particular a
     // rebuilt/tagged window may resolve a different user than the raw window.
     // Hosts observe every pass, including those with no pending trigger.
-    if (eligibility && !eligibility.isFirstServe && !eligibility.isCacheBustingPass) {
+    if (eligibility && !eligibility.isFirstServe && !eligibility.prefixRewriteCoversAnchor) {
         sessionLog(
             sessionId,
             "note-nudge: deferring — user already served or first serve unproven",

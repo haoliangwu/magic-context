@@ -24,8 +24,10 @@ import {
     MAP_BATCH_FLOOR_MS,
     type MapMemoriesArgs,
     mapMemories,
+    parseMapMemoriesCompletion,
     selectMapMemoryInputs,
     shouldRequeueIndependentMapping,
+    validateClientMapMemories,
 } from "./map-memories";
 
 const tempDirs: string[] = [];
@@ -168,9 +170,9 @@ describe("mapMemories disposition", () => {
 
             expect(result).toEqual({
                 mapped: 0,
-                independent: 20,
+                independent: 5,
                 batches: 1,
-                remaining: 1,
+                remaining: 16,
                 complete: false,
                 stopReason: "deadline",
             });
@@ -179,13 +181,13 @@ describe("mapMemories disposition", () => {
         }
     });
 
-    test("floors a 12-batch default-deadline backfill and banks its first completed batch", async () => {
+    test("floors a large default-deadline backfill and banks its first completed batch", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:map-floor-primary";
             const dir = tempProject();
-            // 221 memories produce 12 batches. The old even split assigned only
-            // 100 seconds (1,200,000 / 12) to each batch, below the agentic floor.
+            // Even a large backlog must retain the four-minute floor.
+            // Smaller batches change throughput, not the latency allowance.
             const defaultDeadlineMs = 20 * 60 * 1000;
             expect(Math.floor(defaultDeadlineMs / 12)).toBe(100_000);
             expect(computeMapBatchSliceMs(defaultDeadlineMs, 12)).toBe(MAP_BATCH_FLOOR_MS);
@@ -212,13 +214,13 @@ describe("mapMemories disposition", () => {
             expect(promptCalls).toBe(1);
             expect(result).toEqual({
                 mapped: 0,
-                independent: 20,
+                independent: 5,
                 batches: 1,
-                remaining: 201,
+                remaining: 216,
                 complete: false,
                 stopReason: "deadline",
             });
-            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(201);
+            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(216);
         } finally {
             closeQuietly(db);
         }
@@ -249,13 +251,13 @@ describe("mapMemories disposition", () => {
             expect(promptCalls).toBe(1);
             expect(result).toEqual({
                 mapped: 0,
-                independent: 20,
+                independent: 5,
                 batches: 1,
-                remaining: 1,
+                remaining: 16,
                 complete: false,
                 stopReason: "deadline",
             });
-            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(1);
+            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(16);
         } finally {
             closeQuietly(db);
         }
@@ -407,8 +409,8 @@ describe("mapMemories disposition", () => {
             }) as never;
 
             const first = await mapMemories(args);
-            expect(first).toMatchObject({ independent: 20, batches: 1, remaining: 21 });
-            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(21);
+            expect(first).toMatchObject({ independent: 5, batches: 1, remaining: 36 });
+            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(36);
 
             args.deadline = Date.now() + 2 * MAP_BATCH_FLOOR_MS;
             args.client = successfulMapClient() as never;
@@ -416,8 +418,8 @@ describe("mapMemories disposition", () => {
 
             expect(second).toEqual({
                 mapped: 0,
-                independent: 21,
-                batches: 2,
+                independent: 36,
+                batches: 8,
                 remaining: 0,
                 complete: true,
             });
@@ -427,13 +429,13 @@ describe("mapMemories disposition", () => {
         }
     });
 
-    test("commits a 19/20 closed subset and retries only its omitted id", async () => {
+    test("commits a 4/5 closed subset and retries only its omitted id", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:map-omission-retry";
             const dir = tempProject();
             const memoryIds: number[] = [];
-            for (let index = 0; index < 20; index += 1) {
+            for (let index = 0; index < 5; index += 1) {
                 memoryIds.push(
                     insertMemory(db, {
                         projectPath: projectIdentity,
@@ -451,7 +453,7 @@ describe("mapMemories disposition", () => {
                     // truncated, so its returned mappings can commit immediately. Only
                     // its one absent id is present in the retry prompt.
                     expect(ids).toHaveLength(1);
-                    expect(getMemoryVerifications(db, memoryIds).size).toBe(19);
+                    expect(getMemoryVerifications(db, memoryIds).size).toBe(4);
                     expect(getMemoryVerifications(db, ids).has(ids[0] as number)).toBe(false);
                 }
                 const returnedIds = call === 1 ? ids.slice(0, -1) : ids;
@@ -467,15 +469,15 @@ describe("mapMemories disposition", () => {
             const initialPrompt = promptIds[0];
             const retryPrompt = promptIds[1];
             if (!initialPrompt || !retryPrompt) throw new Error("missing prompt fixture");
-            expect(initialPrompt).toHaveLength(20);
+            expect(initialPrompt).toHaveLength(5);
             expect([...initialPrompt].sort((a, b) => a - b)).toEqual(
                 [...memoryIds].sort((a, b) => a - b),
             );
             expect(retryPrompt).toEqual([initialPrompt[initialPrompt.length - 1]]);
-            expect(progress).toEqual([19, 20]);
+            expect(progress).toEqual([4, 5]);
             expect(result).toEqual({
                 mapped: 0,
-                independent: 20,
+                independent: 5,
                 batches: 2,
                 remaining: 0,
                 complete: true,
@@ -485,7 +487,7 @@ describe("mapMemories disposition", () => {
         }
     });
 
-    test("leaves an id omitted again by its targeted retry for the next run", async () => {
+    test("defers an id omitted twice and resumes after backoff", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:map-omission-resume";
@@ -516,9 +518,8 @@ describe("mapMemories disposition", () => {
             if (!initialPrompt || !retryPrompt) throw new Error("missing prompt fixture");
             expect(initialPrompt).toHaveLength(2);
             expect([...initialPrompt].sort((a, b) => a - b)).toEqual([first.id, second.id]);
-            // Mapping prioritizes by the memory query's recency ordering. The retry
-            // contract is that the unreturned id, rather than a fixed prompt position,
-            // is the one left for the next run.
+            // Only the unreturned id is retried. After two omissions it waits
+            // for backoff rather than immediately blocking the next scheduled run.
             expect(retryPrompt).toEqual([second.id]);
             expect(firstResult).toEqual({
                 mapped: 0,
@@ -529,6 +530,9 @@ describe("mapMemories disposition", () => {
             });
             expect(
                 selectMapMemoryInputs(db, projectIdentity, dir).map((memory) => memory.id),
+            ).toEqual([]);
+            expect(
+                selectMapMemoryInputs(db, projectIdentity, dir, true).map((memory) => memory.id),
             ).toEqual([second.id]);
 
             const resumed = mapArgs(db, dir, projectIdentity);
@@ -538,7 +542,15 @@ describe("mapMemories disposition", () => {
             );
             resumed.client = complete.client as never;
 
-            const resumedResult = await mapMemories(resumed);
+            const realNow = Date.now;
+            Date.now = () => realNow() + 3_600_001;
+            resumed.deadline = Date.now() + 300_000;
+            let resumedResult: Awaited<ReturnType<typeof mapMemories>>;
+            try {
+                resumedResult = await mapMemories(resumed);
+            } finally {
+                Date.now = realNow;
+            }
 
             expect(complete.promptIds()).toEqual([[second.id]]);
             expect(resumedResult).toEqual({
@@ -1425,4 +1437,91 @@ test("non-budget mapping rejects a 10/52 manifest without writes", async () => {
     } finally {
         closeQuietly(db);
     }
+});
+
+describe("map-memories whitespace-only output (regression: whitespace must not defeat validation)", () => {
+    const VALID = `<mappings><memory id="1" independent="true"/><memory id="2" files="src/fact.ts"/></mappings>`;
+    const IDS = new Set([1, 2]);
+    const wsMsg = {
+        info: { role: "assistant" },
+        parts: [{ type: "text", text: "\n\n\n\n\n\n\n" }],
+    };
+    const manifestMsg = { info: { role: "assistant" }, parts: [{ type: "text", text: VALID }] };
+    const toolMsg = {
+        info: { role: "assistant" },
+        parts: [{ type: "tool", tool: "grep", state: { status: "completed", input: {} } }],
+    };
+    const ids = (parsed: { id: number }[]) => parsed.map((entry) => entry.id);
+
+    // Hidden completion path (parse: assistantText(completion.messages) || text).
+    test("falls back to completion.text when messages are whitespace-only (the fix)", () => {
+        expect(ids(parseMapMemoriesCompletion(VALID, { messages: [wsMsg] }, IDS))).toEqual([1, 2]);
+    });
+    test("falls back to completion.text when messages are empty", () => {
+        expect(ids(parseMapMemoriesCompletion(VALID, { messages: [] }, IDS))).toEqual([1, 2]);
+    });
+    test("falls back to completion.text for tool-loop messages that carry no text part", () => {
+        expect(ids(parseMapMemoriesCompletion(VALID, { messages: [toolMsg] }, IDS))).toEqual([
+            1, 2,
+        ]);
+    });
+    test("prefers a real manifest carried by messages over completion.text (priority preserved)", () => {
+        const fromMessages = `<mappings><memory id="3" independent="true"/></mappings>`;
+        const parsed = parseMapMemoriesCompletion(
+            "ignored-text",
+            {
+                messages: [
+                    { info: { role: "assistant" }, parts: [{ type: "text", text: fromMessages }] },
+                ],
+            },
+            new Set([3]),
+        );
+        expect(ids(parsed)).toEqual([3]);
+    });
+    test("still rejects when neither messages nor completion.text carry a manifest", () => {
+        expect(() => parseMapMemoriesCompletion("", { messages: [wsMsg] }, IDS)).toThrow();
+    });
+
+    // Client path (validateOutput: assistantText(messages), no completion.text fallback).
+    test("rejects whitespace-only output as 'no output' rather than 'missing complete root' (the fix)", () => {
+        expect(() => validateClientMapMemories([wsMsg], IDS)).toThrow(
+            "map-memories returned no output",
+        );
+    });
+    test("rejects empty output as 'no output'", () => {
+        expect(() => validateClientMapMemories([], IDS)).toThrow("map-memories returned no output");
+    });
+    test("rejects tool-only output as 'no output' (client path has no fallback)", () => {
+        expect(() => validateClientMapMemories([toolMsg], IDS)).toThrow(
+            "map-memories returned no output",
+        );
+    });
+    test("accepts a valid manifest from messages", () => {
+        expect(ids(validateClientMapMemories([manifestMsg], IDS))).toEqual([1, 2]);
+    });
+    test("falls back to completion.text when completion carries no messages field (undefined, not [])", () => {
+        expect(ids(parseMapMemoriesCompletion(VALID, {}, IDS))).toEqual([1, 2]);
+    });
+    test("concatenates multiple text parts and still validates the manifest (un-trimmed join preserved)", () => {
+        const mixed = {
+            info: { role: "assistant" },
+            parts: [
+                { type: "text", text: "\n\n" },
+                { type: "text", text: VALID },
+            ],
+        };
+        expect(ids(parseMapMemoriesCompletion("ignored", { messages: [mixed] }, IDS))).toEqual([
+            1, 2,
+        ]);
+    });
+    test("client path rejects length-capped output before parsing (preserved guard)", () => {
+        const capped = {
+            info: { role: "assistant" },
+            parts: [{ type: "text", text: VALID }],
+            lengthCapped: true,
+        };
+        expect(() => validateClientMapMemories([capped], IDS)).toThrow(
+            "map-memories returned length-capped output",
+        );
+    });
 });

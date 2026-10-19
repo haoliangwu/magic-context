@@ -8,6 +8,7 @@ import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import {
     getMagicContextStorageResolution,
     getProjectMagicContextHistorianDir,
+    isMagicContextStorageOutsideEngram,
 } from "@magic-context/core/shared/data-path";
 import {
     assertOpenCodeStoreGeneration,
@@ -225,7 +226,7 @@ export interface HistorianRunSummary {
     success: number;
     failed: number;
     noop: number;
-    /** Sanitized last failure reason in the window, or empty if none. */
+    /** Sanitized classified reason, marker for a legacy failure with no reason, or empty if none failed. */
     lastFailureReason: string;
     /** ISO timestamp of the most recent run in the window. */
     lastRunAt: string;
@@ -705,16 +706,19 @@ export async function collectHistorianRuns(
         const asNum = (v: unknown): number => (typeof v === "number" ? v : 0);
         return aggRows.map((row) => {
             const sessionId = typeof row.session_id === "string" ? row.session_id : "<unknown>";
+            const failed = asNum(row.failed);
             const rawReason = latestReasonBySession.get(sessionId) ?? "";
             return {
                 sessionId,
                 total: asNum(row.total),
                 success: asNum(row.success),
-                failed: asNum(row.failed),
+                failed,
                 noop: asNum(row.noop),
-                lastFailureReason: sanitizeDiagnosticText(
-                    rawReason.replace(/\s+/g, " ").trim().slice(0, 400),
-                ),
+                lastFailureReason: rawReason.trim()
+                    ? sanitizeDiagnosticText(rawReason.replace(/\s+/g, " ").trim().slice(0, 400))
+                    : failed > 0
+                      ? "no reason recorded (older version)"
+                      : "",
                 lastRunAt:
                     typeof row.last_run_at === "number"
                         ? new Date(row.last_run_at).toISOString()
@@ -863,6 +867,9 @@ export function renderDiagnosticsMarkdown(report: DiagnosticReport): string {
         exists: report.storageDir.exists,
         context_db_size: formatBytes(report.storageDir.contextDbSizeBytes),
     };
+    const storageBackupWarning = isMagicContextStorageOutsideEngram(report.storageDir.path)
+        ? `- Warning: Magic Context storage is at ${sanitizeString(report.storageDir.path)}, outside the folder Engram backs up (~/.local/share/cortexkit/magic-context). It is not included in CortexKit backups.`
+        : null;
 
     const openCodeInstallations = report.opencodeInstallations ?? [];
     const openCodeInstallationTable =
@@ -941,6 +948,7 @@ export function renderDiagnosticsMarkdown(report: DiagnosticReport): string {
         "```",
         "",
         "### Storage",
+        ...(storageBackupWarning ? [storageBackupWarning] : []),
         "```json",
         JSON.stringify(storage, null, 2),
         "```",

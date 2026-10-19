@@ -18,6 +18,7 @@ export function createPiHistorianClient(args: {
 	systemPrompt: string;
 	fallbackModels?: readonly ModelInput[];
 	timeoutMs?: number;
+	maxOutputTokens?: number;
 	thinkingLevel?: string;
 	directory: string;
 	accountingSessionId: string;
@@ -54,6 +55,7 @@ export function createPiHistorianClient(args: {
 			model: modelOverride?.model ?? args.model,
 			fallbackModels: modelOverride ? undefined : args.fallbackModels,
 			timeoutMs: args.timeoutMs,
+			maxOutputTokens: args.maxOutputTokens,
 			cwd: args.directory,
 			// An override is one active attempt. Its missing qualifier deliberately
 			// clears the primary level rather than inheriting it on a bare fallback.

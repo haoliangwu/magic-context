@@ -1,16 +1,23 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { spawn } from "node:child_process";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
-import { updateSessionMeta } from "@magic-context/core/features/magic-context/storage";
+import {
+	getTagsBySession,
+	queuePendingOp,
+	updateSessionMeta,
+} from "@magic-context/core/features/magic-context/storage";
+import * as reasoningStorage from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import {
 	recordOverflowDetected,
 	resetEmergencyRecoveryRegistryForTest,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { __test as decisionLogInternals } from "@magic-context/core/features/magic-context/transform-decision-log";
 import { EmergencyFailClosedError } from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
 import {
+	dropSlot,
 	getInMemorySlot,
 	resetLkgSlotsForTest,
 } from "@magic-context/core/hooks/magic-context/lkg-slot";
@@ -28,9 +35,12 @@ import { contextHost } from "./pi-context-host.test";
 import { reconcilePiLkgEntryIds } from "./pi-lkg";
 import {
 	assistantMessage,
+	assistantToolCall,
 	createFakePi,
 	createTestDb,
 	fakeContext,
+	textOf,
+	toolResultMessage,
 	userMessage,
 } from "./test-utils.test";
 
@@ -89,6 +99,380 @@ describe("Pi context handler LKG replay", () => {
 		tempDirs.length = 0;
 	});
 
+	for (const tailKind of ["prose and result", "two results"] as const) {
+		it(`preserves complete busy recovery bytes on healthy passes (${tailKind})`, async () => {
+			const dir = createTestTempDirFromPath(join(tmpdir(), "pi-lkg-handoff-"));
+			tempDirs.push(dir);
+			const path = join(dir, "context.db");
+			const db = createTestDb(path);
+			const locker = new Database(path);
+			const sessionId = `pi-lkg-handoff-${tailKind}`;
+			sessions.add(sessionId);
+			try {
+				updateSessionMeta(db, sessionId, {
+					piStableIdScheme: 1,
+					systemPromptHash: "sys-v1",
+				});
+				const fake = createFakePi();
+				Object.assign(fake.pi, { getAllTools: () => [] });
+				registerPiContextHandler(fake.pi as never, {
+					db,
+					protectedTags: 0,
+					injection: { injectionBudgetTokens: 10000 },
+					scheduler: { executeThresholdPercentage: 80 },
+				});
+				const handler = fake.handlers.get("context") as PiHandler;
+				let systemPrompt = "Complete system prompt.";
+				const pass = (raw: unknown[], ids: string[]) => {
+					const ctx = fakeContext(sessionId, dir, ids, raw as never);
+					Object.assign(ctx, {
+						getSystemPrompt: () => systemPrompt,
+						model: {
+							provider: "openai-codex",
+							id: "gpt-5.6-sol",
+							contextWindow: 272000,
+							maxTokens: 68000,
+						},
+					});
+					return handler({ messages: raw as never[] }, ctx as never);
+				};
+				const head = [userMessage("original prompt", 1)];
+				if (tailKind === "two results") {
+					const calls = assistantToolCall("call-1", "Read", {}, 2);
+					(calls as { content: unknown[] }).content.push({
+						type: "toolCall",
+						id: "call-2",
+						name: "Read",
+						arguments: {},
+					});
+					head.push(calls);
+				}
+				const headIds = head.map((_, i) => `head-${i}`);
+				const first = await pass(structuredClone(head), headIds);
+				expect(first).toBeDefined();
+				await nextImmediate();
+				updateSessionMeta(db, sessionId, {
+					lastResponseTime: Date.now(),
+					cacheTtl: "59m",
+					lastContextPercentage: 4,
+					lastInputTokens: 4000,
+				});
+				const prose = assistantToolCall("call-1", "Read", {}, 2);
+				(prose as { content: unknown[] }).content.unshift({
+					type: "text",
+					text: "I'll refresh the drafts.",
+				});
+				const tail =
+					tailKind === "two results"
+						? [
+								toolResultMessage("call-1", "Created new file.", 3),
+								toolResultMessage("call-2", "Created new work.", 4),
+							]
+						: [
+								prose,
+								toolResultMessage("call-1", "ca92ad8f\ncommand output", 3),
+							];
+				const raw = [...head, ...tail];
+				const ids = [...headIds, "tail-1", "tail-2"];
+				const tagsBefore = db
+					.query("SELECT * FROM tags WHERE session_id = ? ORDER BY id")
+					.all(sessionId);
+				db.exec("PRAGMA busy_timeout=0");
+				locker.exec("BEGIN IMMEDIATE");
+				const busy = await pass(structuredClone(raw), ids);
+				expect(busy).toBeDefined();
+				if (!busy || !first) throw new Error("Expected served recovery");
+				expect(JSON.stringify(busy.messages)).toBe(
+					JSON.stringify([...first.messages, ...tail]),
+				);
+				expect(
+					db
+						.query("SELECT * FROM tags WHERE session_id = ? ORDER BY id")
+						.all(sessionId),
+				).toEqual(tagsBefore);
+				locker.exec("ROLLBACK");
+				const healthy = await pass(
+					[...structuredClone(raw), userMessage("new turn", 5)],
+					[...ids, "new-1"],
+				);
+				if (!healthy) throw new Error("Expected healthy pass");
+				expect(
+					JSON.stringify(healthy.messages.slice(0, busy.messages.length)),
+				).toBe(JSON.stringify(busy.messages));
+				expect(textOf(healthy.messages.at(-1))).toMatch(/^§\d+§ new turn/);
+				const repeated = await pass(
+					[
+						...structuredClone(raw),
+						userMessage("new turn", 5),
+						userMessage("next turn", 6),
+					],
+					[...ids, "new-1", "new-2"],
+				);
+				expect(
+					JSON.stringify(repeated?.messages.slice(0, healthy.messages.length)),
+				).toBe(JSON.stringify(healthy.messages));
+				for (let passIndex = 0; passIndex < 3; passIndex++)
+					expect(
+						JSON.stringify(
+							(
+								await pass(
+									[
+										...structuredClone(raw),
+										userMessage("new turn", 5),
+										userMessage("next turn", 6),
+									],
+									[...ids, "new-1", "new-2"],
+								)
+							)?.messages,
+						),
+					).toBe(JSON.stringify(repeated?.messages));
+				updateSessionMeta(db, sessionId, { systemPromptHash: "sys-v2" });
+				systemPrompt = "Changed complete system prompt.";
+				const foldRaw = [
+					...structuredClone(raw),
+					userMessage("new turn", 5),
+					userMessage("next turn", 6),
+				];
+				const foldIds = [...ids, "new-1", "new-2"];
+				const folded = await pass(structuredClone(foldRaw), foldIds);
+				const results =
+					folded?.messages.filter(
+						(message) => (message as { role: string }).role === "toolResult",
+					) ?? [];
+				expect(results).toHaveLength(tailKind === "two results" ? 2 : 1);
+				for (const message of results) {
+					expect(textOf(message)).toMatch(/^§\d+§ /);
+					expect(textOf(message).match(/§\d+§/g)).toHaveLength(1);
+				}
+				const decision = decisionLogInternals.getPendingPi(sessionId);
+				expect(decision?.lkgFrozenReleaseReason).toBe(
+					"recovery_tail_normalized",
+				);
+				if (!decision) throw new Error("Expected normalization decision");
+				decisionLogInternals.writeRow(path, {
+					...decision,
+					sessionId,
+					harness: "pi",
+					messageId: "fold-proof",
+				});
+				expect(
+					(
+						db
+							.query(
+								"SELECT materialize_reason FROM transform_decisions WHERE session_id = ?",
+							)
+							.get(sessionId) as { materialize_reason: string }
+					).materialize_reason,
+				).toContain("recovery_tail_normalized");
+				const normalizedTags = getTagsBySession(db, sessionId);
+				expect(
+					JSON.stringify(
+						(await pass(structuredClone(foldRaw), foldIds))?.messages,
+					),
+				).toBe(JSON.stringify(folded?.messages));
+				expect(getTagsBySession(db, sessionId)).toEqual(normalizedTags);
+				const toolTag = getTagsBySession(db, sessionId).find(
+					(tag) => tag.type === "tool" && tag.messageId === "call-1",
+				);
+				if (!toolTag) throw new Error("Expected normalized tool target");
+				queuePendingOp(db, sessionId, toolTag.tagNumber, "drop", 1);
+				updateSessionMeta(db, sessionId, { systemPromptHash: "sys-v3" });
+				systemPrompt = "Third complete system prompt.";
+				await pass(structuredClone(foldRaw), foldIds);
+				expect(
+					getTagsBySession(db, sessionId).find(
+						(tag) => tag.tagNumber === toolTag.tagNumber,
+					)?.status,
+				).toBe("dropped");
+			} finally {
+				if (locker.inTransaction) locker.exec("ROLLBACK");
+				closeQuietly(locker);
+				closeQuietly(db);
+			}
+		});
+	}
+
+	for (const change of [
+		"content mismatch",
+		"branch contraction",
+		"restart",
+		"branch revert",
+		"model switch",
+		"session clear",
+		"other session",
+		"signed restart",
+		"signed content mismatch",
+		"signed active restart",
+		"signed active content mismatch",
+		"signed content mismatch persistence failure",
+		"signed content mismatch multiple completed turns",
+	] as const) {
+		it(`rebuilds an unproven recovery prefix after ${change}`, async () => {
+			const dir = createTestTempDirFromPath(join(tmpdir(), "pi-lkg-unproven-"));
+			tempDirs.push(dir);
+			const db = createTestDb(join(dir, "context.db"));
+			const locker = new Database(join(dir, "context.db"));
+			const sessionId = `pi-lkg-unproven-${change}`;
+			sessions.add(sessionId);
+			try {
+				updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
+				const fake = createFakePi();
+				Object.assign(fake.pi, { getAllTools: () => [] });
+				registerPiContextHandler(fake.pi as never, { db });
+				const handler = fake.handlers.get("context") as PiHandler;
+				let switched = false;
+				let activeSessionId = sessionId;
+				const signed = change.startsWith("signed");
+				const pass = (raw: unknown[], ids: string[]) => {
+					const ctx = fakeContext(activeSessionId, dir, ids, raw as never);
+					Object.assign(ctx, {
+						getSystemPrompt: () => "Complete system.",
+						model: {
+							provider: signed ? "anthropic" : "openai-codex",
+							id: signed
+								? "claude-opus-5-5"
+								: switched
+									? "gpt-5.7"
+									: "gpt-5.6-sol",
+							contextWindow: 272000,
+							maxTokens: 68000,
+						},
+					});
+					return handler({ messages: raw as never[] }, ctx as never);
+				};
+				await pass([userMessage("head", 1)], ["head"]);
+				await nextImmediate();
+				const raw = [userMessage("head", 1), assistantMessage("served raw", 2)];
+				if (signed) {
+					Object.assign(raw[1], {
+						api: "anthropic-messages",
+						provider: "anthropic",
+						model: "claude-opus-5-5",
+					});
+					(raw[1] as { content: unknown[] }).content.unshift({
+						type: "thinking",
+						thinking: "bound thought",
+						thinkingSignature: "signed-proof",
+					});
+					raw.splice(1, 0, assistantMessage("unsigned before signature", 1.5));
+					if (change.includes("multiple")) {
+						const older = assistantMessage("another signed reply", 2.5);
+						(older as { content: unknown[] }).content.unshift({
+							type: "thinking",
+							thinking: "second bound thought",
+							thinkingSignature: "signed-proof-2",
+						});
+						raw.push(older);
+					}
+				}
+				const rawIds = raw.map((_, index) =>
+					index === 0 ? "head" : `tail-${index}`,
+				);
+				db.exec("PRAGMA busy_timeout=0");
+				locker.exec("BEGIN IMMEDIATE");
+				const busy = await pass(structuredClone(raw), rawIds);
+				expect(textOf(busy?.messages.at(-1))).toBe(
+					change.includes("multiple") ? "another signed reply" : "served raw",
+				);
+				locker.exec("ROLLBACK");
+				let nextRaw = raw;
+				let nextIds = rawIds;
+				if (change.includes("content mismatch"))
+					nextRaw = signed
+						? [userMessage("edited head", 1), ...raw.slice(1)]
+						: [raw[0], assistantMessage("edited raw", 2)];
+				if (change === "branch contraction") {
+					nextRaw = raw.slice(1);
+					nextIds = rawIds.slice(1);
+				}
+				if (change === "branch revert") {
+					nextRaw = [raw[0]];
+					nextIds = ["head"];
+				}
+				if (change === "model switch") switched = true;
+				if (change === "session clear") {
+					clearContextHandlerSession(sessionId);
+					dropSlot(sessionId);
+				}
+				if (change === "other session") {
+					activeSessionId = `${sessionId}-different`;
+					sessions.add(activeSessionId);
+				}
+				if (change.includes("restart")) clearContextHandlerSession(sessionId);
+				if (change.includes("persistence failure")) {
+					const omission = spyOn(
+						reasoningStorage,
+						"addMergedReasoningStrippedIds",
+					).mockReturnValue(false);
+					try {
+						await expect(
+							pass(
+								[...structuredClone(nextRaw), userMessage("new turn", 3)],
+								[...nextIds, "new"],
+							),
+						).rejects.toMatchObject({ code: "PI_STORAGE_BUSY" });
+						expect(
+							omission.mock.calls.some((call) =>
+								call[2].includes(
+									reasoningStorage.thinkingBindingRecoveryFrozenId("tail-2"),
+								),
+							),
+						).toBe(true);
+					} finally {
+						omission.mockRestore();
+					}
+					return;
+				}
+				const healthy = await pass(
+					change.includes("active")
+						? structuredClone(nextRaw)
+						: [...structuredClone(nextRaw), userMessage("new turn", 3)],
+					change.includes("active") ? nextIds : [...nextIds, "new"],
+				);
+				expect(JSON.stringify(healthy?.messages)).toContain(
+					change === "content mismatch"
+						? "edited raw"
+						: change === "branch revert"
+							? "new turn"
+							: "served raw",
+				);
+				if (change === "branch revert")
+					expect(JSON.stringify(healthy?.messages)).not.toContain("served raw");
+				if (signed) {
+					expect(JSON.stringify(busy?.messages)).toContain("signed-proof");
+					expect(JSON.stringify(busy?.messages)).toContain(
+						'"text":"unsigned before signature"',
+					);
+					expect(JSON.stringify(healthy?.messages)).not.toContain(
+						"signed-proof",
+					);
+					expect(JSON.stringify(healthy?.messages)).not.toContain(
+						"bound thought",
+					);
+				}
+				if (change === "session clear" || change === "other session") {
+					expect(textOf(healthy?.messages.at(-2))).toMatch(/^§\d+§ served raw/);
+					expect(
+						decisionLogInternals.getPendingPi(activeSessionId)
+							?.lkgFrozenReleaseReason,
+					).toBeUndefined();
+				} else
+					expect(
+						decisionLogInternals.getPendingPi(sessionId)
+							?.lkgFrozenReleaseReason,
+					).toBe(
+						change.includes("restart")
+							? "lkg_restart_rebuild"
+							: "lkg_recovery_input_rebuild",
+					);
+			} finally {
+				if (locker.inTransaction) locker.exec("ROLLBACK");
+				closeQuietly(locker);
+				closeQuietly(db);
+			}
+		});
+	}
+
 	it("admits first Pi turns during bounded background holds without a saved request", async () => {
 		const dir = createTestTempDirFromPath(join(tmpdir(), "pi-bounded-writer-"));
 		tempDirs.push(dir);
@@ -105,46 +489,78 @@ describe("Pi context handler LKG replay", () => {
 				const handler = handlerFor(db, host);
 				// A separate process can release the lock while the main thread waits
 				// synchronously in SQLite. A timer on this thread could not do that.
+				// The holder needs its own busy timeout: its COMMIT can meet a
+				// concurrent reader from the handler, and without one it would die
+				// with SQLITE_BUSY instead of releasing the lock as the scenario needs.
+				// Hold a real cross-process lock until the foreground request encounters it,
+				// then require that request to succeed without replaying previously served bytes.
 				const writer = spawn(
 					process.execPath,
 					[
 						"-e",
 						`import { Database } from 'bun:sqlite';
 					const db = new Database(${JSON.stringify(path)});
+					db.exec('PRAGMA busy_timeout=5000');
 					db.exec('BEGIN IMMEDIATE'); console.log('locked');
-					setTimeout(() => { db.exec('COMMIT'); db.close(); }, 80);`,
+					if ((await Bun.stdin.text()) !== 'RELEASE\\n') throw new Error('missing release signal');
+					db.exec('COMMIT'); db.close(); console.log('committed');`,
 					],
-					{ stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
+					{ stdio: ["pipe", "pipe", "pipe"], windowsHide: true },
 				);
-				const exited = new Promise<void>((resolve, reject) => {
-					writer.once("error", reject);
-					writer.once("exit", (code) =>
-						code === 0 ? resolve() : reject(new Error(`writer exit ${code}`)),
-					);
+				const locked = Promise.withResolvers<void>();
+				let stdout = "";
+				let stderr = "";
+				writer.stdout.on("data", (chunk) => {
+					stdout += chunk.toString();
+					if (stdout.split("\n").includes("locked")) locked.resolve();
+				});
+				writer.stderr.on("data", (chunk) => {
+					stderr += chunk.toString();
+				});
+				const exited = new Promise<{ code: number | null; error?: Error }>(
+					(resolve) => {
+						writer.once("error", (error) => resolve({ code: null, error }));
+						writer.once("close", (code) => resolve({ code }));
+					},
+				);
+				const exec = db.exec.bind(db);
+				let collided = false;
+				const admission = spyOn(db, "exec").mockImplementation((sql) => {
+					try {
+						return exec(sql);
+					} catch (error) {
+						if (sql === "BEGIN IMMEDIATE" && !collided) {
+							collided = true;
+							writer.stdin.end("RELEASE\n");
+						}
+						throw error;
+					}
 				});
 				try {
-					await new Promise<void>((resolve, reject) => {
-						writer.stdout.once("data", () => resolve());
-						writer.once("error", reject);
-					});
+					await Promise.race([
+						locked.promise,
+						exited.then(({ code, error }) => {
+							throw new Error(
+								`writer exited before locked (${code}): ${error ?? ""}\n${stderr}`,
+							);
+						}),
+					]);
 					const raw = [userMessage(`first turn ${trial}`, 1)];
 					const ctx = fakeContext(sessionId, dir, ["entry-1"], raw);
-					const startedAt = performance.now();
 					await host.emit(handler as never, raw, ctx);
-					const elapsedMs = performance.now() - startedAt;
-					if (process.env.MC_BACKGROUND_BENCHMARK === "1")
-						console.info(
-							JSON.stringify({
-								scenario: "first-turn-80ms-holder",
-								trial,
-								turnMs: elapsedMs,
-								refused: host.controller.signal.aborted,
-							}),
-						);
-					expect(elapsedMs).toBeLessThan(1500);
+					expect(collided).toBe(true);
 					if (host.controller.signal.aborted) refused++;
+					// Saving the last-known-good request is queued on the event loop. Finish
+					// that write before another child starts a transaction on this database.
+					await nextImmediate();
 				} finally {
-					await exited;
+					admission.mockRestore();
+					if (!writer.stdin.writableEnded) writer.stdin.end("RELEASE\n");
+					const { code, error } = await exited;
+					expect(code, `writer exit ${code}: ${error ?? ""}\n${stderr}`).toBe(
+						0,
+					);
+					expect(stdout.split("\n")).toContain("committed");
 				}
 			}
 			expect(refused).toBe(0);

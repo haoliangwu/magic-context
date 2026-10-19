@@ -1,4 +1,5 @@
 import { withContentLanguageDirective } from "../../agents/language-directive";
+import { prepareCompactionMarkerCandidates } from "../../features/magic-context/compaction-marker";
 import { embedAndStoreCompartmentChunks } from "../../features/magic-context/compartment-embedding";
 import { insertCompartmentEvents } from "../../features/magic-context/compartment-events";
 import { isCompartmentLeaseHeld } from "../../features/magic-context/compartment-lease";
@@ -6,6 +7,7 @@ import {
     appendCompartments,
     getCompartments,
 } from "../../features/magic-context/compartment-storage";
+import { externalHistorianFailureReason } from "../../features/magic-context/historian-failure-reason";
 import {
     embedPromotedFacts,
     promoteSessionFactsDurable,
@@ -97,25 +99,27 @@ import {
     producerWindowFailureReason,
 } from "./producer-window-guard";
 import {
+    type BoundarySnapshotValidationResult,
     createDefaultBoundarySnapshotForTests,
     describeBoundaryDiagnostics,
     hasRunnableCompartmentWindow,
     recordHighPressureNoEligibleHead,
     resolveOpenCodeProtectedTailBoundary,
     selectPerRunCap,
-    validateBoundarySnapshot,
 } from "./protected-tail-boundary";
+import { validateBoundarySnapshotOffThread } from "./raw-exact-ordinal-read";
 import {
     getRawSessionTagKeysThrough,
     hasRawMessageProvider,
     hasRawSessionMessageById,
+    prepareRawSessionOrdinals,
     readRawSessionMessageOrdinalById,
     readRawSessionMessageRange,
     readSessionChunk,
 } from "./read-session-chunk";
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
-import { isStrictGapHealingMessage } from "./read-session-raw";
+import { isStrictGapHealingMessage, RawOrdinalsNotReady } from "./read-session-raw";
 import { sendStatusNotification } from "./send-session-notification";
 
 const inconsistentProducerWindows = new Set<string>();
@@ -248,6 +252,10 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         providerHistorianChunkTokens,
         producerKey,
     );
+    // A historian run follows a transform pass of the same session, which has
+    // already waited for the canonical ordinal warm-up; this wait is normally
+    // instant and covers a run started any other way.
+    const ordinalsReady = await prepareRawSessionOrdinals(sessionId);
     let completedSuccessfully = false;
     // Set at COMMIT of the publish transaction. From then on the new compartments are
     // durable and already signaled, so a later throw is a failed side step, not a
@@ -280,7 +288,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             subagentInvocationId: invocationId,
             runKind: telemetry.runKind ?? "incremental",
             status: telemetry.status ?? "failed",
-            failureReason: telemetry.failureReason ?? null,
+            failureReason:
+                telemetry.failureReason ??
+                (telemetry.status === "failed" ? "provider_error" : null),
             chunkStartOrdinal: telemetry.chunkStartOrdinal ?? null,
             chunkEndOrdinal: telemetry.chunkEndOrdinal ?? null,
             unprocessedFrom: telemetry.unprocessedFrom ?? null,
@@ -335,9 +345,27 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         }
     };
 
+    // Exact ordinals that are not ready yet are a normal answer, not a historian
+    // failure: this start is skipped without a failure count, notice or backoff,
+    // and the next transform pass that fires the trigger starts it again.
+    let historianRunStarted = false;
+    const deferUntilOrdinalsReady = (reason: string): void => {
+        sessionLog(
+            sessionId,
+            `historian deferred: exact ordinals not ready (${reason}); a later pass starts it again`,
+        );
+        telemetry.status = "noop";
+        telemetry.failureReason = `ordinals_not_ready: ${reason}`;
+        rollbackDrainReservation();
+    };
+
     updateSessionMeta(db, sessionId, { compartmentInProgress: true });
 
     try {
+        if (!ordinalsReady) {
+            deferUntilOrdinalsReady("ordinal warm-up still running");
+            return;
+        }
         const openCodeDbResolution = resolveOpenCodeDbPath();
         if (!openCodeDbPathExists(openCodeDbResolution) && !hasRawMessageProvider(sessionId)) {
             telemetry.status = "noop";
@@ -440,15 +468,22 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             rollbackDrainReservation();
             return;
         }
-        let validation =
-            boundarySnapshot.rawRangeFingerprint.length > 0
-                ? validateBoundarySnapshot({
-                      db,
-                      snapshot: boundarySnapshot,
-                      currentContextLimit:
-                          deps.currentContextLimit ?? boundarySnapshot.contextLimit,
-                  })
-                : { ok: true };
+        let validation: BoundarySnapshotValidationResult = { ok: true };
+        if (boundarySnapshot.rawRangeFingerprint.length > 0) {
+            // The exact id reads scan the session up to each checked ordinal, so
+            // they run on a worker; this run waits for them without blocking the
+            // thread that serves every session.
+            const checked = await validateBoundarySnapshotOffThread({
+                db,
+                snapshot: boundarySnapshot,
+                currentContextLimit: deps.currentContextLimit ?? boundarySnapshot.contextLimit,
+            });
+            if (checked.kind === "not-ready") {
+                deferUntilOrdinalsReady(`boundary validation ${checked.reason}`);
+                return;
+            }
+            validation = checked.result;
+        }
         // In an active session the protected tail's newest message changes every
         // turn (a fresh user/assistant message lands), so a snapshot captured at
         // trigger time goes stale on the "last ordinal id" check by the time the
@@ -543,9 +578,18 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         const producerLimits = { input: producerWindow.inputLimitTokens };
         const producerReserve = producerWindow.maxOutputTokens;
         const projectPath = resolveProjectIdentity(directory ?? process.cwd());
-        const memories = getMemoriesByProject(db, projectPath, ["active", "permanent"]);
+        // Every attempt in the chain (configured fallbacks, then the session
+        // model as the last resort) sends this same prompt, so size it for each
+        // of their windows too, resolved as their pre-send check resolves them.
+        const fallbackWindows = [
+            ...(deps.fallbackModels ?? []).map((entry) => toModelEntry(entry)?.model),
+            deps.fallbackModelId,
+        ]
+            .filter((key): key is string => typeof key === "string" && key !== producerModel)
+            .map((key) => resolveHistorianProducerWindow(key, deps.historianMaxOutputTokens));
         const promptFit = fitHistorianPrompt({
             window: producerWindow,
+            fallbackWindows,
             systemPrompt: withContentLanguageDirective(
                 COMPARTMENT_AGENT_SYSTEM_PROMPT,
                 deps.language,
@@ -555,8 +599,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             chunkStart: Math.max(1, offset),
             lastOrdinal: eligibleEndOrdinal - 1,
             sessionCompartments: priorCompartments,
-            memories,
+            memories: () => getMemoriesByProject(db, projectPath, ["active", "permanent"]),
             memoryEnabled: deps.memoryEnabled !== false,
+            userObservationsRequested: deps.userObservationsRequested,
         });
         if (!promptFit.ok) {
             telemetry.failureReason = promptFit.reason;
@@ -730,6 +775,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         // the active-run registration; a synchronous no-op above never reaches
         // here, so its lingering registration is cleared instead of blocking the
         // same transform pass's pending-op drain.
+        historianRunStarted = true;
         deps.onHistorianRunStarted?.();
 
         // v2 bounded reference model (replaces the unbounded existing_state dump):
@@ -748,6 +794,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             projectMemory: promptFit.projectMemory,
             inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunkText}`,
             memoryEnabled: deps.memoryEnabled !== false,
+            userObservationsRequested: deps.userObservationsRequested,
         });
 
         // Intentional: session.get failure is non-fatal — we fall back to deps.directory
@@ -793,8 +840,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             twoPass: deps.historianTwoPass,
             language: deps.language,
         });
-        // A window refusal here comes from a fallback model (the primary was fitted
-        // above). Treat it like any other failed pass: count it, notify, and keep
+        // A window refusal here comes from a fallback too small to hold even a
+        // minimal prompt (every other chain model was fitted above). Treat it like
+        // any other failed pass: count it, notify, and keep
         // the reserved drain budget spent so the next trigger does not retry at once.
         if (!validatedPass.ok) {
             // Always track historian failures regardless of usage percentage.
@@ -805,7 +853,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 `historian failure: source=validation reason="${validatedPass.error}" chunkRange=${chunk.startIndex}-${chunk.endIndex} fallbackModel=${deps.fallbackModelId ?? "<none>"} twoPass=${deps.historianTwoPass ? "true" : "false"}`,
             );
             const failCount = incrementHistorianFailure(db, sessionId, validatedPass.error);
-            telemetry.failureReason = `validation: ${validatedPass.error}`;
+            telemetry.failureReason = validatedPass.failureReason ?? validatedPass.error;
             await notifyHistorianIssue(buildHistorianFailureNotice(failCount, validatedPass.error));
             return;
         }
@@ -1199,6 +1247,11 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             deps.onDeferredMarkerPending?.(sessionId);
         } else {
             try {
+                if (
+                    !deps.compactionMarkerStrategy?.publish ||
+                    deps.compactionMarkerStrategy.publish === updateCompactionMarkerAfterPublication
+                )
+                    await prepareCompactionMarkerCandidates(sessionId);
                 (deps.compactionMarkerStrategy?.publish ?? updateCompactionMarkerAfterPublication)(
                     db,
                     sessionId,
@@ -1397,13 +1450,19 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             `historian publish completed: compartments=${persistedCompartments.length} range=${offset}-${lastCompartmentEnd}`,
         );
     } catch (error: unknown) {
+        if (error instanceof RawOrdinalsNotReady && !historianRunStarted) {
+            // A bounded read (count, fingerprint or chunk) found its ordinal
+            // ranks still warming. Nothing was sent to the historian yet.
+            deferUntilOrdinalsReady("bounded read refused");
+            return;
+        }
         const desc = describeError(error);
         if (publishCommitted) {
             // The publication is durable and was signaled right after COMMIT. Counting this
             // as a historian failure would warn the user about a run that succeeded and
             // feed the failure backoff.
             telemetry.status = "success";
-            telemetry.failureReason = `post_publish_exception: ${desc.brief}`;
+            telemetry.failureReason = `post_publish_exception: ${externalHistorianFailureReason(error, "exception")}`;
             sessionLog(
                 sessionId,
                 `historian post-publish step failed; publication stands: ${desc.brief}`,
@@ -1411,7 +1470,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             return;
         }
         // Historian runs are fail-closed because they update durable compartment state.
-        telemetry.failureReason = `exception: ${desc.brief}`;
+        telemetry.failureReason = externalHistorianFailureReason(error, "exception");
         sessionLog(
             sessionId,
             `historian failure: source=exception ${desc.brief}${desc.stackHead ? ` stackHead="${desc.stackHead}"` : ""}`,

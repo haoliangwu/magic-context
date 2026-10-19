@@ -1,4 +1,5 @@
 import { refuseBudgetedToolCall } from "../../features/magic-context/dreamer/token-budget";
+import { blockedReadSessionRefusal } from "../../shared/hidden-zen-read";
 import { sessionLog } from "../../shared/logger";
 
 // The pre-fix truncated render kept at most five characters of the original
@@ -255,6 +256,11 @@ export function createDroppedInputToolExecuteBeforeHook() {
         const call = isRecord(input) ? (input as { tool?: unknown; sessionID?: unknown }) : {};
         const args = isRecord(output) ? (output as { args?: unknown }).args : undefined;
         if (typeof call.sessionID === "string") {
+            const disabled = blockedReadSessionRefusal(call.sessionID);
+            if (disabled) {
+                sessionLog(call.sessionID, disabled, { tool: call.tool });
+                throw new Error(disabled);
+            }
             const refusal = refuseBudgetedToolCall(call.sessionID);
             if (refusal) {
                 sessionLog(call.sessionID, "dreamer token budget: tool call refused", {

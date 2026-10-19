@@ -12,6 +12,7 @@ import {
 	setChannel1NudgeState,
 	setChannel2NudgeState,
 } from "@magic-context/core/features/magic-context/storage";
+import { rememberCurrentToolOutputCount } from "@magic-context/core/hooks/magic-context/tail-hygiene-output-count";
 import * as loggerModule from "@magic-context/core/shared/logger";
 import {
 	clearPiChannel1State,
@@ -95,6 +96,9 @@ describe("maybeChannel1ReminderForToolResult", () => {
 				tagNumber: tag_number,
 				toolName: tool_name,
 			}));
+			const currentParts = reclaimableToolOutputParts(
+				reminder.reclaimable_tool_outputs,
+			);
 			for (const hint of hints)
 				insertTag(
 					db,
@@ -113,15 +117,19 @@ describe("maybeChannel1ReminderForToolResult", () => {
 						: reminder.level === "firm"
 							? [reminder.reclaimable_tokens, 200_000]
 							: [reminder.reclaimable_tokens, 120_000];
-				setPiChannel1Baseline(sessionId, {
-					...channel2BaselineFields(baselineU, baselineT),
-					realUserTurnCount: reminder.sticky ? 6 : 1,
-					reducedSinceRefresh: false,
-					baselineParts: reclaimableToolOutputParts(
-						reminder.reclaimable_tool_outputs,
+				setPiChannel1Baseline(
+					sessionId,
+					rememberCurrentToolOutputCount(
+						{
+							...channel2BaselineFields(baselineU, baselineT),
+							realUserTurnCount: reminder.sticky ? 6 : 1,
+							reducedSinceRefresh: false,
+							baselineParts: currentParts,
+							oldestReclaimableToolTags: hints,
+						},
+						{ parts: currentParts },
 					),
-					oldestReclaimableToolTags: hints,
-				});
+				);
 				if (reminder.sticky) {
 					setChannel1NudgeState(db, sessionId, {
 						level: reminder.level ?? "firm",
@@ -138,14 +146,18 @@ describe("maybeChannel1ReminderForToolResult", () => {
 				rendered.push({ id: reminder.id, text: block?.text ?? "" });
 			} else {
 				setChannel2NudgeState(db, sessionId, "pending");
-				setPiChannel1Baseline(sessionId, {
-					...channel2BaselineFields(reminder.reclaimable_tokens, 100_000),
-					reducedSinceRefresh: false,
-					baselineParts: reclaimableToolOutputParts(
-						reminder.reclaimable_tool_outputs,
+				setPiChannel1Baseline(
+					sessionId,
+					rememberCurrentToolOutputCount(
+						{
+							...channel2BaselineFields(reminder.reclaimable_tokens, 100_000),
+							reducedSinceRefresh: false,
+							baselineParts: currentParts,
+							oldestReclaimableToolTags: hints,
+						},
+						{ parts: currentParts },
 					),
-					oldestReclaimableToolTags: hints,
-				});
+				);
 				let text = "";
 				expect(
 					maybeDeliverChannel2Pi(

@@ -1,3 +1,4 @@
+import "./quiet-live-log";
 /**
  * Vendor the historian SYSTEM prompt from the TS source of truth.
  *

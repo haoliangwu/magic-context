@@ -94,6 +94,8 @@ describe("Pi extension tool error reporting", () => {
 		const result = await runReduce("1");
 		expect(result?.isError).toBe(false);
 		expect(result?.content[0]?.type).toBe("text");
-		expect((result?.content[0] as { text: string }).text).toContain("§1§");
+		expect((result?.content[0] as { text: string }).text).toBe(
+			"1 tag stamped.",
+		);
 	});
 });

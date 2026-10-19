@@ -50,6 +50,10 @@ class MergeTests(unittest.TestCase):
         self.git("init", "-b", "master")
         self.git("config", "user.name", "Merge Fixture")
         self.git("config", "user.email", "fixture@example.invalid")
+        scripts = self.repo / "scripts"
+        scripts.mkdir()
+        for name in ("check-cortexkit-layout.sh", "check-docs-layout.sh", "check-docs-layout.test.sh"):
+            (scripts / name).write_text("#!/bin/sh\necho 'Fixture layout check'\n")
         (self.repo / "README.md").write_text("base\n")
         for package in ("plugin", "pi-plugin", "cli"):
             path = self.repo / "packages" / package
@@ -216,19 +220,19 @@ class MergeTests(unittest.TestCase):
         self.assertFalse(self.commands("bun"))
 
     def test_failing_gate_never_merges_or_pushes(self):
-        self.scenario["fail_runner"] = "bun test"
-        self.assert_refused(self.run_script(), "Command failed (exit 7): bun test")
+        self.scenario["fail_runner"] = "bun run test"
+        self.assert_refused(self.run_script(), "Command failed (exit 7): bun run test")
         self.assert_cleaned()
 
     def test_timeout_never_merges_or_pushes(self):
-        self.scenario.update(fail_runner="bun test", runner_status=124)
+        self.scenario.update(fail_runner="bun run test", runner_status=124)
         self.assert_refused(self.run_script(), "Command failed (exit 124)")
         self.assert_cleaned()
 
     def test_install_failure_never_merges_or_pushes(self):
         self.scenario["fail_runner"] = "bun install --frozen-lockfile"
         self.assert_refused(self.run_script(), "Command failed (exit 7)")
-        self.assertFalse(any(item["args"] == ["test"] for item in self.commands("bun")))
+        self.assertFalse(any(item["args"] == ["run", "test"] for item in self.commands("bun")))
 
     def test_typecheck_failure_never_merges_or_pushes(self):
         self.scenario["fail_runner"] = "bun run typecheck"
@@ -246,8 +250,10 @@ class MergeTests(unittest.TestCase):
         commands = self.commands("bun")
         self.assertEqual([(Path(item["cwd"]).name, item["args"]) for item in commands], [
             ("merge-pr-123", ["install", "--frozen-lockfile"]),
-            ("plugin", ["test"]), ("plugin", ["run", "typecheck"]),
-            ("pi-plugin", ["test"]), ("pi-plugin", ["run", "typecheck"]), ("cli", ["test"]),
+            ("merge-pr-123", ["run", "build:dists"]),
+            ("plugin", ["run", "test"]), ("plugin", ["run", "typecheck"]), ("plugin", ["run", "lint"]),
+            ("pi-plugin", ["run", "test"]), ("pi-plugin", ["run", "typecheck"]), ("pi-plugin", ["run", "lint"]),
+            ("cli", ["run", "test"]), ("cli", ["run", "lint"]),
         ])
         self.assertEqual([item["args"] for item in self.commands("cargo")], [["clippy", "--workspace", "--", "-D", "warnings"], ["test", "--workspace"]])
         self.assertEqual(self.commands("bunx")[0]["args"], ["biome", "check", "--no-errors-on-unmatched", *["./" + path for path in sorted(paths)]])
@@ -258,8 +264,10 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertEqual([(Path(item["cwd"]).name, item["args"]) for item in self.commands("bun")], [
             ("merge-pr-123", ["install", "--frozen-lockfile"]),
-            ("plugin", ["test"]), ("plugin", ["run", "typecheck"]),
-            ("pi-plugin", ["test"]), ("pi-plugin", ["run", "typecheck"]), ("cli", ["test"]),
+            ("merge-pr-123", ["run", "build:dists"]),
+            ("plugin", ["run", "test"]), ("plugin", ["run", "typecheck"]), ("plugin", ["run", "lint"]),
+            ("pi-plugin", ["run", "test"]), ("pi-plugin", ["run", "typecheck"]), ("pi-plugin", ["run", "lint"]),
+            ("cli", ["run", "test"]), ("cli", ["run", "lint"]),
         ])
         self.assertFalse(self.commands("cargo"))
         self.assert_cleaned()
@@ -270,16 +278,17 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertEqual([(Path(item["cwd"]).name, item["args"]) for item in self.commands("bun")], [
             ("merge-pr-123", ["install", "--frozen-lockfile"]),
+            ("merge-pr-123", ["run", "build:dists"]),
             ("e2e-tests", ["test", "scripts/validate-mode-manifest.test.ts"]),
         ])
         self.assertFalse(self.commands("cargo"))
         self.assert_cleaned()
 
-    def test_unrelated_paths_only_install_and_biome(self):
+    def test_unrelated_paths_only_install_build_and_biome(self):
         self.prepare_pr(["docs/example.md"])
         run = self.run_script("--dry-run")
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual([item["args"] for item in self.commands("bun")], [["install", "--frozen-lockfile"]])
+        self.assertEqual([item["args"] for item in self.commands("bun")], [["install", "--frozen-lockfile"], ["run", "build:dists"]])
         self.assertFalse(self.commands("cargo"))
         self.assertEqual(len(self.commands("bunx")), 1)
 
@@ -295,7 +304,7 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn("no surviving changed files", run.stdout)
         self.assertFalse(self.commands("bunx"))
-        self.assertTrue(any(item["args"] == ["test"] for item in self.commands("bun")))
+        self.assertTrue(any(item["args"] == ["run", "test"] for item in self.commands("bun")))
 
     def test_open_master_required(self):
         self.scenario["state"] = "MERGED"
@@ -370,6 +379,64 @@ class MergeTests(unittest.TestCase):
         self.assertEqual([item["args"] for item in self.commands("git") if item["args"][0] == "push"], [["push", "origin", "master"]])
         self.assert_cleaned()
 
+    def test_ci_gate_refuses_unresolved_threads(self):
+        for author in ("cubic-dev-ai", "greptile-apps"):
+            with self.subTest(author=author):
+                self.scenario["threads"] = [[thread(author)]]
+                self.assert_refused(self.run_script("--ci-gate"), "unresolved reviewer-bot findings")
+
+    def test_ci_gate_preserves_running_bot_and_title_refusals(self):
+        self.scenario["check_pages"] = [{"check_runs": [{"app": {"slug": "greptile-apps"}, "name": "Review", "status": "queued"}]}]
+        self.assert_refused(self.run_script("--ci-gate"), "checks are still running")
+        self.scenario["check_pages"] = [{"check_runs": []}]
+        self.scenario["title"] = "Fix #123"
+        self.assert_refused(self.run_script("--ci-gate"), "closing keyword")
+
+    def test_ci_gate_failed_job_stops_before_master_even_while_run_in_progress(self):
+        self.scenario["failed_job"] = True
+        run = self.run_script("--ci-gate")
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("CI job Rust shard: failure", run.stderr)
+        self.assertEqual(self.git("rev-parse", "master").strip(), self.master)
+        pushes = [item["args"] for item in self.commands("git") if item["args"][0] == "push"]
+        self.assertEqual(len(pushes), 1)
+        self.assertTrue(pushes[0][-1].endswith(":refs/heads/train/check-pr-123"))
+        self.assertFalse(self.commands("bun"))
+        self.assert_cleaned()
+
+    def test_ci_gate_fast_forwards_only_the_tested_sha(self):
+        run = self.run_script("--ci-gate")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        pushes = [item["args"] for item in self.commands("git") if item["args"][0] == "push"]
+        self.assertEqual(len(pushes), 2)
+        tested = pushes[0][-1].split(":")[0]
+        self.assertEqual(pushes[1], ["push", "origin", tested + ":refs/heads/master"])
+        self.assertEqual(self.git("rev-parse", "master").strip(), tested)
+        self.assertEqual(self.git("rev-parse", "master^2").strip(), self.scenario["head"])
+        merges = [item["args"] for item in self.commands("git") if item["cwd"] == str(self.repo) and item["args"][0] == "merge"]
+        self.assertEqual(merges, [["merge", "--ff-only", tested]])
+        self.assertIn("completed/success for " + tested, run.stdout)
+        self.assertFalse(self.commands("bun"))
+        self.assertFalse(self.commands("cargo"))
+        self.assertFalse(self.commands("bunx"))
+        self.assert_cleaned()
+
+    def test_ci_gate_dry_run_never_pushes(self):
+        run = self.run_script("--ci-gate", "--dry-run")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("Would push", run.stdout)
+        self.assert_no_merge_or_push()
+        self.assert_cleaned()
+
+    def test_ci_gate_rechecks_pr_head_before_fast_forward(self):
+        self.scenario["recheck"] = {"headRefOid": self.master}
+        run = self.run_script("--ci-gate")
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("head changed during verification", run.stderr)
+        self.assertEqual(self.git("rev-parse", "master").strip(), self.master)
+        self.assertEqual(len([item for item in self.commands("git") if item["args"][0] == "push"]), 1)
+        self.assert_cleaned()
+
     def test_rechecks_head_after_gates(self):
         self.scenario["recheck"] = {"headRefOid": self.master}
         self.assert_refused(self.run_script(), "head changed during verification")
@@ -377,7 +444,7 @@ class MergeTests(unittest.TestCase):
     def test_rechecks_findings_after_gates(self):
         self.scenario["recheck"] = {"reviewThreads": {"nodes": [thread()], "pageInfo": {"hasNextPage": False, "endCursor": None}}}
         self.assert_refused(self.run_script(), "unresolved reviewer-bot findings")
-        self.assertTrue(any(item["args"] == ["test"] for item in self.commands("bun")))
+        self.assertTrue(any(item["args"] == ["run", "test"] for item in self.commands("bun")))
 
     def test_rechecks_title_after_gates(self):
         self.scenario["recheck"] = {"title": "Fix #123"}

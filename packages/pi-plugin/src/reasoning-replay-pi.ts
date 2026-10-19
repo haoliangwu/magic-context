@@ -37,8 +37,8 @@
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage";
 import {
+	activeAnthropicTurnStart,
 	hasAnthropicReasoning,
-	isInActiveAnthropicTurn,
 } from "@magic-context/core/hooks/magic-context/active-anthropic-turn";
 import { latestAssistantTurnMessages } from "@magic-context/core/hooks/magic-context/latest-assistant-turn";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
@@ -204,6 +204,14 @@ export function piBudgetCutoff(args: {
 				(part) => part.type !== "text" || part.text.trim() !== "",
 			),
 		);
+	// Route inference and user-boundary discovery scan the history. Freeze both
+	// once so already-cleared assistants do not each repeat those full scans.
+	const activeTurnStart = activeAnthropicTurnStart(
+		args.messages,
+		args.anthropic === true ||
+			args.prefixBound === true ||
+			hasAnthropicReasoning(args.messages),
+	);
 	return reasoningBudgetCutoff(
 		assistants.map((entry) => {
 			const id = args.piMessageStableId(entry.message, entry.index);
@@ -212,13 +220,7 @@ export function piBudgetCutoff(args: {
 				exempt:
 					entry === newest ||
 					entry === exempt ||
-					isInActiveAnthropicTurn(
-						args.messages,
-						entry.index,
-						args.anthropic === true ||
-							args.prefixBound === true ||
-							hasAnthropicReasoning(args.messages),
-					),
+					(activeTurnStart !== undefined && entry.index >= activeTurnStart),
 				alreadyRemoved:
 					id !== undefined &&
 					args.alreadyGone?.(id) === true &&

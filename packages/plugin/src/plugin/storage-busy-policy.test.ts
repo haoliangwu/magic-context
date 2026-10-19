@@ -1,7 +1,8 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { openDatabase } from "../features/magic-context/storage-db";
+import { saveLkgSlotToDb } from "../hooks/magic-context/lkg-persist";
 import { captureLkgSlot } from "../hooks/magic-context/lkg-replay";
-import { resetLkgSlotsForTest } from "../hooks/magic-context/lkg-slot";
+import { getSlot, resetLkgSlotsForTest } from "../hooks/magic-context/lkg-slot";
 import { STORAGE_BUSY_MESSAGE } from "../hooks/magic-context/storage-busy-refusal";
 import type { MessageLike } from "../hooks/magic-context/transform-operations";
 import { Database, withAsyncPrivilegedWriter } from "../shared/sqlite";
@@ -47,6 +48,11 @@ for (const host of ["OpenCode 1", "OpenCode 2"]) {
                 output: managed,
                 modelKey: "test/model",
                 providerKey: "test",
+            }),
+        ).toBe(true);
+        expect(
+            saveLkgSlotToDb(openDatabase()!, `busy-${host}`, getSlot(`busy-${host}`)!, undefined, {
+                rebuild: true,
             }),
         ).toBe(true);
         const handler = createMessagesTransformHandler({

@@ -1,3 +1,4 @@
+import { readFrozenMergedReasoningParts } from "../../features/magic-context/merged-reasoning-decisions";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
     getMergedReasoningStrippedIds,
@@ -5,12 +6,11 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { getReasoningRemovalState } from "../../features/magic-context/storage-reasoning-removal";
 import {
+    getMaxTagNumberByOwnerMessage,
     getReasoningTokenEstimatesByMessage,
-    getTagsBySession,
 } from "../../features/magic-context/storage-tags";
 import { resolveModelConfigValue } from "../../shared/prompt-surface";
 import { isRecord } from "../../shared/record-type-guard";
-import { contentTagOwnerMessageId } from "../../shared/tag-owner-id";
 import { hasAnthropicReasoning, isInActiveAnthropicTurn } from "./active-anthropic-turn";
 import { estimateTokens } from "./read-session-formatting";
 import { neutralizedReasoningSource } from "./sentinel";
@@ -29,12 +29,12 @@ export function projectOpencodeReasoningBudgetCutoff(
     watermark: number,
     proseRatio: number,
 ): number {
-    const maxTags = new Map<string, number>();
-    for (const tag of getTagsBySession(db, sessionId)) {
-        const id =
-            tag.type === "tool" ? tag.toolOwnerMessageId : contentTagOwnerMessageId(tag.messageId);
-        if (id) maxTags.set(id, Math.max(maxTags.get(id) ?? 0, tag.tagNumber));
-    }
+    // Read the estimates first: they fold this prose ratio into the session's tag
+    // summary, which the owner lookup below then reuses without another read.
+    const textEstimateByMessageId = getReasoningTokenEstimatesByMessage(db, sessionId, proseRatio);
+    // Highest tag per owner message, maintained per session from appended tag
+    // rows instead of reading every tag of the session on each pass.
+    const maxTags = getMaxTagNumberByOwnerMessage(db, sessionId);
     const messageTags = new Map<MessageLike, number>();
     const gone = new Set(getReasoningRemovalState(db, sessionId).messageIds);
     for (const message of messages) {
@@ -43,16 +43,17 @@ export function projectOpencodeReasoningBudgetCutoff(
         messageTags.set(message, tag);
         if (tag > 0 && tag <= watermark) gone.add(message.info.id);
     }
+    const frozenMergedIds = getMergedReasoningStrippedIds(db, sessionId);
     return opencodeReasoningBudgetCutoff({
         messages,
         messageTagNumbers: messageTags,
         budget,
         alreadyRemoved: gone,
-        textEstimateByMessageId: getReasoningTokenEstimatesByMessage(db, sessionId, proseRatio),
+        textEstimateByMessageId,
         proseRatio,
-        frozenMergedIds: getMergedReasoningStrippedIds(db, sessionId),
+        frozenMergedIds,
         alsoGone: new Set(
-            [...getMergedReasoningStrippedIds(db, sessionId)]
+            [...frozenMergedIds]
                 .filter((id) => id.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX))
                 .map((id) => id.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length)),
         ),
@@ -206,6 +207,18 @@ export function opencodeReasoningBudgetCutoff(args: {
     const assistants = args.messages.filter((message) => message.info.role === "assistant");
     const newest = assistants.at(-1);
     const exempt = findLatestAssistantReasoningMutationExemptMessage(args.messages);
+    const anthropic = args.anthropic ?? hasAnthropicReasoning(args.messages);
+    const indexOfMessage = new Map<MessageLike, number>();
+    args.messages.forEach((message, index) => {
+        // First occurrence, as indexOf would answer.
+        if (!indexOfMessage.has(message)) indexOfMessage.set(message, index);
+    });
+    // Decode the frozen decisions once for the whole cutoff. Each cost callback
+    // used to decode all of them again for its single message.
+    const frozenParts = args.frozenMergedIds
+        ? readFrozenMergedReasoningParts(args.frozenMergedIds)
+        : undefined;
+    const frozenPartMessageIds = frozenParts ? new Set(frozenParts.keys()) : undefined;
     return reasoningBudgetCutoff(
         assistants.map((message) => ({
             tag: args.messageTagNumbers.get(message) ?? 0,
@@ -214,14 +227,18 @@ export function opencodeReasoningBudgetCutoff(args: {
                 message === exempt ||
                 isInActiveAnthropicTurn(
                     args.messages,
-                    args.messages.indexOf(message),
-                    args.anthropic ?? hasAnthropicReasoning(args.messages),
+                    indexOfMessage.get(message) ?? -1,
+                    anthropic,
                 ),
             cost: () => {
                 const costMessage = { ...message, parts: [...message.parts] };
-                if (args.frozenMergedIds)
+                const id = message.info.id ?? "";
+                // Stripping can only touch a message with a frozen decision.
+                if (args.frozenMergedIds && (frozenParts?.has(id) || args.frozenMergedIds.has(id)))
                     stripReasoningFromMergedAssistants([costMessage], "anthropic", {
                         frozenMessageIds: args.frozenMergedIds,
+                        frozenParts,
+                        frozenPartMessageIds,
                     });
                 const visible = reasoningTextAndOpaque(
                     args.countNeutralized

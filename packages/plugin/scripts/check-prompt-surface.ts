@@ -16,9 +16,9 @@ import { validateBudgetFixture } from "./prompt-surface-fixture";
 import { builtInLightSurface, type LightSurfaceInput } from "./prompt-surface-measurement";
 
 const rootDir = resolve(import.meta.dir, "../../..");
-const checklistPath = resolve(rootDir, "docs/specs/prompt-surface/checklist.json");
-const budgetFixturePath = resolve(rootDir, "docs/specs/prompt-surface/budget-fixture.json");
-const lightMappingPath = resolve(rootDir, "docs/specs/prompt-surface/light-mapping.md");
+const checklistPath = resolve(rootDir, "packages/plugin/scripts/fixtures/prompt-surface/checklist.json");
+const budgetFixturePath = resolve(rootDir, "packages/plugin/scripts/fixtures/prompt-surface/budget-fixture.json");
+const lightMappingPath = resolve(rootDir, "packages/plugin/scripts/fixtures/prompt-surface/light-mapping.md");
 const VALID_STATUSES = new Set(["compressed", "shared", "not-present"]);
 
 type Checklist = {

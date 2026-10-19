@@ -207,10 +207,14 @@ async function acquireModelLoadLock(lockPath: string): Promise<() => Promise<voi
 // misdetected as stale by another waiting process.
 function startLockHeartbeat(lockPath: string): () => void {
     const HEARTBEAT_MS = Math.floor(STALE_LOCK_MS / 3);
-    const timer = setInterval(() => {
-        // writeFile with fresh content updates mtime; any error is non-fatal.
-        writeStorageFileAsync(lockPath, `pid=${process.pid} alive=${Date.now()}\n`).catch(() => {});
-    }, HEARTBEAT_MS);
+    const timer = inRootAsyncContext(() =>
+        setInterval(() => {
+            // writeFile with fresh content updates mtime; any error is non-fatal.
+            writeStorageFileAsync(lockPath, `pid=${process.pid} alive=${Date.now()}\n`).catch(
+                () => {},
+            );
+        }, HEARTBEAT_MS),
+    );
     // Don't keep the event loop alive solely for the heartbeat.
     timer.unref?.();
     return () => clearInterval(timer);
@@ -1246,3 +1250,5 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         return this.lastFailureReason;
     }
 }
+
+import { inRootAsyncContext } from "../../../shared/sqlite";

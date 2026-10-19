@@ -1,4 +1,5 @@
 import type { Database } from "../../shared/sqlite";
+import { deleteTagIdentityRevisions } from "./storage-tag-identity-revision";
 
 // context.db already has this key/value table. A session's project binding can
 // change without any new messages, so its timestamp cannot represent activity.
@@ -26,6 +27,9 @@ export function deleteSessionActivity(db: Database, sessionIds: readonly string[
     db.prepare(`DELETE FROM schema_migrations_meta WHERE key IN (${placeholders})`).run(
         ...sessionIds.map(sessionActivityKey),
     );
+    // The session's tag identity revision lives in the same table; it goes with
+    // the session's tags (see deleteTagIdentityRevisions).
+    deleteTagIdentityRevisions(db, sessionIds);
 }
 
 export function readSessionActivity(db: Database, sessionId: string): number | undefined {

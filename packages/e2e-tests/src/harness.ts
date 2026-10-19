@@ -51,6 +51,10 @@ export interface TestHarnessOptions {
      * prompts without worrying about scripting every one.
      */
     mockDefault?: MockResponse;
+    /** models.dev catalogue copied into the host cache (see SpawnOptions.modelsCatalog). */
+    modelsCatalog?: string;
+    /** Pin the historian to this provider/model, registered on the mock (see SpawnOptions). */
+    historianProviderModel?: { providerID: string; modelID: string };
 }
 
 export interface SdkClient {
@@ -158,6 +162,8 @@ export class TestHarness implements HostHarness {
             omitConfigDirCompaction: options.omitConfigDirCompaction,
             modelContextLimit: options.modelContextLimit,
             historianMockModel: options.historianMockModel,
+            modelsCatalog: options.modelsCatalog,
+            historianProviderModel: options.historianProviderModel,
             prepareContextDatabase: options.prepareContextDatabase ?? expectMagicContext,
             expectedMagicContextState,
         };
@@ -558,10 +564,13 @@ export class TestHarness implements HostHarness {
             // The historian is pinned to the host's mock provider, on its own mock
             // model when a test names one and on the host model otherwise.
             const historianModel = this.spawnOptions.historianMockModel;
+            const pinned = this.spawnOptions.historianProviderModel;
             assertHistorianMockRouting(
                 this.contextDb(),
                 "opencode",
-                `${this.spawnOptions.mockProviderID ?? "mock-anthropic"}/${historianModel?.id ?? this.spawnOptions.mockModelID ?? "mock-sonnet"}`,
+                pinned
+                    ? `${pinned.providerID}/${pinned.modelID}`
+                    : `${this.spawnOptions.mockProviderID ?? "mock-anthropic"}/${historianModel?.id ?? this.spawnOptions.mockModelID ?? "mock-sonnet"}`,
             );
         }
     }

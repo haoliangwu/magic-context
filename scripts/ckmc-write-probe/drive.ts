@@ -30,6 +30,7 @@ import { Database as BunDatabase } from "bun:sqlite";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { stageExecutable } from "../../packages/e2e-tests/src/rust-runner/executable-staging";
 
 const REPO = resolve(import.meta.dir, "../..");
 const TOOLS = import.meta.dir;
@@ -237,7 +238,7 @@ async function main(): Promise<void> {
         await waitFor(() => existsSync(join(RUN, "pin.ready")), "pinned reader");
     }
 
-    const daemon = startProcess("daemon", join(RUN, "bin", "ckdev-subc"), [], {
+    const daemon = startProcess("daemon", stageExecutable(join(RUN, "bin", "ckdev-subc"), "ckdev-subc", "ck-subc"), [], {
         HOME,
         XDG_RUNTIME_DIR: RUNTIME_DIR,
         XDG_CONFIG_HOME: daemonConfig,
@@ -250,7 +251,7 @@ async function main(): Promise<void> {
     await waitFor(() => existsSync(CONNECTION_FILE), "daemon connection file");
     await Bun.sleep(200);
     const moduleStartFrames = frames();
-    const module = startProcess("module", join(RUN, "bin", "ckdev-mc"), ["--subc", CONNECTION_FILE], {
+    const module = startProcess("module", stageExecutable(join(RUN, "bin", "ckdev-mc"), "ckdev-mc", "ck-mc"), ["--subc", CONNECTION_FILE], {
         HOME,
         NO_COLOR: "1",
         SUBC_MODULE_ID: "magic-context",

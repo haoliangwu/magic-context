@@ -130,7 +130,7 @@ export type NoteNudgeDeliveryOutcome =
 export type AppendAutoSearchHintOutcome =
     | { ok: true; kind: "appended"; decision: AutoSearchHintDecision }
     | { ok: true; kind: "already-present"; decision: AutoSearchHintDecision }
-    | { ok: false; kind: "cas-exhausted" };
+    | { ok: false; kind: "cas-exhausted" | "storage-busy" };
 
 export interface PersistedTodoSyntheticAnchor {
     callId: string;
@@ -1826,26 +1826,6 @@ export function pruneNoteNudgeAnchors(
     return pruned;
 }
 
-export function pruneAutoSearchHintDecisions(
-    db: Database,
-    sessionId: string,
-    visibleMessageIds: Set<string>,
-): number {
-    let pruned = 0;
-    casUpdateJsonArrayColumn(
-        db,
-        sessionId,
-        "auto_search_hint_decisions",
-        isValidAutoSearchHintDecision,
-        (current) => {
-            const next = current.filter((decision) => visibleMessageIds.has(decision.messageId));
-            pruned = current.length - next.length;
-            return pruned > 0 ? next : null;
-        },
-    );
-    return pruned;
-}
-
 export function removeNoteNudgeAnchorByMessageId(
     db: Database,
     sessionId: string,
@@ -1865,6 +1845,105 @@ export function removeNoteNudgeAnchorByMessageId(
         { ensureRow: false },
     );
     return ok && removed;
+}
+
+/**
+ * Discard saved search hints and no-hint omissions only for message IDs the caller
+ * proved were removed by a summary boundary or deleted by the host. An ID absent
+ * from today's branch may reappear and still needs its record to restore cached
+ * bytes, so callers must not pass the complement of today's visible IDs.
+ */
+export function pruneAutoSearchHintDecisions(
+    db: Database,
+    sessionId: string,
+    retiredMessageIds: ReadonlySet<string>,
+): number {
+    if (retiredMessageIds.size === 0) return 0;
+    return updateAutoSearchHintRetirement(db, sessionId, retiredMessageIds).pruned;
+}
+
+const pendingAutoSearchRetirements = new WeakMap<Database, Map<string, Set<string>>>();
+export const AUTO_SEARCH_DECISION_SOFT_LIMIT = 2000;
+
+/** Record IDs removed under a history summary in memory, without a SQLite write on replay. */
+export function queueAutoSearchHintDecisionRetirement(
+    db: Database,
+    sessionId: string,
+    messageIds: ReadonlySet<string>,
+): void {
+    if (messageIds.size === 0) return;
+    let sessions = pendingAutoSearchRetirements.get(db);
+    if (!sessions) {
+        sessions = new Map();
+        pendingAutoSearchRetirements.set(db, sessions);
+    }
+    let retired = sessions.get(sessionId);
+    if (!retired) {
+        retired = new Set();
+        sessions.set(sessionId, retired);
+    }
+    for (const id of messageIds) retired.add(id);
+}
+
+/** Flush only when the host permits a prefix rebuild (busting/HARD), not cached-prefix replay. */
+export function flushAutoSearchHintDecisionRetirement(
+    db: Database,
+    sessionId: string,
+    visibleMessageIds: ReadonlySet<string>,
+): number {
+    const sessions = pendingAutoSearchRetirements.get(db);
+    const retired = sessions?.get(sessionId) ?? new Set<string>();
+    const outcome = updateAutoSearchHintRetirement(db, sessionId, retired, visibleMessageIds);
+    if (outcome.ok) sessions?.delete(sessionId);
+    return outcome.pruned;
+}
+
+function updateAutoSearchHintRetirement(
+    db: Database,
+    sessionId: string,
+    retiredMessageIds: ReadonlySet<string>,
+    visibleMessageIds?: ReadonlySet<string>,
+): { ok: boolean; pruned: number } {
+    let pruned = 0;
+    const ok = casUpdateJsonArrayColumn(
+        db,
+        sessionId,
+        "auto_search_hint_decisions",
+        isValidAutoSearchHintDecision,
+        (current) => {
+            let next = current.filter(
+                (decision) =>
+                    !retiredMessageIds.has(decision.messageId) ||
+                    visibleMessageIds?.has(decision.messageId),
+            );
+            // After summaries replace raw messages, saved decisions normally track the
+            // remaining users. With compaction off all users remain: the blob is bounded
+            // by the session's own user-message count, not a hard cap. Keep every visible
+            // hint and no-hint record. Above the generous limit, discard only oldest
+            // hidden no-hint records; that removes no bytes from this request. Under the
+            // host's rebuild contract, restoring an evicted earlier ID as a new tail
+            // requires a revert and full prefix rebuild. Saved hints still require proof
+            // that their messages were summarized or deleted before they can be removed.
+            let excess = next.length - AUTO_SEARCH_DECISION_SOFT_LIMIT;
+            if (visibleMessageIds && excess > 0) {
+                next = next.filter((decision) => {
+                    if (
+                        excess > 0 &&
+                        decision.decision === "no-hint" &&
+                        !visibleMessageIds.has(decision.messageId)
+                    ) {
+                        excess--;
+                        return false;
+                    }
+                    return true;
+                });
+            }
+            pruned = current.length - next.length;
+            return pruned > 0 ? next : null;
+        },
+        { ensureRow: false },
+    );
+    return { ok, pruned: ok ? pruned : 0 };
 }
 
 export function removeAutoSearchHintDecisionByMessageId(
@@ -2870,10 +2949,48 @@ export function addStaleReduceStrippedIds(
  * because the empty sentinel is filtered off the Anthropic wire).
  */
 export function getProcessedImageStrippedIds(db: Database, sessionId: string): Set<string> {
+    return new Set(getProcessedImageMarkers(db, sessionId).keys());
+}
+
+export type ProcessedImageMarker = "" | "[image stripped]";
+
+/** Old string arrays stored message ids rendered with empty text; provider switches must preserve that text. */
+export function parseProcessedImageMarkers(
+    raw: string | null | undefined,
+): Map<string, ProcessedImageMarker> {
+    if (!raw) return new Map();
+    try {
+        const parsed = JSON.parse(raw);
+        const ids = Array.isArray(parsed) ? parsed : parsed?.ids;
+        const textIds = new Set(Array.isArray(parsed?.textMarkerIds) ? parsed.textMarkerIds : []);
+        return new Map(
+            (Array.isArray(ids) ? ids : [])
+                .filter((id): id is string => typeof id === "string")
+                .map((id) => [id, textIds.has(id) ? "[image stripped]" : ""]),
+        );
+    } catch {
+        return new Map();
+    }
+}
+
+export function serializeProcessedImageMarkers(
+    markers: ReadonlyMap<string, ProcessedImageMarker>,
+): string {
+    const ids = [...markers.keys()];
+    if (ids.length === 0) return "";
+    const textMarkerIds = ids.filter((id) => markers.get(id) === "[image stripped]");
+    // Sessions using only empty markers retain the original JSON id-array encoding.
+    return JSON.stringify(textMarkerIds.length > 0 ? { ids, textMarkerIds } : ids);
+}
+
+export function getProcessedImageMarkers(
+    db: Database,
+    sessionId: string,
+): Map<string, ProcessedImageMarker> {
     const row = db
         .prepare("SELECT processed_image_stripped_ids FROM session_meta WHERE session_id = ?")
         .get(sessionId) as { processed_image_stripped_ids?: string } | null;
-    return new Set(parseStrippedBlob(row?.processed_image_stripped_ids));
+    return parseProcessedImageMarkers(row?.processed_image_stripped_ids);
 }
 
 /**
@@ -2886,6 +3003,7 @@ export function addProcessedImageStrippedIds(
     db: Database,
     sessionId: string,
     ids: Iterable<string>,
+    marker: ProcessedImageMarker | ReadonlyMap<string, ProcessedImageMarker> = "",
 ): boolean {
     const add = [...ids];
     if (add.length === 0) return true;
@@ -2896,16 +3014,16 @@ export function addProcessedImageStrippedIds(
             .prepare("SELECT processed_image_stripped_ids FROM session_meta WHERE session_id = ?")
             .get(sessionId) as { processed_image_stripped_ids?: string | null } | undefined;
         const rawStored = row ? (row.processed_image_stripped_ids ?? null) : null;
-        const current = new Set<string>(parseStrippedBlob(rawStored));
+        const current = parseProcessedImageMarkers(rawStored);
         let changed = false;
         for (const id of add) {
             if (!current.has(id)) {
-                current.add(id);
+                current.set(id, typeof marker === "string" ? marker : (marker.get(id) ?? ""));
                 changed = true;
             }
         }
         if (!changed) return true;
-        const nextBlob = JSON.stringify([...current]);
+        const nextBlob = serializeProcessedImageMarkers(current);
         const result = db
             .prepare(
                 "UPDATE session_meta SET processed_image_stripped_ids = ? WHERE session_id = ? AND processed_image_stripped_ids IS ?",
@@ -3027,6 +3145,7 @@ export function getCompactionMarkerHealth(
 export interface PostprocessReplaySnapshot {
     staleReduceStrippedIds: Set<string>;
     processedImageStrippedIds: Set<string>;
+    processedImageMarkers: Map<string, ProcessedImageMarker>;
     strippedPlaceholderIds: Set<string>;
     hiddenSeamPlaceholderIds: Set<string>;
     noteNudgeAnchors: NoteNudgeAnchor[];
@@ -3086,7 +3205,10 @@ export function loadPostprocessReplaySnapshot(
     const thinkingBindingRecoveryTarget = row?.thinking_binding_recovery_target;
     return {
         staleReduceStrippedIds: new Set(parseStrippedBlob(row?.stale_reduce_stripped_ids)),
-        processedImageStrippedIds: new Set(parseStrippedBlob(row?.processed_image_stripped_ids)),
+        processedImageStrippedIds: new Set(
+            parseProcessedImageMarkers(row?.processed_image_stripped_ids).keys(),
+        ),
+        processedImageMarkers: parseProcessedImageMarkers(row?.processed_image_stripped_ids),
         strippedPlaceholderIds: new Set(placeholders.ids),
         hiddenSeamPlaceholderIds: new Set(placeholders.hiddenSeamIds),
         noteNudgeAnchors: parseJsonArray(row?.note_nudge_anchors, isValidNoteNudgeAnchor),
@@ -3229,9 +3351,13 @@ export function getPendingPiCompactionMarkerState(
     } catch {
         // Fall through to clear malformed durable state below.
     }
-    db.prepare(
-        "UPDATE session_meta SET pending_pi_compaction_marker_state = NULL WHERE session_id = ? AND pending_pi_compaction_marker_state = ?",
-    ).run(sessionId, raw);
+    const cleared = db
+        .prepare(
+            "UPDATE session_meta SET pending_pi_compaction_marker_state = NULL WHERE session_id = ? AND pending_pi_compaction_marker_state = ?",
+        )
+        .run(sessionId, raw);
+    if (cleared.changes > 0)
+        sessionLog(sessionId, "Pi compaction-marker clear: reason=malformed-state");
     return null;
 }
 
@@ -3239,9 +3365,19 @@ export function setPendingPiCompactionMarkerState(
     db: Database,
     sessionId: string,
     state: PendingPiCompactionMarker | null,
+    clearReason = "explicit-reset",
 ): void {
     ensureSessionMetaRow(db, sessionId);
-    const blob = state ? stableStringify(state) : null;
+    if (state === null) {
+        const pending = getPendingPiCompactionMarkerState(db, sessionId);
+        if (pending) clearPendingPiCompactionMarkerStateIf(db, sessionId, pending, clearReason);
+        else
+            db.prepare(
+                "UPDATE session_meta SET pending_pi_compaction_marker_state = NULL WHERE session_id = ? AND pending_pi_compaction_marker_state = ''",
+            ).run(sessionId);
+        return;
+    }
+    const blob = stableStringify(state);
     db.prepare(
         "UPDATE session_meta SET pending_pi_compaction_marker_state = ? WHERE session_id = ?",
     ).run(blob, sessionId);
@@ -3251,6 +3387,8 @@ export function clearPendingPiCompactionMarkerStateIf(
     db: Database,
     sessionId: string,
     expected: PendingPiCompactionMarker,
+    // Pass null to log this marker's removal only after the caller commits its surrounding transaction.
+    reason: string | null = "explicit-clear",
 ): boolean {
     const expectedBlob = stableStringify(expected);
     const result = db
@@ -3259,7 +3397,20 @@ export function clearPendingPiCompactionMarkerStateIf(
              WHERE session_id = ? AND pending_pi_compaction_marker_state = ?`,
         )
         .run(sessionId, expectedBlob);
+    if (result.changes > 0 && reason !== null)
+        logPiCompactionMarkerClear(sessionId, expected, reason);
     return result.changes > 0;
+}
+
+export function logPiCompactionMarkerClear(
+    sessionId: string,
+    marker: PendingPiCompactionMarker,
+    reason: string,
+): void {
+    sessionLog(
+        sessionId,
+        `Pi compaction-marker clear: reason=${reason} endMessageId=${marker.endMessageId} ordinal=${marker.ordinal} firstKeptEntryId=${marker.firstKeptEntryId ?? "<none>"}`,
+    );
 }
 
 export function getSessionsWithPendingPiMarker(db: Database): string[] {

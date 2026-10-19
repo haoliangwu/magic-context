@@ -61,6 +61,13 @@ const MINUTE_MS = 60_000;
  */
 const MAX_SEARCH_MS = 4 * 366 * 24 * 60 * MINUTE_MS;
 
+let candidateVisitsForTests: (() => void) | undefined;
+
+/** Count searched minutes in tests without affecting normal cron callers. */
+export function __setCronCandidateVisitCounterForTests(counter?: () => void): void {
+    candidateVisitsForTests = counter;
+}
+
 /** Parse one field into the set of matching values, or null on error. */
 function parseField(token: string, spec: FieldSpec): Set<number> | null {
     const values = new Set<number>();
@@ -226,6 +233,7 @@ export function nextOccurrence(
     const capMs = afterMs + Math.max(0, Math.min(MAX_SEARCH_MS, maxSearchMs));
 
     while (cursorMs <= capMs) {
+        candidateVisitsForTests?.();
         const candidate = new Date(cursorMs);
         if (matchesCron(cron, candidate)) {
             if (!excludeCivilMinute || civilMinuteKey(candidate) !== excludeCivilMinute) {

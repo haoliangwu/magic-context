@@ -1,0 +1,312 @@
+{
+	"description": "Repository layouts and whether a filesystem read alone may call HEAD unborn (no commits yet). Shared by packages/plugin/src/features/magic-context/memory/unborn-head.test.ts and crates/mc-module/src/project_identity.rs. Each case is built in an empty temporary directory: a key ending in '/' is a directory, any other key is a file with that text, and '{root}' in a file's text is replaced by the temporary directory's absolute path. 'probe' is the directory checked, relative to the temporary directory. 'unborn': false means the caller must ask git.",
+	"cases": [
+		{
+			"name": "fresh git init",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/heads/main\n",
+				"repo/.git/config": "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/": null,
+				"repo/.git/refs/tags/": null
+			},
+			"probe": "repo",
+			"unborn": true
+		},
+		{
+			"name": "subdirectory of a fresh repository",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/heads/main\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/": null,
+				"repo/src/deep/": null
+			},
+			"probe": "repo/src/deep",
+			"unborn": true
+		},
+		{
+			"name": "HEAD written with a Windows line ending",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/heads/main\r\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/": null
+			},
+			"probe": "repo",
+			"unborn": true
+		},
+		{
+			"name": "unborn branch whose name has a slash",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/heads/feature/new\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/feature/": null
+			},
+			"probe": "repo",
+			"unborn": true
+		},
+		{
+			"name": "branch with a loose ref file",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/heads/main\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/main": "0123456789abcdef0123456789abcdef01234567\n"
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "branch held only in packed-refs",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/heads/main\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/": null,
+				"repo/.git/packed-refs": "# pack-refs with: peeled fully-peeled sorted \n0123456789abcdef0123456789abcdef01234567 refs/heads/main\n"
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "packed-refs listing only other refs",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/heads/main\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/": null,
+				"repo/.git/packed-refs": "# pack-refs with: peeled fully-peeled sorted \n0123456789abcdef0123456789abcdef01234567 refs/heads/mainline\n0123456789abcdef0123456789abcdef01234568 refs/tags/v1\n^0123456789abcdef0123456789abcdef01234569\n"
+			},
+			"probe": "repo",
+			"unborn": true
+		},
+		{
+			"name": "packed-refs line this reader does not understand",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/heads/main\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/": null,
+				"repo/.git/packed-refs": "something unexpected\n"
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "loose ref path is a directory",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/heads/main\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/main/": null
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "linked worktree on an orphan branch (relative gitdir and commondir)",
+			"entries": {
+				"main/.git/HEAD": "ref: refs/heads/main\n",
+				"main/.git/objects/": null,
+				"main/.git/refs/heads/main": "0123456789abcdef0123456789abcdef01234567\n",
+				"main/.git/worktrees/wt/HEAD": "ref: refs/heads/orphan\n",
+				"main/.git/worktrees/wt/commondir": "../..\n",
+				"main/.git/worktrees/wt/gitdir": "../../../../wt/.git\n",
+				"wt/.git": "gitdir: ../main/.git/worktrees/wt\n"
+			},
+			"probe": "wt",
+			"unborn": true
+		},
+		{
+			"name": "linked worktree whose branch exists in the common directory",
+			"entries": {
+				"main/.git/HEAD": "ref: refs/heads/main\n",
+				"main/.git/objects/": null,
+				"main/.git/refs/heads/main": "0123456789abcdef0123456789abcdef01234567\n",
+				"main/.git/refs/heads/topic": "0123456789abcdef0123456789abcdef01234567\n",
+				"main/.git/worktrees/wt/HEAD": "ref: refs/heads/topic\n",
+				"main/.git/worktrees/wt/commondir": "../..\n",
+				"wt/.git": "gitdir: ../main/.git/worktrees/wt\n"
+			},
+			"probe": "wt",
+			"unborn": false
+		},
+		{
+			"name": "linked worktree whose branch is packed in the common directory",
+			"entries": {
+				"main/.git/HEAD": "ref: refs/heads/main\n",
+				"main/.git/objects/": null,
+				"main/.git/refs/heads/": null,
+				"main/.git/packed-refs": "0123456789abcdef0123456789abcdef01234567 refs/heads/topic\n",
+				"main/.git/worktrees/wt/HEAD": "ref: refs/heads/topic\n",
+				"main/.git/worktrees/wt/commondir": "../..\n",
+				"wt/.git": "gitdir: ../main/.git/worktrees/wt\n"
+			},
+			"probe": "wt",
+			"unborn": false
+		},
+		{
+			"name": "gitdir file with an absolute path",
+			"entries": {
+				"store/repo.git/HEAD": "ref: refs/heads/main\n",
+				"store/repo.git/objects/": null,
+				"store/repo.git/refs/heads/": null,
+				"checkout/.git": "gitdir: {root}/store/repo.git\n"
+			},
+			"probe": "checkout",
+			"unborn": true
+		},
+		{
+			"name": "gitdir file pointing nowhere",
+			"entries": {
+				"repo/.git": "gitdir: ../missing/.git\n"
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "malformed .git file",
+			"entries": {
+				"repo/.git": "not a gitdir line\n"
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "commondir pointing nowhere",
+			"entries": {
+				"wt/.git": "gitdir: ../meta\n",
+				"meta/HEAD": "ref: refs/heads/main\n",
+				"meta/commondir": "../missing\n"
+			},
+			"probe": "wt",
+			"unborn": false
+		},
+		{
+			"name": "reftable ref storage directory",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/heads/.invalid\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads": "this repository uses the reftable format\n",
+				"repo/.git/reftable/tables.list": "",
+				"repo/.git/config": "[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefstorage = reftable\n"
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "reftable directory with an ordinary-looking HEAD",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/heads/main\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/": null,
+				"repo/.git/reftable/": null
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "ref storage named in the configuration only",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/heads/main\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/": null,
+				"repo/.git/config": "[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefStorage = files\n"
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "detached HEAD",
+			"entries": {
+				"repo/.git/HEAD": "0123456789abcdef0123456789abcdef01234567\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/": null
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "HEAD pointing outside refs/heads",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/remotes/origin/main\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/": null
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "HEAD naming a branch git would reject",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/heads/bad..name\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/": null
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "HEAD with extra lines",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/heads/main\nref: refs/heads/other\n",
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/": null
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "HEAD missing",
+			"entries": {
+				"repo/.git/objects/": null,
+				"repo/.git/refs/heads/": null
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "objects directory missing",
+			"entries": {
+				"repo/.git/HEAD": "ref: refs/heads/main\n",
+				"repo/.git/refs/heads/": null
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "empty .git directory",
+			"entries": {
+				"repo/.git/": null
+			},
+			"probe": "repo",
+			"unborn": false
+		},
+		{
+			"name": "no repository at all",
+			"entries": {
+				"plain/": null
+			},
+			"probe": "plain",
+			"unborn": false
+		},
+		{
+			"name": "fresh repository nested in one with commits",
+			"entries": {
+				"outer/.git/HEAD": "ref: refs/heads/main\n",
+				"outer/.git/objects/": null,
+				"outer/.git/refs/heads/main": "0123456789abcdef0123456789abcdef01234567\n",
+				"outer/inner/.git/HEAD": "ref: refs/heads/main\n",
+				"outer/inner/.git/objects/": null,
+				"outer/inner/.git/refs/heads/": null
+			},
+			"probe": "outer/inner",
+			"unborn": true
+		},
+		{
+			"name": "subdirectory of a repository with commits",
+			"entries": {
+				"outer/.git/HEAD": "ref: refs/heads/main\n",
+				"outer/.git/objects/": null,
+				"outer/.git/refs/heads/main": "0123456789abcdef0123456789abcdef01234567\n",
+				"outer/sub/": null
+			},
+			"probe": "outer/sub",
+			"unborn": false
+		}
+	]
+}

@@ -9,7 +9,7 @@ import {
 	tokenCountUsesByteBound,
 } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { UNKNOWN_FIT_RATIO } from "@magic-context/core/hooks/magic-context/tokenizer-calibration";
-import { tokenizePiMessages } from "./tokenize-pi-messages";
+import { piFitMessageBytes, tokenizePiMessages } from "./tokenize-pi-messages";
 
 export class PiStorageBusyError extends Error {
 	readonly code = "PI_STORAGE_BUSY";
@@ -107,22 +107,29 @@ export function estimatePiOutgoingInputTokens(
 		!hasTokenizerForFit()
 	)
 		return { tokens: 0, trusted: false };
-	const complete = messages.every((message) => {
+	const knownRole = (message: unknown) => {
 		if (!message || typeof message !== "object") return false;
+		return ["user", "assistant", "toolResult", "custom"].includes(
+			(message as { role?: string }).role ?? "",
+		);
+	};
+	const countable = (message: unknown) => {
+		if (!knownRole(message)) return false;
 		const m = message as { role?: string; content?: unknown };
 		return (
-			["user", "assistant", "toolResult"].includes(m.role ?? "") &&
-			(typeof m.content === "string" ||
-				(Array.isArray(m.content) &&
-					m.content.every(
-						(p) =>
-							p &&
-							typeof p === "object" &&
-							["text", "thinking", "toolCall"].includes(String(p.type)),
-					)))
+			typeof m.content === "string" ||
+			(Array.isArray(m.content) &&
+				m.content.every(
+					(p) =>
+						p &&
+						typeof p === "object" &&
+						["text", "thinking", "redacted_thinking", "toolCall"].includes(
+							String(p.type),
+						),
+				))
 		);
-	});
-	if (!complete) return { tokens: 0, trusted: false };
+	};
+	const complete = messages.every(countable);
 	const measuredForBounds =
 		measuredPrefix &&
 		measuredPrefix.modelKey === observed.modelKey &&
@@ -136,13 +143,15 @@ export function estimatePiOutgoingInputTokens(
 		const priced = measuredForBounds?.appendedMessages ?? messages;
 		const baseline = measuredForBounds?.inputTokens ?? 0;
 		let contentBytes = 0;
-		for (const rawMessage of priced) {
+		for (const rawMessage of priced.filter(knownRole)) {
 			const message = rawMessage as {
 				content:
 					| string
 					| Array<{
+							type?: string;
 							text?: string;
 							thinking?: string;
+							redacted?: boolean;
 							thinkingSignature?: string;
 							textSignature?: string;
 							name?: string;
@@ -151,18 +160,21 @@ export function estimatePiOutgoingInputTokens(
 			};
 			if (typeof message.content === "string")
 				contentBytes += Buffer.byteLength(message.content);
-			else
+			else if (Array.isArray(message.content))
 				for (const part of message.content) {
+					if (!part || typeof part !== "object") continue;
+					// Count known provider text even beside an image or extension part.
+					// Unsupported parts may add input, but cannot subtract that text.
 					for (const value of [
-						part.text,
-						part.thinking,
-						part.thinkingSignature,
-						part.textSignature,
-						part.name,
+						part.type === "text" ? part.text : undefined,
+						part.type === "thinking" && !part.redacted
+							? part.thinking
+							: undefined,
+						part.type === "toolCall" ? part.name : undefined,
 					])
 						if (typeof value === "string")
 							contentBytes += Buffer.byteLength(value);
-					if (part.arguments !== undefined)
+					if (part.type === "toolCall" && part.arguments !== undefined)
 						contentBytes += Buffer.byteLength(JSON.stringify(part.arguments));
 				}
 			if (baseline + Math.ceil(contentBytes / 4) > contextLimit) break;
@@ -191,7 +203,10 @@ export function estimatePiOutgoingInputTokens(
 		const upper =
 			envelope +
 			Math.max(UNKNOWN_FIT_RATIO, fit.toolsRatio, fit.proseRatio) *
-				Buffer.byteLength(JSON.stringify(priced));
+				priced.reduce<number>(
+					(sum, message) => sum + piFitMessageBytes(message),
+					0,
+				);
 		if (upper <= contextLimit)
 			return {
 				tokens: upper,
@@ -200,15 +215,35 @@ export function estimatePiOutgoingInputTokens(
 				refusalBasis: "byte-bound",
 			};
 	}
+	if (!complete) {
+		// Unrecognized extension roles/parts require counting their entire JSON,
+		// including metadata the provider might omit. That estimate can request
+		// reclaim, but cannot prove that the actual request exceeds the window.
+		return {
+			tokens: providerMass(
+				{
+					system: observed.systemTokens,
+					tools:
+						observed.toolDefinitionTokens +
+						messages.reduce<number>(
+							(sum, message) => sum + piFitMessageBytes(message),
+							0,
+						),
+				},
+				observed.calibration ?? calibrationForModelKey(observed.modelKey),
+				true,
+			),
+			trusted: true,
+			refusalGrade: false,
+		};
+	}
 	const bounded = messages.some((rawMessage) => {
 		const content = (rawMessage as { content: unknown }).content;
 		if (typeof content === "string") return tokenCountUsesByteBound(content);
 		return (content as Array<Record<string, unknown>>).some((part) =>
 			[
 				part.text,
-				part.thinking,
-				part.thinkingSignature,
-				part.textSignature,
+				part.redacted ? undefined : part.thinking,
 				part.name,
 				part.arguments === undefined
 					? undefined
@@ -225,7 +260,10 @@ export function estimatePiOutgoingInputTokens(
 					system: observed.systemTokens,
 					tools:
 						observed.toolDefinitionTokens +
-						Buffer.byteLength(JSON.stringify(messages)),
+						messages.reduce<number>(
+							(sum, message) => sum + piFitMessageBytes(message),
+							0,
+						),
 				},
 				observed.calibration ?? calibrationForModelKey(observed.modelKey),
 				true,
@@ -258,9 +296,7 @@ export function estimatePiOutgoingInputTokens(
 			return (content as Array<Record<string, unknown>>).every((part) =>
 				[
 					part.text,
-					part.thinking,
-					part.thinkingSignature,
-					part.textSignature,
+					part.redacted ? undefined : part.thinking,
 					part.name,
 					part.arguments === undefined
 						? undefined
@@ -318,6 +354,8 @@ export interface PiMeasuredPrefixFit {
 	envelopeSignature: string;
 	inputTokens: number;
 	appendedMessages: readonly unknown[];
+	/** Messages sent in the previous request, used only to measure estimate drift. */
+	previousMessages?: readonly unknown[];
 }
 
 /** Prefer correlated provider input plus the new tail; otherwise price the full envelope. */
@@ -367,12 +405,7 @@ export function assertPiRawFallbackFits(
 	let serializationFailed = false;
 	try {
 		for (const message of pricedMessages) {
-			const serialized = JSON.stringify(message);
-			if (typeof serialized !== "string") {
-				serializationFailed = true;
-				break;
-			}
-			bytes += Buffer.byteLength(serialized) + 1;
+			bytes += piFitMessageBytes(message) + 1;
 			if (baseInputTokens + Math.ceil(bytes / 4) > contextLimit) break;
 		}
 	} catch {
@@ -389,14 +422,14 @@ export function assertPiRawFallbackFits(
 		if (!message || typeof message !== "object") return false;
 		const m = message as { role?: string; content?: unknown };
 		return (
-			["user", "assistant", "toolResult"].includes(m.role ?? "") &&
+			["user", "assistant", "toolResult", "custom"].includes(m.role ?? "") &&
 			(typeof m.content === "string" ||
 				(Array.isArray(m.content) &&
 					m.content.every(
 						(p: unknown) =>
 							p !== null &&
 							typeof p === "object" &&
-							["text", "thinking", "toolCall"].includes(
+							["text", "thinking", "redacted_thinking", "toolCall"].includes(
 								String((p as { type?: unknown }).type),
 							),
 					)))
@@ -431,4 +464,24 @@ export function assertPiRawFallbackFits(
 		);
 		throw new PiStorageBusyError({ cause });
 	}
+}
+
+/** Reject a request only when its proven minimum exceeds the window; an estimated excess requests reclaim. */
+export function classifyPiOutgoingFit(
+	estimate: ReturnType<typeof estimatePiOutgoingInputTokens>,
+	limit: number | undefined,
+): "over-window-proof" | "upper-estimate-pressure" | "fits-or-unknown" {
+	if (!limit || !Number.isFinite(limit) || limit <= 0) return "fits-or-unknown";
+	if (
+		estimate.refusalGrade &&
+		typeof estimate.refusalTokens === "number" &&
+		Number.isFinite(estimate.refusalTokens) &&
+		estimate.refusalTokens > limit
+	)
+		return "over-window-proof";
+	return estimate.trusted &&
+		Number.isFinite(estimate.tokens) &&
+		estimate.tokens > limit
+		? "upper-estimate-pressure"
+		: "fits-or-unknown";
 }

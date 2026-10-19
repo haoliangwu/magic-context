@@ -75,6 +75,10 @@ test("historian rendered blocks match the shared Rust golden", () => {
                 projectMemory,
                 inputSource: c.input_source,
                 memoryEnabled: c.memory_enabled,
+                userObservationsRequested:
+                    "user_observations_requested" in c
+                        ? (c.user_observations_requested as boolean)
+                        : undefined,
                 extractionFree: c.extraction_free,
             }),
         ).toBe(c.prompt);

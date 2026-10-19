@@ -114,6 +114,8 @@ interface RunCompartmentPhaseArgs {
     skipAwaitForThisPass?: boolean;
     /** When true, extract user behavior observations from historian output */
     experimentalUserMemories?: boolean;
+    /** False when the dreamer is not runnable; the historian then skips user observations. */
+    userObservationsRequested?: boolean;
     /** When true, inject wall-clock dates on compartments in <session-history>. */
     experimentalTemporalAwareness?: boolean;
     /** When true, run a second editor pass after historian to clean U: lines. */
@@ -409,6 +411,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
                     ensureProjectRegistered: args.ensureProjectRegistered,
                     getNotificationParams: args.getNotificationParams,
                     experimentalUserMemories: args.experimentalUserMemories,
+                    userObservationsRequested: args.userObservationsRequested,
                     historianTwoPass: args.historianTwoPass,
                     historianExpandTools: args.historianExpandTools,
                     memoryEnabled: args.memoryEnabled,
@@ -473,6 +476,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
                 ensureProjectRegistered: args.ensureProjectRegistered,
                 getNotificationParams: args.getNotificationParams,
                 experimentalUserMemories: args.experimentalUserMemories,
+                userObservationsRequested: args.userObservationsRequested,
                 historianTwoPass: args.historianTwoPass,
                 historianExpandTools: args.historianExpandTools,
                 memoryEnabled: args.memoryEnabled,

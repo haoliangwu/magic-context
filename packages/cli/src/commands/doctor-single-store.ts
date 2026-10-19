@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, realpathSync, statfsSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import {
     closeDatabase,
     getPersistedSchemaVersion,
@@ -10,6 +10,7 @@ import {
     resolveDatabasePath,
 } from "@magic-context/core/features/magic-context/storage-db";
 import { Database } from "@magic-context/core/shared/sqlite";
+import { availableDiskBytes, checkDiskSpace, existingDirectoryAncestor } from "../lib/disk-space";
 import { probeHostProcessesUsing } from "./doctor-opencode2-cache";
 import { defaultInspectHolders } from "./doctor-repair-db";
 import { parseRepairHistoryArgs, runDoctorSingleStoreRepair } from "./doctor-single-store-repair";
@@ -50,12 +51,6 @@ function engineContextPath(): string {
         : (value("MAGIC_CONTEXT_STORAGE_DIR") ??
           join(xdg ?? join(value("HOME") ?? ".", ".local", "share"), "cortexkit", "magic-context"));
     return join(dir, "context.db");
-}
-
-function existingAncestor(path: string): string {
-    let current = resolve(path);
-    while (!existsSync(current)) current = dirname(current);
-    return current;
 }
 
 function undo(backup: string, data: string, print: (line: string) => void): void {
@@ -123,10 +118,7 @@ export function runDoctorSingleStore(
         now: () => new Date(),
         inspectHolders: defaultInspectHolders,
         lsofSpawn: spawnSync,
-        freeBytes: (path) => {
-            const fs = statfsSync(path);
-            return fs.bavail * fs.bsize;
-        },
+        freeBytes: availableDiskBytes,
         print: console.log,
         ...overrides,
     };
@@ -227,19 +219,25 @@ export function runDoctorSingleStore(
             );
         const backupBytes = statSync(context).size + statSync(store).size;
         const workingBytes = 2 * statSync(store).size;
-        const backupVolume = existingAncestor(backupRoot);
+        const backupVolume = existingDirectoryAncestor(backupRoot);
         const sameVolume = statSync(data).dev === statSync(backupVolume).dev;
-        const need = Math.ceil((workingBytes + (sameVolume ? backupBytes : 0)) * 1.1);
-        const have = deps.freeBytes(data);
-        if (have < need)
+        const dataSpace = checkDiskSpace(
+            data,
+            workingBytes + (sameVolume ? backupBytes : 0),
+            deps.freeBytes,
+        );
+        if (!dataSpace.sufficient)
             return refuse(
                 "single_store_disk_space",
-                `need ${need} bytes; have ${have} bytes on ${data}`,
+                `need ${dataSpace.requiredBytes} bytes; have ${dataSpace.availableBytes} bytes on ${data}`,
             );
-        if (!sameVolume && deps.freeBytes(backupVolume) < Math.ceil(backupBytes * 1.1))
+        const backupSpace = sameVolume
+            ? undefined
+            : checkDiskSpace(backupVolume, backupBytes, deps.freeBytes);
+        if (backupSpace && !backupSpace.sufficient)
             return refuse(
                 "single_store_disk_space",
-                `backup needs ${Math.ceil(backupBytes * 1.1)} bytes; have ${deps.freeBytes(backupVolume)} bytes on ${backupVolume}`,
+                `backup needs ${backupSpace.requiredBytes} bytes; have ${backupSpace.availableBytes} bytes on ${backupVolume}`,
             );
         const backupDir = join(
             backupRoot,

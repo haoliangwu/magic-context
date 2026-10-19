@@ -11,12 +11,13 @@ import {
 	hasPiFallbackToolOwnerTags,
 } from "./fallback-tag-probes-pi";
 
-test("Pi fallback probes cache metadata-only passes and see local, sibling and rollback tag changes", () => {
+test("Pi fallback probes cache metadata-only passes and see local, initialized sibling and rollback tag changes", () => {
 	const root = createTestTempDirFromPath(join(tmpdir(), "pi-fallback-probes-"));
 	const db = new Database(join(root, "context.db"));
 	initializeDatabase(db);
 	runMigrations(db);
 	const sibling = new Database(join(root, "context.db"));
+	initializeDatabase(sibling);
 	const insert = (
 		connection: Database,
 		id: string,

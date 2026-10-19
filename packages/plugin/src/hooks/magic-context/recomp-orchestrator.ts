@@ -68,6 +68,8 @@ export interface ManagedRecompContext {
      *  be empty when `/ctx-recomp` runs before the first transform pass). */
     fallbackModelId?: string;
     userMemoriesEnabled: boolean;
+    /** False when the dreamer is not runnable; wrapup's historian then skips user observations. */
+    userObservationsRequested?: boolean;
     /** Two-pass historian (editor cleanup) — config `historian.two_pass`. */
     historianTwoPass?: boolean;
     historianExpandTools?: Record<string, string | false>;
@@ -215,7 +217,11 @@ export function buildRecompDeps(
         getNotificationParams: () => ctx.getNotificationParams(sessionId),
         onCompartmentStatePublished: (sid: string) => {
             ctx.liveSessionState.historyRefreshSessions.add(sid);
-            ctx.liveSessionState.pendingMaterializationSessions.add(sid);
+            requestPendingMaterialization(
+                ctx.liveSessionState.pendingMaterializationSessions,
+                sid,
+                "recomp",
+            );
         },
         // Plan v6: recomp is explicit (applies the marker directly) so this is a
         // no-op for recomp, but the runner type is shared and the callback is
@@ -289,3 +295,5 @@ export async function runManagedRecomp(
         return `## Magic Recomp — Failed\n\n${failure}`;
     }
 }
+
+import { requestPendingMaterialization } from "./pending-materialization";

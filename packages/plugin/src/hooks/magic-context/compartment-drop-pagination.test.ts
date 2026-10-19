@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +11,7 @@ import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     getRawSessionTagKeysThrough,
     type RawSessionTagKeys,
+    readRawSessionMessages,
     withRawMessageProvider,
 } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
@@ -29,10 +30,6 @@ function normalizedKeys(keys: RawSessionTagKeys): {
             .map(([callId, owners]) => [callId, [...owners].sort()] as [string, string[]])
             .sort(([left], [right]) => left.localeCompare(right)),
     };
-}
-
-function delay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 afterEach(() => {
@@ -306,15 +303,16 @@ describe("compartment drop tag-key pagination", () => {
         closeReadOnlySessionDb();
         resetOpenCodeDbPathStateForTesting();
 
-        // Two load-invariant measurements replace an absolute wall-clock budget, which a
-        // shared CI runner under parallel test load cannot honor (136 ms observed against
-        // a 100 ms budget with the yielding traversal in place). (1) A self-rescheduling
-        // immediate counts event-loop turns during the scan: a traversal that yields
-        // between its 32 pages hands the loop at least 31 turns; a non-yielding scan hands
-        // it none. (2) The longest stall is compared with the scan's own duration, so
-        // both scale together under load: a non-yielding scan stalls for the whole scan.
-        const tickTimes: number[] = [];
-        const timer = setInterval(() => tickTimes.push(performance.now()), 5);
+        // Every SQLite page must hand the loop to another callback before the next
+        // read. Observing each boundary also catches one missing yield in a long scan.
+        const pageTurns: number[] = [];
+        const readPage = readRawSessionMessages.readPage;
+        const pagesRead = spyOn(readRawSessionMessages, "readPage").mockImplementation(
+            (...args) => {
+                pageTurns.push(loopTurns);
+                return readPage(...args);
+            },
+        );
         let loopTurns = 0;
         let counting = true;
         const countTurns = () => {
@@ -323,35 +321,22 @@ describe("compartment drop tag-key pagination", () => {
             setImmediate(countTurns);
         };
         try {
-            await delay(20);
-            loopTurns = 0;
             setImmediate(countTurns);
-            const scanStartedAt = performance.now();
-            await getRawSessionTagKeysThrough(sessionId, messageCount, { pageSize: 32 });
-            const scanFinishedAt = performance.now();
+            const keys = await getRawSessionTagKeysThrough(sessionId, messageCount, {
+                pageSize: 32,
+            });
             counting = false;
-            await delay(20);
 
             const pages = Math.ceil(messageCount / 32);
+            expect(keys.messageFileKeys.size).toBe(messageCount * partsPerMessage);
+            expect(pageTurns).toHaveLength(pages);
             expect(loopTurns).toBeGreaterThanOrEqual(pages - 1);
-
-            const observedTimes = [
-                scanStartedAt,
-                ...tickTimes.filter((t) => t >= scanStartedAt && t <= scanFinishedAt),
-                scanFinishedAt,
-            ].sort((left, right) => left - right);
-            let maxGapMs = 0;
-            for (let index = 1; index < observedTimes.length; index += 1) {
-                maxGapMs = Math.max(
-                    maxGapMs,
-                    (observedTimes[index] ?? 0) - (observedTimes[index - 1] ?? 0),
-                );
+            for (let index = 1; index < pageTurns.length; index += 1) {
+                expect(pageTurns[index]).toBeGreaterThan(pageTurns[index - 1]!);
             }
-            const scanDurationMs = scanFinishedAt - scanStartedAt;
-            expect(maxGapMs).toBeLessThanOrEqual(Math.max(scanDurationMs / 4, 20));
         } finally {
             counting = false;
-            clearInterval(timer);
+            pagesRead.mockRestore();
         }
     }, 30_000);
 });

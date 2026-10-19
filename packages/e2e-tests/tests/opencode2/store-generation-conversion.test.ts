@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { OpenCode } from "@opencode/client";
 import { readRawSessionMessagesFromDb } from "../../../plugin/src/hooks/magic-context/read-session-raw";
@@ -10,6 +10,7 @@ import { rawMessages } from "../../../plugin/src/v2/hooks/store";
 import { V2StoreReader } from "../../../plugin/src/v2/store-reader";
 import { buildMockHistorianPayload } from "../../src/mock-historian";
 import { MockProvider } from "../../src/mock-provider/server";
+import { markerWorkerBundleFixture } from "../../src/marker-worker-bundle-fixture";
 import {
     conversionFixture,
     type ConversionFixture,
@@ -118,6 +119,13 @@ interface Evidence {
     longArmHistorianRequestCount: number;
     existingValidationFailureLines: string[];
     forward: FlipEvidence;
+    /**
+     * One entry per rebuild of the cached m[0]/m[1] head that the 2.x boot logged
+     * through its fifth transform pass, in order. Two log lines count: the
+     * OpenCode 2 compaction-fold owner's rebuild (`HARD reason=...`) and an
+     * executed transform fold (`m[0] HARD fold decision: reason=... executed=true`).
+     */
+    forwardRebuilds: string[];
     back: FlipEvidence;
     doctorBetween: string;
     doctorAfter: string;
@@ -357,6 +365,36 @@ function readFolds(
     return folds;
 }
 
+/**
+ * Returns one entry per rebuild of the cached m[0]/m[1] head that a boot logged
+ * for the session, in order, through its `throughFold`-th transform pass:
+ * `fold_owner:<reason>` for a rebuild by the OpenCode 2 compaction-fold owner
+ * (v2/fold/owner.ts, logged as `HARD reason=...`) and `transform:<reason>` for
+ * an executed transform fold. `readFolds` cannot show the first kind: that
+ * rebuild renders the head before the transform runs, so the transform then
+ * reports a cache hit on bytes rebuilt moments earlier on the same request.
+ */
+function readRebuilds(
+    fixture: ConversionFixture,
+    label: string,
+    sessionId: string,
+    throughFold: number,
+): string[] {
+    const path = fixture.logPath(label);
+    if (!existsSync(path)) return [];
+    const rebuilds: string[] = [];
+    let folds = 0;
+    for (const line of readFileSync(path, "utf8").split("\n")) {
+        if (!line.includes(sessionId)) continue;
+        const ownerHard = /\] HARD reason=(\S+)/.exec(line);
+        if (ownerHard) rebuilds.push(`fold_owner:${ownerHard[1]}`);
+        const transformHard = /m\[0\] HARD fold decision: reason=(\S+) executed=true/.exec(line);
+        if (transformHard) rebuilds.push(`transform:${transformHard[1]}`);
+        if (/injected m\[0\]\/m\[1\] \(rematerialized=/.test(line) && ++folds >= throughFold) break;
+    }
+    return rebuilds;
+}
+
 function readGeneration(fixture: ConversionFixture, sessionId: string): string | null {
     const rows = contextRows<{ generation: string | null }>(
         fixture,
@@ -473,6 +511,8 @@ function runDoctor(fixture: ConversionFixture): string {
 }
 beforeAll(async () => {
     const fixture = conversionFixture("issue-492-f1-conversion-e2e");
+    const workerMissingBundle = markerWorkerBundleFixture();
+    cleanup.push(async () => workerMissingBundle.dispose());
     const mock = new MockProvider();
     const provider = await mock.start();
     cleanup.push(() => mock.stop());
@@ -582,7 +622,13 @@ beforeAll(async () => {
                     parts: [{ type: "text", text }, ...extraParts],
                 },
             });
-            if (!result.data) throw new Error(`1.x prompt failed: ${JSON.stringify(result.error)}`);
+            if (!result.data) {
+                const logs = readdirSync(fixture.root, { recursive: true })
+                    .filter((path) => String(path).endsWith(".log"))
+                    .map((path) => `${path}:\n${readFileSync(join(fixture.root, String(path)), "utf8").slice(-30000)}`)
+                    .join("\n");
+                throw new Error(`1.x prompt failed: ${JSON.stringify(result.error)}\n${v1.stderr()}\n${logs}`);
+            }
             if (result.data.info?.error) {
                 throw new Error(`1.x assistant error: ${JSON.stringify(result.data.info.error)}`);
             }
@@ -798,6 +844,7 @@ beforeAll(async () => {
     // ── 2.0.5: same data root, same session, real conversion ──────────────────
     fixture.env.MAGIC_CONTEXT_LOG_PATH = fixture.logPath("v2");
     const v2 = await spawnOpencode2({
+        magicContextPlugin: workerMissingBundle.root,
         existingIsolation: fixture,
         existingMock: { mock, baseURL: provider.baseURL },
         magicContextConfig,
@@ -842,6 +889,8 @@ beforeAll(async () => {
         .find((request) => JSON.stringify(request.body.input ?? "").includes("first prompt on the converted store"));
     if (!firstConvertedRequest) throw new Error("the first converted prompt reached no v2 provider input");
     const firstConvertedInput = JSON.stringify(firstConvertedRequest.body.input);
+    expect(existsSync(join(workerMissingBundle.root, "dist/v2/compaction-marker-candidates-worker.js"))).toBe(false);
+    expect(readFileSync(fixture.logPath("v2"), "utf8")).not.toContain("compaction-marker-drain-failure");
     const forwardRebaseLines = rebaseLinesFor(fixture, "v2", sessionId);
     const forwardCompartments = readCompartments(fixture, sessionId);
     const forwardProjection = v2Projection(fixture, sessionId);
@@ -936,6 +985,7 @@ beforeAll(async () => {
         .slice(forwardFirstRequest)
         .filter((request) => !isHistorianRequest(request.body));
     const forwardPins = forwardServed.slice(0, 5).map((request) => servedPin(fixture, request.body));
+    const forwardRebuilds = readRebuilds(fixture, "v2", sessionId, 5);
 
     // Give the 2.x boot its own compartment, ending on a row the 1.x tables never
     // held, so the way back has a genuinely unresolvable endpoint to mark.
@@ -1088,6 +1138,7 @@ beforeAll(async () => {
             folds: forwardFolds,
             pins: forwardPins,
         },
+        forwardRebuilds,
         back: {
             rebaseLines: backRebaseLines,
             generation: backGeneration,
@@ -1127,6 +1178,7 @@ beforeAll(async () => {
     console.log(`[issue-492] back rebase: ${backRebaseLines.join(" | ")}`);
     console.log(`[issue-492] forward pins: ${JSON.stringify(forwardPins)}`);
     console.log(`[issue-492] forward folds: ${JSON.stringify(forwardFolds)}`);
+    console.log(`[issue-492] forward rebuilds: ${JSON.stringify(forwardRebuilds)}`);
     console.log(`[issue-492] back folds: ${JSON.stringify(backFolds)}`);
     console.log(`[issue-492] back pins: ${JSON.stringify(backPins)}`);
     console.log(
@@ -1250,14 +1302,24 @@ test("the search index matches the v2 projection with no duplicate ordinals", ()
     expect(new Set(ids).size).toBe(ids.length);
 });
 
-test("the converted store serves one HARD and four byte-identical cache hits", () => {
+// The conversion clears the cached m[0]/m[1] head (store-generation-rebase.ts),
+// so the first 2.x request must rebuild it exactly once. The OpenCode 2
+// compaction-fold owner does that rebuild (reason boot_recovery) because the
+// converted store has no 2.x fold record yet, and it renders the head before
+// the transform runs; the transform then serves those bytes as a cache hit.
+// Before 0.49.11 that fold stored a system-prompt hash of the raw request draft,
+// which never matched the hash the transform compares, so the same request
+// rebuilt the head a second time with reason system_hash. Removing that extra
+// rebuild after a compaction is a documented 0.49.11 fix.
+test("the converted store rebuilds once and serves five byte-identical cache hits", () => {
     expect(evidence.forward.pins).toHaveLength(5);
-    expect(new Set(evidence.forward.pins.slice(1)).size).toBe(1);
+    expect(new Set(evidence.forward.pins).size).toBe(1);
+    expect(evidence.forwardRebuilds).toEqual(["fold_owner:boot_recovery"]);
     const folds = evidence.forward.folds.slice(0, 5);
     expect(folds).toHaveLength(5);
-    expect(folds.map((fold) => fold.rematerialized)).toEqual([true, false, false, false, false]);
-    expect(["first_render", "system_hash"]).toContain(folds[0]?.reason);
-    expect(folds.slice(1).map((fold) => fold.reason)).toEqual([
+    expect(folds.map((fold) => fold.rematerialized)).toEqual([false, false, false, false, false]);
+    expect(folds.map((fold) => fold.reason)).toEqual([
+        "cache_hit",
         "cache_hit",
         "cache_hit",
         "cache_hit",

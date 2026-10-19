@@ -14,8 +14,8 @@ import {
 import { log } from "../shared/logger";
 import { setOutputReserveConfig } from "../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../shared/prompt-surface";
-import { setWindowOverlayPath } from "../shared/window-geometry";
 import { isCompactionEnabled, migrateLegacyAgentEnabledInMemory } from "./agent-disable";
+import { warnDeprecatedMuralModel, warnDeprecatedWindowOverlayPath } from "./deprecated-config";
 import {
     cortexKitProjectConfigBasePath,
     cortexKitUserConfigBasePath,
@@ -437,6 +437,8 @@ export function parsePluginConfig(
         configWithoutRemovedAgent,
         preMigrationWarnings,
     );
+    warnDeprecatedMuralModel(migratedExperimental, preMigrationWarnings);
+    warnDeprecatedWindowOverlayPath(migratedExperimental, preMigrationWarnings);
     // Dreamer v2: convert the legacy v1 dreamer shape (window schedule, tasks
     // array, user_memories/pin_key_files blocks) into the per-task `tasks` record.
     // Runs AFTER migrate-experimental so experimental.user_memories (already
@@ -870,7 +872,6 @@ export function loadPluginConfigDetailed(
     if (profileResolution.activeProfile) config.profile = profileResolution.activeProfile;
     if (applyRuntimeGlobals) {
         setOutputReserveConfig(config.output_reserve);
-        setWindowOverlayPath(config.models?.window_overlay_path);
     }
     const leafValidationWarnings = [...(config.configWarnings ?? [])];
     if (config.configWarnings?.length) {

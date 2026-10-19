@@ -1,8 +1,24 @@
+import { sessionLog } from "../../shared/logger";
 import { clonePreservingInstances } from "./payload";
 import type { SessionContext, V2Message } from "./types";
 
+interface GenerateReplayAnchor {
+    id: string;
+    tail: V2Message[];
+}
+
+/** Preserve the host boundary before Magic Context tags or drops tool results. */
+export function generateReplayAnchor(messages: V2Message[]): GenerateReplayAnchor | undefined {
+    let index = messages.length - 1;
+    while (index >= 0 && !messages[index]?.id) index--;
+    if (index < 0) return undefined;
+    const id = messages.at(index)?.id;
+    if (!id) return undefined;
+    return { id, tail: clonePreservingInstances(messages.slice(index + 1)) };
+}
+
 interface ServedPrefix {
-    anchor: string;
+    anchor: GenerateReplayAnchor;
     model: string;
     agent: string;
     system: SessionContext["system"];
@@ -15,10 +31,14 @@ interface ServedPrefix {
 export class V2GenerateReplay {
     private readonly prefixes = new Map<string, ServedPrefix>();
 
-    capture(draft: SessionContext, anchor: string | undefined): void {
-        if (!anchor) return;
+    capture(draft: SessionContext, anchor: GenerateReplayAnchor | undefined): void {
+        if (!anchor) {
+            this.prefixes.delete(draft.sessionID);
+            sessionLog(draft.sessionID, "generate replay capture skipped: no-anchor");
+            return;
+        }
         this.prefixes.set(draft.sessionID, {
-            anchor,
+            anchor: clonePreservingInstances(anchor),
             model: `${draft.model.providerID}/${draft.model.id}`,
             agent: draft.agent,
             system: clonePreservingInstances(draft.system),
@@ -33,17 +53,27 @@ export class V2GenerateReplay {
 
     apply(draft: SessionContext): boolean {
         const prefix = this.prefixes.get(draft.sessionID);
-        if (
-            !prefix ||
-            prefix.model !== `${draft.model.providerID}/${draft.model.id}` ||
-            prefix.agent !== draft.agent
-        )
+        const skip = (reason: string): false => {
+            sessionLog(draft.sessionID, `generate replay apply skipped: ${reason}`);
             return false;
+        };
+        if (!prefix) return skip("no-prefix");
+        if (prefix.model !== `${draft.model.providerID}/${draft.model.id}`)
+            return skip("model-mismatch");
+        if (prefix.agent !== draft.agent) return skip("agent-mismatch");
         // Host checkpoints can remove the anchor. Without it we cannot distinguish
         // already-served history from the live tail, so leave the request alone.
-        const index = draft.messages.findIndex((message) => message.id === prefix.anchor);
-        if (index < 0) return false;
-        const tail = draft.messages.slice(index + 1);
+        const index = draft.messages.findIndex((message) => message.id === prefix.anchor.id);
+        if (index < 0) return skip("anchor-not-found");
+        const end = index + 1 + prefix.anchor.tail.length;
+        // Count alone can consume a new side question after a checkpoint removed
+        // tool results. Match the original host tail, not its managed replacement.
+        if (
+            JSON.stringify(draft.messages.slice(index + 1, end)) !==
+            JSON.stringify(prefix.anchor.tail)
+        )
+            return skip("anchor-tail-mismatch");
+        const tail = draft.messages.slice(end);
         draft.messages.splice(
             0,
             draft.messages.length,

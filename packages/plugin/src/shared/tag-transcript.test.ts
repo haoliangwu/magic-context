@@ -219,9 +219,13 @@ describe("tagTranscript tool aggregation", () => {
     it("truncates assistant tool_use parts via text fallback when setToolOutput asserts", () => {
         const tagger = new FakeTagger();
         const toolUse = new ThrowingToolOutputPart("tool_use", "read:99", '{"file":"long-a"}');
+        const toolResult = new TestPart("tool_result", "read:99", "result");
         const transcript: Transcript = {
             harness: "pi",
-            messages: [{ info: { id: "assistant-1", role: "assistant" }, parts: [toolUse] }],
+            messages: [
+                { info: { id: "assistant-1", role: "assistant" }, parts: [toolUse] },
+                { info: { id: "user-1", role: "user" }, parts: [toolResult] },
+            ],
             commit() {},
         };
 
@@ -241,6 +245,7 @@ describe("tagTranscript tool aggregation", () => {
         // Skeleton-drop now renders the one canonical placeholder, not a
         // separate "[truncated]" vocabulary.
         expect(toolUse.getText()).toBe(`[dropped \u00a7${tag}\u00a7]`);
+        expect(toolResult.getText()).toBe(`[dropped \u00a7${tag}\u00a7]`);
     });
 
     it("drops every contiguous folded tool_result block for the paired callId", () => {

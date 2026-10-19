@@ -128,7 +128,7 @@ describe("bounded Pi session reader with an oversized entry", () => {
 		);
 	});
 
-	it("still finds the session's latest message time", () => {
+	it("still finds the session's latest message time", async () => {
 		const { path } = writeSession([
 			...SESSION.slice(0, 1),
 			message("u9", "u1", {
@@ -138,7 +138,7 @@ describe("bounded Pi session reader with an oversized entry", () => {
 			}),
 		]);
 
-		expect(latestPiMessageTime(path)).toBe(900);
+		expect(await latestPiMessageTime(path)).toBe(900);
 	});
 
 	it("pages primer history at the ordinals the full conversion assigns", async () => {

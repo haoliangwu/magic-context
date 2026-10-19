@@ -2,16 +2,16 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+	MURAL_MODEL_DEPRECATION_WARNING,
+	WINDOW_OVERLAY_PATH_DEPRECATION_WARNING,
+} from "@magic-context/core/config/deprecated-config";
 import { getProtectedTokensTierOverrides } from "@magic-context/core/config/project-security";
 import { REMOVED_AGENT_CONFIG_WARNING } from "@magic-context/core/config/removed-agent-config";
 import { MagicContextConfigSchema } from "@magic-context/core/config/schema/magic-context";
+import { buildDreamTaskRuntimeConfigs } from "@magic-context/core/features/magic-context/dreamer/task-config";
 import { resolveEpochFloorForPass } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { Database } from "@magic-context/core/shared/sqlite";
-import {
-	getWindowOverlay,
-	reloadWindowOverlay,
-	setWindowOverlayPath,
-} from "@magic-context/core/shared/window-geometry";
 import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import { loadPiConfig, loadPiConfigDetailed } from "./index";
 
@@ -66,7 +66,6 @@ function writeUserConfig(
 }
 
 afterEach(() => {
-	setWindowOverlayPath(undefined);
 	if (originalHome === undefined) {
 		delete process.env.HOME;
 	} else {
@@ -103,45 +102,24 @@ describe("loadPiConfig", () => {
 		});
 	});
 
-	it("does not invalidate a same-path overlay during routine config reads", () => {
+	it("parses the old window path but warns once that it is ignored", () => {
 		const cwd = makeTempRoot("mc-pi-cwd-");
 		const home = makeTempRoot("mc-pi-home-");
-		const overlayRoot = makeTempRoot("mc-pi-overlay-");
-		const overlayPath = join(overlayRoot, "window-overlay.json");
+		const path = "/tmp/retired-fusiform-window.json";
 		withHome(home);
 		writeUserConfig(
 			home,
-			JSON.stringify({ models: { window_overlay_path: overlayPath } }),
+			JSON.stringify({ models: { window_overlay_path: path } }),
 		);
-		const writeOverlay = (modelId: string) =>
-			writeFileSync(
-				overlayPath,
-				JSON.stringify({
-					schema: "fusiform-window-overlay/v1",
-					generated_at: "2026-09-01T00:00:00Z",
-					minted_provider_ids: [],
-					cells: [
-						{
-							provider_id: "hunt-provider",
-							model_id: modelId,
-							facts: {},
-						},
-					],
-				}),
-			);
 
-		writeOverlay("before-rewrite");
-		loadPiConfig({ cwd });
-		expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
+		const result = loadPiConfigDetailed({ cwd });
 
-		writeOverlay("after-rewrite");
-		expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
-
-		loadPiConfig({ cwd });
-		expect(getWindowOverlay()?.cells[0]?.model_id).toBe("before-rewrite");
-
-		reloadWindowOverlay(overlayPath);
-		expect(getWindowOverlay()?.cells[0]?.model_id).toBe("after-rewrite");
+		expect(result.config.models?.window_overlay_path).toBe(path);
+		const warnings = result.warnings.filter((message) =>
+			message.includes("models.window_overlay_path"),
+		);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain(WINDOW_OVERLAY_PATH_DEPRECATION_WARNING);
 	});
 
 	it("marks an unmigrated legacy project config as an untrusted load", () => {
@@ -236,6 +214,37 @@ describe("loadPiConfig", () => {
 
 		expect(result.config.smart_drops).toBe(true);
 		expect(result.loadedFromPaths).toEqual([userPath]);
+	});
+
+	it("loads the retired mural.model with one deprecation warning and resolves compress-cues from dreamer.pi", () => {
+		const cwd = makeTempRoot("mc-pi-cwd-");
+		const home = makeTempRoot("mc-pi-home-");
+		withHome(home);
+		writeUserConfig(
+			home,
+			JSON.stringify({
+				mural: { enabled: true, model: "google/antigravity-gemini-3.8-flash" },
+				dreamer: {
+					pi: { model: "google-antigravity/antigravity-gemini-3.8-flash" },
+				},
+			}),
+		);
+
+		const result = loadPiConfig({ cwd });
+
+		expect(result.config.mural.enabled).toBe(true);
+		expect(
+			result.warnings.filter((w) =>
+				w.endsWith(MURAL_MODEL_DEPRECATION_WARNING),
+			),
+		).toHaveLength(1);
+		const compressCues = buildDreamTaskRuntimeConfigs(
+			result.config.dreamer,
+			"pi",
+		).find((task) => task.task === "compress-cues");
+		expect(compressCues?.model).toEqual({
+			model: "google-antigravity/antigravity-gemini-3.8-flash",
+		});
 	});
 
 	it("honors user storage permissions while ignoring a project-tier override", () => {

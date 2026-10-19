@@ -1,9 +1,11 @@
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { moduleRawBlockMappings } from "./module-wire";
 import {
+    readRawSessionBoundaryEndpoints,
     readRawSessionMessageIdOrdinalsForRange,
     readRawSessionMessagePartsById,
 } from "./read-session-chunk";
+import type { RawMessageParts } from "./read-session-raw";
 import { formatDate } from "./temporal-awareness";
 
 interface StoredBoundary {
@@ -37,7 +39,14 @@ export class SharedCompartmentBoundaryError extends Error {
     }
 }
 
-/** Resolve host ordinals and module block IDs for rendering, leaving the shared rows unchanged. */
+/**
+ * Resolve host ordinals and module block IDs for rendering, leaving the shared rows unchanged.
+ *
+ * State sync calls this whenever any module watermark moves, so on a long
+ * session it runs often over many compartments. Boundary messages are read in
+ * one bounded batch (see readRawSessionBoundaryEndpoints), and while the host
+ * store is unchanged a message already read is not read again.
+ */
 export function resolveSharedCompartmentBoundaries(
     db: ContextDatabase,
     sessionId: string,
@@ -51,25 +60,64 @@ export function resolveSharedCompartmentBoundaries(
     // in the module's existing date cache, so they need no host-history lookup.
     if (rows.every((row) => row.start_block_index !== null && row.end_block_index !== null))
         return [];
-    // Read message-ID ordinals once and reuse them for every compartment endpoint,
-    // avoiding a separate scan of session history for each start and end.
-    const ordinals = readRawSessionMessageIdOrdinalsForRange(sessionId, 1, Number.MAX_SAFE_INTEGER);
-    const rawById = new Map<string, ReturnType<typeof readRawSessionMessagePartsById>>();
+    // The whole session's ordinal map, read at most once per call: provider-served
+    // sessions take every endpoint ordinal from it, and a legacy row with a missing
+    // endpoint ID needs it to find the message at an inferred ordinal.
+    let ordinalBasis: Map<string, number> | undefined;
+    const ordinals = () => {
+        ordinalBasis ??= readRawSessionMessageIdOrdinalsForRange(
+            sessionId,
+            1,
+            Number.MAX_SAFE_INTEGER,
+        );
+        return ordinalBasis;
+    };
+    const stored = readRawSessionBoundaryEndpoints(
+        sessionId,
+        rows.flatMap((row) => [row.start_message_id, row.end_message_id]),
+        rows.flatMap((row) => (row.end_block_index === null ? [row.end_message_id] : [])),
+    );
+    const providerRaw = new Map<string, RawMessageParts | null>();
     const endpoint = (rawId: string, blockIndex: number | null, edge: "start" | "end") => {
-        if (!rawById.has(rawId))
-            rawById.set(rawId, readRawSessionMessagePartsById(sessionId, rawId));
-        const raw = rawById.get(rawId) ?? null;
-        const ordinal = raw?.id === rawId ? (ordinals.get(rawId) ?? null) : null;
-        const block =
-            blockIndex !== null
-                ? blockIndex
-                : edge === "start"
-                  ? 0
-                  : (moduleRawBlockMappings(raw).at(-1)?.blockIndex ?? 0);
-        return { ordinal, id: `${rawId}#${block}`, raw };
+        // Only a whole-message end needs the message's blocks.
+        const needsLastBlock = blockIndex === null && edge === "end";
+        let ordinal: number | null;
+        let createdAt: number | null | undefined;
+        let lastBlockIndex = 0;
+        if (stored === null) {
+            if (!providerRaw.has(rawId))
+                providerRaw.set(rawId, readRawSessionMessagePartsById(sessionId, rawId));
+            const raw = providerRaw.get(rawId) ?? null;
+            ordinal = raw?.id === rawId ? (ordinals().get(rawId) ?? null) : null;
+            createdAt = raw?.createdAt;
+            if (needsLastBlock)
+                lastBlockIndex = moduleRawBlockMappings(raw).at(-1)?.blockIndex ?? 0;
+        } else {
+            let read = stored.get(rawId);
+            // Read this ID alone when the batch above lacks it (an ID found from a
+            // neighboring row's ordinal for an empty endpoint) or lacks the last
+            // block a whole-message end needs.
+            if (
+                read === undefined ||
+                (needsLastBlock && read && read.lastBlockIndex === undefined)
+            ) {
+                read =
+                    readRawSessionBoundaryEndpoints(
+                        sessionId,
+                        [rawId],
+                        needsLastBlock ? [rawId] : [],
+                    )?.get(rawId) ?? null;
+                stored.set(rawId, read);
+            }
+            ordinal = read?.ordinal ?? null;
+            createdAt = read?.createdAt;
+            if (needsLastBlock) lastBlockIndex = read?.lastBlockIndex ?? 0;
+        }
+        const block = blockIndex !== null ? blockIndex : edge === "start" ? 0 : lastBlockIndex;
+        return { ordinal, id: `${rawId}#${block}`, createdAt };
     };
     const idsByOrdinal = rows.some((row) => !row.start_message_id || !row.end_message_id)
-        ? new Map([...ordinals].map(([id, ordinal]) => [ordinal, id]))
+        ? new Map([...ordinals()].map(([id, ordinal]) => [ordinal, id]))
         : null;
     const endpoints = rows.map((row) => ({
         start: endpoint(row.start_message_id, row.start_block_index, "start"),
@@ -128,10 +176,10 @@ export function resolveSharedCompartmentBoundaries(
         if (!row.end_message_id)
             end = resolveMissingId(row.end_message_id, row.end_block_index, endOrdinal, "end");
         const dates =
-            typeof start.raw?.createdAt === "number" && typeof end.raw?.createdAt === "number"
+            typeof start.createdAt === "number" && typeof end.createdAt === "number"
                 ? {
-                      start_date: formatDate(start.raw.createdAt),
-                      end_date: formatDate(end.raw.createdAt),
+                      start_date: formatDate(start.createdAt),
+                      end_date: formatDate(end.createdAt),
                   }
                 : { start_date: null, end_date: null };
         return {

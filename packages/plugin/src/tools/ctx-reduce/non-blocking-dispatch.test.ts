@@ -97,7 +97,7 @@ describe("ctx_reduce drop queueing", () => {
             sessionID: "ses-1",
         } as never);
 
-        expect(result).toContain("Queued");
+        expect(result).toBe("2 tags stamped.");
         const pendingCount = db
             .prepare("SELECT COUNT(*) AS count FROM pending_ops WHERE session_id = ?")
             .get("ses-1") as { count: number };

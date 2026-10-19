@@ -1,0 +1,73 @@
+{
+  "checks": 18,
+  "arms": [
+    {
+      "name": "before",
+      "host": "opencode v2.0.27",
+      "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6",
+      "databases": [
+        "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/opencode/opencode2.db-shm",
+        "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/cortexkit/magic-context/context.db-shm",
+        "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/opencode/opencode2.db",
+        "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/opencode/opencode2.db-wal",
+        "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/cortexkit/magic-context/context.db",
+        "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-L6xIJ6/XDG_DATA_HOME/cortexkit/magic-context/context.db-wal"
+      ],
+      "runnerBytes": 37718,
+      "btwBytes": 37962,
+      "wirePrefixBytes": 886,
+      "wirePrefixEqual": false,
+      "firstDifferentByte": 862,
+      "runnerPrefixSha256": "c5d827ec189d4ec7f2e9f76f60aad1465b1598a2e8fb9cb39d77475fc8523b7f",
+      "btwPrefixSha256": "b2899a48807f846035cda00213cdf3237f693b7c6ea791f864751e9f285192b9",
+      "instructionsEqual": true,
+      "instructionsSha256": "dea3835daca79130d282584df9cbcf3489558e4130838730133e51f2f8cfddaa",
+      "toolsEqual": true,
+      "toolsSha256": "0091794471d62449c8e5c79cdcc4a6adc8cf90697f7b2526c85d4dbe91891423",
+      "runnerLastInput": {
+        "type": "function_call_output",
+        "call_id": "call_final",
+        "output": "§5§ RAW-final-OUTPUT"
+      },
+      "btwCorrespondingInput": {
+        "type": "function_call_output",
+        "call_id": "call_final",
+        "output": "RAW-final-OUTPUT"
+      }
+    },
+    {
+      "name": "after",
+      "host": "opencode v2.0.27",
+      "root": "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-OMuWMt",
+      "databases": [
+        "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-OMuWMt/XDG_DATA_HOME/opencode/opencode2.db-shm",
+        "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-OMuWMt/XDG_DATA_HOME/cortexkit/magic-context/context.db-shm",
+        "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-OMuWMt/XDG_DATA_HOME/opencode/opencode2.db",
+        "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-OMuWMt/XDG_DATA_HOME/opencode/opencode2.db-wal",
+        "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-OMuWMt/XDG_DATA_HOME/cortexkit/magic-context/context.db",
+        "/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-666/capture-OMuWMt/XDG_DATA_HOME/cortexkit/magic-context/context.db-wal"
+      ],
+      "runnerBytes": 37718,
+      "btwBytes": 37968,
+      "wirePrefixBytes": 886,
+      "wirePrefixEqual": true,
+      "firstDifferentByte": null,
+      "runnerPrefixSha256": "8de05448b6f8edef00a2ecb4acb83e707b3382b4d3955beb90864860c20a9613",
+      "btwPrefixSha256": "8de05448b6f8edef00a2ecb4acb83e707b3382b4d3955beb90864860c20a9613",
+      "instructionsEqual": true,
+      "instructionsSha256": "8fb12cd18e119523ae8b41079a72e07bf2a0e8c819918b846e62697ac49026ee",
+      "toolsEqual": true,
+      "toolsSha256": "0091794471d62449c8e5c79cdcc4a6adc8cf90697f7b2526c85d4dbe91891423",
+      "runnerLastInput": {
+        "type": "function_call_output",
+        "call_id": "call_final",
+        "output": "§5§ RAW-final-OUTPUT"
+      },
+      "btwCorrespondingInput": {
+        "type": "function_call_output",
+        "call_id": "call_final",
+        "output": "§5§ RAW-final-OUTPUT"
+      }
+    }
+  ]
+}

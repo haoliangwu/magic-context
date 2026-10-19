@@ -17,9 +17,11 @@ import {
     captureChannel1PostReduceGraceBaseline,
     clearPendingCompactionMarkerStateIf,
     clearPersistedTodoSyntheticAnchor,
+    flushAutoSearchHintDecisionRetirement,
     getActiveTagsBySession,
     getAutoSearchHintDecisions,
     getChannel1NudgeState,
+    getMaxDroppedTagNumber,
     getMaxM0MutationId,
     getNoteNudgeAnchors,
     getPendingCompactionMarkerState,
@@ -27,8 +29,8 @@ import {
     getPendingOpsCount,
     getPersistedTodoPermissionDenied,
     getPersistedTodoSyntheticAnchor,
+    getTagsBySession,
     type PendingCompactionMarker,
-    pruneAutoSearchHintDecisions,
     pruneNoteNudgeAnchors,
     replacePendingCompactionMarkerStateIf,
     setPendingCompactionMarkerState,
@@ -45,6 +47,7 @@ import {
     getEmergencyInputSample,
     getMergedReasoningStrippedIds,
     getPersistedCompactionMarkerState,
+    getProcessedImageMarkers,
     getThinkingBindingRecoveryTarget,
     getTrailingBlankDecisions,
     type PersistedCompactionMarkerState,
@@ -61,9 +64,9 @@ import {
     markDropLeavesReasoning,
 } from "../../features/magic-context/storage-reasoning-removal";
 import {
-    getReasoningTokenEstimatesByMessage,
     getTagNumberByMessageId,
     markTagsCompactedByMessageIds,
+    tryGetReasoningTokenEstimatesByMessage,
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
 import type { Tagger } from "../../features/magic-context/tagger";
@@ -73,6 +76,7 @@ import {
 } from "../../features/magic-context/temporal-decisions";
 import type { SessionMeta, TagEntry } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
+import { getUnpublishedAutoSearchNoHint } from "../../shared/auto-search-lifecycle";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
@@ -80,6 +84,7 @@ import { isRecord } from "../../shared/record-type-guard";
 import { stableStringify } from "../../shared/stable-json";
 import { hasAnthropicReasoning } from "./active-anthropic-turn";
 import {
+    applyFlushedStatuses,
     type ConvertedToolDropMode,
     foldBustsServedPrefix,
     prepareLegacyToolSkeletonConversions,
@@ -149,6 +154,7 @@ import {
     postprocessReplaySnapshot,
     postprocessTailTags,
 } from "./postprocess-read-cache";
+import { providerVisiblePart } from "./provider-visible-parts";
 import { estimateTokens } from "./read-session-formatting";
 import { DEFAULT_KEEP_REASONING_TOKENS, opencodeReasoningBudgetCutoff } from "./reasoning-budget";
 import { captureOpencodeReasoningBudgetStatus } from "./reasoning-budget-status";
@@ -163,6 +169,7 @@ import {
     modelAcceptsEmptyContent,
     replaySentinelByMessageIds,
 } from "./sentinel";
+import { servedPrefixMatches } from "./strict-thinking-prefix";
 import {
     applyFrozenTrailingBlankDecisions,
     clearOldReasoning,
@@ -170,6 +177,7 @@ import {
     findMergedReasoningStripDecisions,
     findReasoningBearingAssistantIds,
     findTrailingBlankDecisionCandidates,
+    replayClearedReasoning,
     replayStrippedInlineThinking,
     snapshotTrailingBlankSourceDecisions,
     stripClearedReasoning,
@@ -187,6 +195,7 @@ import {
     recentSupersessionOwnerMessageIds,
 } from "./supersession-reclaim";
 import { byteSize, prependTag } from "./tag-content-primitives";
+import { waitForTagOwners } from "./tag-owner-warmup";
 import {
     assertTailHygieneContentUnchangedIfEnabled,
     countRealUserMessages,
@@ -200,8 +209,9 @@ import {
 import { injectTemporalMarkers } from "./temporal-awareness";
 import { buildSyntheticTodoPart, isSyntheticTodoPart, type SyntheticTodoPart } from "./todo-view";
 import {
-    advanceToolReclaimWatermarkToCurrentMax,
+    advanceToolReclaimWatermarkByDistance,
     buildSyntheticToolReclaimOps,
+    toolReclaimDistanceEntries,
 } from "./tool-reclaim";
 import {
     appendReminderToUserMessageById,
@@ -653,8 +663,12 @@ function isPartDroppedBeforeWire(part: unknown, providerID: string | undefined):
 function servedMessageKey(message: unknown, providerID: string | undefined): string {
     const record = isRecord(message) ? message : {};
     const info = isRecord(record.info) ? record.info : {};
+    // Fields of a part the provider never receives (tool metadata such as LSP
+    // diagnostics) are left out as well; see provider-visible-parts.ts.
     const parts = Array.isArray(record.parts)
-        ? record.parts.filter((part) => !isPartDroppedBeforeWire(part, providerID))
+        ? record.parts
+              .filter((part) => !isPartDroppedBeforeWire(part, providerID))
+              .map(providerVisiblePart)
         : (record.parts ?? null);
     // The JSON round trip drops undefined fields and shared references, so a live
     // object and its JSON snapshot compare equal when they would serialize equal.
@@ -921,6 +935,12 @@ export function applyRustModeDeferredCompactionMarker(args: {
     );
     args.afterApply?.(outcome);
     switch (outcome.kind) {
+        case "deferred":
+            sessionLog(
+                args.sessionId,
+                "rust compaction-marker drain: candidate preparation deferred; pending target retained",
+            );
+            break;
         case "applied":
         case "already-current":
         case "stale-skip":
@@ -979,6 +999,9 @@ export function clearRustModeBoundaryRecord(db: ContextDatabase, sessionId: stri
  * Rust-mode host thinking strips for prefix-bound models: replay the persisted
  * binding-mismatch set, apply an armed reactive recovery, and on a busting pass
  * freeze and remove every remaining signed block past the pass's first change.
+ * A module signed-thinking reset (bytes before the active turn's kept thinking
+ * changed) removes every signed block, the active turn's included, and skips the
+ * reactive restore of the turn's originals, which are bound to the old bytes.
  */
 function applyRustModeThinkingStrips(
     args: Parameters<typeof runRustModePostprocess>[0],
@@ -990,6 +1013,11 @@ function applyRustModeThinkingStrips(
     const recoveryMessageIds = new Set<string>();
     let thinkingBindingRecovery: ThinkingBindingRecoveryApplication | null = null;
     let proactiveThinkingStrip: ProactiveThinkingStrip | null = null;
+    // A module signed-thinking reset invalidates every signed block served before this
+    // pass, the active turn's included, so no thinking is protected from it.
+    const signedThinkingReset =
+        args.cacheBustingPass === true && args.moduleSignedThinkingReset === true;
+    const stripProtection = signedThinkingReset ? undefined : args.protectedThinkingMessages;
     {
         try {
             for (const id of getMergedReasoningStrippedIds(args.db, args.sessionId)) {
@@ -1027,7 +1055,7 @@ function applyRustModeThinkingStrips(
             args.messages,
             args.resolvedProviderID,
             recoveryMessageIds,
-            args.protectedThinkingMessages,
+            stripProtection,
         );
         // On a busting pass of a prefix-bound model, every remaining assistant
         // with reasoning past the pass's first changed byte is persisted into the
@@ -1039,34 +1067,45 @@ function applyRustModeThinkingStrips(
         // is no permission to strip them, unless this host edited earlier
         // bytes itself on the same pass.
         const moduleBustStrips =
-            !args.activeThinkingTurn &&
-            args.cacheBustingPass === true &&
-            (args.moduleReasoningTrimOnly !== true || hostEditBeforeNewestThinking);
+            signedThinkingReset ||
+            (!args.activeThinkingTurn &&
+                args.cacheBustingPass === true &&
+                (args.moduleReasoningTrimOnly !== true || hostEditBeforeNewestThinking));
         const stripFrom =
-            args.thinkingBindingRecoveryEnabledForModel === true
+            args.thinkingBindingRecoveryEnabledForModel === true || signedThinkingReset
                 ? proactiveStripStartIndex({ ...args, cacheBustingPass: moduleBustStrips })
                 : null;
         if (stripFrom !== null) {
+            const stripped = args.messages.slice(stripFrom);
             const outcome = freezeReasoningOnBustingPass({
                 db: args.db,
                 sessionId: args.sessionId,
-                messages: args.messages.slice(stripFrom),
-                protectedMessages: args.protectedThinkingMessages,
+                messages: stripped,
+                protectedMessages: stripProtection,
                 alreadyFrozen: recoveryMessageIds,
             });
             if (outcome.strip) {
                 proactiveThinkingStrip = outcome.strip;
                 for (const id of outcome.strip.messageIds) recoveryMessageIds.add(id);
+            }
+            // The module already persisted the reset, so its removal is served even when
+            // this host's own record of it could not be written.
+            const removed = signedThinkingReset
+                ? new Set(findReasoningBearingAssistantIds(stripped))
+                : new Set(outcome.strip?.messageIds ?? []);
+            if (removed.size > 0) {
                 stripReasoningFromAssistantIds(
                     args.messages,
                     args.resolvedProviderID,
-                    new Set(outcome.strip.messageIds),
-                    args.protectedThinkingMessages,
+                    removed,
+                    stripProtection,
                 );
             }
         }
     }
-    args.restoreLatestTurnOriginals?.();
+    // The turn's originals are bound to the bytes the reset changed: restoring them would
+    // put back exactly the thinking the reset removed.
+    if (!signedThinkingReset) args.restoreLatestTurnOriginals?.();
     return { thinkingBindingRecovery, proactiveThinkingStrip };
 }
 
@@ -1104,6 +1143,14 @@ export function runRustModePostprocess(args: {
      * blocks on a prefix-bound model.
      */
     moduleReasoningTrimOnly?: boolean;
+    /**
+     * The module removed every signed thinking block it serves on this busting pass
+     * (`signed_thinking_reset` in its response): bytes before the active turn's kept
+     * thinking changed, so no signed block from before this pass is valid any more.
+     * The host strips and freezes all of them, the active turn's included, and skips
+     * the reactive restore of the turn's originals.
+     */
+    moduleSignedThinkingReset?: boolean;
     /**
      * Set when the module deferred but this pass stops serving a frozen
      * last-known-good replay. The frozen replay served the messages that arrived
@@ -1188,11 +1235,6 @@ export function runRustModePostprocess(args: {
     for (const anchor of getNoteNudgeAnchors(args.db, args.sessionId)) {
         appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
     }
-    for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
-        if (decision.decision === "hint") {
-            appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
-        }
-    }
     const trailingBlankDecisions = new Map<string, TrailingBlankDecision>();
     // Only visible assistants can be stripped or become candidates. The persisted
     // replay document also contains archived turns, often far larger than this tail.
@@ -1265,7 +1307,10 @@ export function runRustModePostprocess(args: {
             .map((m) => m.info.id as string),
         anchorMessageId: currentUserMessageId,
         isLiveTail: args.messages.at(-1)?.info.id === currentUserMessageId,
-        isCacheBustingPass: args.cacheBustingPass === true,
+        // Rust's prefix_bust_permitted flag authorizes edits but does not prove
+        // any bytes before this user message actually changed. Wait for an
+        // unserved user message at the tail rather than originate a rewrite.
+        prefixRewriteCoversAnchor: false,
     });
     const noteReadStillVisible = hasVisibleNoteReadCall(args.messages);
     const deferredNoteText = peekNoteNudgeText(
@@ -1293,6 +1338,17 @@ export function runRustModePostprocess(args: {
                 args.sessionId,
                 `rust note-nudge delivery skipped wire append: ${outcome.kind}`,
             );
+        }
+    }
+
+    // Render a newly delivered note before the saved auto-search hint so the
+    // next request's note-then-hint replay preserves these exact message bytes.
+    for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
+        if (
+            decision.decision === "hint" &&
+            getUnpublishedAutoSearchNoHint(args.sessionId, decision.messageId) === undefined
+        ) {
+            appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
         }
     }
 
@@ -1512,6 +1568,9 @@ export const defaultCompactionMarkerStrategy: CompactionMarkerStrategy = {
 };
 
 interface RunPostTransformPhaseArgs {
+    opencode2?: boolean;
+    /** Add §N§ reduction handles to messages sent untagged during recovery, once a fold replaces the provider's cached prefix. */
+    normalizeRecoveryTail?: () => void;
     compactionMarkerStrategy?: CompactionMarkerStrategy;
     sessionId: string;
     db: ContextDatabase;
@@ -1560,6 +1619,10 @@ interface RunPostTransformPhaseArgs {
      * knows a fallback directory that may belong to another project.
      */
     freezeM0M1?: boolean;
+    activeThinkingPrefixHold?: boolean;
+    directoryPrefixHold?: boolean;
+    forceSignedRebuildForFit?: boolean;
+    readLastServedMessages?: () => readonly unknown[] | null;
     deferredHistoryWasPendingAtPassStart: boolean;
     compartmentInjectionRebuiltFromDb: boolean;
     rebuiltHistoryFromInitialPrepare: boolean;
@@ -1681,6 +1744,7 @@ interface RunPostTransformPhaseArgs {
 }
 
 export interface PostTransformPhaseResult {
+    thinkingReleasedForFit?: boolean;
     explicitMaterializedSuccessfully: boolean;
     deferredMaterializedSuccessfully: boolean;
     materialized: boolean;
@@ -1886,11 +1950,51 @@ export function finalizeMessageRepresentation(
     return { clearedParts, mergedReasoningParts };
 }
 
+// The legacy renderer embeds history in the first user message rather than m[1].
+// Rebuilding its cache is not evidence that the provider will see different text.
+function legacyPublishedHeadChanged(args: RunPostTransformPhaseArgs): boolean {
+    if (!args.pendingCompartmentInjection || !args.readLastServedMessages) return false;
+    const served = args.readLastServedMessages();
+    // A known first request has no served prefix to preserve. An absent reader,
+    // unlike an empty served snapshot, cannot establish that it is a first render.
+    if (served === null) return true;
+    const previous = served[0] as MessageLike | undefined;
+    if (!Array.isArray(previous?.parts) || !args.pendingCompartmentInjection) return false;
+    const text = previous.parts.find(
+        (part): part is { type: "text"; text: unknown } =>
+            typeof part === "object" &&
+            part !== null &&
+            "type" in part &&
+            part.type === "text" &&
+            "text" in part,
+    )?.text;
+    if (typeof text !== "string") return false;
+    const block = `<session-history>\n${args.pendingCompartmentInjection.block}\n</session-history>`;
+    return text !== block && !text.startsWith(`${block}\n\n`);
+}
+
 export async function runPostTransformPhase(
     args: RunPostTransformPhaseArgs,
 ): Promise<PostTransformPhaseResult> {
     const tPostprocessSetup = performance.now();
     const compactionOff = args.compactionOff === true;
+    // Wait before this phase reads any decision/protection snapshot. The tagged
+    // message graph and prepared history are one coherent caller-owned input;
+    // do not replace only pieces of that render with a peer's newer epoch.
+    if (
+        !compactionOff &&
+        !tryGetReasoningTokenEstimatesByMessage(
+            args.db,
+            args.sessionId,
+            sessionDecisionCalibration(args.db, args.sessionId).proseRatio,
+        )
+    ) {
+        await waitForTagOwners(
+            args.db,
+            args.sessionId,
+            sessionDecisionCalibration(args.db, args.sessionId).proseRatio,
+        );
+    }
     // A caught error or failed persistence can leave an already-mutated array
     // only partly replayed. Never publish it, even if it fits the window. The
     // wrapper owns last-good replay or refusal; native compaction owns off mode.
@@ -1920,17 +2024,20 @@ export async function runPostTransformPhase(
     const reasoningMutationExemptMessage = findLatestAssistantReasoningMutationExemptMessage(
         args.messages,
     );
-    // `isExplicitFlush` reads pendingMaterializationSessions — the persistent
-    // "user wants pending ops + heuristics to run" signal. Survives across
-    // blocked defer passes (compartmentRunning) so /ctx-flush intent is not
-    // lost when historian races the user's command.
+    // Keep queued drops and cleanup work after a pass that cannot apply them.
+    // A user command, fit retry or system change may have requested that work;
+    // the request is not necessarily an explicit user flush.
     const pendingMaterializationAtPassStart = args.pendingMaterializationSessions.has(
+        args.sessionId,
+    );
+    const pendingOrigin = pendingMaterializationOrigin(
+        args.pendingMaterializationSessions,
         args.sessionId,
     );
     const deferredMaterializationAtPassStart = args.deferredMaterializationSessions.has(
         args.sessionId,
     );
-    const isExplicitFlush = pendingMaterializationAtPassStart;
+    let isExplicitFlush = pendingMaterializationAtPassStart;
     const deferredMaterializationWasPending = deferredMaterializationAtPassStart;
     const alreadyRanThisTurn =
         args.currentTurnId !== null &&
@@ -1976,8 +2083,8 @@ export async function runPostTransformPhase(
         args.canRunCompartments &&
         !args.awaitedCompartmentRun &&
         activeCompartmentRun !== undefined;
-    const deferredMaterialize = args.canConsumeDeferredLate && deferredMaterializationWasPending;
-    const materializationRequested = isExplicitFlush || deferredMaterialize;
+    let deferredMaterialize = args.canConsumeDeferredLate && deferredMaterializationWasPending;
+    let materializationRequested = isExplicitFlush || deferredMaterialize;
     // Persist eligible prefix work off-wire before authorizing automatic cleanup.
     // Execute may refresh m[1] without changing it: only changed bytes supply a ride.
     // A failed or contended advisory alone must never open the reduction lanes.
@@ -2008,11 +2115,11 @@ export async function runPostTransformPhase(
               removedIds: getReasoningRemovalState(args.db, args.sessionId).messageIds,
           })
         : new Set<unknown>();
-    const activeThinkingTurn = retainedThinking.size > 0;
+    let activeThinkingTurn = retainedThinking.size > 0;
     const protectedThinkingMessages = new Set(
         args.messages.filter((message) => message.parts.some((part) => retainedThinking.has(part))),
     );
-    const newTargets = protectNewTagMutations(
+    let newTargets = protectNewTagMutations(
         args.messages,
         args.targets,
         retainedThinking,
@@ -2026,9 +2133,30 @@ export async function runPostTransformPhase(
         const tag = args.messageTagNumbers.get(message);
         if (tag && tag > 0) safeReasoningCutoff = Math.min(safeReasoningCutoff, tag - 1);
     }
-    const freezeM0M1 =
-        args.freezeM0M1 === true ||
+    let activeThinkingPrefixHold =
+        args.activeThinkingPrefixHold === true ||
         (activeThinkingTurn && args.thinkingBindingRecoveryEnabledForModel === true);
+    let freezeM0M1 = args.freezeM0M1 === true || activeThinkingPrefixHold;
+    let rewritingSignedPrefix = false;
+    let thinkingReleasedForFit = false;
+    const releaseThinkingForRewrite = (forFit = false) => {
+        const stripped = freezeReasoningOnBustingPass({
+            db: args.db,
+            sessionId: args.sessionId,
+            messages: args.messages,
+            alreadyFrozen: bindingThinking,
+        });
+        if (stripped.persistenceFailed)
+            throw new Error("Cannot persist signed thinking omission before prefix rewrite");
+        retainedThinking.clear();
+        protectedThinkingMessages.clear();
+        activeThinkingTurn = false;
+        activeThinkingPrefixHold = false;
+        freezeM0M1 = args.directoryPrefixHold === true;
+        newTargets = args.targets;
+        rewritingSignedPrefix = true;
+        thinkingReleasedForFit ||= forFit;
+    };
     const foldDueDecision =
         m0M1EnabledForFold && args.m0M1 && !freezeM0M1
             ? mustMaterialize({
@@ -2062,6 +2190,7 @@ export async function runPostTransformPhase(
             !shouldCaptureCachedPrefix &&
             hasCompleteCachedM0M1(args.db, args.sessionId));
     const firstRenderBust = m0M1EnabledForFold && !completeCachedPrefixAvailable;
+    const servedBeforeFirstRender = firstRenderBust ? args.readLastServedMessages?.() : null;
     let foldExecutedThisPass = false;
     // The one bust permission an executed fold grants: true only when the fold
     // also loses the provider's cached prefix (see foldBustsServedPrefix). Every
@@ -2097,7 +2226,13 @@ export async function runPostTransformPhase(
         m1Bytes: args.sessionMeta.cachedM1Bytes ?? null,
         muralDataUrl: (args.sessionMeta as M0M1State).cachedM0MuralDataUrl ?? null,
     };
-    if ((foldDueDecision.value || softRefreshOpportunity) && m0M1EnabledForFold && args.m0M1) {
+    if (
+        (foldDueDecision.value ||
+            softRefreshOpportunity ||
+            (firstRenderBust && activeThinkingPrefixHold)) &&
+        m0M1EnabledForFold &&
+        args.m0M1
+    ) {
         let committedFoldBustsServedPrefix: boolean | undefined;
         try {
             const previousM1 = args.sessionMeta.cachedM1Bytes?.toString("utf8");
@@ -2128,11 +2263,18 @@ export async function runPostTransformPhase(
                         args.targets,
                     );
                     return (db, rendered) => {
-                        const bustsPrefix = foldBustsServedPrefix(
-                            foldDueDecision.reason,
-                            servedPrefixBeforeFold,
-                            rendered,
-                        );
+                        const bustsPrefix = activeThinkingPrefixHold
+                            ? !servedPrefixMatches({
+                                  messages: servedBeforeFirstRender,
+                                  m0Text: rendered.m0Bytes.toString(),
+                                  m1Text: rendered.m1Bytes.toString(),
+                                  muralDataUrl: rendered.muralDataUrl,
+                              })
+                            : foldBustsServedPrefix(
+                                  foldDueDecision.reason,
+                                  servedPrefixBeforeFold,
+                                  rendered,
+                              );
                         if (bustsPrefix) {
                             if (!conversions.isCurrent(db)) {
                                 throw new MaterializeContentionError({
@@ -2149,6 +2291,9 @@ export async function runPostTransformPhase(
                 },
             });
             preparedPrefix = foldResult;
+            if (activeThinkingPrefixHold && firstRenderBust && committedFoldBustsServedPrefix) {
+                releaseThinkingForRewrite();
+            }
             prefixPreflightFailed = foldResult.materializationContentionRetryExhausted === true;
             foldExecutedThisPass = foldExecutesThisPass(
                 foldDueDecision.value || softRefreshOpportunity,
@@ -2208,6 +2353,16 @@ export async function runPostTransformPhase(
             `m[0] HARD fold decision: reason=${m0MaterializeReason ?? foldDueDecision.reason ?? (foldExecutedThisPass ? "drift" : "soft_refresh")} executed=${foldExecutedThisPass} bustsServedPrefix=${foldBustsServedPrefixThisPass}`,
         );
     }
+    if (args.normalizeRecoveryTail && (foldBustsServedPrefixThisPass || firstRenderBust)) {
+        args.normalizeRecoveryTail();
+        args.tags = getTagsBySession(args.db, args.sessionId);
+        newTargets = protectNewTagMutations(
+            args.messages,
+            args.targets,
+            retainedThinking,
+            args.thinkingBindingRecoveryEnabledForModel === true,
+        );
+    }
     // Fold decision, cached-prefix capture and the m[1] soft refresh run above;
     // time precomputation and commit together so setup has no untimed stretch.
     logTransformTiming(
@@ -2217,6 +2372,28 @@ export async function runPostTransformPhase(
         `foldExecuted=${foldExecutedThisPass} m1Refreshed=${publishedM1RefreshedThisPass}`,
     );
     const tPassDecisions = performance.now();
+    const frontToolCandidates = args.tags.filter(
+        (tag) =>
+            tag.type === "tool" &&
+            tag.status === "active" &&
+            args.targets.get(tag.tagNumber)?.canDrop?.(),
+    );
+    if (
+        activeThinkingPrefixHold &&
+        (args.forceSignedRebuildForFit ||
+            (args.contextUsage.percentage >= 95 &&
+                frontToolCandidates.length > 0 &&
+                frontToolCandidates.every(
+                    (tag) => newTargets.get(tag.tagNumber)?.thinkingRewriteProtected === true,
+                )))
+    ) {
+        releaseThinkingForRewrite(true);
+    }
+    if (activeThinkingPrefixHold) {
+        isExplicitFlush = false;
+        deferredMaterialize = false;
+        materializationRequested = false;
+    }
 
     const shouldReadPendingOps =
         !compactionOff &&
@@ -2235,7 +2412,11 @@ export async function runPostTransformPhase(
         args.schedulerDecision === "execute" &&
         pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected)
     )
-        args.pendingMaterializationSessions.add(args.sessionId);
+        requestPendingMaterialization(
+            args.pendingMaterializationSessions,
+            args.sessionId,
+            "thinking_hold",
+        );
     const formatPendingOpsDepth = (): string => {
         const depth = getPendingOpsCount(args.db, args.sessionId);
         return depth === null ? "not loaded (deferred pass)" : String(depth);
@@ -2244,7 +2425,13 @@ export async function runPostTransformPhase(
     // A retry after an aborted idle fold is still provider-cold even though its
     // persisted pair needs no second fold. Any newly queued work belongs on that
     // retry, not on the warm tool step after the provider finally answers.
-    const idleExpiryRebuild = !freezeM0M1 && args.m0M1?.hardSignals?.cacheExpired === true;
+    const heldIdleExpiryRebuild =
+        activeThinkingPrefixHold && args.m0M1?.hardSignals?.cacheExpired === true;
+    // An expired timer alone cannot authorize cleanup when an unresolved project
+    // directory requires replaying cached m[0]/m[1]. Unfinished signed turns
+    // retain their separately protected opportunity to edit the suffix.
+    const idleExpiryRebuild =
+        (!freezeM0M1 || activeThinkingPrefixHold) && args.m0M1?.hardSignals?.cacheExpired === true;
     const rideSignals = {
         subagentExecute: !args.fullFeatureMode && args.schedulerDecision === "execute",
         hardFold: foldBustsServedPrefixThisPass || firstRenderBust || idleExpiryRebuild,
@@ -2252,22 +2439,34 @@ export async function runPostTransformPhase(
             emergencyDropEligible &&
             (args.contextUsage.percentage >= 95 ||
                 getEmergencyInputSample(args.db, args.sessionId) === 0),
-        explicitFlush: isExplicitFlush || (deferredMaterialize && !prefixPreflightFailed),
+        explicitFlush:
+            isExplicitFlush &&
+            hasPendingMaterializationOrigin(
+                args.pendingMaterializationSessions,
+                args.sessionId,
+                "user_flush",
+            ),
         publishedHistory:
-            publishedM1RefreshedThisPass ||
-            (!m0M1EnabledForFold &&
-                (args.pendingCompartmentInjection?.compartmentCount ?? 0) > 0 &&
-                (args.historyRebuiltThisPass ||
-                    args.rebuiltHistoryFromInitialPrepare ||
-                    (args.canConsumeDeferredLate && args.deferredHistoryWasPendingAtPassStart))),
+            !prefixPreflightFailed &&
+            (publishedM1RefreshedThisPass ||
+                (!m0M1EnabledForFold &&
+                    (args.pendingCompartmentInjection?.compartmentCount ?? 0) > 0 &&
+                    legacyPublishedHeadChanged(args))),
     };
-    // A cache-bust opportunity is not permission to edit an unfinished signed
-    // turn. Retain pending drops until a real user message ends the tool loop.
-    const publishedWorkDrainAllowed = !compactionOff && hasReclaimRide(rideSignals);
+    // Warm-cache thinking holds defer every new prefix edit. First render, idle
+    // expiry and pressure relief can admit work, but the target guards still
+    // forbid changes before any retained signature. A genuine prefix rewrite
+    // first omits every signed block. The directory veto freezes injection only.
+    const publishedWorkDrainAllowed =
+        !compactionOff &&
+        (!activeThinkingPrefixHold ||
+            firstRenderBust ||
+            idleExpiryRebuild ||
+            emergencyDropEligible) &&
+        hasReclaimRide(rideSignals);
     const shouldApplyPendingOps = publishedWorkDrainAllowed;
     const shouldRunHeuristics =
-        !compactionOff &&
-        hasReclaimRide(rideSignals) &&
+        publishedWorkDrainAllowed &&
         (rideSignals.publishedHistory ||
             materializationRequested ||
             forceMaterialization ||
@@ -2276,6 +2475,7 @@ export async function runPostTransformPhase(
             // without creating an independent prefix rewrite.
             foldBustsServedPrefixThisPass ||
             firstRenderBust ||
+            heldIdleExpiryRebuild ||
             // the derived force band emergency floor for BOTH primary and subagent. For a primary
             // this coincides with forceMaterialization (fullFeatureMode && the derived force band);
             // for a subagent (no forceMaterialization) it's the only path that
@@ -2286,6 +2486,10 @@ export async function runPostTransformPhase(
     // Every first-application lane and m[1] refresh uses this same permission.
     // It authorizes mutation; individual lanes may still find no eligible work.
     const isCacheBustingPass = publishedWorkDrainAllowed;
+    const reclaimDistance = isCacheBustingPass
+        ? toolReclaimDistanceEntries(args.messages, args.targets)
+        : [];
+    const canEditWholePrefix = isCacheBustingPass && !activeThinkingPrefixHold;
     const previousTemporalDecisions =
         args.temporalCandidates && !compactionOff
             ? new Map([
@@ -2299,7 +2503,7 @@ export async function runPostTransformPhase(
             : undefined;
     const temporalDecisions =
         args.temporalCandidates && !compactionOff
-            ? isCacheBustingPass
+            ? canEditWholePrefix
                 ? new Map([
                       ...(previousTemporalDecisions ?? []),
                       ...freezeTemporalDecisions(args.db, args.sessionId, args.temporalCandidates),
@@ -2347,6 +2551,75 @@ export async function runPostTransformPhase(
     const removedReasoningIds = new Set<string>();
     let dropLeavesReasoning = false;
     let reasoningRemovalReadable = false;
+    const refreshReasoningRemovalUnion = (): void => {
+        if (compactionOff) return;
+        try {
+            if (reasoningRemovalEnabled) {
+                const committed = getReasoningRemovalState(args.db, args.sessionId);
+                for (const id of committed.messageIds) removedReasoningIds.add(id);
+                dropLeavesReasoning = committed.dropLeavesReasoning;
+            }
+            const committedWatermark = args.db
+                .prepare(
+                    "SELECT cleared_reasoning_through_tag AS watermark, last_observed_model_key AS modelKey FROM session_meta WHERE session_id=?",
+                )
+                .get(args.sessionId) as { watermark: number; modelKey: string | null } | null;
+            // A model transition intentionally resets the watermark. Never mix
+            // its older epoch into this pass's tagged/prepared input.
+            if (
+                committedWatermark &&
+                committedWatermark.modelKey === args.sessionMeta.lastObservedModelKey
+            ) {
+                args.sessionMeta.clearedReasoningThroughTag = Math.max(
+                    args.sessionMeta.clearedReasoningThroughTag,
+                    committedWatermark.watermark,
+                );
+                if (!prefixBoundModel) {
+                    if (canUseEmptySentinels)
+                        replayClearedReasoning(
+                            args.messages,
+                            args.reasoningByMessage,
+                            args.messageTagNumbers,
+                            args.sessionMeta.clearedReasoningThroughTag,
+                        );
+                    replayStrippedInlineThinking(
+                        args.messages,
+                        args.messageTagNumbers,
+                        args.sessionMeta.clearedReasoningThroughTag,
+                    );
+                }
+            }
+        } catch (error) {
+            failPass("reasoning-removal-read-failure", error);
+            throw new EmergencyFailClosedError("Saved reasoning removals could not be refreshed", {
+                cause: error,
+            });
+        }
+    };
+    const replayCommittedVisibleDrops = (): boolean => {
+        if (compactionOff) return false;
+        const visible = new Set(args.messages);
+        const targets = new Map(
+            [...args.targets].filter(([, target]) => {
+                if (target.mutationParts)
+                    return target.mutationParts.some(
+                        ({ message, part }) =>
+                            visible.has(message) &&
+                            message.info.syntheticHead !== true &&
+                            message.parts.includes(part) &&
+                            (!isRecord(part) || part.synthetic !== true),
+                    );
+                return (
+                    target.message !== undefined &&
+                    visible.has(target.message) &&
+                    target.message.info.syntheticHead !== true
+                );
+            }),
+        );
+        // History preparation may reuse a host text object for a synthetic
+        // prefix. A persisted drop of the former raw part must not erase it.
+        return applyFlushedStatuses(args.sessionId, args.db, targets);
+    };
     if (reasoningRemovalEnabled) {
         try {
             const state = getReasoningRemovalState(args.db, args.sessionId);
@@ -2377,7 +2650,7 @@ export async function runPostTransformPhase(
             !isExplicitFlush &&
             !forceMaterialization;
         const reason = isExplicitFlush
-            ? "explicit_flush"
+            ? `pending_materialization origin=${pendingOrigin}`
             : deferredMaterialize
               ? "deferred_materialization"
               : forceMaterialization
@@ -2484,7 +2757,7 @@ export async function runPostTransformPhase(
     try {
         if (shouldApplyPendingOps) {
             const applyReason = isExplicitFlush
-                ? "explicit_flush"
+                ? `pending_materialization origin=${pendingOrigin}`
                 : deferredMaterialize
                   ? "deferred_materialization"
                   : foldBustsServedPrefixThisPass && args.schedulerDecision !== "execute"
@@ -2551,6 +2824,8 @@ export async function runPostTransformPhase(
             const emergencyRewriteAlreadyPriced =
                 pendingOpsDidMutate ||
                 foldBustsServedPrefixThisPass ||
+                firstRenderBust ||
+                heldIdleExpiryRebuild ||
                 args.historyRebuiltThisPass ||
                 args.compartmentInjectionRebuiltFromDb ||
                 args.rebuiltHistoryFromInitialPrepare;
@@ -2677,10 +2952,9 @@ export async function runPostTransformPhase(
             // providers keep their reasoning intact. Inline-thinking stripping
             // below stays provider-independent (it removes literal <thinking> tags
             // from text, never touches typed reasoning parts).
-            // Prefix-bound models never take this watermark lane: it skips an
-            // ineligible message instead of stopping there, so it could remove
-            // a block from the middle and invalidate every newer one. They take
-            // the oldest-prefix removal below instead.
+            // Prefix-bound models never partially remove reasoning: removing
+            // an older block invalidates kept newer signatures. A true prefix
+            // rewrite takes the all-thinking binding strip instead.
             const ageLaneAllowed = !prefixBoundModel;
             const bindingStrippedIds = new Set<string>();
             if (routineCleanupApplied && prefixBoundModel) {
@@ -2692,31 +2966,36 @@ export async function runPostTransformPhase(
                     }
                 }
             }
-            const budgetCutoff = routineCleanupApplied
-                ? Math.min(
-                      safeReasoningCutoff,
-                      opencodeReasoningBudgetCutoff({
-                          messages: args.messages,
-                          messageTagNumbers: args.messageTagNumbers,
-                          budget: args.keepReasoningTokens ?? DEFAULT_KEEP_REASONING_TOKENS,
-                          alreadyRemoved: removedReasoningIds,
-                          alsoGone: bindingStrippedIds,
-                          countNeutralized: reasoningRemovalSelectable,
-                          proseRatio: sessionDecisionCalibration(args.db, args.sessionId)
-                              .proseRatio,
-                          frozenMergedIds: getMergedReasoningStrippedIds(args.db, args.sessionId),
-                          anthropic:
-                              canUseEmptySentinels ||
-                              prefixBoundModel ||
-                              hasAnthropicReasoning(args.messages),
-                          textEstimateByMessageId: getReasoningTokenEstimatesByMessage(
-                              args.db,
-                              args.sessionId,
-                              sessionDecisionCalibration(args.db, args.sessionId).proseRatio,
-                          ),
-                      }),
-                  )
-                : 0;
+            const reasoningEstimates = tryGetReasoningTokenEstimatesByMessage(
+                args.db,
+                args.sessionId,
+                sessionDecisionCalibration(args.db, args.sessionId).proseRatio,
+            );
+            const budgetCutoff =
+                routineCleanupApplied && !activeThinkingPrefixHold && reasoningEstimates
+                    ? Math.min(
+                          safeReasoningCutoff,
+                          opencodeReasoningBudgetCutoff({
+                              messages: args.messages,
+                              messageTagNumbers: args.messageTagNumbers,
+                              budget: args.keepReasoningTokens ?? DEFAULT_KEEP_REASONING_TOKENS,
+                              alreadyRemoved: removedReasoningIds,
+                              alsoGone: bindingStrippedIds,
+                              countNeutralized: reasoningRemovalSelectable,
+                              proseRatio: sessionDecisionCalibration(args.db, args.sessionId)
+                                  .proseRatio,
+                              frozenMergedIds: getMergedReasoningStrippedIds(
+                                  args.db,
+                                  args.sessionId,
+                              ),
+                              anthropic:
+                                  canUseEmptySentinels ||
+                                  prefixBoundModel ||
+                                  hasAnthropicReasoning(args.messages),
+                              textEstimateByMessageId: reasoningEstimates,
+                          }),
+                      )
+                    : 0;
             const clearedReasoning =
                 routineCleanupApplied && canUseEmptySentinels && ageLaneAllowed
                     ? clearOldReasoning(
@@ -2756,7 +3035,12 @@ export async function runPostTransformPhase(
             // and persisted before final representation applies them; a failed
             // write applies nothing new and replays only the earlier set.
             let removedReasoningMessages = 0;
-            if (routineCleanupApplied && reasoningRemovalSelectable && reasoningRemovalReadable) {
+            if (
+                routineCleanupApplied &&
+                !prefixBoundModel &&
+                reasoningRemovalSelectable &&
+                reasoningRemovalReadable
+            ) {
                 // The binding-mismatch set holds assistants whose reasoning an
                 // earlier strip already took off the wire; the prefix walk
                 // passes over them instead of stopping there.
@@ -2852,7 +3136,7 @@ export async function runPostTransformPhase(
                 !freezeM0M1 &&
                 !pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected)
             ) {
-                args.pendingMaterializationSessions.delete(args.sessionId);
+                clearPendingMaterialization(args.pendingMaterializationSessions, args.sessionId);
             }
             if (args.currentTurnId) {
                 args.lastHeuristicsTurnId.set(args.sessionId, args.currentTurnId);
@@ -2907,6 +3191,7 @@ export async function runPostTransformPhase(
                     }
                 }
                 const editReclaim = buildEditSupersessionReclaim({
+                    watermark: args.sessionMeta.toolReclaimWatermark ?? 0,
                     db: args.db,
                     sessionId: args.sessionId,
                     targets: newTargets,
@@ -2938,7 +3223,7 @@ export async function runPostTransformPhase(
                 autoReclaimDidMutate = applyPendingOperations(
                     args.sessionId,
                     args.db,
-                    args.targets,
+                    newTargets,
                     args.protectedTagIds,
                     undefined,
                     [],
@@ -2960,12 +3245,16 @@ export async function runPostTransformPhase(
         }
         const tBatchFinalize = performance.now();
         args.batch?.finalize();
-        // Advance whenever reclaim could have applied, even if no tags were
-        // selected. Plain execute-band residency does not advance the watermark;
-        // otherwise each newly eligible tag could drop separately instead of
-        // waiting for the next independently priced batch.
+        // Only outputs with three newer user turns or a quarter-window of newer
+        // content move the bookmark. Drops and edit compression above used the
+        // previous bookmark, so newly distant outputs survive this rebuild.
         if (toolReclaimApplicationOpportunity) {
-            const maxTagNumber = advanceToolReclaimWatermarkToCurrentMax(args.db, args.sessionId);
+            const maxTagNumber = advanceToolReclaimWatermarkByDistance(
+                args.db,
+                args.sessionId,
+                reclaimDistance,
+                args.usableWindow,
+            );
             args.sessionMeta.toolReclaimWatermark = Math.max(
                 args.sessionMeta.toolReclaimWatermark ?? 0,
                 maxTagNumber,
@@ -3036,7 +3325,7 @@ export async function runPostTransformPhase(
             const t8 = performance.now();
             const frozenStaleReduceIds = replaySnapshot.staleReduceStrippedIds;
             const staleReduceResult = dropStaleReduceCalls(args.messages, frozenStaleReduceIds, {
-                detect: isCacheBustingPass,
+                detect: canEditWholePrefix,
                 protectedCount: args.protectedCount,
                 protectedCallIds: new Set(
                     args.tags
@@ -3059,25 +3348,47 @@ export async function runPostTransformPhase(
         }
     }
 
-    // Processed-image strip — same REPLAY/DETECT freeze as stale ctx_reduce.
-    // The empty image sentinel is filtered off the Anthropic wire, so the first
-    // strip of a message removes its image blocks (a real byte change). Keying
-    // that first strip on the live watermark let a DEFER pass cross an older
-    // image message and remove its images mid-prefix, busting the cache.
-    // Freeze the id set on cache-busting passes; replay it every pass.
-    if (canUseEmptySentinels && !compactionOff && replaySnapshot) {
+    // Persist image ids and replacement text only when the cached prefix may
+    // change. Later cache-preserving passes restore only those saved decisions,
+    // including after a provider switch, instead of discovering new strips.
+    if (!compactionOff && replaySnapshot) {
         try {
             const tImg = performance.now();
+            // Applying queued reductions and emergency cleanup above can mark
+            // additional tags dropped after the input watermark was sampled.
+            // Refresh the maximum dropped tag only when the prefix may change;
+            // cache-preserving passes restore saved decisions without discovery.
+            const imageWatermark = canEditWholePrefix
+                ? Math.max(args.watermark, getMaxDroppedTagNumber(args.db, args.sessionId))
+                : args.watermark;
             const frozenImageIds = replaySnapshot.processedImageStrippedIds;
-            const imageResult = stripProcessedImages(args.messages, frozenImageIds, {
-                detect: isCacheBustingPass && args.watermark > 0,
-                watermark: args.watermark,
+            const frozenMarkers = replaySnapshot.processedImageMarkers;
+            const replacementText = canUseEmptySentinels ? "" : "[image stripped]";
+            stripProcessedImages(args.messages, frozenImageIds, {
+                detect: canEditWholePrefix && imageWatermark > 0,
+                watermark: imageWatermark,
                 messageTagNumbers: args.messageTagNumbers,
+                protectedCutoff: args.protectedCutoff,
+                contextPercentage: args.contextUsage.percentage,
+                replacementText,
+                frozenMarkers,
+                protectedMessageIds: new Set([
+                    ...args.tags
+                        .filter((tag) => protectedToolTags.has(tag.tagNumber))
+                        .map((tag) => tag.toolOwnerMessageId ?? tag.messageId),
+                ]),
+                persistNewIds: (ids, markers) => {
+                    if (!addProcessedImageStrippedIds(args.db, args.sessionId, ids, markers))
+                        return false;
+                    // Another plugin process sharing this session may have saved
+                    // a different marker before our compare-and-swap completed.
+                    const committed = getProcessedImageMarkers(args.db, args.sessionId);
+                    for (const id of ids)
+                        frozenMarkers.set(id, committed.get(id) ?? replacementText);
+                    return true;
+                },
                 onFirstApplication: recordFirstApplicationAt,
             });
-            if (isCacheBustingPass && imageResult.newlyStrippedIds.length > 0) {
-                addProcessedImageStrippedIds(args.db, args.sessionId, imageResult.newlyStrippedIds);
-            }
             logTransformTiming(args.sessionId, "stripProcessedImages", tImg);
         } catch (error) {
             failPass("image-strip-exception", error);
@@ -3356,20 +3667,6 @@ export async function runPostTransformPhase(
 
     const tNudgeBlock = performance.now();
 
-    // Sticky-injection replay (§2.4): every pass replays every persisted anchor
-    // so cached user-message bytes remain identical until that message leaves
-    // the visible window. Prune happens later, only on cache-busting passes.
-    if (args.fullFeatureMode && !compactionOff && replaySnapshot) {
-        for (const anchor of replaySnapshot.noteNudgeAnchors) {
-            appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
-        }
-        for (const decision of replaySnapshot.autoSearchHintDecisions) {
-            if (decision.decision === "hint") {
-                appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
-            }
-        }
-    }
-
     // Visibility check: scan the post-drop messages array for a non-stripped
     // ctx_note(action="read") tool call. This decides whether the suppression
     // path inside `peekNoteNudgeText` should fire — see the comment block
@@ -3448,9 +3745,18 @@ export async function runPostTransformPhase(
                 );
             } else {
                 const tMarkerDrain = performance.now();
-                const outcome = (
-                    args.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy
-                ).applyDeferred(args.db, args.sessionId, pending, args.sessionDirectory);
+                const strategy = args.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy;
+                const candidatesReady =
+                    strategy.applyDeferred !== applyDeferredCompactionMarker ||
+                    (await prepareCompactionMarkerCandidates(args.sessionId));
+                const outcome: MarkerUpdateOutcome = candidatesReady
+                    ? strategy.applyDeferred(
+                          args.db,
+                          args.sessionId,
+                          pending,
+                          args.sessionDirectory,
+                      )
+                    : { kind: "deferred", reason: "candidate-preparation" };
                 logTransformTiming(
                     args.sessionId,
                     "pp.markerDrain",
@@ -3458,6 +3764,16 @@ export async function runPostTransformPhase(
                     `outcome=${outcome.kind}`,
                 );
                 switch (outcome.kind) {
+                    case "deferred":
+                        // Summary discovery may observe a new summary or fail to load
+                        // its worker. Only marker replacement waits: serve the rebuilt
+                        // request now and retry replacement on a later history rebuild.
+                        suppressV12HistoryDrain = true;
+                        sessionLog(
+                            args.sessionId,
+                            "compaction-marker drain: candidate preparation deferred; preserving deferred history refresh signal",
+                        );
+                        break;
                     case "applied":
                     case "already-current":
                     case "stale-skip":
@@ -3542,6 +3858,24 @@ export async function runPostTransformPhase(
         : false;
     let noteNudgeAppendedThisPass = false;
     const noteNudgeUserMessageId = findNoteNudgeUserMessageId(args.messages);
+    // A changed m[0]/m[1] history message proves the request is already rewriting
+    // bytes before the target user message. Reductions after that user message,
+    // or cleanup that was permitted but changed nothing, cannot pay for a nudge.
+    const lastServedForNote =
+        canEditWholePrefix && (m0RematerializedThisPass || historyWasConsumedThisPass)
+            ? args.readLastServedMessages?.()
+            : null;
+    const rewrittenHeadCoversNote =
+        !!lastServedForNote &&
+        args.messages
+            .slice(0, prependedMessageCount)
+            .some(
+                (message, index) =>
+                    isSyntheticHeadMessage(message) &&
+                    index < lastServedForNote.length &&
+                    servedMessageKey(message, args.resolvedProviderID) !==
+                        servedMessageKey(lastServedForNote[index], args.resolvedProviderID),
+            );
     const noteNudgeEligibility = args.fullFeatureMode
         ? observeNoteNudgeServe({
               db: args.db,
@@ -3551,7 +3885,7 @@ export async function runPostTransformPhase(
                   .map((m) => m.info.id as string),
               anchorMessageId: noteNudgeUserMessageId,
               isLiveTail: args.messages.at(-1)?.info.id === noteNudgeUserMessageId,
-              isCacheBustingPass,
+              prefixRewriteCoversAnchor: canEditWholePrefix && rewrittenHeadCoversNote,
           })
         : undefined;
     const deferredNoteText = args.fullFeatureMode
@@ -3584,6 +3918,19 @@ export async function runPostTransformPhase(
         }
     }
 
+    // Render notes before hints on first delivery AND replay. Replaying hints
+    // before a newly delivered note would reverse their order on the next pass.
+    if (args.fullFeatureMode && !compactionOff && replaySnapshot) {
+        for (const anchor of replaySnapshot.noteNudgeAnchors) {
+            appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
+        }
+        for (const decision of replaySnapshot.autoSearchHintDecisions) {
+            if (decision.decision === "hint") {
+                appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
+            }
+        }
+    }
+
     // Todo state synthesis is deliberately isolated so its live permission
     // refresh and cache-boundary behavior can be tested independently.
     // A busting pass that moves or clears the synthetic todo pair removes it
@@ -3599,7 +3946,7 @@ export async function runPostTransformPhase(
             messages: args.messages,
             fullFeatureMode: args.fullFeatureMode,
             compactionOff,
-            isCacheBustingPass,
+            isCacheBustingPass: canEditWholePrefix,
             sessionMeta: args.sessionMeta,
             todowriteAvailability: args.todowriteAvailability,
             client: args.client,
@@ -3710,7 +4057,7 @@ export async function runPostTransformPhase(
         logTransformTiming(args.sessionId, "pp.autoSearchHint", tAutoSearch);
     }
 
-    if (args.fullFeatureMode && isCacheBustingPass) {
+    if (args.fullFeatureMode && canEditWholePrefix) {
         const visibleIds = new Set<string>();
         for (const message of args.messages) {
             if (typeof message.info?.id === "string") {
@@ -3718,17 +4065,22 @@ export async function runPostTransformPhase(
             }
         }
         const prunedAnchors = pruneNoteNudgeAnchors(args.db, args.sessionId, visibleIds);
-        const prunedDecisions = pruneAutoSearchHintDecisions(args.db, args.sessionId, visibleIds);
-        if (prunedAnchors > 0 || prunedDecisions > 0) {
+        flushAutoSearchHintDecisionRetirement(args.db, args.sessionId, visibleIds);
+        // A branch switch can hide user messages that will later be served again.
+        // Keep their saved search hints, including no-hint omissions. Only the actual
+        // prefix trim records IDs covered by a summary; this prefix-rebuild opportunity
+        // may flush them to storage, while cached-prefix replay must not write them.
+        // Today's visible IDs are not proof of deletion.
+        if (prunedAnchors > 0) {
             sessionLog(
                 args.sessionId,
-                `sticky-injection GC: pruned ${prunedAnchors} note-nudge anchor(s), ${prunedDecisions} auto-search decision(s)`,
+                `sticky-injection GC: pruned ${prunedAnchors} note-nudge anchor(s)`,
             );
         }
     }
 
     const materializeReason =
-        m0MaterializeReason ?? (explicitMaterializedSuccessfully ? "explicit_flush" : null);
+        m0MaterializeReason ?? (explicitMaterializedSuccessfully ? pendingOrigin : null);
     const materialized =
         m0RematerializedThisPass ||
         explicitMaterializedSuccessfully ||
@@ -3745,7 +4097,7 @@ export async function runPostTransformPhase(
         historyWasConsumedThisPass;
     // The proactive thinking strip rides the shared bust permission only, so a
     // defer pass never originates a strip.
-    const proactiveThinkingStripPermitted = isCacheBustingPass;
+    const proactiveThinkingStripPermitted = isCacheBustingPass && !activeThinkingPrefixHold;
 
     // Final representation strips run once, after all topology mutations; execute
     // and defer must serialize identical prefixes. Do not add message, tool-target,
@@ -3825,7 +4177,7 @@ export async function runPostTransformPhase(
                 }
             }
 
-            if (canUseEmptySentinels && isCacheBustingPass) {
+            if (canUseEmptySentinels && canEditWholePrefix) {
                 const candidates = findMergedReasoningStripDecisions(
                     args.messages,
                     args.resolvedProviderID,
@@ -3908,7 +4260,7 @@ export async function runPostTransformPhase(
         }
     };
 
-    if (isCacheBustingPass && trailingBlankDecisions.size > 0) {
+    if (canEditWholePrefix && trailingBlankDecisions.size > 0) {
         // A source snapshot can outlive the message's projection when a marker trims history.
         // Heal only IDs still present now so the first strip cannot land later on a defer serve.
         const visibleMessageIds = new Set(
@@ -4055,6 +4407,10 @@ export async function runPostTransformPhase(
     // blocks exactly as a primary's does.
     // The first rebuilding pass after upgrade switches how reasoning a drop
     // touched is served; that changes bytes only where such a part is present.
+    // Todo and search work also suspend the pass. Read the committed union
+    // after the last suspension, even when this pass selected no new IDs.
+    refreshReasoningRemovalUnion();
+    replayCommittedVisibleDrops();
     const dropModeSwitchesThisPass =
         !canUseEmptySentinels &&
         !dropLeavesReasoning &&
@@ -4113,6 +4469,7 @@ export async function runPostTransformPhase(
     }
     const prefixEditBesidesReasoningTrim =
         firstRenderBust ||
+        heldIdleExpiryRebuild ||
         materializationRequested ||
         explicitMaterializedSuccessfully ||
         deferredMaterializedSuccessfully ||
@@ -4213,7 +4570,16 @@ export async function runPostTransformPhase(
         reasoningStatusRatio,
     );
 
-    args.restoreLatestTurnOriginals?.();
+    if (!rewritingSignedPrefix) args.restoreLatestTurnOriginals?.();
+    // Authorized restoration must not undo a peer's durable omissions.
+    if (!rewritingSignedPrefix && args.restoreLatestTurnOriginals) {
+        refreshReasoningRemovalUnion();
+        if (replayCommittedVisibleDrops()) {
+            finalizeMessageRepresentation(args.messages, args.resolvedProviderID, finalizeOptions);
+        }
+        if (reasoningRemovalEnabled)
+            removeReasoningParts(args.messages, removedReasoningIds, args.resolvedProviderID);
+    }
     sessionLog(
         args.sessionId,
         `final representation: clearedParts=${finalRepresentation.clearedParts} mergedReasoningParts=${finalRepresentation.mergedReasoningParts} removedReasoningParts=${removedReasoningParts} settledDroppedReasoning=${settledDroppedReasoning}`,
@@ -4257,6 +4623,7 @@ export async function runPostTransformPhase(
                     hygieneCalibration,
                 );
                 const baseline = refreshTailHygieneBaseline({
+                    opencode2: args.opencode2,
                     messages: args.messages,
                     tags,
                     protectedTagNumbers: args.protectedTagNumbers,
@@ -4284,7 +4651,10 @@ export async function runPostTransformPhase(
                     );
                 }
                 const tTailState = performance.now();
-                const structuralSignature = tailHygieneStructuralSignature(args.messages);
+                const structuralSignature = tailHygieneStructuralSignature(
+                    args.messages,
+                    args.opencode2,
+                );
                 const effective = effectiveTailHygiene(baseline);
                 const durableGrace =
                     baseline.evaluable && !baseline.generationInvalidated
@@ -4308,8 +4678,15 @@ export async function runPostTransformPhase(
                     ...baseline,
                     usableWindow: args.usableWindow,
                     realUserTurnCount: countRealUserMessages(args.messages),
+                    // A successful refresh replaces the stale counts invalidated by ctx_reduce.
+                    // Release that temporary hold even without a generation change; persisted
+                    // post-reduce grace still waits for sufficient regrowth before reminding.
                     reducedSinceRefresh:
-                        baseline.baselineGeneration !== previous?.baselineGeneration
+                        baseline.baselineGeneration !== previous?.baselineGeneration ||
+                        ((previous?.generationInvalidated === true ||
+                            previous?.evaluable === false) &&
+                            baseline.evaluable &&
+                            !baseline.generationInvalidated)
                             ? false
                             : (previous?.reducedSinceRefresh ?? false),
                     agentDropsAppliedThisPass: pendingOpsDidMutate,
@@ -4357,7 +4734,7 @@ export async function runPostTransformPhase(
     const tTailGuard = performance.now();
     if (assertedBaseline) {
         try {
-            const servedSignature = tailHygieneStructuralSignature(args.messages);
+            const servedSignature = tailHygieneStructuralSignature(args.messages, args.opencode2);
             if (
                 !sameTailHygieneStructuralSignature(
                     assertedBaseline.structuralSignature,
@@ -4379,6 +4756,7 @@ export async function runPostTransformPhase(
             );
         }
         assertTailHygieneContentUnchangedIfEnabled({
+            opencode2: args.opencode2,
             messages: args.messages,
             tags: assertedBaseline.tags,
             protectedTagNumbers: assertedBaseline.protectedTagNumbers,
@@ -4415,6 +4793,7 @@ export async function runPostTransformPhase(
         prefixTrimStatus: deliveredPrefix?.prefixTrimStatus ?? null,
         thinkingBindingRecovery,
         proactiveThinkingStrip,
+        thinkingReleasedForFit,
     };
 }
 
@@ -4428,7 +4807,11 @@ export function checkM0MutationDriftAndSignal(args: {
     const currentMaxMutationId = getMaxM0MutationId(args.db, args.sessionId) ?? 0;
     const cachedMaxMutationId = args.cachedM0MaxMutationId ?? 0;
     if (currentMaxMutationId !== cachedMaxMutationId) {
-        args.pendingMaterializationSessions.add(args.sessionId);
+        requestPendingMaterialization(
+            args.pendingMaterializationSessions,
+            args.sessionId,
+            "mutation_drift",
+        );
         args.historyRefreshSessions?.add(args.sessionId);
         sessionLog(
             args.sessionId,
@@ -4438,3 +4821,11 @@ export function checkM0MutationDriftAndSignal(args: {
     }
     return false;
 }
+
+import { prepareCompactionMarkerCandidates } from "../../features/magic-context/compaction-marker";
+import {
+    clearPendingMaterialization,
+    hasPendingMaterializationOrigin,
+    pendingMaterializationOrigin,
+    requestPendingMaterialization,
+} from "./pending-materialization";

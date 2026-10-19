@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Local merge gate: GitHub's successful bot checks do not mean their findings
 # were handled. Only resolving the review threads on GitHub clears this gate.
-# Usage: scripts/merge-pr.sh <number> [--dry-run | --findings-only]
-# Requires gh, jq, GNU timeout (coreutils on macOS), git, and the touched runners.
+# Usage: scripts/merge-pr.sh <number> [--ci-gate] [--dry-run | --findings-only]
+# --ci-gate certifies a trial merge on train/check-pr-<number>, then fast-forwards
+# master to that exact SHA. Without it, touched-package gates run locally.
+# Requires gh, jq, Python 3, GNU timeout (coreutils on macOS), git, and the touched runners.
 # AFT's gh shim may refuse read-only GraphQL until gh api graphql is declared;
 # this script reports that limitation and never bypasses the shim.
 set -euo pipefail
@@ -10,6 +12,7 @@ set -euo pipefail
 REVIEW_BOTS='["cubic-dev-ai", "greptile-apps"]'
 REPOSITORY=cortexkit/magic-context
 COMMAND_TIMEOUT=20m
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 
 die() { printf 'merge-pr: %s\n' "$*" >&2; exit 1; }
 run() {
@@ -23,12 +26,14 @@ run() {
 number=''
 dry_run=0
 findings_only=0
+ci_gate=0
 for arg in "$@"; do
   case "$arg" in
     --dry-run) dry_run=1 ;;
     --findings-only) findings_only=1 ;;
+    --ci-gate) ci_gate=1 ;;
     *)
-      [[ "$arg" =~ ^[1-9][0-9]*$ ]] || die "Usage: scripts/merge-pr.sh <number> [--dry-run | --findings-only]"
+      [[ "$arg" =~ ^[1-9][0-9]*$ ]] || die "Usage: scripts/merge-pr.sh <number> [--ci-gate] [--dry-run | --findings-only]"
       [ -z "$number" ] || die 'Supply exactly one PR number.'
       number=$arg
       ;;
@@ -122,11 +127,20 @@ check_runs() {
 $pending"
 }
 
+check_title() {
+  local closing
+  closing=$(run jq -nr --arg title "$title" '$title | test("(^|[^[:alnum:]_])(fix(es|ed)?|close[sd]?|resolve[sd]?)[[:space:]]+#[0-9]+"; "i")')
+  if [ "$closing" = true ]; then
+    die 'PR title contains a GitHub closing keyword with a number. Edit the title/message before merging; no automatic issue closing is allowed.'
+  fi
+}
+
 head=''
 title=''
 check_findings
 [ "$findings_only" -eq 0 ] || exit 0
 check_runs
+check_title
 
 root=$(run git rev-parse --show-toplevel)
 cd "$root"
@@ -166,6 +180,17 @@ cleanup() {
 trap cleanup EXIT
 run git worktree add --detach "$worktree" master
 added=1
+if [ "$ci_gate" -eq 1 ]; then
+  run git -C "$worktree" merge --no-ff -m "Merge PR #$number: $title" "$head"
+  tested_sha=$(run git -C "$worktree" rev-parse HEAD)
+  if [ "$dry_run" -eq 1 ]; then
+    printf 'Dry run passed. Would push %s to train/check-pr-%s, wait for CI, then fast-forward master and push that SHA.\n' "$tested_sha" "$number"
+    exit 0
+  fi
+  # This disposable branch is replaced on retries; master is never force-pushed.
+  run git push --force origin "$tested_sha:refs/heads/train/check-pr-$number"
+  python3 "$SCRIPT_DIR/ci-gate.py" wait "$tested_sha" --branch "train/check-pr-$number"
+else
 run git -C "$worktree" merge --no-ff --no-edit "$head"
 
 changed_file=$(run mktemp "${worktree%/*}/merge-pr-files.XXXXXX")
@@ -192,7 +217,14 @@ while IFS= read -r -d '' file; do
 done < "$changed_file"
 (
   cd "$worktree"
+  run bash scripts/check-cortexkit-layout.sh
+  run bash scripts/check-docs-layout.sh
+  run bash scripts/check-docs-layout.test.sh
   run bun install --frozen-lockfile
+  # Some plugin and Pi tests load the built worker bundles (for example the
+  # auto-search worker), as CI does after its build step. A fresh worktree has
+  # no dist, so build both plugin dists before any package gate runs.
+  run bun run build:dists
   for rule in "${PACKAGE_GATES[@]}"; do
     IFS='|' read -r package runner prefixes <<< "$rule"
     selected=0
@@ -207,9 +239,14 @@ done < "$changed_file"
     if [ "$selected" -eq 1 ]; then
       (
         cd "packages/$package"
+        # Run each package's own test and lint scripts, as CI does: they carry
+        # the timeouts, parallelism and engine flags the suite was written for,
+        # and the package's own Biome settings. Plain `bun test` uses Bun's 5 s
+        # default timeout, and a Biome run from the repository root can miss a
+        # package's formatting rules, so both can pass here and fail in CI.
         case "$runner" in
-          test-typecheck) run bun test; run bun run typecheck ;;
-          test) run bun test ;;
+          test-typecheck) run bun run test; run bun run typecheck; run bun run lint ;;
+          test) run bun run test; run bun run lint ;;
           mode-manifest) run bun test scripts/validate-mode-manifest.test.ts ;;
           *) die "Unknown package gate runner: $runner" ;;
         esac
@@ -227,14 +264,8 @@ done < "$changed_file"
     printf 'Biome: no surviving changed files to check.\n'
   fi
 )
+fi
 
-check_title() {
-  local closing
-  closing=$(run jq -nr --arg title "$title" '$title | test("(^|[^[:alnum:]_])(fix(es|ed)?|close[sd]?|resolve[sd]?)[[:space:]]+#[0-9]+"; "i")')
-  if [ "$closing" = true ]; then
-    die 'PR title contains a GitHub closing keyword with a number. Edit the title/message before merging; no automatic issue closing is allowed.'
-  fi
-}
 check_title
 if [ "$dry_run" -eq 1 ]; then
   printf 'Dry run passed. Would merge %s with message "Merge PR #%s: %s", then push origin master.\n' "$head" "$number" "$title"
@@ -254,6 +285,12 @@ run git fetch origin master
 if ! timeout "$COMMAND_TIMEOUT" git merge-base --is-ancestor origin/master master; then
   die 'origin/master advanced during verification; update local master and retry.'
 fi
-run git merge --no-ff -m "Merge PR #$number: $title" "$tested_head"
-run git push origin master
+if [ "$ci_gate" -eq 1 ]; then
+  run git merge --ff-only "$tested_sha"
+  [ "$(run git rev-parse master)" = "$tested_sha" ] || die 'Master is not the CI-tested merge SHA.'
+  run git push origin "$tested_sha:refs/heads/master"
+else
+  run git merge --no-ff -m "Merge PR #$number: $title" "$tested_head"
+  run git push origin master
+fi
 run git log --oneline -1

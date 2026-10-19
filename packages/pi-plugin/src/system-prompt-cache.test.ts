@@ -24,6 +24,37 @@ import {
 import { createTestDb } from "./test-utils.test";
 
 describe("processSystemPromptForCache", () => {
+	it("freezes scoped environment dates but not document Date fields", () => {
+		const db = createTestDb();
+		const sessionId = "pi-env-date";
+		getOrCreateSessionMeta(db, sessionId);
+		updateSessionMeta(db, sessionId, {
+			cacheTtl: "never",
+			lastResponseTime: Date.now(),
+		});
+		const prompt = (date: string) =>
+			`<plugin-env>\nDate: ${date}\n</plugin-env>\nToday's date: ${date} (UTC-12)\n<document>\nDate: 1999-12-31\n</document>`;
+		const run = (date: string, isCacheBusting = false) =>
+			processSystemPromptForCache({
+				db,
+				sessionId,
+				systemPrompt: prompt(date),
+				isCacheBusting,
+			});
+		try {
+			const base = run("2026-10-12");
+			const held = run("2026-10-13");
+			expect(held.systemPrompt).toBe(base.systemPrompt);
+			expect(held.hashChanged).toBe(false);
+			const paid = run("2026-10-13", true);
+			expect(paid.systemPrompt).toContain("Date: 2026-10-13");
+			expect(paid.systemPrompt).toContain("Date: 1999-12-31");
+			expect(run("2026-10-13").hashChanged).toBe(false);
+		} finally {
+			clearPiSystemPromptSession(sessionId);
+			closeQuietly(db);
+		}
+	});
 	it("initializes hash on first pass without reporting hashChanged", () => {
 		const db = createTestDb();
 		try {

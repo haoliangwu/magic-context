@@ -10,7 +10,8 @@ Paths are relative to `packages/plugin/`. Pi uses the same core through `package
 - `src/hooks/magic-context/protected-tail-boundary.ts`, `read-session-true-raw-tokens.ts`, `host-served-rows.ts`: which raw messages are eligible.
 - `src/hooks/magic-context/read-session-chunk.ts`: formatting the eligible range into a chunk.
 - `src/hooks/magic-context/compartment-runner-incremental.ts`, `compartment-runner-historian.ts`: running the model and publishing.
-- `src/hooks/magic-context/reference-retrieval.ts`, `reference-seeds.generated.ts`, `historian-prompt.source.md` (built into `historian-prompt.generated.ts`): the prompt.
+- `src/hooks/magic-context/compartment-prompt.ts`, `reference-retrieval.ts`, `historian-prompt-fit.ts`: assembling and fitting the prompt.
+- `src/hooks/magic-context/reference-seeds.source.xml` (built into `reference-seeds.generated.ts` by `scripts/build-reference-seeds.ts`), `historian-prompt.source.md` (built into `historian-prompt.generated.ts`): prompt sources.
 - `src/hooks/magic-context/compartment-parser.ts`, `compartment-runner-validation.ts`: parsing and validation.
 - `src/hooks/magic-context/producer-window-guard.ts`: checking the prompt fits the model.
 - `src/hooks/magic-context/decay-curve.ts`, `decay-render.ts`: rendering compartments by age.
@@ -45,7 +46,14 @@ On OpenCode 2, a boundary never lands on a row the host does not serve by its ow
 
 ## Producer
 
-`compartment-runner-incremental.ts` reads the eligible chunk and runs the historian model on it with a bounded prompt: four rotating seed example compartments, the last six persisted compartments of this session (`reference-retrieval.ts`), and the project-memory block so it does not re-emit known facts. It never sends a full state dump. The prompt carries the session's content-language directive.
+`compartment-runner-incremental.ts` reads the eligible chunk and runs the historian model on it. The user prompt puts reference material before the raw chunk in this order, omitting empty reference blocks:
+
+1. **Cross-project examples** (`<compartment_examples_from_other_projects>`): normally three seeds from a bundled corpus of 60, generated from `reference-seeds.source.xml`. Each is a whole example unit: a compartment plus any facts, events and user observations, not project memory to deduplicate against. Session ID and chunk start deterministically select one seed from each of three rotating importance bands among 85–100, 60–84, 30–59, 10–29 and 1–9, rotating picks within each band. No embeddings are used.
+2. **Session references** (`<session_references>`): up to three older compartments chosen to fill importance bands left uncovered or underrepresented by the seeds, then the four most recent compartments. Each group is chronological; no-content placeholders are excluded. All stored tiers are shown (legacy rows use flat content). Older examples carry importance scores; recent ones omit them to avoid anchoring new scores.
+3. **Project memory** (`<project-memory>`): unexpired active and permanent memories for this project in supported categories, grouped in category-priority order as fact lines without IDs, for fact deduplication and contradiction awareness.
+4. **New messages** (`<new_messages>`): the eligible raw-history chunk with absolute ordinals, followed by a transcript guard that treats its contents as data, not instructions.
+
+Reference selection starts with at most ten compartments: three seeds plus seven session references. The system prompt carries the session's content-language directive.
 
 The historian emits, for each compartment:
 
@@ -57,7 +65,9 @@ The historian emits, for each compartment:
 
 On OpenCode 1 it may use a small read-only tool allow-list (`read`, `aft_outline`, `aft_zoom`, `aft_search`, reducible with `historian.disallowed_tools`), and `historian.two_pass` adds an editor pass that removes low-signal lines and duplicates across compartments.
 
-Before sending, `producer-window-guard.ts` checks the prompt fits the model's usable input window with a 3% estimator margin, using calibrated token ratios and an output reserve derived from the configured `maxTokens` or the catalog. A prompt that cannot fit a known window is refused before dispatch (`producer_prompt_exceeds_window`) and its drain reservation is released. An unknown window sends with a warning. A single atomic component too large to fit is split at its largest result boundary with a truncation marker instead of being refused forever. A timeout falls back to the next model in the configured chain.
+Before reading the chunk, `historian-prompt-fit.ts` fits the whole prompt to the producer's input window after reserving output space. To preserve the requested chunk budget, it drops diverse older references first, then recent references oldest first, then lowest-priority project-memory lines, then seeds (even down to zero). It removes whole examples and memories, not parts of them. Only then does it shrink the chunk. It reserves 64 extra tokens, measured by the local token estimator, for differences when joining prompt blocks. If fewer than 1,000 tokens fit (or the requested budget if smaller), the run is refused (`producer_prompt_unfit`). The reference and memory blocks have no separate token budgets; project memory has no fixed count cap.
+
+Before sending, `producer-window-guard.ts` checks the actual prompt fits the model's usable input window with a 3% estimator margin, using calibrated token ratios and an output reserve derived from the configured `maxTokens` or the catalog. A prompt that cannot fit a known window is refused before dispatch (`producer_prompt_exceeds_window`) and its drain reservation is released. An unknown window sends without trimming, with a warning. A single atomic component too large to fit is split at its largest result boundary with a truncation marker instead of being refused forever. A timeout falls back to the next model in the configured chain.
 
 ## Validation
 

@@ -100,7 +100,7 @@ test("foreground admission keeps the loop ticking while a separate writer holds 
     }
 }, 30000);
 
-test("a foreground in-pass writer has bounded 250ms tolerance and restores its timeout", () => {
+test("a foreground in-pass writer has bounded 2000ms tolerance and restores its timeout", () => {
     const { db, path, close } = fixture();
     const blocker = new Database(path);
     blocker.exec("BEGIN IMMEDIATE");
@@ -109,15 +109,15 @@ test("a foreground in-pass writer has bounded 250ms tolerance and restores its t
         expect(() =>
             withSqliteTransformPass(() => withPrivilegedWriter(db, () => undefined)),
         ).toThrow(SqliteAcquisitionBusyError);
-        expect(performance.now() - start).toBeGreaterThanOrEqual(200);
-        expect(performance.now() - start).toBeLessThan(400);
+        expect(performance.now() - start).toBeGreaterThanOrEqual(1900);
+        expect(performance.now() - start).toBeLessThan(2500);
         expect(db.prepare("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
     } finally {
         blocker.exec("ROLLBACK");
         blocker.close();
         close();
     }
-});
+}, 30000);
 
 test("ready background publication retries on a timer and retains its write", async () => {
     const { db, path, close } = fixture();

@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { closeDatabase, openDatabase } from "./storage-db";
 import { ensureSessionMetaRow } from "./storage-meta-shared";
@@ -83,6 +84,48 @@ test.skipIf(process.platform === "win32")(
             ).toEqual([]);
         } finally {
             replay.close();
+        }
+    },
+);
+
+test.skipIf(process.platform === "win32")(
+    "shared SQLite issue releases files with untracked statements",
+    () => {
+        const plainPath = fixturePath();
+        const plainDb = new BunDatabase(plainPath);
+        plainDb.exec("PRAGMA journal_mode=WAL; CREATE TABLE t(a)");
+        const plainStatement = plainDb.prepare("SELECT 1");
+        let plainCloseAttempted = false;
+        try {
+            plainStatement.all();
+            expect(openFiles(plainPath).length).toBeGreaterThan(0);
+            // Bun's default close keeps its files open until this statement is finalized.
+            plainCloseAttempted = true;
+            plainDb.close();
+            expect(openFiles(plainPath).length).toBeGreaterThan(0);
+        } finally {
+            plainStatement.finalize();
+            if (!plainCloseAttempted) plainDb.close();
+        }
+        expect(openFiles(plainPath)).toEqual([]);
+
+        const path = fixturePath();
+        const db = new Database(path);
+        db.exec("PRAGMA journal_mode=WAL; CREATE TABLE t(a)");
+        const trackedStatement = db.prepare("SELECT 1");
+        trackedStatement.all();
+        // Use Bun's native prepare method to keep a live statement outside the wrapper's owner.
+        const untrackedStatement = BunDatabase.prototype.prepare.call(db as never, "SELECT 1");
+        let wrapperCloseAttempted = false;
+        try {
+            untrackedStatement.all();
+            expect(openFiles(path).length).toBeGreaterThan(0);
+            wrapperCloseAttempted = true;
+            db.close();
+            expect(openFiles(path)).toEqual([]);
+        } finally {
+            untrackedStatement.finalize();
+            if (!wrapperCloseAttempted) db.close();
         }
     },
 );

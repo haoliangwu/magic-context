@@ -87,7 +87,7 @@ const fencedSources: Array<{ path: string; sites: string[]; reporterCalls?: stri
     },
     {
         path: "packages/pi-plugin/src/context-handler.ts",
-        sites: ["pi_compaction_queue"],
+        sites: ["pi_fallback_adoption"],
     },
 ];
 
@@ -149,7 +149,7 @@ const newlyCoveredSites = [
     "pi_materialize_cache",
     "pi_soft_refresh_cache",
     "pi_historian_publish",
-    "pi_compaction_queue",
+    "pi_fallback_adoption",
     "note_nudge_trigger",
     "user_memory_candidate_insert",
 ] as const;

@@ -110,7 +110,8 @@ export function detectConfigPaths(): ConfigPaths {
 // Pi paths
 // ============================================================================
 
-function envFirstHomeDir(): string {
+/** `$HOME` when set, else the OS home directory. */
+export function envFirstHomeDir(): string {
     const home = process.env.HOME?.trim();
     return home || homedir();
 }
@@ -240,7 +241,18 @@ export function getOmpPackageDir(): string | undefined {
  * global settings in response to values owned by either higher-precedence layer.
  */
 export function getOmpNonGlobalConfigSources(cwd = process.cwd()): string[] {
-    const sources =
+    const sources = getOmpConfigOverlayPaths(cwd);
+    const projectConfig = resolve(cwd, ".omp", "config.yml");
+    if (existsSync(projectConfig)) sources.push(projectConfig);
+    return [...new Set(sources)];
+}
+
+/**
+ * `PI_CONFIG_FILES` overlay paths in the order OMP merges them (later wins),
+ * resolved against `cwd` with `~` expanded, whether or not the files exist.
+ */
+export function getOmpConfigOverlayPaths(cwd = process.cwd()): string[] {
+    return (
         process.env.PI_CONFIG_FILES?.split(delimiter)
             .map((entry) => entry.trim())
             .filter(Boolean)
@@ -251,10 +263,8 @@ export function getOmpNonGlobalConfigSources(cwd = process.cwd()): string[] {
                         ? join(envFirstHomeDir(), entry.slice(2))
                         : entry;
                 return resolve(cwd, expanded);
-            }) ?? [];
-    const projectConfig = resolve(cwd, ".omp", "config.yml");
-    if (existsSync(projectConfig)) sources.push(projectConfig);
-    return [...new Set(sources)];
+            }) ?? []
+    );
 }
 
 /** OMP's npm/link plugin root, including profile and XDG data layout. */

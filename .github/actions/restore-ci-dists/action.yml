@@ -1,0 +1,25 @@
+name: Restore same-commit CI dists
+description: Restore complete package output, checking its commit and archive digest
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/wait-ci-artifact
+      id: wait
+      with:
+        artifact: ci-dists-${{ github.sha }}
+        producer: Preflight (checks and dists)
+        timeout-minutes: "10"
+    - uses: actions/download-artifact@v4
+      with:
+        artifact-ids: ${{ steps.wait.outputs.artifact-id }}
+        merge-multiple: true
+        path: ${{ runner.temp }}/ci-dists
+    - shell: bash
+      run: |
+        cd "$RUNNER_TEMP/ci-dists"
+        test "$(cat ci-dists.commit)" = "$GITHUB_SHA"
+        sha256sum --check ci-dists.sha256
+        tar -xzf ci-dists.tar.gz -C "$GITHUB_WORKSPACE"
+        # The archive is verified against this checkout's commit. Refresh the entry
+        # mtime so a newer checkout timestamp cannot masquerade as stale source bytes.
+        touch "$GITHUB_WORKSPACE/packages/plugin/dist/index.js"

@@ -46,9 +46,8 @@ import type { StoreRow } from "./store-reader";
  * The rows below are exactly what `@opencode/cli@2.0.5` wrote into
  * `session_message` when it converted a synthetic 1.x store in a throwaway root;
  * the "before" ordinals are what MC's 1.x reader produced from the same store
- * before conversion. Full transcript, coordinate inventory and the rebase design:
- * `.cortexkit/alfonso/reviews/issue-492-migration.md` and
- * `.cortexkit/alfonso/reviews/issue-492-f1-rebase.md`.
+ * before conversion. Rebase must recover endpoints by message identity rather
+ * than reusing ordinals from the old projection.
  *
  * Every case below drives the real rebase against a real Magic Context database:
  * the saved state is written the way the product writes it, the projection is

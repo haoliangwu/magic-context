@@ -10,7 +10,9 @@ use std::error::Error;
 use std::path::PathBuf;
 
 use mc_module::route_targets::RouteTargetConfig;
-use mc_module::{manifest_with_route_targets, McHandler, McTransportHandler, DEFAULT_MODULE_ID};
+use mc_module::{
+    manifest_with_route_targets_and_smart_notes, McHandler, McTransportHandler, DEFAULT_MODULE_ID,
+};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -79,14 +81,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // is optional: ck-mc starts and serves without it.
     let route_targets =
         RouteTargetConfig::for_configured_runners(mc_module::config::user_configured_runners());
+    let smart_notes_enabled = mc_module::config::user_smart_notes_enabled();
     subc_client_rs::serve_with(
         &connection_file,
-        manifest_with_route_targets(&module_id, &route_targets),
+        manifest_with_route_targets_and_smart_notes(
+            &module_id,
+            &route_targets,
+            smart_notes_enabled,
+        ),
         McTransportHandler::new(
             McHandler::new_with_connection_file_and_route_targets(
                 Some(connection_file.clone()),
                 route_targets,
             )
+            .with_startup_smart_notes_enabled(smart_notes_enabled)
             .with_log_directory(logger.logs_dir().to_path_buf()),
         ),
     )

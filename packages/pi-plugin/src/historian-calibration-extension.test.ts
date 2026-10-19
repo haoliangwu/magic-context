@@ -194,3 +194,276 @@ it("does not apply historian sampling calibration to provenance-only dreamer chi
 		else process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE = temperature;
 	}
 });
+
+async function withCalibrationHook(
+	temperature: string,
+	check: (
+		hook: (event: { payload: unknown }, ctx: { model?: unknown }) => unknown,
+		notices: string[],
+	) => void,
+	catalog?: unknown,
+): Promise<void> {
+	const { spyOn } = await import("bun:test");
+	const { __temperatureTest } = await import(
+		"../../plugin/src/shared/subagent-temperature"
+	);
+	const { default: extension } = await import(
+		"./historian-calibration-extension"
+	);
+	const keys = [
+		"MAGIC_CONTEXT_HISTORIAN_TEMPERATURE",
+		"MAGIC_CONTEXT_HISTORIAN_MAX_OUTPUT_TOKENS",
+		"MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY",
+		"MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE",
+		"XDG_CACHE_HOME",
+		"OPENCODE_MODELS_PATH",
+	];
+	const previous = keys.map((key) => process.env[key]);
+	// The child reads OpenCode's models.dev cache; give it a private one, never the machine's.
+	const { mkdirSync, rmSync, writeFileSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const cacheRoot = createTestTempDirFromPath(
+		join(tmpdir(), "mc-pi-temperature-catalog-"),
+	);
+	if (catalog !== undefined) {
+		mkdirSync(join(cacheRoot, "opencode"), { recursive: true });
+		writeFileSync(
+			join(cacheRoot, "opencode", "models.json"),
+			JSON.stringify(catalog),
+		);
+	}
+	const notices: string[] = [];
+	const output = spyOn(process.stdout, "write").mockImplementation((line) => {
+		notices.push(String(line));
+		return true;
+	});
+	__temperatureTest.reset();
+	try {
+		process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE = temperature;
+		process.env.MAGIC_CONTEXT_HISTORIAN_MAX_OUTPUT_TOKENS = "32000";
+		delete process.env.MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY;
+		delete process.env.MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE;
+		process.env.XDG_CACHE_HOME = cacheRoot;
+		delete process.env.OPENCODE_MODELS_PATH;
+		let hook:
+			| ((event: { payload: unknown }, ctx: { model?: unknown }) => unknown)
+			| undefined;
+		extension({
+			on(name: string, handler: typeof hook) {
+				if (name === "before_provider_request") hook = handler;
+			},
+		} as never);
+		if (!hook) throw new Error("provider hook was not registered");
+		check(hook, notices);
+	} finally {
+		output.mockRestore();
+		keys.forEach((key, index) => {
+			if (previous[index] === undefined) delete process.env[key];
+			else process.env[key] = previous[index];
+		});
+		__temperatureTest.reset();
+		rmSync(cacheRoot, { recursive: true, force: true });
+	}
+}
+
+for (const [host, field] of [
+	["Pi", "supportsTemperature"],
+	["OMP", "supportsSamplingParams"],
+] as const) {
+	it(`${host} calibrates each resolved model only on affirmative metadata, including fallbacks`, async () => {
+		await withCalibrationHook("0.1", (hook, notices) => {
+			for (const [id, compat, expected] of [
+				["flash", { [field]: true }, 0.1],
+				["fallback", { [field]: false }, undefined],
+				["unknown", {}, undefined],
+			] as const) {
+				for (const payload of [
+					{ max_output_tokens: 4096, temperature: 0.9 },
+					{ generationConfig: { temperature: 0.9, maxOutputTokens: 4096 } },
+					{ inferenceConfig: { temperature: 0.9, maxTokens: 4096 } },
+				]) {
+					const result = hook(
+						{ payload },
+						{ model: { provider: host, id, compat } },
+					) as Record<string, unknown>;
+					const options = (result.generationConfig ??
+						result.inferenceConfig ??
+						result) as Record<string, unknown>;
+					expect(options.temperature).toBe(expected);
+					if (expected === undefined)
+						expect("temperature" in options).toBe(false);
+					expect(
+						options.max_output_tokens ??
+							options.maxOutputTokens ??
+							options.maxTokens,
+					).toBe(32000);
+				}
+			}
+			expect(notices.map((line) => JSON.parse(line))).toEqual([
+				{
+					type: "mc_temperature",
+					model: `${host}/flash`,
+					supported: true,
+					source: "host",
+				},
+				{
+					type: "mc_temperature",
+					model: `${host}/fallback`,
+					supported: false,
+					source: "host",
+				},
+				{
+					type: "mc_temperature",
+					model: `${host}/unknown`,
+					supported: null,
+					source: "none",
+				},
+			]);
+		});
+	});
+}
+
+it("Codex-shaped provider never receives temperature when metadata is missing", async () => {
+	await withCalibrationHook("0.1", (hook) => {
+		let calls = 0;
+		const provider = (payload: Record<string, unknown>) => {
+			calls++;
+			if ("temperature" in payload)
+				throw new Error("Codex error: Unsupported parameter: temperature");
+			return "historian manifest";
+		};
+		const model = {
+			provider: "openai-codex",
+			id: "gpt-6.1-sol",
+			api: "openai-codex-responses",
+			reasoning: true,
+		};
+		for (let run = 0; run < 2; run++) {
+			const payload = hook(
+				{ payload: { max_output_tokens: 4096 } },
+				{ model },
+			) as Record<string, unknown>;
+			expect(provider(payload)).toBe("historian manifest");
+			expect(payload).not.toHaveProperty("temperature");
+		}
+		expect(calls).toBe(2);
+	});
+});
+
+it("provider hook honours explicit zero on a supported model", async () => {
+	await withCalibrationHook("0", (hook) => {
+		const result = hook(
+			{ payload: {} },
+			{
+				model: {
+					provider: "mock",
+					id: "zero",
+					compat: { supportsTemperature: true },
+				},
+			},
+		);
+		expect(result).toEqual({ temperature: 0 });
+	});
+});
+
+// The relevant slice of models.dev as OpenCode caches it.
+const MODELS_DEV = {
+	google: { models: { "gemini-3.8-flash": { temperature: true } } },
+	openrouter: {
+		models: {
+			"google/gemini-3.8-flash": { temperature: true },
+			"openai/gpt-6.1-sol": { temperature: false },
+		},
+	},
+	openai: { models: { "gpt-6.1-sol": { temperature: false } } },
+};
+
+it("Pi and OMP Gemini Flash get the historian temperature from the models.dev cache when the registry is silent", async () => {
+	await withCalibrationHook(
+		"0.1",
+		(hook, notices) => {
+			// Model shapes as Pi's registry and the Antigravity extension register them: they carry no
+			// temperature field, so the models.dev cache must decide.
+			for (const model of [
+				{
+					provider: "openrouter",
+					id: "google/gemini-3.8-flash",
+					api: "openai-completions",
+					compat: { thinkingFormat: "openrouter" },
+				},
+				{
+					provider: "google",
+					id: "antigravity-gemini-3.8-flash",
+					api: "google-generative-ai",
+				},
+				{
+					provider: "google-antigravity",
+					id: "gemini-3.8-flash",
+					api: "google-generative-ai",
+				},
+			]) {
+				const result = hook(
+					{ payload: { max_output_tokens: 4096 } },
+					{ model },
+				) as Record<string, unknown>;
+				expect(result.temperature).toBe(0.1);
+			}
+			for (const model of [
+				{
+					provider: "openai-codex",
+					id: "gpt-6.1-sol",
+					api: "openai-codex-responses",
+				},
+				{
+					provider: "openrouter",
+					id: "openai/gpt-6.1-sol",
+					api: "openai-completions",
+				},
+			]) {
+				const result = hook(
+					{ payload: { max_output_tokens: 4096, temperature: 1 } },
+					{ model },
+				) as Record<string, unknown>;
+				expect(result).not.toHaveProperty("temperature");
+			}
+			expect(notices.map((line) => JSON.parse(line))).toEqual([
+				{
+					type: "mc_temperature",
+					model: "openrouter/google/gemini-3.8-flash",
+					supported: true,
+					source: "catalog",
+					entry: "openrouter/google/gemini-3.8-flash",
+				},
+				{
+					type: "mc_temperature",
+					model: "google/antigravity-gemini-3.8-flash",
+					supported: true,
+					source: "catalog",
+					entry: "google/gemini-3.8-flash",
+				},
+				{
+					type: "mc_temperature",
+					model: "google-antigravity/gemini-3.8-flash",
+					supported: true,
+					source: "catalog",
+					entry: "google/gemini-3.8-flash",
+				},
+				{
+					type: "mc_temperature",
+					model: "openai-codex/gpt-6.1-sol",
+					supported: null,
+					source: "none",
+				},
+				{
+					type: "mc_temperature",
+					model: "openrouter/openai/gpt-6.1-sol",
+					supported: false,
+					source: "catalog",
+					entry: "openrouter/openai/gpt-6.1-sol",
+				},
+			]);
+		},
+		MODELS_DEV,
+	);
+});

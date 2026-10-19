@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 export type BodyProvider = "anthropic" | "openai" | "gemini";
@@ -27,8 +27,16 @@ export interface NormalizedRequestBody {
 }
 
 export interface PiBodySnapshot {
+    /** The number in the `<n>-req.json` file name, counted by the capture extension. */
     sequence: number;
     path: string;
+    /**
+     * When the capture extension last wrote the body file. The extension numbers
+     * its files with its own per-process counter, which is not Magic Context's
+     * ledger sequence and restarts with every Pi process, so the write time is
+     * what ties a body to the context pass that produced it.
+     */
+    writtenAtMs: number;
     wireModel?: string;
     messages: NormalizedMessage[];
 }
@@ -377,6 +385,7 @@ export function loadPiBodySnapshots(directory: string | undefined): Map<number, 
             snapshots.set(Number.parseInt(match[1], 10), {
                 sequence: Number.parseInt(match[1], 10),
                 path,
+                writtenAtMs: statSync(path).mtimeMs,
                 wireModel:
                     typeof body.model === "string" && body.model.length > 0 ? body.model : undefined,
                 messages: normalizeRequestBody(body, "openai").messages,

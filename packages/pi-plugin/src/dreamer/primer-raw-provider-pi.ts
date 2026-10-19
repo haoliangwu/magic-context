@@ -5,9 +5,14 @@ import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-ses
 import { RAW_SUMMARY_TEXT_MAX_CHARS } from "@magic-context/core/hooks/magic-context/read-session-raw";
 import {
 	convertEntriesToRawMessagePage,
+	iterateAsyncEntriesToRawMessageRange,
 	iterateEntriesToRawMessageRange,
 } from "../read-session-pi";
-import { findSession, lines } from "./bounded-session-reader";
+import {
+	asyncLines,
+	asyncSessionHeaders,
+	lines,
+} from "./bounded-session-reader";
 import { resolvePiCodingAgentModule } from "./pi-session-api";
 
 export interface PiPrimerRawProviderDeps {
@@ -85,15 +90,9 @@ function projectEntry(value: unknown): unknown {
 	};
 }
 
-function* summaryEntries(path: string): Generator<unknown> {
+function summaryProjector(): (parsed: unknown) => unknown {
 	let pendingResults = 0;
-	for (const line of lines(path)) {
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(line);
-		} catch {
-			continue;
-		}
+	return (parsed) => {
 		const entry = projectEntry(parsed);
 		const e = record(entry);
 		if (e.type === "message") {
@@ -106,7 +105,33 @@ function* summaryEntries(path: string): Generator<unknown> {
 			} else if (m.role === "user" || m.role === "assistant")
 				pendingResults = 0;
 		}
-		yield entry;
+		return entry;
+	};
+}
+
+function* summaryEntries(path: string): Generator<unknown> {
+	const project = summaryProjector();
+	for (const line of lines(path)) {
+		let entry: unknown;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			/* Like Pi, ignore malformed lines rather than ending the session scan. */
+		}
+		if (entry !== undefined) yield project(entry);
+	}
+}
+
+async function* asyncSummaryEntries(path: string): AsyncGenerator<unknown> {
+	const project = summaryProjector();
+	for await (const line of asyncLines(path)) {
+		let entry: unknown;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		yield project(entry);
 	}
 }
 
@@ -123,11 +148,29 @@ export function createPiPrimerRawProviderFactory(
 				if (!mod.getAgentDir) return null;
 				directory = join(mod.getAgentDir(), "sessions");
 			}
-			const path = findSession(directory, !deps.sessionDir, sessionId);
+			let path: string | null = null;
+			for await (const header of asyncSessionHeaders(
+				directory,
+				!deps.sessionDir,
+			)) {
+				if (header.id === sessionId) {
+					path = header.path;
+					break;
+				}
+			}
 			if (!path) return null;
+			const sessionPath = path;
 			return {
 				readMessages() {
 					throw new Error("Pi primer history requires bounded pages");
+				},
+				iterateMessageRangeAsync(from, to) {
+					return iterateAsyncEntriesToRawMessageRange(
+						asyncSummaryEntries(sessionPath),
+						from - 1,
+						Number.MAX_SAFE_INTEGER,
+						to,
+					);
 				},
 				iterateMessageRange(from, to) {
 					// One iterator owns the JSONL traversal. Closing it after an early

@@ -447,6 +447,10 @@ export async function dismissUserMemory(id: number): Promise<void> {
   return invoke("dismiss_user_memory", { id });
 }
 
+export async function restoreUserMemory(id: number): Promise<void> {
+  return invoke("restore_user_memory", { id });
+}
+
 export async function deleteUserMemory(id: number): Promise<void> {
   return invoke("delete_user_memory", { id });
 }

@@ -13,11 +13,13 @@ const names = ["applyDeferredCompactionMarker", "reconcileMarkerRepresentation",
 async function instrument() {
     const root = mkdtempSync(join(tmpdir(), "mc-s3-markers-"));
     const trace = join(root, "calls.jsonl");
+    const phaseTrace = join(root, "publication.jsonl");
     writeFileSync(trace, "");
+    writeFileSync(phaseTrace, "");
     symlinkSync(resolve(import.meta.dir, "../../../plugin/node_modules"), join(root, "node_modules"), "dir");
     writeFileSync(join(root, "package.json"), JSON.stringify({ type: "module", main: "index.js" }));
     const found = new Set<string>();
-    const build = await Bun.build({ entrypoints: [join(import.meta.dir, "marker-s3-plugin.ts")], outdir: root, naming: "index.js", target: "node", format: "esm", define: { "process.env.NODE_ENV": '"production"' }, external: ["@opencode-ai/plugin", "onnxruntime-node", "onnxruntime-web", "sharp", "bun:sqlite", "node:sqlite"], plugins: [{ name: "marker-counters", setup(builder) {
+    const build = await Bun.build({ entrypoints: [join(import.meta.dir, "marker-s3-plugin.ts")], outdir: root, naming: "index.js", target: "node", format: "esm", define: { "process.env.NODE_ENV": '"production"', "process.env.MC_S3_PHASE_TRACE": JSON.stringify(phaseTrace) }, external: ["@opencode-ai/plugin", "onnxruntime-node", "onnxruntime-web", "sharp", "bun:sqlite", "node:sqlite"], plugins: [{ name: "marker-counters", setup(builder) {
         builder.onLoad({ filter: /(?:compaction-marker-manager|transform-postprocess-phase|storage-meta-persisted)\.ts$/ }, async ({ path }) => {
             let source = readFileSync(path, "utf8");
             const tree = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -33,8 +35,14 @@ async function instrument() {
         });
     } }] });
     if (!build.success) throw new Error(build.logs.join("\n"));
+    // The historian waits for this worker to load message positions and the
+    // messages that own each tag. Ship it beside the plugin, as production does.
+    const worker = await Bun.build({ entrypoints: [join(import.meta.dir, "../../../plugin/src/hooks/magic-context/raw-ordinal-warmup-worker.ts")], outdir: root, naming: "raw-ordinal-warmup-worker.js", target: "node", format: "esm", external: ["bun:sqlite", "node:sqlite"] });
+    if (!worker.success) throw new Error(worker.logs.join("\n"));
+    const markerWorker = await Bun.build({ entrypoints: [join(import.meta.dir, "../../../plugin/src/features/magic-context/compaction-marker-candidates-worker.ts")], outdir: root, naming: "compaction-marker-candidates-worker.js", target: "node", format: "esm", external: ["bun:sqlite", "node:sqlite"] });
+    if (!markerWorker.success) throw new Error(markerWorker.logs.join("\n"));
     expect([...found].sort()).toEqual([...names].sort());
-    return { root, calls: (sessionID: string) => readFileSync(trace, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(call => call.sessionID === sessionID) };
+    return { root, calls: (sessionID: string) => readFileSync(trace, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(call => call.sessionID === sessionID), phases: (sessionId: string) => readFileSync(phaseTrace, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(row => row.sessionId === sessionId).map(row => row.phase) };
 }
 const usage = { input_tokens: 100, output_tokens: 10 };
 function historian(body: unknown) {
@@ -44,7 +52,7 @@ function historian(body: unknown) {
     const split = Math.min(start + 1, end);
     return { text: `<compartment start="${start}" end="${split}" title="Published control"><p1>The source history remains accessible after publication.</p1></compartment>${split < end ? `<compartment start="${split + 1}" end="${end}" title="Protected continuation"><p1>The later source turns continue the same task.</p1></compartment>` : ""}`, usage };
 }
-async function until(predicate: () => boolean) { const end = Date.now()+15000; while (!predicate()) { if (Date.now()>end) throw new Error("historian publication did not complete"); await Bun.sleep(25); } }
+async function until(predicate: () => boolean, failure = "historian publication did not complete") { const end = Date.now()+15000; while (!predicate()) { if (Date.now()>end) throw new Error(failure); await Bun.sleep(25); } }
 
 test("I10 real-host counters: v2 fold plus historian publication plus ten turns invoke no v1 marker members; v1 control invokes all four", async () => {
     const fixture = await instrument();
@@ -76,7 +84,7 @@ test("I10 real-host counters: v2 fold plus historian publication plus ten turns 
         console.info("I10_V2", JSON.stringify(Object.fromEntries(names.map(name => [name, fixture.calls(session.id).filter(call => call.name === name).length]))));
         expect(db.prepare("SELECT compaction_marker_state, pending_compaction_marker_state FROM session_meta WHERE session_id = ? AND (coalesce(compaction_marker_state, '') != '' OR pending_compaction_marker_state IS NOT NULL)").all(session.id)).toEqual([]);
         db.close();
-    } catch(error) { console.error(host.stderr().slice(-6000)); throw error; }
+    } catch(error) { console.error(host.stderr().slice(-6000)); console.error(host.pluginLog().slice(-10000)); throw error; }
     finally { await host.stop(); }
     const v1 = await TestHarness.create({ modelContextLimit: 16000, magicContextConfig: { execute_threshold_percentage: 65, protected_tokens: 4000, memory: { enabled: false } }, openCodeConfigExtra: { plugin: [fixture.root] } });
     try {
@@ -101,6 +109,9 @@ test("I10 real-host counters: v2 fold plus historian publication plus ten turns 
         await v1.sendPrompt(session, "Consume published marker");
         for(let index=0;index<10;index++) await v1.sendPrompt(session, `control defer ${index}`);
         await v1.sendPrompt(session, "Run direct marker control");
+        expect(directRequested).toBe(true);
+        expect(fixture.phases(session)).toEqual(["ready", "published", "complete"]);
+        expect((v1.contextDb().prepare("SELECT count(*) AS n FROM compartment_state_lease WHERE session_id = ? AND expires_at > ?").get(session, Date.now()) as {n:number}).n).toBe(0);
         const called = new Set(fixture.calls(session).map(call => call.name));
         expect([...called].sort()).toEqual([...names].sort());
         const counts = Object.fromEntries(names.map(name => [name, fixture.calls(session).filter(call => call.name === name).length]));
@@ -109,7 +120,7 @@ test("I10 real-host counters: v2 fold plus historian publication plus ten turns 
         console.info("I10_V1", JSON.stringify({ counts, latest, source: "fixture RawMessageProvider reads real v1 SDK messages" }));
     } catch (error) {
         console.error(v1.opencode.stderr().slice(-3000));
-        try { console.error(readFileSync(join(v1.opencode.env.workdir, "marker.log"), "utf8").split("\n").filter(line => /trigger|historian|compartment|boundar/i.test(line)).slice(-35).join("\n")); } catch {}
+        try { console.error(readFileSync(join(v1.opencode.env.dataDir, "state", "marker.log"), "utf8").split("\n").filter(line => /trigger|historian|compartment|boundar|ordinal|owner/i.test(line)).slice(-35).join("\n")); } catch {}
         throw error;
     } finally { await v1.dispose(); rmSync(fixture.root, { recursive: true, force: true }); }
 }, 180000);

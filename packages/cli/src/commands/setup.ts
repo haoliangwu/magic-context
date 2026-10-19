@@ -8,6 +8,7 @@
  * installation and native context/memory conflict handling.
  */
 import type { HarnessAdapter } from "../adapters/types";
+import { offerDashboardInstall } from "../lib/dashboard-install";
 import { ensureDocsProposalGitignore } from "../lib/docs-proposal-gitignore";
 import { resolveAdaptersForCommand } from "../lib/harness-select";
 import { intro, log, note, outro } from "../lib/prompts";
@@ -71,6 +72,9 @@ export async function runSetup(argv: string[]): Promise<number> {
         outro("Setup finished with warnings — see above.");
         return 1;
     }
+    // Offered only after every harness was set up. The offer handles its own
+    // failures, so it cannot change the exit code below.
+    if (!dryRun) await offerDashboardInstall(argv);
     outro(dryRun ? "Dry run done — no changes were made." : "Done.");
     return 0;
 }

@@ -33,6 +33,32 @@ const slot: LkgSlot = {
 };
 
 describe("LKG durable write discipline", () => {
+    it("metadata preparation failure retains the durable request without publishing Pi metadata", () => {
+        const { db, raw } = fixture();
+        try {
+            expect(saveLkgSlotToDb(db, "ses", slot)).toBe(true);
+            let serializations = 0;
+            const digests = [...slot.inputContentDigests];
+            Object.defineProperty(digests, "toJSON", {
+                value: () => {
+                    if (++serializations === 2) throw new Error("metadata preparation failed");
+                    return [...digests];
+                },
+            });
+            let published = false;
+            expect(
+                saveLkgSlotToDb(db, "ses", { ...slot, inputContentDigests: digests }, () => {
+                    published = true;
+                }),
+            ).toBe(false);
+            expect(serializations).toBe(2);
+            expect(published).toBe(false);
+            expect(raw.inTransaction).toBe(false);
+            expect(loadPersistedLkgSlot(db, "ses")?.jsonPrefix).toBe(slot.jsonPrefix);
+        } finally {
+            raw.close();
+        }
+    });
     it("does not hydrate a durable slot while marker rebuilding admission is fenced", () => {
         const { db, raw } = fixture();
         try {
