@@ -53,8 +53,9 @@ import {
 } from "@magic-context/core/hooks/magic-context/apply-operations";
 import { applyHeuristicCleanup } from "@magic-context/core/hooks/magic-context/heuristic-cleanup";
 import {
-  advanceToolReclaimWatermarkToCurrentMax,
+  advanceToolReclaimWatermarkByDistance,
   buildSyntheticToolReclaimOps,
+  toolReclaimDistanceEntries,
 } from "@magic-context/core/hooks/magic-context/tool-reclaim";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta-session";
 import type {
@@ -1734,9 +1735,11 @@ export function deriveMutationPlan(view: DshTranscriptView, ctx: PlanContext): M
     // upstream), so the application opportunity is every pass. Protections
     // mirror the shared lane: watermark floor, AGE_RECLAIM_MIN_TOKENS value
     // floor, newest todowrite, tags already carrying real pending ops, and
-    // only targets whose canDrop() is true. The watermark then advances to
-    // the current max tag so each newly eligible tag waits for the next
-    // independently priced batch (same advance-even-when-idle contract).
+    // only targets whose canDrop() is true. The watermark then advances by
+    // output distance (shared `farBehindToolBookmark`: three newer authored
+    // user turns or a quarter-window of newer content) — a free wire rebuild
+    // is not evidence the model has moved on, so drops use the PREVIOUS
+    // bookmark and distance must survive two rebuilds.
     // DSH has no emergency-drop band yet (fail-closed/LKG layer is deferred),
     // so there is no emergencyDropEligible gate here.
     try {
@@ -1759,7 +1762,16 @@ export function deriveMutationPlan(view: DshTranscriptView, ctx: PlanContext): M
           syntheticOps,
         );
       }
-      advanceToolReclaimWatermarkToCurrentMax(db, sessionId);
+      // Distance entries map output tags through `mutationParts` part identity,
+      // so they must be built from the SHARED targets (the recording wrapper
+      // does not forward `mutationParts`). Both layers edit the same
+      // RecordingParts, so the entries see post-apply content.
+      advanceToolReclaimWatermarkByDistance(
+        db,
+        sessionId,
+        toolReclaimDistanceEntries(transcript.messages, tagged.targets),
+        usableSoft,
+      );
     } catch {
       // Fail-open: reclaim must never break the pre-step chain.
     }

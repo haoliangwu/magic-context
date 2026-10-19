@@ -822,7 +822,9 @@ describe("tool reclaim (auto age-based reclaim lane)", () => {
       db = await createTestDb(join(dir, "context.db"));
       const view = reclaimViewOf(buildFourToolSession());
 
-      // Pass 1: tags assigned, watermark advanced to the current max.
+      // Pass 1: tags assigned, watermark advances by output distance — the
+      // oldest output has three newer authored user turns, so it is the only
+      // tag the bookmark moves past (shared farBehindToolBookmark contract).
       // usableSoft 0 → derived floor 0 → only the newest-3 tool tags protected.
       deriveMutationPlan(view, { db, usableSoft: 0 });
       const toolTags = getTagsBySession(db, view.sessionId).filter((t) => t.type === "tool");
@@ -855,12 +857,16 @@ describe("tool reclaim (auto age-based reclaim lane)", () => {
         ).toBe(false);
       }
 
-      // Watermark persisted at the current max tag.
+      // The bookmark only covers outputs three user turns behind, not the
+      // whole tag range: newer outputs stay ahead of it until the model has
+      // moved on (a free wire rebuild is not evidence of distance).
       const row = db
         .prepare("SELECT tool_reclaim_watermark FROM session_meta WHERE session_id = ?")
         .get(view.sessionId) as { tool_reclaim_watermark?: number } | undefined;
-      const maxTag = toolTags.reduce((max, t) => (t.tagNumber > max.tagNumber ? t : max));
-      expect(row?.tool_reclaim_watermark).toBeGreaterThanOrEqual(maxTag.tagNumber);
+      expect(row?.tool_reclaim_watermark).toBe(oldest.tagNumber);
+      expect(row?.tool_reclaim_watermark).toBeLessThan(
+        Math.max(...toolTags.map((t) => t.tagNumber)),
+      );
     } finally {
       await cleanupDir(dir, db);
     }
