@@ -2,11 +2,15 @@
  * agent/worker — the minimal Magic worker (PLAN §5.13/D7) + recursion
  * isolation (PLAN §9 worker 递归隔离).
  *
- * A worker is a one-shot child agent with: depth pinned (maxDepth 0 — workers
- * can never spawn further), an explicit tool allowlist, delegated approval
- * pinned to 'never' (captureDelegatedPolicyOverrides), and no default shell /
- * network / credential inheritance beyond what the allowlist grants. It is
- * used for the tool-requiring Dreamer paths.
+ * A worker is a one-shot child agent started through the DSH 0.2.1 activation
+ * API: depth pinned (maxDepth 0 — workers can never spawn further), caller
+ * delivery (no settlement notice in the borrowed parent's conversation), and
+ * delegated approval pinned to 'never' by the activation manager. DSH 0.2.1
+ * composes new children from their Agent Preset (the parent's when none is
+ * selected) and no longer accepts a per-request toolFilter/persona, so the
+ * task instructions travel as the leading prompt block and the worker's tool
+ * surface is the inherited preset's. It is used for the tool-requiring
+ * Dreamer paths.
  *
  * RECURSION ISOLATION: the agent-plane Magic listeners (context plane,
  * knowledge gate, session tracking) must NOT process child sessions — a child
@@ -19,13 +23,10 @@
  */
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
-import { textBlock } from "../compat/dsh-0.1/session";
 import {
-  appendDelegatedPolicyOverrides,
-  captureDelegatedPolicyOverrides,
-  magicWorkerRequest,
+  magicWorkerActivation,
+  magicWorkerPrompt,
   subagentsOf,
-  type SubagentStartRequest,
 } from "../compat/dsh-0.1/subagent";
 
 /** Whether a session is a CHILD session (subagent origin or delegation depth). */
@@ -51,7 +52,10 @@ export interface MagicWorkerDeps {
   readonly label: string;
   /** The worker's task prompt (user turn). */
   readonly prompt: string;
-  /** Tool allowlist (default: the read-only maintenance surface). */
+  /**
+   * Preferred tool allowlist. Kept for callers/tests; DSH 0.2.1 composes new
+   * children from their Agent Preset, so this no longer narrows the surface.
+   */
   readonly allow?: readonly string[];
   /** Optional system prompt for the worker. */
   readonly systemPrompt?: string;
@@ -63,9 +67,9 @@ export interface MagicWorkerDeps {
 
 /**
  * Run one Magic worker. Returns null on failure/cancel/timeout (never throws
- * to the caller's pre-step chain). Delegated policy overrides (approval
- * 'never' + the parent's sandbox mode) are applied BEFORE the first await of
- * the run.
+ * to the caller's pre-step chain). The activation manager seeds the delegated
+ * policy (approval 'never' + the parent's sandbox mode) onto the child log
+ * before publication.
  */
 export async function runMagicWorker(
   ctx: Context,
@@ -79,24 +83,14 @@ export async function runMagicWorker(
       return null;
     }
     const started = Date.now();
-    const request: SubagentStartRequest = magicWorkerRequest(deps.parent, {
-      label: deps.label,
-      prompt: [textBlock(deps.prompt)],
-      allow: deps.allow ?? ["read", "grep", "glob", "fs_search"],
-      maxDepth: 0, // workers can never spawn further (recursion cap)
-      signal: deps.signal,
-      persona: deps.systemPrompt,
-    });
-
-    const run = await subagents.start("spawn", request);
-    // Approval pinning + sandbox inheritance BEFORE the run proceeds. The
-    // overrides attach to the child SESSION; the local agent (when exposed)
-    // carries it.
-    const childSession = (run as unknown as { localAgent?: { session?: unknown } }).localAgent
-      ?.session;
-    if (childSession !== undefined) {
-      appendDelegatedPolicyOverrides(childSession as never, captureDelegatedPolicyOverrides(deps.parent));
-    }
+    const run = await subagents.startActivation(
+      magicWorkerActivation(deps.parent, {
+        label: deps.label,
+        prompt: magicWorkerPrompt(deps.systemPrompt, deps.prompt),
+        maxDepth: 0, // workers can never spawn further (recursion cap)
+        signal: deps.signal,
+      }),
+    );
 
     const timeout = deps.timeoutMs ?? 120_000;
     const result = await Promise.race([

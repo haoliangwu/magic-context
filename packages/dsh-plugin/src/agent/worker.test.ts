@@ -1,15 +1,15 @@
 import { describe, expect, it } from "bun:test";
 import { isMagicChildSession, runMagicWorker } from "./worker";
 
-/** Fake subagents service capturing the start request. */
+/** Fake subagents service capturing the activation spec. */
 function fakeSubagents(runResult?: { ok: true; output: { type: "text"; text: string }[] }) {
-  const calls: Array<{ provider: string; request: Record<string, unknown> }> = [];
+  const calls: Array<Record<string, unknown>> = [];
   const service = {
-    start: async (provider: string, request: Record<string, unknown>) => {
-      calls.push({ provider, request });
+    startActivation: async (spec: Record<string, unknown>) => {
+      calls.push(spec);
       const id = `child-${calls.length}`;
       return {
-        id,
+        childId: id,
         result: Promise.resolve(
           runResult ?? { ok: true, output: [{ type: "text", text: "worker output" }] },
         ),
@@ -27,7 +27,7 @@ function makeCtx(subagents: unknown) {
 }
 
 describe("magic worker (PLAN §5.13 minimal worker)", () => {
-  it("spawns with depth 0, allowlisted tools and returns the text", async () => {
+  it("spawns with depth 0 and caller delivery and returns the text", async () => {
     const { service, calls } = fakeSubagents();
     const ctx = makeCtx(service);
     const parent = {
@@ -43,10 +43,19 @@ describe("magic worker (PLAN §5.13 minimal worker)", () => {
     });
     expect(result?.text).toBe("worker output");
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.provider).toBe("spawn");
-    const request = calls[0]?.request as { maxDepth?: number; toolFilter?: { allow?: string[] } };
-    expect(request.maxDepth).toBe(0);
-    expect(request.toolFilter?.allow).toEqual(["read", "ctx_search"]);
+    const spec = calls[0] as {
+      provider?: string;
+      label?: string;
+      delivery?: string;
+      request?: { maxDepth?: number; prompt?: { text?: string }[] };
+    };
+    expect(spec.provider).toBe("spawn");
+    expect(spec.label).toBe("magic-worker-test");
+    expect(spec.delivery).toBe("caller");
+    expect(spec.request?.maxDepth).toBe(0);
+    // DSH 0.2.1 composes children from their preset: the tool allowlist is
+    // advisory only and no per-request toolFilter is sent.
+    expect(spec.request?.prompt?.[0]?.text).toBe("do the thing");
   });
 
   it("returns null on failure / missing service (never throws)", async () => {
@@ -61,8 +70,8 @@ describe("magic worker (PLAN §5.13 minimal worker)", () => {
     expect(noService).toBeNull();
     // Failed run.
     const failing = fakeSubagents();
-    failing.service.start = async () => ({
-      id: "child-f",
+    failing.service.startActivation = async () => ({
+      childId: "child-f",
       result: Promise.resolve({ ok: false, reason: "model_failed", error: "boom" }),
       dispose: () => {},
     });

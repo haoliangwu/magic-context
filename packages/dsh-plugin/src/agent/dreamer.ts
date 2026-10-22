@@ -11,8 +11,8 @@
  *      ordinary auxiliary call). Dream agents whose prompts REQUIRE tools
  *      (curate / maintain-docs / refresh-primers / map-memories / verify /
  *      verify-broad) run through the dream tool worker
- *      (`dream-worker.ts`: borrowed live parent agent + ctx.subagents.start
- *      spawn + toolFilter allowlist + persona system prompt). `messages`
+ *      (`dream-worker.ts`: borrowed live parent agent + activation API,
+ *      caller delivery, task instructions folded into the prompt). `messages`
  *      returns the synthetic OpenCode-shaped message list for the turn (text
  *      result + synthetic tool parts from the worker's completed tool calls —
  *      the Pi facade's trick, so curate's `inspectCurateMemoryOperations` sees
@@ -386,8 +386,9 @@ export function createDshDreamClient(ctx: Context, deps: DshDreamClientDeps): Ds
       try {
         if (agent !== undefined && TOOL_REQUIRING_DREAM_AGENTS.has(agent)) {
           // Tool-requiring dream agent: borrow a live top-level agent as the
-          // worker parent and run the task through a scoped child (toolFilter
-          // allowlist + persona system prompt + delegated approval 'never').
+          // worker parent and run the task through a scoped child (the child
+          // inherits the parent preset; approval 'never' is seeded by the
+          // activation manager).
           // No live agent → transient failure; the scheduler hot-retries and a
           // later tick (with a session live) picks the task up.
           const parent = presence.pick(dreamSession.directory);

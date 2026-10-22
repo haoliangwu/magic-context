@@ -303,12 +303,19 @@ describe("createDshDreamClient (DreamTimerClient-shaped facade)", () => {
         },
       };
       const { ctx, fire, service } = makeFakeCtx({ llm: stubLlm() });
+      service("agents", {
+        get: (id: unknown) => (id === "child-session-1" ? childAgent : undefined),
+      });
       service("subagents", {
-        start: async (provider: string, request: Record<string, unknown>) => {
-          starts.push({ provider, request });
+        startActivation: async (spec: {
+          provider: string;
+          label: string;
+          delivery: string;
+          request: Record<string, unknown>;
+        }) => {
+          starts.push({ provider: spec.provider, request: spec.request });
           return {
-            id: "child-session-1",
-            localAgent: childAgent,
+            childId: "child-session-1",
             result: Promise.resolve({
               output: [{ type: "text", text: "curated" }],
               stopReason: "completed",
@@ -332,16 +339,17 @@ describe("createDshDreamClient (DreamTimerClient-shaped facade)", () => {
         },
       });
 
-      // Spawn: one-shot worker with the curate tool profile and persona.
+      // Spawn: one-shot caller-delivery activation, depth 0, task system
+      // prompt folded into the leading user block (0.2.1 has no per-request
+      // persona/toolFilter).
       expect(starts).toHaveLength(1);
       expect(starts[0]!.provider).toBe("spawn");
       const request = starts[0]!.request;
-      expect(request.label).toBe("magic-dream-dreamer");
       expect(request.maxDepth).toBe(0);
-      expect(request.toolFilter).toEqual({ allow: ["ctx_memory", "ctx_memory_list"] });
-      expect(request.persona).toBe("curate memories");
+      expect(request.toolFilter).toBeUndefined();
+      expect(request.persona).toBeUndefined();
       const promptBlocks = request.prompt as Array<{ type: string; text?: string }>;
-      expect(promptBlocks[0]?.text).toBe("curate this");
+      expect(promptBlocks[0]?.text).toBe("curate memories\n\ncurate this");
 
       // messages: user + assistant(text + completed ctx_memory tool part).
       const response = await facade.session.messages({ path: { id } });
@@ -375,10 +383,15 @@ describe("createDshDreamClient (DreamTimerClient-shaped facade)", () => {
         options: {},
       };
       const { ctx, fire, service } = makeFakeCtx({ llm: stubLlm() });
+      service("agents", {
+        get: (id: unknown) =>
+          id === "child-session-2"
+            ? { id: "child-session-2", session: { header: {}, events: [] } }
+            : undefined,
+      });
       service("subagents", {
-        start: async () => ({
-          id: "child-session-2",
-          localAgent: { id: "child-session-2", session: { header: {}, events: [] } },
+        startActivation: async () => ({
+          childId: "child-session-2",
           result: Promise.resolve({
             output: [],
             stopReason: "error",

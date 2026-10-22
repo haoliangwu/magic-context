@@ -4,12 +4,15 @@
  * Tool-requiring dream agents (curate / maintain-docs / refresh-primers /
  * map-memories / verify / verify-broad) cannot run through the direct-LLM
  * facade: their prompts expect an agentic loop with tools. This module wires
- * the existing Magic worker seam (`worker.ts` → `ctx.subagents.start("spawn")`
- * + `toolFilter` allowlist + delegated approval pinned to 'never') into the
- * dreamer, mirroring the Pi plugin's `PiSubagentRunner`-backed facade:
+ * the existing Magic worker seam (`worker.ts` → the DSH activation API,
+ * caller delivery, delegated approval pinned to 'never') into the dreamer,
+ * mirroring the Pi plugin's `PiSubagentRunner`-backed facade:
  *
- *   - `DREAM_WORKER_PROFILES` — per-agent tool allowlists (DSH tool names,
- *     mirroring core `agents/dreamer.ts` constants).
+ *   - `DREAM_WORKER_PROFILES` — per-agent preferred tool lists (DSH tool
+ *     names, mirroring core `agents/dreamer.ts` constants). DSH 0.2.1 builds
+ *     new children from their Agent Preset, so the child inherits the parent
+ *     preset's tool surface; the list documents intent, it no longer narrows
+ *     the runtime surface.
  *   - `AgentPresence` — live top-level Magic agents observed via
  *     `agent/created`. DSH's one-shot spawn REQUIRES a parent Agent (workspace,
  *     lineage, delegation depth all derive from it), and the dreamer timer has
@@ -37,14 +40,11 @@
  */
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
-import type { ContentBlock } from "@deepseek-ai/dsh-llm";
-import { textBlock } from "../compat/dsh-0.1/session";
 import {
-  appendDelegatedPolicyOverrides,
-  captureDelegatedPolicyOverrides,
-  magicWorkerRequest,
+  childAgentOf,
+  magicWorkerActivation,
+  magicWorkerPrompt,
   subagentsOf,
-  type SubagentStartRequest,
 } from "../compat/dsh-0.1/subagent";
 import { isMagicChildSession } from "./worker";
 import { sessionEventsOf } from "./session-events";
@@ -271,47 +271,39 @@ export async function runDreamToolWorker(
   if (subagents === undefined) {
     throw transient(new Error("magic-context: subagents service unavailable (dreamer tool worker)"));
   }
-  const allow = DREAM_WORKER_PROFILES[deps.agent] ?? READONLY_FALLBACK_TOOLS;
   const started = Date.now();
-
   const base = {
     label: `magic-dream-${deps.agent}`,
-    prompt: [textBlock(deps.userText)] as ContentBlock[],
-    allow,
+    prompt: magicWorkerPrompt(deps.system, deps.userText),
     maxDepth: 0,
     signal: deps.signal ?? new AbortController().signal,
-    ...(deps.system !== undefined ? { persona: deps.system } : {}),
   };
 
-  let run: Awaited<ReturnType<typeof subagents.start>>;
+  let run: Awaited<ReturnType<typeof subagents.startActivation>>;
   try {
-    run = await subagents.start("spawn", buildRequest(deps.parent, base, deps.model));
+    run = await subagents.startActivation(
+      magicWorkerActivation(deps.parent, {
+        ...base,
+        ...(deps.model !== undefined
+          ? { agentOptions: { provider: deps.model.provider, model: deps.model.model } }
+          : {}),
+      }),
+    );
   } catch (error) {
     // agentOptions capability rejection (or spawn failure) — retry once with
     // the parent's own route before giving up.
     if (deps.model === undefined) throw transient(asError(error));
     log(`[dream-worker] spawn with agentOptions failed, retrying on parent route: ${brief(error)}`);
     try {
-      run = await subagents.start("spawn", buildRequest(deps.parent, base, undefined));
+      run = await subagents.startActivation(magicWorkerActivation(deps.parent, base));
     } catch (retryError) {
       throw transient(asError(retryError));
     }
   }
 
-  // Delegated policy pinning (approval 'never' + sandbox inheritance) — same
-  // contract as runMagicWorker, applied before the run proceeds.
-  const childSession = (run as unknown as { localAgent?: { session?: unknown } }).localAgent
-    ?.session;
-  if (childSession !== undefined) {
-    try {
-      appendDelegatedPolicyOverrides(
-        childSession as never,
-        captureDelegatedPolicyOverrides(deps.parent),
-      );
-    } catch (error) {
-      log(`[dream-worker] delegated policy pinning failed (continuing): ${brief(error)}`);
-    }
-  }
+  // The activation manager seeds the delegated policy (approval 'never' + the
+  // parent's sandbox mode) onto the child session before publication — the
+  // old manual append is gone with the 0.2.1 activation API.
 
   const result = await Promise.race([
     run.result,
@@ -343,9 +335,9 @@ export async function runDreamToolWorker(
     throw new Error("magic-context: dream tool worker refused the task");
   }
 
-  const toolCalls = collectToolCalls(
-    (run as unknown as { localAgent?: Agent }).localAgent,
-  );
+  // The activation exposes only the durable child id; the live child agent is
+  // resolved through the agents registry while the run is still resident.
+  const toolCalls = collectToolCalls(childAgentOf(ctx, String(run.childId)));
   const text = result.output
     .map((block) => (block.type === "text" ? block.text : ""))
     .join("\n")
@@ -364,26 +356,6 @@ export async function runDreamToolWorker(
     toolCallCount: toolCalls.toolCallCount,
     completedToolCalls: toolCalls.completedToolCalls,
   };
-}
-
-function buildRequest(
-  parent: Agent,
-  base: {
-    label: string;
-    prompt: ContentBlock[];
-    allow: readonly string[];
-    maxDepth: number;
-    signal: AbortSignal;
-    persona?: string;
-  },
-  model: { provider: string; model: string } | undefined,
-): SubagentStartRequest {
-  return magicWorkerRequest(parent, {
-    ...base,
-    ...(model !== undefined
-      ? { agentOptions: { provider: model.provider, model: model.model } }
-      : {}),
-  });
 }
 
 /* ─────────────────── child-session tool-call reconstruction ─────────────── */

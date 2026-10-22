@@ -60,7 +60,8 @@ const CONTRACTS: readonly PackageContract[] = [
       "captureDelegatedPolicyOverrides",
       "resolveChildDepth",
       "SubagentDepthError",
-      "toolFilter",
+      "startActivation",
+      "SubagentActivationSpec",
     ],
   },
   {
