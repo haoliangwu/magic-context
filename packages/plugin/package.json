@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/opencode-magic-context",
-  "version": "0.49.12",
+  "version": "0.49.18",
   "type": "module",
   "description": "OpenCode plugin for Magic Context — cross-session memory and context management",
   "main": "dist/index.js",
@@ -37,13 +37,14 @@
     "README.md"
   ],
   "scripts": {
-    "build": "bun ../../scripts/check-bun.mjs && tsc -p ../retina-local-fs/tsconfig.build.json && bun run build:tui && bun ../../scripts/clean-dist-chunks.mjs dist index.js transformers-web.js transformers-node-wasm.js && bun build src/features/magic-context/memory/transformers-web-entry.ts --outfile dist/transformers-web.js --target browser --format esm --external onnxruntime-web && bun scripts/build-transformers-node-wasm.ts dist && bun build src/index.ts src/features/magic-context/memory/embedding-worker.ts src/features/magic-context/memory/embedding-worker-process.ts src/features/magic-context/migration-worker.ts src/hooks/magic-context/auto-search-worker.ts src/hooks/magic-context/raw-ordinal-warmup-worker.ts src/features/magic-context/compaction-marker-candidates-worker.ts --outdir dist --entry-naming '[name].[ext]' --target node --format esm --splitting --external @opencode-ai/plugin --external onnxruntime-node --external onnxruntime-web --external sharp --external bun:ffi --external bun:sqlite --external node:sqlite && bun run build:v2 && tsc --emitDeclarationOnly",
-    "build:v2": "bun ../../scripts/clean-dist-chunks.mjs dist/v2 server.js embedding-worker.js embedding-worker-process.js migration-worker.js && bun build src/features/magic-context/memory/transformers-web-entry.ts --outfile dist/v2/transformers-web.js --target browser --format esm --external onnxruntime-web && bun scripts/build-transformers-node-wasm.ts dist/v2 && bun build src/v2/server.ts src/features/magic-context/memory/embedding-worker.ts src/features/magic-context/memory/embedding-worker-process.ts src/features/magic-context/migration-worker.ts src/hooks/magic-context/auto-search-worker.ts src/hooks/magic-context/raw-ordinal-warmup-worker.ts src/features/magic-context/compaction-marker-candidates-worker.ts --outdir dist/v2 --entry-naming '[name].[ext]' --target node --format esm --splitting --external @opencode/plugin --external onnxruntime-node --external onnxruntime-web --external sharp --external bun:ffi --external bun:sqlite --external node:sqlite",
+    "build": "bun ../../scripts/check-bun.mjs && tsc -p ../retina-local-fs/tsconfig.build.json && bun run build:tui && bun ../../scripts/clean-dist-chunks.mjs dist index.js transformers-web.js transformers-node-wasm.js && bun build src/features/magic-context/memory/transformers-web-entry.ts --outfile dist/transformers-web.js --target browser --format esm --external onnxruntime-web && bun scripts/build-transformers-node-wasm.ts dist && bun build src/index.ts src/features/magic-context/memory/embedding-worker.ts src/features/magic-context/memory/embedding-worker-process.ts src/features/magic-context/migration-worker.ts src/hooks/magic-context/auto-search-worker.ts src/hooks/magic-context/raw-ordinal-warmup-worker.ts src/features/magic-context/compaction-marker-candidates-worker.ts src/features/magic-context/chunk-embedding-write-worker.ts --outdir dist --entry-naming '[name].[ext]' --target node --format esm --splitting --external @opencode-ai/plugin --external onnxruntime-node --external onnxruntime-web --external sharp --external bun:ffi --external bun:sqlite --external node:sqlite && bun run build:v2 && tsc --emitDeclarationOnly",
+    "build:v2": "bun ../../scripts/clean-dist-chunks.mjs dist/v2 server.js embedding-worker.js embedding-worker-process.js migration-worker.js && bun build src/features/magic-context/memory/transformers-web-entry.ts --outfile dist/v2/transformers-web.js --target browser --format esm --external onnxruntime-web && bun scripts/build-transformers-node-wasm.ts dist/v2 && bun build src/v2/server.ts src/features/magic-context/memory/embedding-worker.ts src/features/magic-context/memory/embedding-worker-process.ts src/features/magic-context/migration-worker.ts src/hooks/magic-context/auto-search-worker.ts src/hooks/magic-context/raw-ordinal-warmup-worker.ts src/features/magic-context/compaction-marker-candidates-worker.ts src/features/magic-context/chunk-embedding-write-worker.ts --outdir dist/v2 --entry-naming '[name].[ext]' --target node --format esm --splitting --external @opencode/plugin --external onnxruntime-node --external onnxruntime-web --external sharp --external bun:ffi --external bun:sqlite --external node:sqlite",
     "build:tui": "bun scripts/build-tui.ts",
     "check:tui-compiled": "git diff --exit-code -- src/tui-compiled && test -z \"$(git status --porcelain -- src/tui-compiled)\"",
     "check:transformers-node-wasm": "bun scripts/verify-transformers-node-wasm.ts",
     "typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit && tsc -p tsconfig.scripts.json",
-    "test": "bun ../../scripts/check-bun.mjs && bun install --frozen-lockfile && MC_REVIEW_ASSERT_LIVENESS=1 BUN_JSC_useOMGJIT=0 bun test --parallel=4 --timeout 30000",
+    "test": "bun ../../scripts/check-bun.mjs && bun install --frozen-lockfile && bun run test:active-session-backfill && MC_REVIEW_ASSERT_LIVENESS=1 BUN_JSC_useOMGJIT=0 bun test --parallel=4 --timeout 30000 --test-name-pattern '^(?!re-embeds 1600 old chunks)'",
+    "test:active-session-backfill": "MC_REVIEW_ASSERT_LIVENESS=1 BUN_JSC_useOMGJIT=0 bun test src/hooks/magic-context/auto-embed-session.test.ts --test-name-pattern '^re-embeds 1600 old chunks' --timeout 120000",
     "test:serial": "bun install --frozen-lockfile && MC_REVIEW_ASSERT_LIVENESS=1 BUN_JSC_useOMGJIT=0 bun test --timeout 30000",
     "test:parallel:probe": "bun scripts/verify-parallel-db-isolation.ts",
     "lint": "bun ../../scripts/check-bun.mjs && biome check .",
@@ -54,7 +55,7 @@
     "prepublishOnly": "bun run build && bun run check:tui-compiled"
   },
   "//check:tui-compiled": "Check drift on output already generated by build or build:tui; this check never regenerates files. CI and prepublishOnly build first.",
-  "//test": "Only test runs disable JSC's optimizing WebAssembly tier so per-file isolation does not pay its compilation cost on every file. This is not a production setting and does not change host process engine options.",
+  "//test": "The strict 50ms active-session backfill latency gate runs alone before the four-worker suite, which excludes only that already-run case. Unrelated workers can deschedule the latency monitor. Test runs also disable JSC's optimizing WebAssembly tier so per-file isolation does not pay its compilation cost on every file; production host options are unchanged.",
   "dependencies": {
     "@cortexkit/subc-client": "0.11.1",
     "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",

@@ -16,7 +16,7 @@ import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
  * captured at the top of the handler. These tests lock that contract in.
  */
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -41,6 +41,7 @@ import {
     openDatabase,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
+import * as logger from "../../shared/logger";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import { createPromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
@@ -145,6 +146,43 @@ function buildHandler(opts?: {
 }
 
 describe("system-prompt-hash drain semantics (Oracle review 2026-04-26 Finding A1)", () => {
+    it("logs changed system elements as byte metadata without prompt content", async () => {
+        useTempDataHome("sph-diagnostics-");
+        const sessionId = "ses-diagnostics";
+        resolveCtxReduceAvailabilityFromMessages(sessionId, [
+            { info: { id: "u", role: "user" }, parts: [{ type: "text", text: "hello" }] },
+        ] as never);
+        const handler = buildHandler();
+        const log = spyOn(logger, "sessionLog");
+        try {
+            await handler.handler(
+                { sessionID: sessionId },
+                { system: ["éSECRET-A", "unchanged-secret ## Magic Context", "removed-secret"] },
+            );
+            const output = { system: ["éSECRET-B", "unchanged-secret ## Magic Context"] };
+            await handler.handler({ sessionID: sessionId }, output);
+            const line = log.mock.calls
+                .map((call) => call[1])
+                .find((line) => line.startsWith("system prompt hash changed:"));
+            expect(line).toContain("0:changed(bytes=10,md5=");
+            expect(line).toContain("firstDiffByte=9");
+            expect(line).toContain("1:unchanged");
+            expect(line).toContain("2:removed");
+            expect(line).not.toContain("SECRET");
+            expect(line).not.toContain("unchanged-secret ## Magic Context");
+            expect(line).not.toContain("removed-secret");
+            expect(output.system).toEqual(["éSECRET-B", "unchanged-secret ## Magic Context"]);
+            handler.clearSession(sessionId);
+            log.mockClear();
+            await handler.handler({ sessionID: sessionId }, { system: ["added-secret"] });
+            expect(log.mock.calls.map((call) => call[1]).join("\n")).toContain(
+                "firstDiffByte=unknown",
+            );
+        } finally {
+            log.mockRestore();
+            clearCtxReduceAvailability(sessionId);
+        }
+    });
     it("a cold handler adopts a midnight date change on the idle-expired request", async () => {
         useTempDataHome("sph-cold-midnight-");
         const sessionId = "ses-cold-midnight";

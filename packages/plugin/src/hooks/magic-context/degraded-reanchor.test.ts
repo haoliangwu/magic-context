@@ -502,7 +502,7 @@ describe("Layer A — fork-orphan marker hygiene (#263)", () => {
             userMessage("msg_later_1", "later one"),
             userMessage("msg_later_2", "later two"),
         ];
-        const pass1 = prepareCompartmentInjection(db, SESSION_ID, pass1Messages, true);
+        const pass1 = prepareCompartmentInjection(db, SESSION_ID, pass1Messages, true, []);
         expect(pass1?.compartmentEndMessageId).toBeNull();
         // Hygiene removed the orphan during this degraded pass.
         const remaining = listSessionCompactionMarkers(SESSION_ID);
@@ -517,7 +517,7 @@ describe("Layer A — fork-orphan marker hygiene (#263)", () => {
             userMessage("msg_comp_end", "compartment end"),
             userMessage("msg_later_1", "later one"),
         ];
-        const pass2 = prepareCompartmentInjection(db, SESSION_ID, pass2Messages, true);
+        const pass2 = prepareCompartmentInjection(db, SESSION_ID, pass2Messages, true, []);
         expect(pass2?.compartmentEndMessageId).toBe("msg_comp_end");
         expect(pass2?.skippedVisibleMessages).toBe(2);
         expect(pass2Messages.length).toBe(1);
@@ -565,14 +565,14 @@ describe("Layer B — degraded-mode re-anchor (#264)", () => {
 
         // Pass 1 (bust): first degraded detection — hygiene no-ops (no marker
         // state), count=1, no re-anchor yet.
-        const pass1 = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
+        const pass1 = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true, []);
         expect(pass1?.compartmentEndMessageId).toBeNull();
         expect(pass1?.skippedVisibleMessages).toBe(0);
 
         // Pass 2 (bust): count reaches the threshold — re-anchor splices at the
         // visible msg_c1_end boundary instead of looping.
         const pass2Messages = makeVisible();
-        const pass2 = prepareCompartmentInjection(db, SESSION_ID, pass2Messages, true);
+        const pass2 = prepareCompartmentInjection(db, SESSION_ID, pass2Messages, true, []);
         expect(pass2?.compartmentEndMessageId).toBe("msg_c1_end");
         expect(pass2?.compartmentEndMessage).toBe(5);
         expect(pass2?.skippedVisibleMessages).toBe(1);
@@ -593,7 +593,7 @@ describe("Layer B — degraded-mode re-anchor (#264)", () => {
 
         // Store A: one degraded bust pass (count = 1, below the threshold).
         seedTwoCompartments();
-        const storeAPass = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
+        const storeAPass = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true, []);
         expect(storeAPass?.compartmentEndMessageId).toBeNull();
 
         // Store B: independent database, same session id, its FIRST degraded pass.
@@ -603,7 +603,7 @@ describe("Layer B — degraded-mode re-anchor (#264)", () => {
             db = storeB;
             seedTwoCompartments();
             const messages = makeVisible();
-            const storeBPass = prepareCompartmentInjection(storeB, SESSION_ID, messages, true);
+            const storeBPass = prepareCompartmentInjection(storeB, SESSION_ID, messages, true, []);
             // Still pass 1 for THIS store: no re-anchor, nothing spliced.
             expect(storeBPass?.compartmentEndMessageId).toBeNull();
             expect(storeBPass?.skippedVisibleMessages).toBe(0);
@@ -621,7 +621,7 @@ describe("Layer B — degraded-mode re-anchor (#264)", () => {
             userMessage("msg_x", "x"),
         ];
         // A single degraded bust pass must stay degraded (no premature re-anchor).
-        const pass1 = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
+        const pass1 = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true, []);
         expect(pass1?.compartmentEndMessageId).toBeNull();
         expect(pass1?.skippedVisibleMessages).toBe(0);
     });
@@ -632,8 +632,8 @@ describe("Layer B — degraded-mode re-anchor (#264)", () => {
             userMessage("msg_unrelated", "unrelated"),
             userMessage("msg_x", "x"),
         ];
-        prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
-        const pass2 = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
+        prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true, []);
+        const pass2 = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true, []);
         expect(pass2?.compartmentEndMessageId).toBeNull();
         expect(pass2?.needsFreshMaterialization).toBe(true);
     });
@@ -672,16 +672,16 @@ describe("Byte stability — defer passes during degraded mode", () => {
         ];
 
         // Bust pass establishes the degraded cache (count=1).
-        const bust = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true);
+        const bust = prepareCompartmentInjection(db, SESSION_ID, makeVisible(), true, []);
         expect(bust?.compartmentEndMessageId).toBeNull();
 
         // Two defer passes: degraded cache forces a rebuild each time, but the
         // re-anchor must NOT first-apply on a defer pass, and the rendered block
         // must stay byte-identical.
         const defer1Messages = makeVisible();
-        const defer1 = prepareCompartmentInjection(db, SESSION_ID, defer1Messages, false);
+        const defer1 = prepareCompartmentInjection(db, SESSION_ID, defer1Messages, false, []);
         const defer2Messages = makeVisible();
-        const defer2 = prepareCompartmentInjection(db, SESSION_ID, defer2Messages, false);
+        const defer2 = prepareCompartmentInjection(db, SESSION_ID, defer2Messages, false, []);
 
         expect(defer1?.block).toBe(bust?.block);
         expect(defer2?.block).toBe(bust?.block);

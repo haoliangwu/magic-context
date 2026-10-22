@@ -410,7 +410,7 @@ describe("Pi context handler LKG replay", () => {
 								[...structuredClone(nextRaw), userMessage("new turn", 3)],
 								[...nextIds, "new"],
 							),
-						).rejects.toMatchObject({ code: "PI_STORAGE_BUSY" });
+						).rejects.toMatchObject({ code: "PI_DEGRADED_PASS" });
 						expect(
 							omission.mock.calls.some((call) =>
 								call[2].includes(
@@ -612,7 +612,13 @@ describe("Pi context handler LKG replay", () => {
 					raw,
 					ctx,
 				);
-				host.assertRefused(served, raw);
+				host.assertRefused(
+					served,
+					raw,
+					emergency
+						? undefined
+						: "Magic Context could not safely prepare this turn [MC-S06] (context-handler-failed: ordinary transform defect). This request was not sent.",
+				);
 			} finally {
 				closeQuietly(db);
 			}

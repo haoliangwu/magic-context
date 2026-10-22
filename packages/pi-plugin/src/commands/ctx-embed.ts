@@ -2,15 +2,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isUsableProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	embedSessionCompartmentChunks,
-	getAutoEmbeddingSessionCoverage,
 	getEmbeddingCoverageStatus,
-	getProjectEmbeddingSnapshot,
 	type SessionChunkBackfillProgress,
 } from "@magic-context/core/features/magic-context/project-embedding-registry";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
+import { maybeAutoEmbedSessionBackfill } from "@magic-context/core/hooks/magic-context/auto-embed-session";
 import {
-	autoEmbedAttemptedBySession,
-	autoEmbedIdentityBySession,
+	activeEmbeddingSessions,
 	embedPauseBySession,
 	embedRunStateBySession,
 	invalidateAutoEmbedSession,
@@ -26,6 +24,7 @@ const EMBED_PROGRESS_MIN_INTERVAL_MS = 10_000;
 type EmbedDrainStatus = { text: string; level: "success" | "info" };
 
 export function clearPiEmbedSessionState(sessionId: string): void {
+	activeEmbeddingSessions.delete(sessionId);
 	embedPauseBySession.delete(sessionId);
 	const ctrl = embedRunStateBySession.get(sessionId);
 	if (ctrl) {
@@ -265,51 +264,14 @@ export function maybeAutoEmbedPiSession(
 	projectDir: string,
 	projectIdentity: string,
 ): void {
-	// Embeddings are stored per project; a session outside any project (empty
-	// identity) has nothing to embed under.
 	if (!isUsableProjectIdentity(projectIdentity)) return;
-	const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
-	const embedIdentity = snapshot
-		? JSON.stringify([
-				snapshot.providerIdentity,
-				snapshot.chunkModelId,
-				snapshot.runtimeFingerprint,
-			])
-		: "off";
-	if (autoEmbedIdentityBySession.get(sessionId) !== embedIdentity)
-		invalidateAutoEmbedSession(sessionId);
-	if (autoEmbedAttemptedBySession.has(sessionId)) return;
-	if (embedPauseBySession.has(sessionId)) return;
-	autoEmbedAttemptedBySession.add(sessionId);
-	autoEmbedIdentityBySession.set(sessionId, embedIdentity);
-	void (async () => {
-		try {
-			// Defer off the context-handler thread before any DB/config work:
-			// ensureProjectRegisteredFromPiDirectory does its config load + stale
-			// wipe synchronously, so awaiting it first would run on the hot path.
-			await new Promise((resolve) => setTimeout(resolve, 0));
-			await ensureProjectRegisteredFromPiDirectory(projectDir, deps.db);
-			const coverage = await getAutoEmbeddingSessionCoverage(
-				deps.db,
-				projectIdentity,
-				sessionId,
-			);
-			if (!coverage.enabled) {
-				invalidateAutoEmbedSession(sessionId);
-				return;
-			}
-			const remaining = coverage.total - coverage.embedded;
-			if (remaining <= 0) return;
-			// Silent bootstrap trigger: no pre-announce, no busy/zero-work
-			// chatter, and the once-per-process latch never resets. The
-			// announce-then-drain shape looped every turn on large backlogs:
-			// the project-level passive backfill holds the drain lock during
-			// its (bounded) catch-up, so this drain returned "busy" each pass,
-			// reset its own latch, and re-announced the same count. Retries
-			// belong to the passive backfill; progress lives in /ctx-embed.
-			await runEmbedDrain(deps.db, projectIdentity, sessionId);
-		} catch {
-			// best-effort background drain
-		}
-	})();
+	maybeAutoEmbedSessionBackfill(
+		{
+			db: deps.db,
+			projectIdentity,
+			ensureRegistered: () =>
+				ensureProjectRegisteredFromPiDirectory(projectDir, deps.db),
+		},
+		sessionId,
+	);
 }

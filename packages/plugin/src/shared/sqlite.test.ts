@@ -1,14 +1,40 @@
 import { describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
     Database,
     detectSqliteRuntime,
     getSqliteMemoryStats,
     loadSqliteModule,
+    openImmutableDatabase,
     SqliteRuntimeUnavailableError,
 } from "./sqlite";
+import { createTestTempDir } from "./test-temp-dir";
 
 describe("SQLite runtime selector", () => {
+    it("imports the shared SQLite module in Bun without node:sqlite available", () => {
+        const sqliteUrl = new URL("./sqlite.ts", import.meta.url).href;
+        const script = `
+            const getBuiltinModule = process.getBuiltinModule;
+            process.getBuiltinModule = function (specifier) {
+                if (specifier === "node:sqlite") throw new Error("node:sqlite deliberately unavailable");
+                return getBuiltinModule.call(process, specifier);
+            };
+            await import(${JSON.stringify(sqliteUrl)});
+            console.log("shared SQLite import succeeded");
+        `;
+        const child = spawnSync(process.execPath, ["-e", script], {
+            encoding: "utf8",
+            windowsHide: true,
+        });
+
+        expect(child.error).toBeUndefined();
+        expect(child.status).toBe(0);
+        expect(child.stdout).toContain("shared SQLite import succeeded");
+    });
+
     it("suppresses only the node:sqlite experimental warning in a real Node process", () => {
         // Node 24.21 no longer emits this warning, so inject it during loading
         // to keep the suppression assertion load-bearing on newer runtimes.
@@ -78,6 +104,36 @@ describe("SQLite runtime selector", () => {
             db.close();
         }
         expect(getSqliteMemoryStats().connectionCount).toBe(before);
+    });
+
+    it("reads a checkpointed WAL database without creating sidecars or changing bytes", () => {
+        const { dir: directory, cleanup } = createTestTempDir(
+            "mc-plugin-test-xdg-pid-",
+            "immutable-sqlite-",
+        );
+        const path = join(directory, "context.db");
+        try {
+            const writer = new Database(path);
+            writer.exec(
+                "PRAGMA journal_mode=WAL; CREATE TABLE sample (value INTEGER); INSERT INTO sample VALUES (42); PRAGMA wal_checkpoint(TRUNCATE)",
+            );
+            writer.close();
+            expect(existsSync(`${path}-wal`)).toBe(false);
+            expect(existsSync(`${path}-shm`)).toBe(false);
+
+            const before = createHash("sha256").update(readFileSync(path)).digest("hex");
+            const reader = openImmutableDatabase(path);
+            try {
+                expect(reader.prepare("SELECT value FROM sample").get()).toEqual({ value: 42 });
+            } finally {
+                reader.close();
+            }
+            expect(createHash("sha256").update(readFileSync(path)).digest("hex")).toBe(before);
+            expect(existsSync(`${path}-wal`)).toBe(false);
+            expect(existsSync(`${path}-shm`)).toBe(false);
+        } finally {
+            cleanup();
+        }
     });
 
     it("wraps a missing node:sqlite module with the detected runtime and cause", async () => {

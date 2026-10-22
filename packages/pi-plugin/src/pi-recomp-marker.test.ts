@@ -24,6 +24,62 @@ function branchEntry(id: string, role: "user" | "assistant", text: string) {
 }
 
 describe("queueAndApplyPiRecompMarker (eager path coverage precondition)", () => {
+	it("keeps a failed read-back pending instead of retiring it as already-current on rebinding", () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-recomp-read-back";
+		const entries: unknown[] = [
+			branchEntry("e1", "user", "one"),
+			branchEntry("e2", "assistant", "two"),
+			branchEntry("e3", "user", "three"),
+		];
+		const appendCompaction = mock(
+			(
+				_summary: unknown,
+				firstKeptEntryId: unknown,
+				_tokensBefore: unknown,
+				_details: unknown,
+				_fromHook: unknown,
+				_usage: unknown,
+			) => {
+				entries.push({
+					type: "compaction",
+					id: "corrupt",
+					firstKeptEntryId,
+					details: {},
+				});
+				return "corrupt";
+			},
+		);
+		const ctx = {
+			sessionManager: {
+				appendCompaction,
+				getBranch: () => entries,
+				getEntry: (id: string) =>
+					entries.find((entry) => (entry as { id?: string }).id === id),
+			},
+		};
+		try {
+			appendCompartments(db, sessionId, [
+				{
+					sequence: 0,
+					startMessage: 1,
+					endMessage: 2,
+					startMessageId: "e1",
+					endMessageId: "e2",
+					title: "Recomp",
+					content: "body",
+				},
+			]);
+			for (let pass = 0; pass < 3; pass++) {
+				queueAndApplyPiRecompMarker({ db, sessionId, ctx });
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).not.toBeNull();
+			}
+			expect(appendCompaction).toHaveBeenCalledTimes(1);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("applies the marker when the branch covers the recomp boundary", () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-recomp-eager-covered";
@@ -39,19 +95,39 @@ describe("queueAndApplyPiRecompMarker (eager path coverage precondition)", () =>
 					content: "recomp body",
 				},
 			]);
-			const appendCompaction = mock(() => "compact-1");
+			const entries: unknown[] = [
+				branchEntry("e1", "user", "one"),
+				branchEntry("e2", "assistant", "two"),
+				branchEntry("e3", "user", "three"),
+			];
+			const appendCompaction = mock(
+				(
+					_summary: unknown,
+					firstKeptEntryId: unknown,
+					_tokensBefore: unknown,
+					details: unknown,
+					_fromHook: unknown,
+					_usage: unknown,
+				) => {
+					entries.push({
+						type: "compaction",
+						id: "compact-1",
+						firstKeptEntryId,
+						details,
+					});
+					return "compact-1";
+				},
+			);
 			const ctx = {
 				sessionManager: {
 					appendCompaction,
+					getEntry: (id: string) =>
+						entries.find((entry) => (entry as { id?: string }).id === id),
 					// The recomp materialization rendered the compartment; the
 					// branch still carries the kept tail starting at ordinal 3
 					// (lastCompactedOrdinal 2 + 1), so the boundary resolves to
 					// a real, replay-safe entry id.
-					getBranch: () => [
-						branchEntry("e1", "user", "one"),
-						branchEntry("e2", "assistant", "two"),
-						branchEntry("e3", "user", "three"),
-					],
+					getBranch: () => entries,
 				},
 			};
 
@@ -83,10 +159,20 @@ describe("queueAndApplyPiRecompMarker (eager path coverage precondition)", () =>
 					content: "recomp body",
 				},
 			]);
-			const appendCompaction = mock(() => "compact-1");
+			const appendCompaction = mock(
+				(
+					_summary: unknown,
+					_firstKeptEntryId: unknown,
+					_tokensBefore: unknown,
+					_details: unknown,
+					_fromHook: unknown,
+					_usage: unknown,
+				) => "compact-1",
+			);
 			const ctx = {
 				sessionManager: {
 					appendCompaction,
+					getEntry: () => undefined,
 					// No entry at ordinal 3: the rendered content covering the
 					// marker boundary does not exist (no recomp materialization
 					// in this context), so nothing may be trimmed.

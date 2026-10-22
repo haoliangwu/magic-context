@@ -2167,6 +2167,79 @@ full narrative
         assert_eq!(validated.unprocessed_from, 3);
     }
 
+    /// The historian prompt must say what `<unprocessed_from>` holds when nothing is
+    /// left unprocessed; otherwise small models guess `0` or the last index and an
+    /// otherwise complete chunk fails validation. The prompt prescribes chunk end + 1,
+    /// so that exact value must validate, while a chunk that leaves a trailing suffix
+    /// uncovered must still name that suffix's first message.
+    #[test]
+    fn fully_covered_chunk_validates_with_the_prompt_prescribed_boundary() {
+        assert!(
+            crate::historian_prompt::HISTORIAN_SYSTEM_PROMPT.contains(
+                "If every message in the chunk is covered by a compartment, nothing is unprocessed: set `<unprocessed_from>` to the chunk's last message index + 1."
+            ),
+            "historian system prompt must define the fully covered <unprocessed_from> value"
+        );
+
+        let covered = xml(
+            &[(54353, 54428, "first"), (54429, 54431, "second")],
+            54432,
+            "",
+        );
+        validate_historian_output(
+            &covered,
+            &chunk(54353, 54431),
+            &[],
+            ValidateOptions::default(),
+        )
+        .expect("a fully covered chunk with chunk end + 1 publishes");
+
+        let zero = validate_historian_output(
+            &xml(&[(1, 10, "all")], 0, ""),
+            &chunk(1, 10),
+            &[],
+            ValidateOptions::default(),
+        )
+        .expect_err("0 is not the prescribed completion value");
+        assert!(zero
+            .message
+            .contains("<unprocessed_from> 0 is outside chunk 1-10"));
+
+        let last = validate_historian_output(
+            &xml(&[(1, 10, "all")], 10, ""),
+            &chunk(1, 10),
+            &[],
+            ValidateOptions::default(),
+        )
+        .expect_err("the last covered index is not the prescribed completion value");
+        assert!(last
+            .message
+            .contains("<unprocessed_from> 10 does not match completed chunk boundary 11"));
+    }
+
+    #[test]
+    fn uncovered_tail_still_requires_its_first_message_as_the_boundary() {
+        let correct = validate_historian_output(
+            &xml(&[(1, 6, "prefix")], 7, ""),
+            &chunk(1, 10),
+            &[],
+            ValidateOptions::default(),
+        )
+        .expect("the first uncovered message is the correct boundary");
+        assert_eq!(correct.unprocessed_from, 7);
+
+        let claims_complete = validate_historian_output(
+            &xml(&[(1, 6, "prefix")], 11, ""),
+            &chunk(1, 10),
+            &[],
+            ValidateOptions::default(),
+        )
+        .expect_err("chunk end + 1 cannot claim completion over an uncovered tail");
+        assert!(claims_complete
+            .message
+            .contains("<unprocessed_from> 11 does not match next uncovered message 7"));
+    }
+
     #[test]
     fn zero_side_channel_anchor_is_suppressed() {
         let extra = r#"

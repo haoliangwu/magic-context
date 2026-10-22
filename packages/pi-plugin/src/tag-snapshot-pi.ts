@@ -8,7 +8,18 @@ import {
 	getTagsByNumbers,
 	getTagsBySession,
 } from "@magic-context/core/features/magic-context/storage-tags";
-import type { Database } from "@magic-context/core/shared/sqlite";
+import {
+	type Database,
+	getSqliteDatabasePath,
+	inRootAsyncContext,
+} from "@magic-context/core/shared/sqlite";
+import type { PiContextBudget } from "./pi-context-budget";
+import {
+	type PiHydrationGeneration,
+	type PiHydrationRequest,
+	PiTagHydrationError,
+	startPiTagSnapshotWorker,
+} from "./tag-snapshot-worker-client-pi";
 
 /** Connection-local tag revisions avoid invalidating snapshots for unrelated metadata writes. */
 export function createPiTagSnapshotReader(db: Database) {
@@ -29,6 +40,18 @@ export function createPiTagSnapshotReader(db: Database) {
 		CREATE TEMP TABLE IF NOT EXISTS pi_tag_watch (session_id TEXT PRIMARY KEY);
 		CREATE TEMP TABLE IF NOT EXISTS pi_tag_changes (session_id TEXT, tag_number INTEGER, PRIMARY KEY (session_id, tag_number));
 		CREATE TEMP TABLE IF NOT EXISTS pi_tag_version_own (session_id TEXT PRIMARY KEY, count INTEGER NOT NULL);
+		CREATE TEMP TABLE IF NOT EXISTS pi_tag_first_watch (session_id TEXT PRIMARY KEY);
+		CREATE TEMP TABLE IF NOT EXISTS pi_tag_first_rows (session_id TEXT, id INTEGER, tag_number INTEGER, PRIMARY KEY(session_id, id));
+		CREATE TEMP TABLE IF NOT EXISTS pi_tag_first_allocation (session_id TEXT PRIMARY KEY, incarnation TEXT, seen INTEGER);
+		DROP TRIGGER IF EXISTS temp.pi_tag_first_allocation;
+		CREATE TEMP TRIGGER pi_tag_first_allocation AFTER UPDATE ON main.schema_migrations_meta
+		WHEN SUBSTR(NEW.key, 1, 13) = 'tag_revision:' AND INSTR(OLD.value, ':') = 0
+		AND NEW.value = (SELECT value FROM schema_migrations_meta WHERE key = 'tag_revision_incarnation') || ':' || OLD.value
+		AND EXISTS (SELECT 1 FROM pi_tag_first_watch WHERE session_id = SUBSTR(NEW.key, 14)) BEGIN
+			INSERT INTO pi_tag_first_allocation SELECT SUBSTR(NEW.key, 14), ${tagRevisionIncarnationSql("NEW.value")}, 0
+			WHERE NOT EXISTS (SELECT 1 FROM pi_tag_first_allocation WHERE session_id = SUBSTR(NEW.key, 14));
+			UPDATE pi_tag_first_allocation SET seen = seen + 1 WHERE session_id = SUBSTR(NEW.key, 14);
+		END;
 		DROP TRIGGER IF EXISTS temp.pi_tag_version_ai;
 		DROP TRIGGER IF EXISTS temp.pi_tag_version_ad;
 		DROP TRIGGER IF EXISTS temp.pi_tag_version_au;
@@ -48,6 +71,9 @@ export function createPiTagSnapshotReader(db: Database) {
 				GROUP BY session_id, tag_number;
 		END;
 		CREATE TEMP TRIGGER IF NOT EXISTS pi_tag_insert AFTER INSERT ON main.tags BEGIN
+			INSERT INTO pi_tag_first_rows SELECT NEW.session_id, NEW.id, NEW.tag_number
+			WHERE EXISTS (SELECT 1 FROM pi_tag_first_watch WHERE session_id = NEW.session_id)
+			AND NOT EXISTS (SELECT 1 FROM pi_tag_first_rows WHERE session_id = NEW.session_id AND id = NEW.id);
 			UPDATE pi_tag_revision SET revision = revision + 1;
 			INSERT INTO pi_tag_session_revision VALUES (NEW.session_id, 1) ON CONFLICT(session_id) DO UPDATE SET revision = revision + 1;
 			INSERT INTO pi_tag_changes SELECT NEW.session_id, NEW.tag_number WHERE EXISTS (SELECT 1 FROM pi_tag_watch WHERE session_id = NEW.session_id) AND NOT EXISTS (SELECT 1 FROM pi_tag_changes WHERE session_id = NEW.session_id AND tag_number = NEW.tag_number);
@@ -114,12 +140,252 @@ export function createPiTagSnapshotReader(db: Database) {
 	const watch = db.prepare("INSERT OR IGNORE INTO pi_tag_watch VALUES (?)");
 	const unwatch = db.prepare("DELETE FROM pi_tag_watch WHERE session_id = ?");
 	const cache = new Map<string, SnapshotEntry>();
+	// An empty snapshot with no revision row may later receive its first local
+	// insert without becoming foreign. pi_tag_first_allocation must record this
+	// connection allocating exactly one matching incarnation, every inserted
+	// number must remain in pi_tag_changes, and durable version advances must
+	// equal this connection's own writes. Foreign/recreated counters do not qualify.
+	const ownFirstAllocation =
+		db.prepare(`SELECT 1 FROM pi_tag_first_allocation allocation
+		WHERE session_id = ? AND seen = 1 AND incarnation || ':0' = ?
+		AND EXISTS (SELECT 1 FROM pi_tag_watch WHERE session_id = allocation.session_id)
+		AND EXISTS (SELECT 1 FROM pi_tag_first_rows WHERE session_id = allocation.session_id)
+		AND NOT EXISTS (SELECT 1 FROM pi_tag_first_rows first_row WHERE first_row.session_id = allocation.session_id
+		AND NOT EXISTS (SELECT 1 FROM pi_tag_changes change WHERE change.session_id = first_row.session_id AND change.tag_number IS first_row.tag_number))`);
+	const managed = new Set<string>();
+	const epoch = ++connectionEpoch;
+	const sessionEpochs = new Map<string, number>();
+	let jobId = 0;
+	let current: OwnerJob | undefined;
+	let desiredSession: string | undefined;
+	let failedUntil = 0;
+	let lastFailure: unknown;
+	const totalRevision = db.prepare(
+		"SELECT COALESCE(value, '0') AS revision, value IS NOT NULL AS present FROM (SELECT 1) LEFT JOIN schema_migrations_meta ON key = ?",
+	);
+	const assertOutsideTransaction = () => {
+		const connection = db as unknown as {
+			inTransaction?: boolean;
+			isTransaction?: boolean;
+		};
+		if (connection.inTransaction || connection.isTransaction)
+			throw new PiTagHydrationError("readiness requested inside a transaction");
+	};
+	const stamps = (sessionId: string, id: number) => {
+		assertOutsideTransaction();
+		const revision = revisionReaders.get(db)?.(sessionId);
+		if (!revision) throw new PiTagHydrationError("owner revision unavailable");
+		const stamp = versionStamp.get(sessionId, sessionId) as {
+			durable: number;
+			own: number;
+		};
+		const total = totalRevision.get(tagRevisionKey(sessionId)) as {
+			revision: string;
+			present: number;
+		};
+		return {
+			connectionEpoch: epoch,
+			sessionEpoch: sessionEpochs.get(sessionId) ?? 0,
+			jobId: id,
+			sessionId,
+			localRevision: revision[0],
+			foreignRevision: revision[1],
+			durableVersion: stamp.durable,
+			ownVersion: stamp.own,
+			totalRevision: total.revision,
+			revisionPresent: total.present,
+		};
+	};
+	const ready = (sessionId: string) => {
+		assertOutsideTransaction();
+		const cached = cache.get(sessionId);
+		if (!cached?.fallback) return false;
+		const revision = revisionReaders.get(db)?.(sessionId);
+		if (!revision || cached.foreignRevision !== revision[1]) return false;
+		const stamp = versionStamp.get(sessionId, sessionId) as {
+			durable: number;
+			own: number;
+		};
+		return (
+			stamp.durable - cached.durableVersion === stamp.own - cached.ownVersion
+		);
+	};
+	const cancel = (sessionId: string) => {
+		sessionEpochs.set(sessionId, (sessionEpochs.get(sessionId) ?? 0) + 1);
+		if (desiredSession === sessionId) desiredSession = undefined;
+		if (current?.sessionId === sessionId) current.cancel();
+	};
+	// A shared prewarm outlives individual context waiters. Its TEMP bookkeeping
+	// must not inherit a cancelled waiter's transform-write or ownership guard.
+	const load = (sessionId: string): Promise<void> =>
+		inRootAsyncContext(async () => {
+			managed.add(sessionId);
+			if (ready(sessionId)) return;
+			desiredSession = sessionId;
+			if (current) {
+				// A running or non-retryable job is shared by every waiter. A job that
+				// already failed as stale is not: returning its rejected result would
+				// make the readiness retry fail with the same stale error without ever
+				// reading again. Wait for its worker to exit, then start a new one.
+				if (current.sessionId === sessionId && !current.stale)
+					return current.result;
+				current.cancel();
+				await current.released;
+				if (desiredSession !== sessionId)
+					throw new PiTagHydrationError(
+						"session hydration superseded",
+						"stale",
+					);
+				return load(sessionId);
+			}
+			if (performance.now() < failedUntil) throw lastFailure;
+			watch.run(sessionId);
+			const token = stamps(sessionId, ++jobId);
+			const previous = cache.get(sessionId);
+			const legacyFallbackOnly =
+				previous &&
+				previous.foreignRevision === token.foreignRevision &&
+				(previous.legacyFallback ||
+					token.durableVersion - previous.durableVersion !==
+						token.ownVersion - previous.ownVersion);
+			const path = getSqliteDatabasePath(db);
+			const factory =
+				workerFactories.get(db) ??
+				((request, cached) => {
+					if (!path)
+						throw new PiTagHydrationError(
+							"read-only hydration requires a file-backed database",
+						);
+					return startPiTagSnapshotWorker({ ...request, path }, { cached });
+				});
+			const worker = factory(
+				{
+					path: path ?? "",
+					sessionId,
+					connectionEpoch: epoch,
+					sessionEpoch: token.sessionEpoch,
+					jobId: token.jobId,
+				},
+				previous?.tags ?? [],
+			);
+			const destination: OwnerJob = {
+				sessionId,
+				result: Promise.resolve(),
+				released: worker.released,
+				cancel: worker.cancel,
+			};
+			current = destination;
+			let jobs = activeJobs.get(sessionId);
+			if (!jobs) {
+				jobs = new Set();
+				activeJobs.set(sessionId, jobs);
+			}
+			const lifetime = {
+				cancel,
+				released: worker.released,
+				get result() {
+					return destination.result;
+				},
+			};
+			jobs.add(lifetime);
+			destination.result = worker.result
+				.then(({ candidate, generation }) => {
+					// No await is allowed from this owner validation through publication.
+					const live = stamps(sessionId, token.jobId);
+					if (
+						current !== destination ||
+						desiredSession !== sessionId ||
+						!samePiTagSnapshotToken(token, live) ||
+						token.totalRevision !== live.totalRevision ||
+						generation.revision !== token.totalRevision ||
+						generation.durable !== token.durableVersion
+					)
+						throw new PiTagHydrationError(
+							"owner generation or lifetime changed",
+							"stale",
+						);
+					const snapshot: SnapshotEntry = {
+						firstAllocationPending:
+							!live.revisionPresent &&
+							candidate.tags.length === 0 &&
+							!db
+								.prepare("SELECT 1 FROM tags WHERE session_id = ? LIMIT 1")
+								.get(sessionId),
+						revision: legacyFallbackOnly
+							? previous.revision
+							: live.localRevision,
+						foreignRevision: live.foreignRevision,
+						tags: legacyFallbackOnly ? previous.tags : candidate.tags,
+						active: legacyFallbackOnly ? previous.active : candidate.active,
+						fallback: candidate.fallback,
+						durableVersion: live.durableVersion,
+						ownVersion: live.ownVersion,
+					};
+					if (cache.size >= 100 && !cache.has(sessionId)) {
+						const oldest = cache.keys().next().value;
+						if (oldest !== undefined) {
+							cache.delete(oldest);
+							unwatch.run(oldest);
+							clearChanged.run(oldest);
+						}
+					}
+					if (!legacyFallbackOnly) clearChanged.run(sessionId);
+					if (snapshot.firstAllocationPending) {
+						db.prepare(
+							"DELETE FROM pi_tag_first_allocation WHERE session_id = ?",
+						).run(sessionId);
+						db.prepare(
+							"DELETE FROM pi_tag_first_rows WHERE session_id = ?",
+						).run(sessionId);
+						db.prepare(
+							"INSERT OR IGNORE INTO pi_tag_first_watch VALUES (?)",
+						).run(sessionId);
+					}
+					cache.set(sessionId, snapshot);
+				})
+				.catch((error) => {
+					if (error instanceof PiTagHydrationError && error.code === "stale")
+						destination.stale = true;
+					// Cancelling an old session is not a connection failure. Do not
+					// replay its cancellation as the next session's startup error.
+					if (
+						current === destination &&
+						desiredSession === sessionId &&
+						token.sessionEpoch === (sessionEpochs.get(sessionId) ?? 0)
+					) {
+						lastFailure = error;
+						failedUntil =
+							performance.now() +
+							(error instanceof PiTagHydrationError && error.code === "stale"
+								? 0
+								: 500);
+					}
+					throw error;
+				});
+			// Observe cancellation immediately without making a failed pass wait
+			// for a native worker to exit. Release still gates the next worker and
+			// removal of this job's lifetime callback, even after result rejects.
+			void Promise.allSettled([destination.result, worker.released]).then(
+				() => {
+					if (current === destination) current = undefined;
+					jobs.delete(lifetime);
+					if (!jobs.size) activeJobs.delete(sessionId);
+				},
+			);
+			return destination.result;
+		});
+	owners.set(db, {
+		ready,
+		load,
+		manage: (sessionId) => managed.add(sessionId),
+		cancel,
+	});
 	const fallbackRows = db.prepare(
-		`SELECT ${FALLBACK_ROW_COLUMNS} FROM tags WHERE session_id = ? AND ${FALLBACK_ROW_PREDICATE}`,
+		`SELECT ${PI_FALLBACK_ROW_COLUMNS} FROM tags WHERE session_id = ? AND ${PI_FALLBACK_ROW_PREDICATE}`,
 	);
 	const fallbackRowsByNumbers = db.prepare(
-		`SELECT ${FALLBACK_ROW_COLUMNS} FROM tags WHERE session_id = ?
-		 AND tag_number IN (SELECT value FROM json_each(?)) AND ${FALLBACK_ROW_PREDICATE}`,
+		`SELECT ${PI_FALLBACK_ROW_COLUMNS} FROM tags WHERE session_id = ?
+		 AND tag_number IN (SELECT value FROM json_each(?)) AND ${PI_FALLBACK_ROW_PREDICATE}`,
 	);
 	/** Bring the cached entry up to date, or return null inside a transaction. */
 	const sync = (sessionId: string): SnapshotEntry | null => {
@@ -141,7 +407,28 @@ export function createPiTagSnapshotReader(db: Database) {
 			own: number;
 		};
 		let snapshot = cache.get(sessionId);
+		if (
+			snapshot?.firstAllocationPending &&
+			snapshot.foreignRevision !== external &&
+			snapshot.revision !== local &&
+			stamp.durable - snapshot.durableVersion ===
+				stamp.own - snapshot.ownVersion &&
+			ownFirstAllocation.get(sessionId, external)
+		) {
+			snapshot.foreignRevision = external;
+			snapshot.firstAllocationPending = false;
+			db.prepare("DELETE FROM pi_tag_first_watch WHERE session_id = ?").run(
+				sessionId,
+			);
+			db.prepare("DELETE FROM pi_tag_first_rows WHERE session_id = ?").run(
+				sessionId,
+			);
+		}
 		if (!snapshot || snapshot.foreignRevision !== external) {
+			if (managed.has(sessionId))
+				throw new PiTagHydrationError(
+					"tag snapshot is not ready; turn not sent, retry",
+				);
 			// Another connection changed this session's tags. There is no record
 			// of which rows, so reread them all, but reuse the cached object for
 			// every unchanged row. Consumers that diff rows by object identity
@@ -218,6 +505,7 @@ export function createPiTagSnapshotReader(db: Database) {
 			// use. The cached tag rows are left as they are for such writers,
 			// which is unchanged behaviour.
 			snapshot.fallback = undefined;
+			snapshot.legacyFallback = true;
 		}
 		snapshot.durableVersion = stamp.durable;
 		snapshot.ownVersion = stamp.own;
@@ -229,6 +517,10 @@ export function createPiTagSnapshotReader(db: Database) {
 		borrowed = false,
 	): ReturnType<typeof getTagsBySession> => {
 		const snapshot = sync(sessionId);
+		if (!snapshot && managed.has(sessionId))
+			throw new PiTagHydrationError(
+				"managed snapshot read inside a transaction",
+			);
 		if (!snapshot) return getTagsBySession(db, sessionId);
 		// Heuristics can edit their working entries; never expose the cached objects.
 		return borrowed ? snapshot.tags : snapshot.tags.map((tag) => ({ ...tag }));
@@ -237,14 +529,39 @@ export function createPiTagSnapshotReader(db: Database) {
 	fallbackReaders.set(db, (sessionId) => {
 		const snapshot = sync(sessionId);
 		if (!snapshot) return null;
+		if (!snapshot.fallback && managed.has(sessionId))
+			throw new PiTagHydrationError(
+				"fallback snapshot is not ready; turn not sent, retry",
+			);
 		snapshot.fallback ??= fallbackRows.all(sessionId) as PiFallbackTagRow[];
 		return snapshot.fallback;
 	});
 	readers.set(db, read);
+	const close = db.close.bind(db);
+	Object.defineProperty(db, "close", {
+		configurable: true,
+		writable: true,
+		value: (...args: Parameters<Database["close"]>) => {
+			// Weak-key readers are collected only when the engine examines their
+			// connection keys. Release large snapshots immediately on explicit close
+			// rather than retaining closed sessions until a major collection.
+			desiredSession = undefined;
+			current?.cancel();
+			cache.clear();
+			entryReaders.delete(db);
+			fallbackReaders.delete(db);
+			readers.delete(db);
+			revisionReaders.delete(db);
+			owners.delete(db);
+			workerFactories.delete(db);
+			return close(...args);
+		},
+	});
 	return read;
 }
 
-type SnapshotTag = ReturnType<typeof getTagsBySession>[number];
+export type PiSnapshotTag = ReturnType<typeof getTagsBySession>[number];
+type SnapshotTag = PiSnapshotTag;
 
 /**
  * A tag row that names an unsettled Pi id: a message tag stored under a
@@ -265,12 +582,14 @@ export interface PiFallbackTagRow {
 // exist reads these cached rows instead of querying the table. Matching stays
 // in SQL's own LIKE (ASCII case-insensitive), so the cached set is exactly the
 // set a direct table query would return.
-const FALLBACK_ROW_COLUMNS =
+export const PI_FALLBACK_ROW_COLUMNS =
 	"id, tag_number, type, message_id, tool_owner_message_id, entry_fingerprint";
-const FALLBACK_ROW_PREDICATE = `((type = 'message' AND message_id LIKE 'pi-msg-%')
+export const PI_FALLBACK_ROW_PREDICATE = `((type = 'message' AND message_id LIKE 'pi-msg-%')
 	OR (type = 'tool' AND tool_owner_message_id LIKE 'pi-msg-%'))`;
 
 interface SnapshotEntry {
+	firstAllocationPending?: boolean;
+	legacyFallback?: boolean;
 	revision: string;
 	foreignRevision: string;
 	tags: SnapshotTag[];
@@ -300,6 +619,154 @@ function sameRow(
 ): boolean {
 	for (const key of keys) if (!Object.is(left[key], right[key])) return false;
 	return true;
+}
+
+export interface PiTagSnapshotCandidate {
+	tags: SnapshotTag[];
+	active: SnapshotTag[];
+	fallback: PiFallbackTagRow[];
+	estimatedBytes: number;
+}
+
+/**
+ * Evidence required to publish a job into its original connection/session.
+ * Only this session's revisions participate: unrelated database commits must
+ * not invalidate a long-running hydration.
+ */
+export interface PiTagSnapshotToken {
+	connectionEpoch: number;
+	sessionEpoch: number;
+	jobId: number;
+	sessionId: string;
+	localRevision: string;
+	foreignRevision: string;
+	durableVersion: number;
+	ownVersion: number;
+}
+
+export function samePiTagSnapshotToken(
+	left: PiTagSnapshotToken,
+	right: PiTagSnapshotToken,
+): boolean {
+	return (
+		left.connectionEpoch === right.connectionEpoch &&
+		left.sessionEpoch === right.sessionEpoch &&
+		left.jobId === right.jobId &&
+		left.sessionId === right.sessionId &&
+		left.localRevision === right.localRevision &&
+		left.foreignRevision === right.foreignRevision &&
+		left.durableVersion === right.durableVersion &&
+		left.ownVersion === right.ownVersion
+	);
+}
+
+// Includes row slots, array references and string headers as well as UTF-16
+// payloads. This is candidate admission, not a bound on process RSS or GC cost.
+function candidateRowBytes(row: object, overhead: number): number {
+	let bytes = overhead;
+	for (const value of Object.values(row)) {
+		if (typeof value === "string") bytes += 24 + value.length * 2;
+		else if (value instanceof Uint8Array) bytes += 24 + value.byteLength;
+	}
+	return bytes;
+}
+
+/**
+ * Private streaming assembly: only finish exposes the arrays, after both
+ * streams end. Work and identity reuse happen per row, never at publication.
+ * The caller supplies scheduling between rows; this helper never reads SQLite.
+ */
+export function createPiTagSnapshotCandidate(
+	cached: readonly SnapshotTag[] = [],
+	byteLimit = 128 * 1024 * 1024,
+) {
+	const tags: SnapshotTag[] = [];
+	const active: SnapshotTag[] = [];
+	const fallback: PiFallbackTagRow[] = [];
+	let estimatedBytes = 192;
+	let oldIndex = 0;
+	let keys: (keyof SnapshotTag)[] | undefined;
+	let tagsEnded = false;
+	let fallbackEnded = false;
+	let failed = false;
+	const reject = (reason: string): never => {
+		failed = true;
+		throw new Error(`Pi tag hydration: ${reason}`);
+	};
+	const admit = (row: object, overhead: number) => {
+		estimatedBytes += candidateRowBytes(row, overhead);
+		if (estimatedBytes > byteLimit) reject("candidate memory limit exceeded");
+	};
+	return {
+		get estimatedBytes() {
+			return estimatedBytes;
+		},
+		appendTag(row: SnapshotTag) {
+			if (failed || tagsEnded) reject("tag packet after end or failure");
+			const previous = tags.at(-1);
+			if (
+				previous &&
+				(previous.tagNumber > row.tagNumber ||
+					(previous.tagNumber === row.tagNumber &&
+						(previous.id ?? 0) >= (row.id ?? 0)))
+			)
+				reject("noncanonical tag order");
+			admit(row, 384);
+			keys ??= Object.keys(row) as (keyof SnapshotTag)[];
+			while (oldIndex < cached.length) {
+				const old = cached[oldIndex];
+				if (
+					!old ||
+					old.tagNumber > row.tagNumber ||
+					(old.tagNumber === row.tagNumber && (old.id ?? 0) >= (row.id ?? 0))
+				)
+					break;
+				oldIndex += 1;
+			}
+			const old = cached[oldIndex];
+			const selected =
+				old && old.id === row.id && sameRow(old, row, keys) ? old : row;
+			Object.freeze(selected);
+			tags.push(selected);
+			if (isActive(selected)) active.push(selected);
+		},
+		appendFallback(row: PiFallbackTagRow) {
+			if (failed || fallbackEnded)
+				reject("fallback packet after end or failure");
+			admit(row, 192);
+			fallback.push(Object.freeze(row));
+		},
+		end(stream: "tags" | "fallback") {
+			if (failed) reject("end after failure");
+			if (stream === "tags") {
+				if (tagsEnded) reject("duplicate tag end");
+				tagsEnded = true;
+			} else {
+				if (fallbackEnded) reject("duplicate fallback end");
+				fallbackEnded = true;
+			}
+		},
+		finish(): PiTagSnapshotCandidate {
+			if (failed || !tagsEnded || !fallbackEnded)
+				throw new Error("Pi tag hydration: incomplete candidate");
+			return { tags, active, fallback, estimatedBytes };
+		},
+	};
+}
+
+export type PiTagSnapshotCandidateLoader = (
+	assembly: ReturnType<typeof createPiTagSnapshotCandidate>,
+) => Promise<void>;
+
+/** Internal injection seam for transport and deterministic candidate tests. */
+export async function loadPiTagSnapshotCandidate(
+	loader: PiTagSnapshotCandidateLoader,
+	cached: readonly SnapshotTag[] = [],
+	byteLimit?: number,
+): Promise<PiTagSnapshotCandidate> {
+	const assembly = createPiTagSnapshotCandidate(cached, byteLimit);
+	await loader(assembly);
+	return assembly.finish();
 }
 
 /**
@@ -457,4 +924,169 @@ export function readPiFallbackTagRows(
 ): readonly PiFallbackTagRow[] | null {
 	createPiTagSnapshotReader(db);
 	return fallbackReaders.get(db)?.(sessionId) ?? null;
+}
+
+interface OwnerJob {
+	sessionId: string;
+	result: Promise<void>;
+	released: Promise<void>;
+	cancel: () => void;
+	/** Set when this job's result rejected because the database changed while it
+	 * read. Such a result must not be shared with a later load of the same
+	 * session: that load is a retry and needs a fresh read. */
+	stale?: boolean;
+}
+
+type PiSnapshotWorkerFactory = (
+	request: PiHydrationRequest,
+	cached: readonly PiSnapshotTag[],
+) => {
+	result: Promise<{
+		candidate: PiTagSnapshotCandidate;
+		generation: PiHydrationGeneration;
+	}>;
+	released: Promise<void>;
+	cancel: () => void;
+};
+
+let connectionEpoch = 0;
+const owners = new WeakMap<
+	Database,
+	{
+		ready: (sessionId: string) => boolean;
+		load: (sessionId: string) => Promise<void>;
+		manage: (sessionId: string) => void;
+		cancel: (sessionId: string) => void;
+	}
+>();
+const workerFactories = new WeakMap<Database, PiSnapshotWorkerFactory>();
+const activeJobs = new Map<
+	string,
+	Set<{
+		cancel: (sessionId: string) => void;
+		result: Promise<void>;
+		released: Promise<void>;
+	}>
+>();
+const waitDeadlines = new WeakMap<PiContextBudget, number>();
+
+/** Internal fixture seam; never selects a synchronous loader in production. */
+export function __setPiTagSnapshotWorkerForTests(
+	db: Database,
+	factory: PiSnapshotWorkerFactory,
+): void {
+	workerFactories.set(db, factory);
+}
+
+/** Start only the current destination; clone callers invoke this after inheritance. */
+export function prewarmPiTagSnapshot(db: Database, sessionId: string): void {
+	createPiTagSnapshotReader(db);
+	void owners
+		.get(db)
+		?.load(sessionId)
+		.catch(() => {});
+}
+
+/** Cancel in-flight jobs only after a session switch or teardown is confirmed.
+ * Cached complete snapshots remain available if the same reader is reused.
+ * A cancellable session_before_switch announcement must not invoke this.
+ */
+export function cancelPiTagSnapshotSession(sessionId: string): void {
+	for (const job of activeJobs.get(sessionId) ?? []) job.cancel(sessionId);
+}
+
+/** Runtime shutdown owns both result settlement and native thread release.
+ * The caller applies its existing shutdown deadline; context passes never
+ * await this drain and can refuse while a cancelled native read is exiting.
+ */
+export async function drainPiTagSnapshotSession(
+	sessionId: string,
+): Promise<void> {
+	await Promise.allSettled(
+		[...(activeJobs.get(sessionId) ?? [])].flatMap((job) => [
+			job.result,
+			job.released,
+		]),
+	);
+}
+
+export function assertPiTagSnapshotReady(
+	db: Database,
+	sessionId: string,
+): void {
+	createPiTagSnapshotReader(db);
+	const owner = owners.get(db);
+	owner?.manage(sessionId);
+	if (!owner?.ready(sessionId))
+		throw new PiTagHydrationError(
+			"tag snapshot is not ready; turn not sent, retry",
+		);
+}
+
+/** A valid cached snapshot returns synchronously without starting a worker or
+ * consuming the local change journal; normal pipeline synchronization owns it.
+ * Missing or invalid snapshots instead return an asynchronous readiness wait.
+ */
+export function ensurePiTagSnapshotReady(
+	db: Database,
+	sessionId: string,
+	budget: PiContextBudget,
+): Promise<void> | void {
+	budget.assert();
+	createPiTagSnapshotReader(db);
+	const owner = owners.get(db);
+	if (!owner) throw new PiTagHydrationError("snapshot owner unavailable");
+	owner.manage(sessionId);
+	if (owner.ready(sessionId)) return;
+	let deadline = waitDeadlines.get(budget);
+	if (deadline === undefined) {
+		deadline = performance.now() + budget.hydrationAllowance();
+		waitDeadlines.set(budget, deadline);
+	}
+	const end = deadline;
+	return (async () => {
+		// A stale worker's partial candidate is discarded. Start at the first page
+		// again until one complete generation fits in the original pass allowance.
+		for (;;) {
+			budget.assert();
+			const allowance = Math.min(
+				end - performance.now(),
+				budget.hydrationAllowance(),
+			);
+			if (allowance <= 0)
+				throw new PiTagHydrationError(
+					"remaining pass budget exhausted waiting for tag snapshot; turn not sent, retry",
+					"deadline",
+				);
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				await budget.wait(
+					Promise.race([
+						owner.load(sessionId),
+						new Promise<never>((_, reject) => {
+							timer = setTimeout(
+								() =>
+									reject(
+										new PiTagHydrationError(
+											"remaining pass budget exhausted waiting for tag snapshot; turn not sent, retry",
+											"deadline",
+										),
+									),
+								allowance,
+							);
+						}),
+					]),
+				);
+				budget.assert();
+				assertPiTagSnapshotReady(db, sessionId);
+				return;
+			} catch (error) {
+				budget.assert();
+				if (!(error instanceof PiTagHydrationError && error.code === "stale"))
+					throw error;
+			} finally {
+				clearTimeout(timer);
+			}
+		}
+	})();
 }

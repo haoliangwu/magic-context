@@ -327,10 +327,19 @@ function closeConnection(connection: ReaderConnection): void {
 
 /** Boot-scoped read-only handles. Each lease still closes in the caller's finally block.
  * Statements, not results, are cached: WAL updates are visible on the next query.
- * A replaced/missing file cannot reuse the old inode, and disposal releases all handles. */
+ * A replaced/missing file cannot reuse the old inode, and disposal releases all handles.
+ *
+ * Work that opens readers over a long time (a hidden run polls the store for its whole
+ * lifetime) takes a `hold()`. Closing the pool while a hold is outstanding only marks it
+ * closing: readers can still be opened, and the pool closes when the last hold is
+ * released. Without that, disposing the plugin instance mid-run made the run's next poll
+ * fail with "Store reader pool is closed". */
 export class V2StoreReaderPool {
     private readonly connections = new Map<string, ReaderConnection>();
     private closed = false;
+    private closing = false;
+    private holds = 0;
+    private readonly idleWaiters = new Set<() => void>();
 
     constructor(private readonly capacity = 4) {
         if (!Number.isSafeInteger(capacity) || capacity < 1)
@@ -375,11 +384,69 @@ export class V2StoreReaderPool {
         if (connection.leases === 0) closeConnection(connection);
     }
 
+    /**
+     * Keep the pool open until the returned release is called. Refused once the pool is
+     * closing or closed, so a close always finishes once the existing holders are done.
+     */
+    hold(): () => void {
+        if (this.closed || this.closing) throw new Error("Store reader pool is closed");
+        this.holds++;
+        let released = false;
+        return () => {
+            if (released) return;
+            released = true;
+            this.holds--;
+            if (this.holds === 0 && this.closing) this.finishClose();
+        };
+    }
+
+    /** True once every handle is closed and no further reader can be opened. */
+    isClosed(): boolean {
+        return this.closed;
+    }
+
+    /** Number of outstanding holds. */
+    holdCount(): number {
+        return this.holds;
+    }
+
+    /** Close now when nothing holds the pool; otherwise close after the last hold is released. */
     close(): void {
+        if (this.closed || this.closing) return;
+        this.closing = true;
+        if (this.holds === 0) this.finishClose();
+    }
+
+    /**
+     * `close()`, then wait at most `timeoutMs` for the pool to actually close. Resolves
+     * true when it closed within the wait. On false the pool is still closing and will
+     * close when its last hold is released; the caller is not kept waiting for that.
+     */
+    async closeWhenIdle(timeoutMs: number): Promise<boolean> {
+        this.close();
+        if (this.closed) return true;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let waiter: (() => void) | undefined;
+        try {
+            await new Promise<void>((resolve) => {
+                waiter = resolve;
+                this.idleWaiters.add(resolve);
+                timer = setTimeout(resolve, Math.max(0, timeoutMs));
+            });
+        } finally {
+            if (timer) clearTimeout(timer);
+            if (waiter) this.idleWaiters.delete(waiter);
+        }
+        return this.closed;
+    }
+
+    private finishClose(): void {
         if (this.closed) return;
         this.closed = true;
         for (const connection of this.connections.values()) this.retire(connection);
         this.connections.clear();
+        for (const resolve of this.idleWaiters) resolve();
+        this.idleWaiters.clear();
     }
 }
 
@@ -570,6 +637,13 @@ export class V2StoreReader {
         return typeof row.parent_id === "string" && row.parent_id.length > 0;
     }
 
+    /** Authoritative liveness snapshot for background orphan cleanup. */
+    sessionIds(): string[] {
+        return (this.prepare("SELECT id FROM session_v2").all() as { id: string }[]).map(
+            (row) => row.id,
+        );
+    }
+
     /**
      * The most recently updated top-level user session the host created in
      * `directory`, or undefined when there is none. Children, Magic Context's
@@ -659,7 +733,12 @@ export class V2StoreReader {
             maxChars: number;
             truncationMarker: string;
         },
-    ): Array<{ seq: number; time_created: number; text: string }> {
+    ): Array<{
+        seq: number;
+        time_created: number;
+        text: string;
+        follows_assistant_reply: number;
+    }> {
         const { boundaryMs, before, limit, maxChars, truncationMarker } = options;
         if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10000)
             throw new Error("Invalid page limit");
@@ -669,11 +748,12 @@ export class V2StoreReader {
         const head = Math.floor((maxChars - truncationMarker.length) / 2);
         const tail = maxChars - truncationMarker.length - head;
         return this.prepare(`WITH users AS (
-            SELECT seq, time_created, data FROM session_message
-            WHERE session_id = ? AND type = 'user' AND time_created ${before ? "<=" : ">"} ?
+            SELECT session_id, seq, time_created, data FROM session_message
+            WHERE session_id = ? AND type = 'user' AND time_created ${before ? "<=" : ">"}
+                ?
             ORDER BY time_created ${direction}, seq ${direction} LIMIT ?
         ), texts AS (
-            SELECT seq, time_created, CASE
+            SELECT session_id, seq, time_created, CASE
                 WHEN json_extract(data, '$.synthetic') = 1 OR json_extract(data, '$.ignored') = 1 THEN ''
                 WHEN json_type(data, '$.text') = 'text' THEN json_extract(data, '$.text')
                 ELSE COALESCE((SELECT group_concat(json_extract(value, '$.text'), char(10))
@@ -683,7 +763,19 @@ export class V2StoreReader {
                       AND COALESCE(json_extract(value, '$.ignored'), 0) <> 1), '') END AS text
             FROM users WHERE json_valid(data)
         ) SELECT seq, time_created, CASE WHEN length(text) > ?
-            THEN substr(text, 1, ?) || ? || substr(text, -?) ELSE text END AS text
+            THEN substr(text, 1, ?) || ? || substr(text, -?) ELSE text END AS text,
+            EXISTS (
+                SELECT 1 FROM session_message assistant_reply
+                 WHERE assistant_reply.session_id = texts.session_id
+                   AND assistant_reply.type = 'assistant'
+                   AND assistant_reply.seq < texts.seq
+                   AND EXISTS (
+                       SELECT 1 FROM session_message prior_user
+                        WHERE prior_user.session_id = texts.session_id
+                          AND prior_user.type = 'user'
+                          AND prior_user.seq < assistant_reply.seq
+                   )
+            ) AS follows_assistant_reply
           FROM texts ORDER BY time_created ${direction}, seq ${direction}`).all(
             sessionID,
             boundaryMs,
@@ -696,6 +788,7 @@ export class V2StoreReader {
             seq: number;
             time_created: number;
             text: string;
+            follows_assistant_reply: number;
         }>;
     }
 
@@ -895,6 +988,24 @@ export class V2StoreReader {
                          WHERE session_id = ? AND type IN (${rawTypes}) AND seq <= ?
                          ORDER BY seq DESC LIMIT ?`,
                 ).all(sessionID, ...RAW_MESSAGE_TYPES, throughSeq, limit) as RawRow[]
+            ).map(decode);
+        });
+    }
+
+    /**
+     * Instruction-update rows (`type = 'system'`) at or before `throughSeq`,
+     * oldest first. Only these rows are read, so a long session pays for its few
+     * instruction rows rather than for its whole history.
+     */
+    instructionRowsThrough(sessionID: string, throughSeq: number): StoreRow[] {
+        return trackDecodeOperation("instructionRowsThrough", () => {
+            if (!Number.isSafeInteger(throughSeq)) throw new Error("Invalid seq upper bound");
+            return (
+                this.prepare(
+                    `SELECT id, session_id, type, seq, time_created, data FROM session_message
+                         WHERE session_id = ? AND type = 'system' AND seq <= ?
+                         ORDER BY seq ASC`,
+                ).all(sessionID, throughSeq) as RawRow[]
             ).map(decode);
         });
     }

@@ -153,7 +153,7 @@ Add `--force` to automatically fix what doctor can — it clears stale plugin ca
 
 ## Model configuration
 
-The setup wizard helps you pick models for the historian and dreamer. Historian summary quality depends on this separate model, so use one that follows structured summarization instructions reliably. A model that bills per request can keep background-work cost flat. Magic Context uses only your explicit `fallback_models` before the live session model; see the [historian configuration reference](/reference/configuration/#historian).
+The setup wizard helps you pick models for the historian and dreamer. Historian summary quality depends on this separate model, so use one that follows structured summarization instructions reliably. A model that bills per request can keep background-work cost flat. A configured historian uses only its primary and explicit `fallback_models`, reporting failure when they are exhausted rather than using the session model. With no historian model, OpenCode inherits the session model; Pi and Oh My Pi do not summarize. See the [historian configuration reference](/reference/configuration/#historian).
 
 ## Dashboard
 

@@ -136,6 +136,10 @@ async function openCode(host: "oc1" | "oc2", signed: boolean, seed: number, acti
         directory: project,
         projectPath: project,
         historianRunnable: false,
+        hostRawMessages: () => [],
+        hostMessageReconciliationSource: () => [],
+        hostPrepareRawOrdinals: async () => true,
+        hostModelFallback: () => null,
         protectedTools: { read: 0 },
         memoryConfig: { enabled: false, injectionBudgetTokens: 1000, autoPromote: false },
         client: {

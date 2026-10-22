@@ -26,9 +26,74 @@ function add(status: string, time = NOW - 1_000, error = "failure code 42", task
     db.query("INSERT INTO subagent_invocations (session_id, harness, subagent, task, started_at, ended_at, status, error) VALUES (?, 'opencode', ?, ?, ?, ?, ?, ?)")
         .run(`session-${serial}`, subagent, task, time - 100, time, status, error);
 }
-async function run(now = NOW) {
-    return runFailureSentinel({ db: join(root, "context.db"), stateFile: join(root, "state.json"), connectionFile: join(root, "none"), send: false, now: () => now, stdout: () => {}, stderr: () => {} });
+// Inserts one attempt with explicit session, task and parent link, and returns its id.
+function attempt(fields: { session: string; status: string; time: number; error?: string | null; task?: string | null; parent?: number | null; subagent?: string }): number {
+    const row = db.query("INSERT INTO subagent_invocations (session_id, harness, subagent, task, started_at, ended_at, status, error, parent_invocation_id) VALUES (?, 'opencode', ?, ?, ?, ?, ?, ?, ?) RETURNING id")
+        .get(fields.session, fields.subagent ?? "historian", fields.task ?? null, fields.time - 100, fields.time, fields.status, fields.error ?? null, fields.parent ?? null) as { id: number };
+    return row.id;
 }
+// The existing cases judge rows the moment they end; the settle window has its own test.
+async function run(now = NOW, settleMs = 0) {
+    return runFailureSentinel({ db: join(root, "context.db"), stateFile: join(root, "state.json"), connectionFile: join(root, "none"), send: false, settleMs, now: () => now, stdout: () => {}, stderr: () => {} });
+}
+
+const QUOTA = "Historian host recorded an assistant error: APIError: Antigravity account pool has no account available within the configured wait limit.";
+
+test("a quota failure recovered by a completed fallback raises no alert", async () => {
+    for (let i = 0; i < 8; i++) {
+        const primary = attempt({ session: `s-${i}`, status: "failed", time: NOW - 60_000 + i * 1_000, error: QUOTA });
+        // Half the fallbacks record their parent link, half only share the session.
+        attempt({ session: `s-${i}`, status: "completed", time: NOW - 30_000 + i * 1_000, task: "fallback", parent: i % 2 === 0 ? primary : null });
+    }
+    expect((await run()).alerts).toHaveLength(0);
+});
+
+test("a pre-send window refusal recovered by a completed fallback raises no alert", async () => {
+    const WINDOW = "opencode/deepseek-v4.1-flash-free: producer_prompt_exceeds_window calibrated_tokens=287038 limit=162960 estimator_margin=0.03";
+    for (let i = 0; i < 8; i++) {
+        const primary = attempt({ session: `w-${i}`, status: "failed", time: NOW - 60_000 + i * 1_000, error: WINDOW });
+        attempt({ session: `w-${i}`, status: "completed", time: NOW - 30_000 + i * 1_000, task: "fallback", parent: primary });
+    }
+    expect((await run()).alerts).toHaveLength(0);
+});
+
+test("a quota failure whose fallback also failed still alerts", async () => {
+    for (let i = 0; i < 8; i++) {
+        const primary = attempt({ session: `s-${i}`, status: "failed", time: NOW - 60_000 + i * 1_000, error: QUOTA });
+        attempt({ session: `s-${i}`, status: "failed", time: NOW - 30_000 + i * 1_000, task: "fallback", parent: primary, error: "overloaded_error 529" });
+    }
+    const rules = (await run()).alerts.map((alert) => `${alert.rule}:${alert.task}`);
+    expect(rules).toContain("new_class:(untitled)");
+    expect(rules).toContain("failure_share:(untitled)");
+});
+
+test("a non-quota failure is not excused by its fallback", async () => {
+    const primary = attempt({ session: "s", status: "failed", time: NOW - 60_000, error: "missing complete root element" });
+    attempt({ session: "s", status: "completed", time: NOW - 30_000, task: "fallback", parent: primary });
+    expect((await run()).alerts.map((alert) => alert.rule)).toContain("new_class");
+});
+
+test("an unlinked fallback in another session or outside the start window recovers nothing", async () => {
+    attempt({ session: "a", status: "failed", time: NOW - 250_000, error: QUOTA });
+    attempt({ session: "b", status: "completed", time: NOW - 240_000, task: "fallback" });
+    attempt({ session: "c", status: "failed", time: NOW - 200_000, error: QUOTA });
+    // Starts about 150 s after c failed, beyond the 120 s start window.
+    attempt({ session: "c", status: "completed", time: NOW - 50_000, task: "fallback" });
+    const alerts = (await run()).alerts.filter((alert) => alert.rule === "new_class");
+    expect(alerts).toHaveLength(1);
+    // Both failures still count, so neither unrelated fallback recovered one.
+    expect(alerts[0]?.count).toBe(2);
+});
+
+test("a failure is judged only after the settle window, once its fallback has finished", async () => {
+    const primary = attempt({ session: "s", status: "failed", time: NOW - 1_000, error: QUOTA });
+    // Inside the default window the failure is not evaluated at all, and the
+    // watermark stays before it.
+    expect((await run(NOW, 5 * 60_000)).examined).toBe(0);
+    attempt({ session: "s", status: "completed", time: NOW + 30_000, task: "fallback", parent: primary });
+    expect((await run(NOW + 6 * 60_000, 5 * 60_000)).alerts).toHaveLength(0);
+    expect(JSON.parse(readFileSync(join(root, "state.json"), "utf8")).cursor.id).toBe(2);
+});
 
 test("new class alerts once and a seven-day prior class prevents a new-class wake", async () => {
     add("failed", NOW - 6 * DAY, "failure code 9");
@@ -121,7 +186,7 @@ test("one wake contains all alerting classes and uses the persisted watermark", 
     const wakes: string[] = [];
     const result = await runFailureSentinel({
         db: join(root, "context.db"), stateFile: join(root, "state.json"),
-        connectionFile: join(root, "none"), send: true, now: () => NOW,
+        connectionFile: join(root, "none"), send: true, settleMs: 0, now: () => NOW,
         wake: async (content) => { wakes.push(content); }, stderr: () => {},
     });
     expect(result.alerts.map((alert) => alert.rule)).toEqual(["new_class", "new_class"]);

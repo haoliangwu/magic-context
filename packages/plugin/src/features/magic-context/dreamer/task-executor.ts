@@ -131,7 +131,7 @@ import type {
     TaskExecutorContext,
 } from "./task-scheduler";
 import { DreamTokenBudgetExceeded } from "./token-budget";
-import { runVerify } from "./verify";
+import { runVerify, VERIFY_RUN_TOKEN_BUDGET } from "./verify";
 
 export interface DreamTaskExecutorDeps {
     client?: PluginContext["client"];
@@ -233,7 +233,8 @@ function dreamRunFailureDetail(error: unknown): DreamRunFailureDetail {
             child_session_id: null,
         };
     }
-    const localRefusal = error instanceof HiddenCompletionRefusal;
+    const localRefusal =
+        error instanceof HiddenCompletionRefusal || error instanceof DreamerModuleFailureError;
     const providerFailure =
         error instanceof Error && error.name === "DreamerProviderOutputFailureError";
     return {
@@ -241,9 +242,11 @@ function dreamRunFailureDetail(error: unknown): DreamRunFailureDetail {
             ? "local_refusal"
             : providerFailure
               ? "provider_error"
-              : /no models?|model chain is empty/i.test(message)
-                ? "no_models"
-                : "unknown",
+              : /lease_(?:lost|expired)|Dream lease (?:lost|unavailable)/i.test(message)
+                ? "child_aborted"
+                : /no models?|model chain is empty/i.test(message)
+                  ? "no_models"
+                  : "unknown",
         model_attempted: null,
         models_tried: [],
         provider_error: providerFailure ? sanitizeDiagnosticText(message).slice(0, 500) : null,
@@ -255,6 +258,15 @@ function dreamRunFailureDetail(error: unknown): DreamRunFailureDetail {
               }
             : {}),
     };
+}
+
+/** Handled incomplete work still has a known cause even without a thrown prompt error. */
+function incompleteFailure(
+    error: unknown,
+    fallback: DreamRunFailureDetail["failure_class"] = "parse_failed",
+): DreamRunFailureDetail {
+    const detail = dreamRunFailureDetail(error);
+    return detail.failure_class === "unknown" ? { ...detail, failure_class: fallback } : detail;
 }
 
 function classifyFailure(error: unknown): { transient: boolean; brief: string } {
@@ -518,6 +530,10 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 | undefined
         )?.resetDreamTokenBudget?.(config.task);
         const startedAt = Date.now();
+        const effectiveTokenBudget =
+            config.task === "verify" || config.task === "verify-broad"
+                ? Math.min(config.tokenBudget ?? VERIFY_RUN_TOKEN_BUDGET, VERIFY_RUN_TOKEN_BUDGET)
+                : config.tokenBudget;
         const leaseAcquisition: LeaseAcquisition =
             ctx.leaseAcquisition ??
             acquireLeaseWithAcquisition(db, holderId, leaseKey) ??
@@ -586,7 +602,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             if (state.sessionId) {
                 const previous = childSpending.get(state.sessionId) ?? 0;
                 budgetSpent += Math.max(0, state.spent - previous);
-                childSpending.set(state.sessionId, state.spent);
+                childSpending.set(state.sessionId, Math.max(previous, state.spent));
             } else budgetSpent = Math.max(budgetSpent, state.spent);
             budgetFinalized ||= state.finalizeFired;
         };
@@ -641,10 +657,20 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                                   }
                                 : {}),
                             ...(extra?.progress ? { progress: extra.progress } : {}),
-                            ...(config.tokenBudget
+                            ...(childSpending.size
+                                ? {
+                                      children: [...childSpending].map(
+                                          ([sessionId, promptTokens]) => ({
+                                              sessionId,
+                                              promptTokens,
+                                          }),
+                                      ),
+                                  }
+                                : {}),
+                            ...(effectiveTokenBudget
                                 ? {
                                       tokenBudget: {
-                                          budget: config.tokenBudget,
+                                          budget: effectiveTokenBudget,
                                           spent: budgetSpent,
                                           finalizeFired: budgetFinalized,
                                           banked:
@@ -797,8 +823,20 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     `[dreamer] compress-cues: compressed=${result.compressed} skipped=${result.skipped} chunks=${result.chunks} remaining=${result.remaining}`,
                 );
                 if (!result.complete) {
-                    const error = incompleteMessage(result.remaining);
-                    recordRun("failed", error);
+                    if (result.stopReason === "deadline" && result.chunks === 0)
+                        return skip("compress-cues: insufficient time to start a chunk");
+                    const error = `${incompleteMessage(result.remaining)}; ${result.failureStage ? `${result.failureStage}: ` : ""}${result.failure ? describeError(result.failure).brief : `${result.skipped} cues rejected by validation`}`;
+                    recordRun("failed", error, {
+                        banked: result.compressed,
+                        failure: incompleteFailure(
+                            result.failure,
+                            result.failureStage === "child-start"
+                                ? "local_refusal"
+                                : result.stopReason === "timeout-circuit-breaker"
+                                  ? "provider_timeout"
+                                  : "parse_failed",
+                        ),
+                    });
                     return { status: "failed", transient: true, error };
                 }
                 recordRun("completed", null);
@@ -854,12 +892,20 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     `[dreamer] map-memories: committed=${result.mapped + result.independent} mapped=${result.mapped} independent=${result.independent} batches=${result.batches} remaining=${result.remaining} complete=${result.complete}${result.stopReason ? ` stop_reason=${result.stopReason}` : ""}`,
                 );
                 if (!result.complete) {
+                    if (result.deferred)
+                        return skip(
+                            "map-memories: all pending mappings are in content-keyed retry backoff; no child started",
+                        );
+                    if (result.stopReason === "deadline" && result.batches === 0 && !result.failure)
+                        return skip("map-memories: insufficient time to start a batch");
                     if (result.stopReason === "timeout-circuit-breaker") {
                         // The mapper stopped after two timed-out batches committed
                         // nothing, rather than simply running out of overall time.
                         // Record a failure so /ctx-dream and history show that distinction.
                         const error = `map-memories starvation: timeout circuit breaker stopped the run with ${result.remaining} remain`;
-                        recordRun("failed", error);
+                        recordRun("failed", error, {
+                            failure: incompleteFailure(result.failure, "provider_timeout"),
+                        });
                         return { status: "failed", transient: true, error };
                     }
                     const processed = result.mapped + result.independent;
@@ -872,8 +918,15 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                         recordRun("completed", null, { progress });
                         return { status: "completed" };
                     }
-                    const error = incompleteMessage(result.remaining);
-                    recordRun("failed", error);
+                    const error = `${incompleteMessage(result.remaining)}; ${result.failureStage ? `${result.failureStage}: ` : ""}${result.failure ? describeError(result.failure).brief : "manifest returned no accepted mapping decisions"}`;
+                    recordRun("failed", error, {
+                        failure: incompleteFailure(
+                            result.failure,
+                            result.failureStage === "child-start"
+                                ? "local_refusal"
+                                : "parse_failed",
+                        ),
+                    });
                     return { status: "failed", transient: true, error };
                 }
                 recordRun("completed", null);
@@ -909,25 +962,24 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     result.skipped +
                     result.refused;
                 const verificationProgress = `${config.task}${config.task === "verify-broad" ? ` cycle ${result.broadCycleStartAt ?? "open"}` : ""}: processed ${processed} (verified ${result.verified}, updated ${result.updated}, archived ${result.archived}, skipped ${result.skipped}, refused ${result.refused}); ${result.remaining} remain`;
-                const broadProgress = config.task === "verify-broad" ? verificationProgress : null;
                 const backlogAfter =
                     config.task === "verify-broad"
                         ? { pending: result.remaining, total: backlogAtStart.total }
                         : undefined;
                 if (!result.complete) {
-                    // A broad cycle is intentionally resumable: ordinary progress
-                    // is a successful scheduled run, even though this deadline did
-                    // not drain the complete cycle. Only a zero-progress broad run
-                    // is a failure that should raise the dashboard's red status.
-                    if (broadProgress && processed > 0) {
+                    // Incremental verify and verify-broad resume from per-memory stamps; a bounded run that
+                    // banked decisions is useful work, not an incomplete-run failure.
+                    if (processed > 0) {
                         recordRun("completed", null, {
-                            progress: broadProgress,
+                            progress: verificationProgress,
                             memoryChanges: computeMemoryDelta(memoryBefore),
                             backlogAfter,
                             banked: result.verified + result.updated + result.archived,
                         });
                         return { status: "completed" };
                     }
+                    if (result.stopReason === "deadline")
+                        return skip(`${config.task}: insufficient time to start a batch`);
                     const batchTimedOut = result.stopReason === "batch-timeout";
                     const error = batchTimedOut
                         ? `${config.task}: a batch timed out within its time slice; ${result.remaining} remain`
@@ -937,6 +989,14 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                         memoryChanges: computeMemoryDelta(memoryBefore),
                         backlogAfter,
                         banked: result.verified + result.updated + result.archived,
+                        failure: incompleteFailure(
+                            error,
+                            batchTimedOut
+                                ? "provider_timeout"
+                                : result.stopReason === "token-budget"
+                                  ? "token_budget"
+                                  : "parse_failed",
+                        ),
                     });
                     // A hot retry would split the deadline the same way and time out
                     // again, so a batch timeout waits for the next scheduled run.
@@ -1088,6 +1148,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 });
                 if (retro.skipReason) return skip(retro.skipReason);
                 recordRun("completed", null, {
+                    progress: retro.noOpReason,
                     memoryChanges: computeMemoryDelta(memoryBefore),
                     backlogAfter:
                         retro.retrospectiveWatermarkMs == null
@@ -1100,6 +1161,7 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 // runs) so the next run only scans newer messages.
                 return {
                     status: "completed",
+                    ...(retro.noOpReason ? { detail: retro.noOpReason } : {}),
                     schedulePatch:
                         retro.retrospectiveWatermarkMs != null || retro.taskStateJson !== undefined
                             ? {
@@ -1398,6 +1460,7 @@ async function runRetrospectiveTask(
     retrospectiveWatermarkMs: number | null;
     taskStateJson?: string;
     skipReason?: string;
+    noOpReason?: string;
 }> {
     const { db, projectIdentity, holderId, leaseKey } = ctx;
     const { deps, deadline, parent, onBudgetUpdate } = helpers;
@@ -1435,29 +1498,49 @@ async function runRetrospectiveTask(
         : undefined;
     const completedWindow = (
         retrospectiveWatermarkMs: number | null,
-    ): { retrospectiveWatermarkMs: number | null; taskStateJson?: string } => ({
+        noOpReason?: string,
+    ): {
+        retrospectiveWatermarkMs: number | null;
+        taskStateJson?: string;
+        noOpReason?: string;
+    } => ({
         retrospectiveWatermarkMs,
         ...(clearedTaskStateJson ? { taskStateJson: clearedTaskStateJson } : {}),
+        ...(noOpReason ? { noOpReason } : {}),
     });
     const messages = withGlobalOrdinals(scan.messages);
     const userMessages = messages.filter(
         (message) => message.role === "user" && message.text.trim().length > 0,
     );
     if (userMessages.length === 0) {
-        log("[dreamer] retrospective: no user messages in window");
-        return completedWindow(scan.maxScannedTs);
+        const noOpReason = "no reply-following user lines";
+        log(`[dreamer] retrospective: ${noOpReason}`);
+        return completedWindow(scan.maxScannedTs, noOpReason);
     }
 
     // Only POST-watermark user lines are genuinely new; the rest are the overlap
     // re-read. If nothing is new, the window was already handled last run.
-    const postWatermarkOrdinals = new Set(
+    const newUserOrdinals = new Set(
         userMessages
             .filter((message) => message.ts > watermarkMs)
             .map((message) => message.ordinal),
     );
-    if (postWatermarkOrdinals.size === 0) {
+    if (newUserOrdinals.size === 0) {
         log("[dreamer] retrospective: only overlap lines, nothing new");
-        return completedWindow(scan.maxScannedTs);
+        return completedWindow(scan.maxScannedTs, "only overlap lines, nothing new");
+    }
+
+    // First user messages cannot show a correction to an assistant response.
+    // Hosts retain this source-history fact without exposing assistant text.
+    const postWatermarkOrdinals = new Set(
+        userMessages
+            .filter((message) => message.ts > watermarkMs && message.followsAssistantReply === true)
+            .map((message) => message.ordinal),
+    );
+    if (postWatermarkOrdinals.size === 0) {
+        const noOpReason = "no reply-following user lines";
+        log(`[dreamer] retrospective: ${noOpReason}`);
+        return completedWindow(scan.maxScannedTs, noOpReason);
     }
 
     const abortController = new AbortController();

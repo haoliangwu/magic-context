@@ -87,6 +87,16 @@ export class PiContextBudget {
 			),
 		);
 	}
+
+	hydrationAllowance(): number {
+		return Math.max(
+			0,
+			Math.min(
+				this.remainingWork() - PI_CONTEXT_BUDGET.completionReserveMs,
+				this.remainingOutcome() - PI_CONTEXT_BUDGET.completionReserveMs,
+			),
+		);
+	}
 	assertOutcome = (): void => {
 		this.assertOwner();
 		this.signal?.throwIfAborted();

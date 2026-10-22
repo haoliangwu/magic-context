@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
@@ -27,6 +28,8 @@ const pi = {
 	},
 };
 const sandbox = {
+	AsyncLocalStorage,
+	sessionLog() {},
 	performance,
 	setTimeout,
 	clearTimeout,

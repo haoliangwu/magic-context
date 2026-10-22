@@ -23,6 +23,7 @@ import {
 	createFakePi,
 	createTestDb,
 	fakeContext,
+	heavyReasoningUsage,
 	type PiMessage,
 	toolResultMessage,
 	userMessage,
@@ -175,12 +176,12 @@ async function fixture() {
 			},
 		};
 	};
+	// A heavy signed step: the bounded hold keeps the turn's prefix while
+	// usage stays below the cap (65% + 10).
 	const hold = () => {
 		source.push(
-			assistantMessage(
-				"",
-				50,
-				extra([
+			assistantMessage("", 50, {
+				...extra([
 					{
 						type: "thinking",
 						thinking: "active plan",
@@ -193,7 +194,8 @@ async function fixture() {
 						arguments: { path: "current.ts" },
 					},
 				]),
-			),
+				usage: heavyReasoningUsage(),
+			}),
 			toolResultMessage("active-call", "current result ".repeat(8000), 51),
 		);
 		ids.push("thinking", "result");

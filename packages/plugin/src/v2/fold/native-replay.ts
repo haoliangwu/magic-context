@@ -1,6 +1,6 @@
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import { HEAD_IDS } from "../hooks/payload";
-import type { SessionContext, V2Message } from "../hooks/types";
+import type { SessionContext, V2Context, V2Message } from "../hooks/types";
 import {
     RAW_MESSAGE_TYPES,
     type StoreRow,
@@ -24,6 +24,13 @@ interface Snapshot {
     admissionID: string;
     summary: string;
 }
+interface DurableSnapshot {
+    sourceDigest: string;
+    sessionID: string;
+    admissionID: string;
+    summaryDigest: string;
+    historyDigest: string;
+}
 const coordinates = new WeakMap<V2Message, string>();
 export function nativeRowID(message: V2Message): string | undefined {
     return coordinates.get(message) ?? message.id;
@@ -41,11 +48,59 @@ export function isLocalCheckpoint(row: StoreRow): row is StoreRow<"compaction"> 
     return (
         row.type === "compaction" &&
         row.data.status === "completed" &&
-        row.data.providerContext === undefined
+        row.data.providerContext === undefined &&
+        (row.data.native as { messages?: unknown } | undefined)?.messages === undefined
     );
+}
+export function isAdmittedLocalCheckpoint(
+    storage: NativeFoldCache,
+    sessionID: string,
+    cut: StoreRow<"compaction">,
+): boolean {
+    if (!isLocalCheckpoint(cut) || cut.session_id !== sessionID) return false;
+    const admission = storage.admission(sessionID, cut.id);
+    if (!admission?.payload || admission.digest !== foldDigest(admission.payload)) return false;
+    try {
+        const snapshot = JSON.parse(admission.payload) as Snapshot;
+        return (
+            snapshot.source === storage.sourceID &&
+            snapshot.sessionID === sessionID &&
+            snapshot.admissionID === cut.id &&
+            snapshot.summary === cut.data.summary
+        );
+    } catch {
+        return false;
+    }
 }
 const conversational = (row: { type: string }) =>
     (RAW_MESSAGE_TYPES as readonly string[]).includes(row.type) || row.type === "location-switched";
+const historyDigest = (reader: V2StoreReader, sessionID: string, through: number) =>
+    foldDigest(JSON.stringify(reader.range(sessionID, -1, through).filter(conversational)));
+const admissionKey = (sessionID: string) => `native-fold/v2/${encodeURIComponent(sessionID)}`;
+
+export async function forgetNativeFoldProvenance(
+    storage: V2Context["storage"],
+    sessionID: string,
+    legacyOnly = false,
+): Promise<void> {
+    const remove = async (key: string) => {
+        if (storage.remove) await storage.remove(key);
+        else await storage.set(key, null);
+    };
+    if (!legacyOnly) await remove(admissionKey(sessionID));
+    if (!storage.scan) return;
+    let after: string | undefined;
+    do {
+        const page = await storage.scan({ prefix: "native-fold/v1/", after, limit: 100 });
+        for (const { key } of page.entries) {
+            // Legacy keys put the source hash before the session id. Scan
+            // those keys even if this process has not observed the source.
+            if (key.slice("native-fold/v1/".length).split("/").slice(1).join("/") === sessionID)
+                await remove(key);
+        }
+        after = page.next;
+    } while (after);
+}
 
 /** A disposable per-session row cache. The host owns the session history and
  * every edit and revert to it; this cache only holds copies. Host events
@@ -61,9 +116,11 @@ export class NativeFoldReplay {
     private readonly metadataThrough = new Map<string, number>();
     private readonly loaded = new Map<string, number>();
     private readonly sources = new Map<string, string>();
+    private readonly staleHeads = new Set<string>();
     constructor(
         readonly storage: NativeFoldCache,
         private readonly openReader: (sessionID: string) => V2StoreReader,
+        private readonly admissions?: V2Context["storage"],
     ) {
         storage.onEvict((sessionID) => this.clear(sessionID));
     }
@@ -105,6 +162,64 @@ export class NativeFoldReplay {
     }
     async baseline(sessionID: string): Promise<string | undefined> {
         return this.tail(sessionID)?.baseline;
+    }
+    private admissionKey(sessionID: string): string {
+        return admissionKey(sessionID);
+    }
+    private async removeAdmission(key: string): Promise<void> {
+        if (this.admissions?.remove) await this.admissions.remove(key);
+        else await this.admissions?.set(key, null);
+    }
+    private async removeLegacyAdmissions(sessionID: string): Promise<void> {
+        if (this.admissions) await forgetNativeFoldProvenance(this.admissions, sessionID, true);
+    }
+    async admits(
+        sessionID: string,
+        cut: StoreRow<"compaction">,
+        reader: V2StoreReader,
+    ): Promise<boolean> {
+        if (!isLocalCheckpoint(cut) || cut.session_id !== sessionID) return false;
+        if (isAdmittedLocalCheckpoint(this.storage, sessionID, cut)) return true;
+        if (!this.admissions) return false;
+        // Persist digests, not the summary or captured message bytes. A matching
+        // host-store identity authorizes rebuilding only from that same store.
+        try {
+            const source = reader.hostIdentity();
+            const saved = (await this.admissions.get(this.admissionKey(sessionID))) as
+                | { payload: string; digest: string }
+                | undefined;
+            if (!saved?.payload || saved.digest !== foldDigest(saved.payload)) return false;
+            const snapshot = JSON.parse(saved.payload) as DurableSnapshot;
+            if (
+                snapshot.sourceDigest !== foldDigest(source) ||
+                snapshot.sessionID !== sessionID ||
+                snapshot.admissionID !== cut.id ||
+                snapshot.summaryDigest !== foldDigest(cut.data.summary ?? "")
+            )
+                return false;
+            // The host-store identity can stay the same while hidden row contents
+            // change. Compare pre-cut rows before accepting a cold admission;
+            // host content-update events invalidate warm admissions without rescanning.
+            if (snapshot.historyDigest !== historyDigest(reader, sessionID, cut.seq - 1)) {
+                this.staleHeads.add(sessionID);
+                this.invalidate(sessionID);
+                await this.removeAdmission(this.admissionKey(sessionID));
+                return false;
+            }
+            await this.storage.supply(
+                sessionID,
+                cut.id,
+                JSON.stringify({
+                    source: this.storage.sourceID,
+                    sessionID,
+                    admissionID: cut.id,
+                    summary: cut.data.summary,
+                }),
+            );
+            return true;
+        } catch {
+            return false;
+        }
     }
     private rendered(row: StoreRow, model: SessionContext["model"]): V2Message[] {
         return restoreRow(
@@ -213,6 +328,7 @@ export class NativeFoldReplay {
                 this.loaded.set(draft.sessionID, through);
                 this.unavailable.delete(draft.sessionID);
                 this.changed.delete(draft.sessionID);
+                this.staleHeads.delete(draft.sessionID);
             } finally {
                 reader.close();
             }
@@ -251,7 +367,8 @@ export class NativeFoldReplay {
     }): Promise<boolean> {
         const { draft, reader, summary } = args;
         const tail = this.tail(draft.sessionID);
-        const id = reader.latestRunningCompaction(draft.sessionID)?.id;
+        const running = reader.latestRunningCompaction(draft.sessionID);
+        const id = running?.id;
         if (!id || !tail || tail.model !== `${draft.model.providerID}/${draft.model.id}`)
             return false;
         const through = reader.latestSequence(draft.sessionID);
@@ -279,6 +396,25 @@ export class NativeFoldReplay {
             summary,
         };
         await this.storage.supply(draft.sessionID, id, JSON.stringify(snapshot));
+        if (this.admissions) {
+            const provenance: DurableSnapshot = {
+                sourceDigest: foldDigest(reader.hostIdentity()),
+                sessionID: draft.sessionID,
+                admissionID: id,
+                summaryDigest: foldDigest(summary),
+                historyDigest: historyDigest(
+                    reader,
+                    draft.sessionID,
+                    (running?.seq ?? through) - 1,
+                ),
+            };
+            const payload = JSON.stringify(provenance);
+            await this.admissions.set(this.admissionKey(draft.sessionID), {
+                payload,
+                digest: foldDigest(payload),
+            });
+            await this.removeLegacyAdmissions(draft.sessionID);
+        }
         return true;
     }
     async restore(
@@ -401,6 +537,9 @@ export class NativeFoldReplay {
     sourceChanged(sessionID: string): boolean {
         return this.changed.has(sessionID);
     }
+    needsHeadRebuild(sessionID: string): boolean {
+        return this.staleHeads.has(sessionID);
+    }
     private clear(sessionID: string): void {
         this.sources.delete(sessionID);
         this.metadata.delete(sessionID);
@@ -409,8 +548,12 @@ export class NativeFoldReplay {
         this.unavailable.delete(sessionID);
         this.dirty.delete(sessionID);
         this.changed.delete(sessionID);
+        this.staleHeads.delete(sessionID);
     }
     async forget(sessionID: string): Promise<void> {
+        // The session id locates the v2 key and matching legacy keys without any
+        // prior source observation. Real hosts remove rows instead of leaving tombstones.
+        if (this.admissions) await forgetNativeFoldProvenance(this.admissions, sessionID);
         await this.storage.forget(sessionID);
     }
 }

@@ -268,6 +268,9 @@ describe("runCompressCues disposition", () => {
             } as never;
 
             const result = await runCompressCues(args);
+            expect(result.failure).toBeInstanceOf(Error);
+            expect((result.failure as Error).message).toContain("provider unavailable");
+            expect(result.failureStage).toBe("child-start");
             expect(result.complete).toBe(false);
             expect(result.remaining).toBe(1);
         } finally {
@@ -307,38 +310,46 @@ describe("runCompressCues disposition", () => {
         }
     });
 
-    test("two consecutive chunk timeouts trip the breaker; the third chunk is never attempted", async () => {
-        const db = freshDb();
-        try {
-            const projectIdentity = "git:cues-breaker";
-            // 120 memories = exactly 3 chunks of 40.
-            for (let index = 0; index < 120; index += 1) {
-                insertMemory(db, {
-                    projectPath: projectIdentity,
-                    category: "ARCHITECTURE",
-                    content: `Cue fact ${index}.`,
-                    sourceSessionId: "ses",
-                });
-            }
-            const args = cueArgs(db, projectIdentity);
-            let promptCalls = 0;
-            args.client = timeoutCueClient(() => {
-                promptCalls += 1;
-            }) as never;
+    for (const hostTimeout of [false, true])
+        test(
+            hostTimeout
+                ? "two consecutive host request timeouts trip the cue breaker"
+                : "two consecutive chunk timeouts trip the breaker; the third chunk is never attempted",
+            async () => {
+                const db = freshDb();
+                try {
+                    const projectIdentity = "git:cues-breaker";
+                    // 120 memories = exactly 3 chunks of 40.
+                    for (let index = 0; index < 120; index += 1) {
+                        insertMemory(db, {
+                            projectPath: projectIdentity,
+                            category: "ARCHITECTURE",
+                            content: `Cue fact ${index}.`,
+                            sourceSessionId: "ses",
+                        });
+                    }
+                    const args = cueArgs(db, projectIdentity);
+                    let promptCalls = 0;
+                    args.client = timeoutCueClient(() => {
+                        promptCalls += 1;
+                        if (hostTimeout)
+                            throw new DOMException("The operation timed out.", "TimeoutError");
+                    }) as never;
 
-            const result = await runCompressCues(args);
+                    const result = await runCompressCues(args);
 
-            // The breaker trips after the 2nd consecutive timeout, so chunk 3 is
-            // never attempted: exactly 2 prompt calls, not 3.
-            expect(promptCalls).toBe(2);
-            expect(result.chunks).toBe(2);
-            expect(result.compressed).toBe(0);
-            expect(result.remaining).toBe(120);
-            expect(result.complete).toBe(false);
-        } finally {
-            closeQuietly(db);
-        }
-    });
+                    // The breaker trips after the 2nd consecutive timeout, so chunk 3 is
+                    // never attempted: exactly 2 prompt calls, not 3.
+                    expect(promptCalls).toBe(2);
+                    expect(result.chunks).toBe(2);
+                    expect(result.compressed).toBe(0);
+                    expect(result.remaining).toBe(120);
+                    expect(result.complete).toBe(false);
+                } finally {
+                    closeQuietly(db);
+                }
+            },
+        );
 
     test("provider-outage completion aborts remaining chunks after the model ladder", async () => {
         const db = freshDb();

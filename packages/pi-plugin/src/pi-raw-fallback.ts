@@ -4,11 +4,14 @@ import {
 	hasMeasuredDecisionCalibration,
 	providerMass,
 } from "@magic-context/core/hooks/magic-context/decision-calibration";
+import { describeDegradedPassFailure } from "@magic-context/core/hooks/magic-context/degraded-pass-refusal";
 import {
 	hasTokenizerForFit,
 	tokenCountUsesByteBound,
 } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { UNKNOWN_FIT_RATIO } from "@magic-context/core/hooks/magic-context/tokenizer-calibration";
+import { isTransientSqliteError } from "@magic-context/core/shared/sqlite";
+import { isTransientPiStorageError } from "./pi-lkg";
 import { piFitMessageBytes, tokenizePiMessages } from "./tokenize-pi-messages";
 
 export class PiStorageBusyError extends Error {
@@ -35,12 +38,27 @@ export class PiDegradedPassError extends Error {
 		readonly site: string,
 		options?: { cause?: unknown },
 	) {
-		super(
-			"Magic Context could not finish preparing this turn; send your message again",
-			options,
-		);
+		super(describeDegradedPassFailure(site, options?.cause), options);
 		this.name = "PiDegradedPassError";
 	}
+}
+
+export function piFallbackRefusal(site: string, cause: unknown): Error {
+	const seen = new Set<unknown>();
+	let current = cause;
+	while (current && typeof current === "object" && !seen.has(current)) {
+		seen.add(current);
+		if (
+			current instanceof PiStorageBusyError ||
+			isTransientSqliteError(current) ||
+			isTransientPiStorageError(current)
+		)
+			return new PiStorageBusyError({ cause });
+		current = (current as { cause?: unknown }).cause;
+	}
+	return cause instanceof PiDegradedPassError
+		? cause
+		: new PiDegradedPassError(site, { cause });
 }
 
 /**
@@ -379,7 +397,7 @@ export function assertPiRawFallbackFits(
 			(!Number.isFinite(observed.envelopeBytes) || observed.envelopeBytes < 0))
 	) {
 		log("raw_fallback_refused completeness=partial");
-		throw new PiStorageBusyError({ cause });
+		throw piFallbackRefusal("fallback-metadata-incomplete", cause);
 	}
 	const measured =
 		measuredPrefix &&
@@ -416,7 +434,12 @@ export function assertPiRawFallbackFits(
 		log(
 			`raw_fallback_over_context_limit proxy_bytes=${bytes} proxy_tokens=${proxyTokens} limit=${contextLimit} early_abort=true serialization_failed=${serializationFailed}`,
 		);
-		throw new PiStorageBusyError({ cause });
+		throw piFallbackRefusal(
+			serializationFailed
+				? "fallback-serialization-failed"
+				: "fallback-over-context-limit",
+			cause,
+		);
 	}
 	const complete = pricedMessages.every((message) => {
 		if (!message || typeof message !== "object") return false;
@@ -438,7 +461,7 @@ export function assertPiRawFallbackFits(
 	const raw = tokenizePiMessages([...pricedMessages]);
 	if (!hasTokenizerForFit()) {
 		log("raw_fallback_refused completeness=partial tokenizer=unavailable");
-		throw new PiStorageBusyError({ cause });
+		throw piFallbackRefusal("fallback-tokenizer-unavailable", cause);
 	}
 	const tokens =
 		baseInputTokens +
@@ -462,7 +485,10 @@ export function assertPiRawFallbackFits(
 		log(
 			`raw_fallback_over_context_limit proxy_bytes=${bytes} proxy_tokens=${proxyTokens} limit=${contextLimit} early_abort=true serialization_failed=${serializationFailed}`,
 		);
-		throw new PiStorageBusyError({ cause });
+		throw piFallbackRefusal(
+			complete ? "fallback-over-context-limit" : "fallback-messages-incomplete",
+			cause,
+		);
 	}
 }
 

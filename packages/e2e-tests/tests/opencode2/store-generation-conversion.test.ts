@@ -181,6 +181,38 @@ function rebaseLinesFor(fixture: ConversionFixture, label: string, sessionId: st
         .filter((line) => line.includes(REBASE_LOG_MARKER) && line.includes(sessionId));
 }
 
+/** The plugin logger's timer flush interval (`FLUSH_INTERVAL_MS` in shared/logger.ts). */
+const PLUGIN_LOG_FLUSH_INTERVAL_MS = 500;
+
+/**
+ * The rebase lines a boot logged during the turn that just returned.
+ *
+ * The plugin buffers log lines: the first buffered line arms a 500 ms flush
+ * timer, and only 50 pending lines flush at once. The transform pass that runs
+ * the rebase logs fewer than 50 lines after it, so the rebase line written
+ * during the turn just awaited can still be in the host's buffer when the turn
+ * returns, and reading the file once at that moment sees nothing. Waiting one
+ * full flush interval past the end of the turn reads every line logged during
+ * it, a second rebase included, so the exactly-one assertions still catch a
+ * duplicate.
+ */
+async function settledRebaseLinesFor(
+    fixture: ConversionFixture,
+    label: string,
+    sessionId: string,
+): Promise<string[]> {
+    const settledAt = Date.now() + PLUGIN_LOG_FLUSH_INTERVAL_MS + 100;
+    // A busy host can fire its flush timer late; give up after a bounded wait
+    // and let the assertions report what was found.
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+        const lines = rebaseLinesFor(fixture, label, sessionId);
+        const now = Date.now();
+        if ((lines.length > 0 && now >= settledAt) || now >= deadline) return lines;
+        await Bun.sleep(100);
+    }
+}
+
 function readCompartments(fixture: ConversionFixture, sessionId: string) {
     return contextRows<{
         sequence: number;
@@ -891,7 +923,7 @@ beforeAll(async () => {
     const firstConvertedInput = JSON.stringify(firstConvertedRequest.body.input);
     expect(existsSync(join(workerMissingBundle.root, "dist/v2/compaction-marker-candidates-worker.js"))).toBe(false);
     expect(readFileSync(fixture.logPath("v2"), "utf8")).not.toContain("compaction-marker-drain-failure");
-    const forwardRebaseLines = rebaseLinesFor(fixture, "v2", sessionId);
+    const forwardRebaseLines = await settledRebaseLinesFor(fixture, "v2", sessionId);
     const forwardCompartments = readCompartments(fixture, sessionId);
     const forwardProjection = v2Projection(fixture, sessionId);
     const forwardFts = readFtsRows(fixture, sessionId);
@@ -1048,7 +1080,7 @@ beforeAll(async () => {
 
     const backFirstRequest = mock.requests().length;
     await promptBack("first prompt back on the old host");
-    const backRebaseLines = rebaseLinesFor(fixture, "v1-back", sessionId);
+    const backRebaseLines = await settledRebaseLinesFor(fixture, "v1-back", sessionId);
     const backCompartments = readCompartments(fixture, sessionId);
     const backProjection = v1Projection(fixture, sessionId);
     const backFts = readFtsRows(fixture, sessionId);

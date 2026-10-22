@@ -447,7 +447,7 @@ describe("bundleIssueReport secret redaction", () => {
         }
     });
 
-    it("sanitizes title, description, config paths, and recent session titles", async () => {
+    it("keeps user-entered title and description while sanitizing private report fields", async () => {
         const root = createTestTempDirFromPath(join(tmpdir(), "mc-issue-sanitize-"));
         tempDirs.push(root);
         const originalCwd = process.cwd();
@@ -523,14 +523,16 @@ describe("bundleIssueReport secret redaction", () => {
 
             const bundled = await bundleIssueReport(
                 report,
-                "Description with /Users/alice/private and token=abc123",
-                "Title with /Users/alice/private and token=abc123",
+                "The issue happens after restart. Reproduction: run the command twice.",
+                "Repeated command loses its tool result",
             );
             const body = readFileSync(bundled.path, "utf-8");
 
             expect(body).toContain("## Title");
-            expect(body).toContain("## Title\n<text omitted>");
-            expect(body).toContain("## Description\n<text omitted>");
+            expect(body).toContain("## Title\nRepeated command loses its tool result");
+            expect(body).toContain(
+                "## Description\nThe issue happens after restart. Reproduction: run the command twice.",
+            );
             expect(body).toContain("Config from `~/path-5`:");
             expect(body).toContain('"title": "<text omitted>"');
             expect(body).toContain('"directory": "~/project-1"');

@@ -321,6 +321,8 @@ async function heldFixture(generation: "v1" | "v2") {
         };
     }
     (await serve("base instructions")).accept();
+    // A heavy signed step (1,600 reasoning tokens): the bounded hold keeps the
+    // turn's prefix while usage stays below the cap (65% + 10).
     source.push({
         info: {
             id: "signed",
@@ -329,6 +331,7 @@ async function heldFixture(generation: "v1" | "v2") {
             providerID: model.providerID,
             modelID: model.modelID,
             finish: "tool-calls",
+            tokens: { input: 0, output: 1_600, reasoning: 1_600 },
         },
         parts: [
             {

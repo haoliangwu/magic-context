@@ -19,9 +19,8 @@
  * ## Timeout
  *
  * The LLM-bound context path must not hang on embedding providers. We use
- * the same 3000ms cap as OpenCode (lines 40-47, 222-229, 239-246). On
- * timeout the `AbortController` is fired so `unifiedSearch()` can cancel
- * the underlying embedding fetch.
+ * a 1-second search deadline and wait at most 200ms for an embedding before
+ * using keyword results. Cancellation aborts the underlying embedding fetch.
  *
  * ## Mutation strategy
  *
@@ -47,6 +46,7 @@
  */
 
 import type { ContextEvent } from "@earendil-works/pi-coding-agent";
+import { getLastCompartmentEndMessage } from "@magic-context/core/features/magic-context/compartment-storage";
 import {
 	embedTextForProject,
 	getProjectEmbeddingSnapshot,
@@ -68,7 +68,10 @@ import {
 	wasAutoSearchSkipped,
 	withAutoSearchDeadline,
 } from "@magic-context/core/hooks/magic-context/auto-search-deadline";
-import { buildAutoSearchHint } from "@magic-context/core/hooks/magic-context/auto-search-hint";
+import {
+	buildAutoSearchHint,
+	selectAutoSearchResults,
+} from "@magic-context/core/hooks/magic-context/auto-search-hint";
 import {
 	coalesceAutoSearchTurn,
 	persistAutoSearchDecision,
@@ -429,6 +432,11 @@ export async function runAutoSearchHintForPi(args: {
 							const gitCommitsEnabled = snapshot?.gitCommitEnabled ?? false;
 							const searchOptions: UnifiedSearchOptions = {
 								limit: 10,
+								maxMessageOrdinal: Math.max(
+									0,
+									getLastCompartmentEndMessage(db, sessionId),
+								),
+								excludeMessageId: userMsgId,
 								memoryEnabled,
 								embeddingEnabled,
 								gitCommitsEnabled,
@@ -497,10 +505,11 @@ export async function runAutoSearchHintForPi(args: {
 
 					const scoreThreshold =
 						options.scoreThreshold ?? DEFAULT_SCORE_THRESHOLD;
-					if (results[0].score < scoreThreshold) {
+					results = selectAutoSearchResults(results, scoreThreshold);
+					if (results.length === 0) {
 						sessionLog(
 							sessionId,
-							`auto-search: top score ${results[0].score.toFixed(3)} below threshold ${scoreThreshold}`,
+							`auto-search: no fragment meets relevance threshold ${scoreThreshold}`,
 						);
 						await writeNoHintAndReconcile("below-threshold");
 						return messages;
@@ -508,6 +517,7 @@ export async function runAutoSearchHintForPi(args: {
 
 					const hintText = buildAutoSearchHint(results, {
 						wordRules: options.wordRules,
+						query: rawPrompt,
 					});
 					if (!hintText) {
 						await writeNoHintAndReconcile("empty");

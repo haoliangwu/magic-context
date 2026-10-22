@@ -66,6 +66,10 @@ export const PASS_DEGRADATION_EFFECTS = {
     // This pass's new removals were not saved: replay or refuse rather than
     // serving a partially prepared request.
     "reasoning-removal-persistence-failure": "changes-request",
+    // The covered instruction-row switch is unreadable, or this rewriting pass
+    // could not save it: which instruction rows are served is unknown.
+    "host-instruction-retention-read-failure": "changes-request",
+    "host-instruction-retention-persistence-failure": "changes-request",
 } as const satisfies Record<string, "changes-request" | "served">;
 
 export type PassDegradationSite = keyof typeof PASS_DEGRADATION_EFFECTS;

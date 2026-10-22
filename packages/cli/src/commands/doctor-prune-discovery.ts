@@ -6,8 +6,8 @@
  *
  * Inspection already deletes records proven stale (dead PID, a process that
  * started after the record was written, or an image no host can run). This
- * module reports what is left and lets the user remove it explicitly. Empty
- * project directories are pruned only here, never during storage opens.
+ * module reports what is left and lets the user remove it explicitly. RPC
+ * startup and shutdown also prune empty project directories; storage opens do not.
  */
 import {
     inspectRpcServerDiscovery,

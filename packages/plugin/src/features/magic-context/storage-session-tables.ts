@@ -1,8 +1,11 @@
 import { clearLkgRecoveryFence } from "../../hooks/magic-context/lkg-recovery-fence";
 import { getHarness } from "../../shared/harness";
-import type { Database } from "../../shared/sqlite";
+import { type Database, prepareCachedStatement, type Statement } from "../../shared/sqlite";
 import { deleteChunkEmbedBackoffForSession } from "./compartment-chunk-embedding";
-import { deleteUnmappedMessageFtsRows } from "./message-fts-rowid-map";
+import {
+    deleteUnmappedMessageFtsRows,
+    getMessageFtsRowidMapBackfillProgress,
+} from "./message-fts-rowid-map";
 import { deleteSessionActivity } from "./session-activity";
 import {
     tagIdentityRevisionKey,
@@ -75,10 +78,31 @@ export const SESSION_SCOPED_TABLES: readonly SessionScopedTableDefinition[] = [
 ];
 
 export interface DeleteSessionScopedRowsOptions {
+    /** The caller clears durable recovery files after COMMIT, outside the SQLite writer lock. */
+    readonly deferRecoveryFenceCleanup?: boolean;
     /** Set only after the Rust module has acknowledged its idempotent session deletion. */
     readonly rustModuleCleanupAcknowledged?: boolean;
     /** Keep tag-change counters when a session may resume; remove them only after host deletion is confirmed. */
     readonly preserveTagRevisionTombstones?: boolean;
+}
+
+const cleanupStatements = new WeakMap<Database, Map<string, Statement>>();
+function cleanupStatement(db: Database, sql: string): Statement {
+    let cache = cleanupStatements.get(db);
+    if (!cache) {
+        cache = new Map();
+        cleanupStatements.set(db, cache);
+    }
+    let statement = cache.get(sql);
+    if (!statement) {
+        // Per-session orphan transactions repeat these queries thousands of times.
+        // Reuse their statements instead of forcing native finalization/GC while
+        // holding the writer. Cap the cache because batch sizes produce distinct SQL.
+        if (cache.size >= 256) cache.clear();
+        statement = prepareCachedStatement(db, sql);
+        cache.set(sql, statement);
+    }
+    return statement;
 }
 
 /**
@@ -101,14 +125,13 @@ export function deleteSessionScopedRows(
     if (options.rustModuleCleanupAcknowledged !== true) {
         const placeholders = sessionIds.map(() => "?").join(", ");
         const harnessPredicate = harness === undefined ? "" : " AND harness = ?";
-        const protectedRows = db
-            .prepare(
-                `SELECT session_id
+        const protectedRows = cleanupStatement(
+            db,
+            `SELECT session_id
                  FROM pending_session_cleanup
                  WHERE session_id IN (${placeholders})
                    AND harness LIKE '%:rust'${harnessPredicate}`,
-            )
-            .all(...sessionIds, ...(harness === undefined ? [] : [`${harness}:rust`])) as Array<{
+        ).all(...sessionIds, ...(harness === undefined ? [] : [`${harness}:rust`])) as Array<{
             session_id: string;
         }>;
         const protectedSessionIds = new Set(protectedRows.map((row) => row.session_id));
@@ -122,26 +145,29 @@ export function deleteSessionScopedRows(
         // With the context rows gone, retain each producing harness next to the
         // tag-change counters. OpenCode's orphan sweep cannot infer Pi/OMP
         // session liveness from OpenCode's own database.
-        const owners = db
-            .prepare(
-                harnessTables
-                    .map(
-                        (definition) =>
-                            `SELECT session_id, harness FROM ${definition.table} WHERE session_id IN (${placeholders})${definition.extraPredicate ? ` AND ${definition.extraPredicate}` : ""}`,
-                    )
-                    .join(" UNION "),
-            )
-            .all(...harnessTables.flatMap(() => deletableSessionIds)) as {
+        const owners = cleanupStatement(
+            db,
+            harnessTables
+                .map(
+                    (definition) =>
+                        `SELECT session_id, harness FROM ${definition.table} WHERE session_id IN (${placeholders})${definition.extraPredicate ? ` AND ${definition.extraPredicate}` : ""}`,
+                )
+                .join(" UNION "),
+        ).all(...harnessTables.flatMap(() => deletableSessionIds)) as {
             session_id: string;
             harness: string;
         }[];
-        const record = db.prepare(
+        const record = cleanupStatement(
+            db,
             "INSERT OR IGNORE INTO schema_migrations_meta (key, value) VALUES (?, ?)",
         );
         for (const owner of owners)
             record.run(tagTombstoneOwnerKey(owner.session_id, owner.harness), owner.harness);
-        const fallback = db.prepare(`INSERT INTO schema_migrations_meta (key, value)
-            SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM schema_migrations_meta WHERE key >= ? AND key < ?)`);
+        const fallback = cleanupStatement(
+            db,
+            `INSERT INTO schema_migrations_meta (key, value)
+            SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM schema_migrations_meta WHERE key >= ? AND key < ?)`,
+        );
         for (const id of deletableSessionIds)
             fallback.run(
                 tagTombstoneOwnerKey(id, getHarness()),
@@ -153,7 +179,8 @@ export function deleteSessionScopedRows(
     for (const sessionId of deletableSessionIds) deleteChunkEmbedBackoffForSession(db, sessionId);
     for (const definition of SESSION_SCOPED_TABLES) {
         if (definition.table === "message_history_fts") {
-            db.prepare(
+            cleanupStatement(
+                db,
                 `DELETE FROM message_history_fts
                  WHERE rowid IN (
                      SELECT fts_rowid
@@ -169,7 +196,8 @@ export function deleteSessionScopedRows(
         if (definition.extraPredicate) predicates.push(definition.extraPredicate);
         const bindHarness = harness !== undefined && definition.harnessScoped === true;
         if (bindHarness) predicates.push("harness = ?");
-        const statement = db.prepare(
+        const statement = cleanupStatement(
+            db,
             `DELETE FROM ${definition.table} WHERE ${predicates.join(" AND ")}`,
         );
         if (bindHarness) statement.run(...deletableSessionIds, harness);
@@ -179,7 +207,8 @@ export function deleteSessionScopedRows(
     // so it cannot appear in the schema-derived SESSION_SCOPED_TABLES list.
     deleteSessionActivity(db, deletableSessionIds);
     if (!options.preserveTagRevisionTombstones) {
-        const retireOwner = db.prepare(
+        const retireOwner = cleanupStatement(
+            db,
             harness === undefined
                 ? "DELETE FROM schema_migrations_meta WHERE key >= ? AND key < ?"
                 : "DELETE FROM schema_migrations_meta WHERE key = ?",
@@ -190,9 +219,12 @@ export function deleteSessionScopedRows(
                     `EXISTS (SELECT 1 FROM ${definition.table} WHERE session_id = ?${definition.extraPredicate ? ` AND ${definition.extraPredicate}` : ""})`,
             )
             .join(" OR ");
-        const retire = db.prepare(`DELETE FROM schema_migrations_meta WHERE key IN (?, ?)
+        const retire = cleanupStatement(
+            db,
+            `DELETE FROM schema_migrations_meta WHERE key IN (?, ?)
             AND NOT (${survivingRows})
-            AND NOT EXISTS (SELECT 1 FROM schema_migrations_meta AS owners WHERE owners.key >= ? AND owners.key < ?)`);
+            AND NOT EXISTS (SELECT 1 FROM schema_migrations_meta AS owners WHERE owners.key >= ? AND owners.key < ?)`,
+        );
         for (const id of deletableSessionIds) {
             if (harness === undefined) retireOwner.run(...tagTombstoneOwnerRange(id));
             else retireOwner.run(tagTombstoneOwnerKey(id, harness));
@@ -204,6 +236,89 @@ export function deleteSessionScopedRows(
             );
         }
     }
-    for (const sessionId of deletableSessionIds) clearLkgRecoveryFence(sessionId);
+    if (!options.deferRecoveryFenceCleanup)
+        for (const sessionId of deletableSessionIds) clearLkgRecoveryFence(sessionId);
     return deletableSessionIds.length;
+}
+
+export const SESSION_CLEANUP_SLICE_ROWS = 64;
+
+/** Delete at most one row slice; the owner marker makes an interrupted purge discoverable. */
+export function deleteSessionScopedRowsSlice(
+    db: Database,
+    sessionId: string,
+    harness: string,
+): { complete: boolean; deleted: number } {
+    if (
+        cleanupStatement(
+            db,
+            "SELECT 1 FROM pending_session_cleanup WHERE session_id = ? AND harness = ?",
+        ).get(sessionId, `${harness}:rust`)
+    )
+        return { complete: true, deleted: 0 };
+    cleanupStatement(
+        db,
+        "INSERT OR IGNORE INTO schema_migrations_meta(key,value) VALUES (?,?)",
+    ).run(tagTombstoneOwnerKey(sessionId, harness), harness);
+    let remaining = SESSION_CLEANUP_SLICE_ROWS;
+    const started = performance.now();
+    // Backoff keys refer to compartment IDs, so retire them before deleting the
+    // compartments themselves. Joining the KV table skips already absent keys.
+    remaining -= deleteChunkEmbedBackoffForSession(db, sessionId, remaining);
+    if (remaining <= 0) return { complete: false, deleted: 0 };
+    for (const definition of SESSION_SCOPED_TABLES) {
+        if (definition.table === "message_history_fts") {
+            const rows = cleanupStatement(
+                db,
+                "SELECT fts_rowid AS id FROM message_fts_rowid_map WHERE session_id = ? LIMIT ?",
+            ).all(sessionId, remaining) as { id: number }[];
+            const removeFts = cleanupStatement(
+                db,
+                "DELETE FROM message_history_fts WHERE rowid = ?",
+            );
+            const removeMap = cleanupStatement(
+                db,
+                "DELETE FROM message_fts_rowid_map WHERE session_id = ? AND fts_rowid = ?",
+            );
+            for (const row of rows) {
+                removeFts.run(row.id);
+                removeMap.run(sessionId, row.id);
+            }
+            remaining -= rows.length;
+            if (remaining > 0 && !getMessageFtsRowidMapBackfillProgress(db).completed)
+                remaining -= cleanupStatement(
+                    db,
+                    `DELETE FROM message_history_fts WHERE rowid IN (
+                    SELECT rowid FROM message_history_fts WHERE session_id = ? LIMIT ?
+                )`,
+                ).run(sessionId, remaining).changes;
+        } else {
+            const predicates = ["session_id = ?"];
+            if (definition.extraPredicate) predicates.push(definition.extraPredicate);
+            if (definition.harnessScoped) predicates.push("harness = ?");
+            const args = [sessionId, ...(definition.harnessScoped ? [harness] : []), remaining];
+            // These two tables have composite primary keys and no SQLite rowid.
+            const withoutRowid =
+                definition.table === "temporal_decisions" ||
+                definition.table === "session_replay_decisions";
+            const key = withoutRowid ? "message_id" : "rowid";
+            remaining -= cleanupStatement(
+                db,
+                `DELETE FROM ${definition.table}
+                WHERE ${withoutRowid ? "session_id = ? AND " : ""}${key} IN (
+                    SELECT ${key} FROM ${definition.table} WHERE ${predicates.join(" AND ")} LIMIT ?
+                )`,
+            ).run(...(withoutRowid ? [sessionId] : []), ...args).changes;
+        }
+        if (remaining <= 0 || performance.now() - started >= 10)
+            return { complete: false, deleted: 0 };
+    }
+    // All table rows are gone (or belong to another harness). The final cleanup
+    // retires KV counters and the owner marker; filesystem work stays deferred.
+    return {
+        complete: true,
+        deleted: deleteSessionScopedRows(db, [sessionId], harness, {
+            deferRecoveryFenceCleanup: true,
+        }),
+    };
 }

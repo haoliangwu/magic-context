@@ -238,7 +238,11 @@ import { abortInFlightRecomps, awaitInFlightRecomps } from "./pi-recomp-runner";
 import { handlePiProviderFailure } from "./provider-error-recovery-pi";
 import { bindStaleBuildNotice } from "./stale-build-notice";
 import { registerStatusLine, updateStatusLine } from "./status-line";
-import { stripTagPrefixFromAssistantMessage } from "./strip-tag-prefix";
+import { registerStreamTagPrefixStrip } from "./stream-tag-prefix-strip";
+import {
+	registerOmpAssistantMessageStrip,
+	stripTagPrefixFromAssistantMessage,
+} from "./strip-tag-prefix";
 import { registerPiSubagentHostTools } from "./subagent-host-tools";
 import {
 	configurePiSubagentExtensions,
@@ -255,6 +259,10 @@ import {
 	acknowledgePiPendingSystemPromptResponses,
 	acknowledgePiSystemPromptResponse,
 } from "./system-prompt-delivery-pi";
+import {
+	drainPiTagSnapshotSession,
+	prewarmPiTagSnapshot,
+} from "./tag-snapshot-pi";
 import { withTimeout } from "./timeout";
 import { registerMagicContextTools, syncCtxMemoryToolEnabled } from "./tools";
 import {
@@ -1975,6 +1983,7 @@ async function startPiMagicContextRuntime(
 		{
 			db,
 			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
+			onInherited: (sessionId) => prewarmPiTagSnapshot(db, sessionId),
 		},
 	);
 	pi.on("session_start", async (event, ctx) => {
@@ -2010,6 +2019,7 @@ async function startPiMagicContextRuntime(
 		await handlePiCloneSessionStart(event, ctx, {
 			db,
 			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
+			onInherited: (sessionId) => prewarmPiTagSnapshot(db, sessionId),
 		});
 		const sessionId = resolveSessionId(ctx);
 		if (
@@ -2029,6 +2039,7 @@ async function startPiMagicContextRuntime(
 				modelKey: canonicalPiModelKey(model.provider, model.id),
 			});
 		}
+		if (sessionId) prewarmPiTagSnapshot(db, sessionId);
 	});
 
 	pi.on("agent_start", (_event, ctx) => {
@@ -2888,6 +2899,18 @@ async function startPiMagicContextRuntime(
 	// (we re-strip and re-inject on the next transform pass), but the
 	// stored text is what Pi's UI renders — without this scrub, users
 	// see internal tag IDs at the start of every assistant turn.
+	//
+	// The same prefix also reaches clients earlier, as streamed `text_delta`
+	// events (Pi JSON/RPC mode). The stream rewrite hides it there; see
+	// stream-tag-prefix-strip.ts for why it is Pi-only. Oh My Pi notifies
+	// its stream listeners before extension handlers run, so it cannot work there.
+	if (PI_HARNESS_KIND !== "omp") {
+		registerStreamTagPrefixStrip(pi, () => !compactionOff);
+	} else {
+		// Oh My Pi gives message_end handlers a detached copy, so the strip
+		// below cannot change what it saves; its assistant_message hook can.
+		registerOmpAssistantMessageStrip(pi, () => !compactionOff);
+	}
 	pi.on("message_end", async (event, ctx) => {
 		try {
 			const leafId = ctx.sessionManager.getLeafId();
@@ -3154,6 +3177,12 @@ async function startPiMagicContextRuntime(
 				// this, sessions accumulate state across `session_shutdown`
 				// in long-lived Pi processes that re-init the extension.
 				clearContextHandlerSession(sessionId);
+				// A cancelled prewarm is still owned by this runtime until its
+				// result settles and worker exits, within the existing shutdown cap.
+				await withTimeout(
+					drainPiTagSnapshotSession(sessionId),
+					SHUTDOWN_DRAIN_MS,
+				);
 			}
 		} catch {
 			// best-effort cleanup
@@ -3212,6 +3241,12 @@ async function startPiMagicContextRuntime(
 		const outgoingSessionId = switchOutgoingSessionId;
 		switchOutgoingSessionId = undefined;
 		try {
+			const incomingSessionId = readSessionId(ctx);
+			if (
+				incomingSessionId &&
+				(_event as { reason?: unknown })?.reason !== "fork"
+			)
+				prewarmPiTagSnapshot(db, incomingSessionId);
 			if (!outgoingSessionId || outgoingSessionId === readSessionId(ctx))
 				return;
 			clearPiSystemPromptSession(outgoingSessionId);

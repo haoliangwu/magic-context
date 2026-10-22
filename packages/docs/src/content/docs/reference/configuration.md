@@ -77,6 +77,8 @@ When and how aggressively Magic Context manages the session's context window. Pe
 | `keep_reasoning_tokens` | integer (0–1000000) \| map<string, integer (0–1000000)> | — | Reasoning tokens to keep on rebuilding passes. Number or per-model object; exact, shorter model keys, provider/\*, then default. Omitted: fixed 10,000. 0 removes all eligible historical reasoning; newest and exempt steps always stay. |
 | `history_budget_percentage` | number (0.05–0.5) | `0.15` | Fraction of usable context (context_limit × execute_threshold) reserved for the session history block (default: 0.15) |
 
+If `cache_ttl` is shorter than the provider's real cache lifetime (for example, a locally hosted model whose prefix cache doesn't expire), idle expiry rebuilds the prompt onto a cache that is still warm and pays for the rewrite for nothing. Set `cache_ttl` to match the provider, or to `"never"` for a cache that doesn't expire.
+
 ## Model profiles
 
 Named user-owned model-selection overlays. A project may select a profile name but cannot define or alter profile contents.
@@ -111,16 +113,16 @@ The background agent that condenses old conversation into compact history.
 | `historian.maxTokens` **Live** | number | — | Maximum output tokens |
 | `historian.expand_tools` **Live** | map<string, string \| boolean> | — | Readable historian tool expansions, keyed by exact host tool name. Templates override built-in defaults; false disables an expansion. Supports ${input.path}, ${output.path}, bare ${output}, array [N], [\*].field, .each("${field}"), .join("separator"), .count and final .truncate(N). Missing fields are empty. Historian text and lists have no implicit caps; explicit .truncate(N) keeps complete sentences and marks omitted characters, or emits only the marker if no sentence fits. When the ctx_expand history-recovery tool is called in verbose mode, its tool-call previews retain their original built-in templates and limits (300 characters per placeholder, 10 list elements, 1000 characters per expansion). Valid in user and project config; never changes the wire or default ctx_expand transcript. |
 | `historian.opencode` | object | — | Strict OpenCode model-resolution block. It accepts no Pi vocabulary. |
-| `historian.opencode.model` **Live** | string \| object | — | Primary OpenCode model entry. |
-| `historian.opencode.fallback_models` **Live** | string \| object[] | — | Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
+| `historian.opencode.model` **Live** | string \| object | — | Primary historian OpenCode model entry. When set, only this model and fallback_models are used; exhaustion reports failure, never the session model. When absent, OpenCode inherits the session model. |
+| `historian.opencode.fallback_models` **Live** | string \| object[] | — | Ordered historian fallback OpenCode entries. A configured primary never adds the session model after this list. Requires an array; legacy singleton values migrate to a one-element array. |
 | `historian.opencode.variant` **Live** | string | — | OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry. |
 | `historian.pi` | object | — | Strict Pi model-resolution block. It accepts no OpenCode vocabulary. |
-| `historian.pi.model` **Live** | string \| object | — | Primary Pi model entry. |
-| `historian.pi.fallback_models` **Live** | string \| object[] | — | Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
+| `historian.pi.model` **Live** | string \| object | — | Primary historian Pi model entry. When set, only this model and fallback_models are used; exhaustion reports failure, never the session model. When absent, Pi does not run the historian. |
+| `historian.pi.fallback_models` **Live** | string \| object[] | — | Ordered historian fallback Pi entries. The session model is never appended. Requires an array; legacy singleton values migrate to a one-element array. |
 | `historian.pi.thinking_level` **Live** | `"off"` \| `"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` \| `"max"` | — | Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
 | `historian.omp` | object | — | Strict OMP model-resolution block. It accepts no OpenCode vocabulary. |
-| `historian.omp.model` **Live** | string \| object | — | Primary OMP model entry. |
-| `historian.omp.fallback_models` **Live** | string \| object[] | — | Ordered fallback OMP entries. |
+| `historian.omp.model` **Live** | string \| object | — | Primary historian OMP model entry. When set, only this model and fallback_models are used; exhaustion reports failure, never the session model. An absent OMP block inherits the Pi block; a selected block without a model does not run the historian. |
+| `historian.omp.fallback_models` **Live** | string \| object[] | — | Ordered historian fallback OMP entries. The session model is never appended. |
 | `historian.omp.thinking_level` **Live** | `"off"` \| `"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` \| `"max"` \| `"inherit"` \| `"auto"` | — | OMP thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
 | `historian.runner` | `"broca"` \| `"host"` | — | Which side runs the historian completion in Rust transform mode: "host" queues it for this process to run on the configured historian model, "broca" routes it to the Broca module. When unset the harness decides: OpenCode 1 and OpenCode 2 use "host", Claude Code (through the Thalamus gateway, which has no host to run a completion) uses "broca". User-level config only — it decides whose provider account pays for the call. |
 | `historian.host_runner` | object | — | Controls for this process's historian pull loop, which answers runs the Rust module queues for the host runner (`historian.runner: "host"`, or unset on OpenCode 1 and OpenCode 2). User-level config only — it decides whether this machine's provider account is spent on folds. |

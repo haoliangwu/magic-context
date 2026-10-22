@@ -286,6 +286,8 @@ async function runHistorianSubagentWithTransientRetriesGuarded(args: {
 			args.onDispatch?.();
 			result = await args.runner.run({
 				...args.options,
+				cacheTail:
+					retryIndex > 0 ? "write" : (args.options.cacheTail ?? "skip"),
 				// The historian runner owns fallback iteration because every candidate's
 				// output must be parsed and validated before the chain can stop.
 				fallbackModels: undefined,
@@ -332,27 +334,18 @@ function buildHistorianFallbackChain(
 	primaryModel: string,
 	primaryThinkingLevel: string | undefined,
 	fallbackModels?: readonly ModelInput[],
-	fallbackModelId?: string,
-): Array<{ entry: ResolvedModelEntry; kind: "configured" | "session" }> {
+): ResolvedModelEntry[] {
 	const seen = new Set<string>([
 		`${primaryModel}\u0000${primaryThinkingLevel ?? ""}`,
 	]);
-	const chain: Array<{
-		entry: ResolvedModelEntry;
-		kind: "configured" | "session";
-	}> = [];
+	const chain: ResolvedModelEntry[] = [];
 	for (const candidate of fallbackModels ?? []) {
 		const entry =
 			typeof candidate === "string" ? { model: candidate } : candidate;
 		const key = `${entry.model}\u0000${entry.qualifier ?? ""}`;
 		if (!entry.model || seen.has(key)) continue;
 		seen.add(key);
-		chain.push({ entry, kind: "configured" });
-	}
-	if (fallbackModelId) {
-		const entry = { model: fallbackModelId };
-		const key = `${entry.model}\u0000`;
-		if (!seen.has(key)) chain.push({ entry, kind: "session" });
+		chain.push(entry);
 	}
 	return chain;
 }
@@ -414,7 +407,7 @@ export interface PiHistorianDeps {
 	historianModel: string;
 	/** Optional ordered fallback chain, retaining each entry's Pi thinking level. */
 	fallbackModels?: readonly ModelInput[];
-	/** Live session model used as the final fallback after configured fallbacks. */
+	/** Live session model for host context; never appended to the configured chain. */
 	fallbackModelId?: string;
 	/** Historian chunk budget derived from its context window. */
 	historianChunkTokens: number;
@@ -1118,6 +1111,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			let validatedDraftText: string | null = firstResult.ok
 				? firstResult.assistantText
 				: null;
+			let fallbackPrompt = prompt;
 
 			// Repair retry on validation failure (mirrors OpenCode behavior).
 			if (validatedPass.kind === "validation-failed") {
@@ -1131,6 +1125,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					validatedPass.error,
 					deps.language,
 				);
+				fallbackPrompt = repairPrompt;
 				const repairResult = await runHistorianSubagentWithTransientRetries({
 					runner,
 					sessionId,
@@ -1170,13 +1165,12 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 
 			// Escalate through the fallback chain on empty/invalid output. Each
 			// candidate is run and validated explicitly because a model can complete
-			// successfully while producing no usable compartments. The live session's
-			// current model is appended as the final last-resort candidate.
+			// successfully while producing no usable compartments. Only explicitly
+			// configured fallback models may receive these summarization requests.
 			const fallbackChain = buildHistorianFallbackChain(
 				historianModel,
 				thinkingLevel,
 				fallbackModels,
-				fallbackModelId,
 			);
 			if (
 				validatedPass.kind !== "ok" &&
@@ -1190,30 +1184,28 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					const candidate = fallbackChain[i];
 					sessionLog(
 						sessionId,
-						`historian: escalating to ${candidate.kind === "session" ? "session-model last resort" : "configured fallback model"} ${candidate.entry.model}`,
+						`historian: escalating to configured fallback model ${candidate.model}`,
 					);
 					const fbResult = await runHistorianSubagentWithTransientRetries({
 						runner,
 						sessionId,
-						passLabel:
-							candidate.kind === "session" ? "fallback-session" : "fallback",
+						passLabel: "fallback",
 						retryBackoffMs,
 						options: {
 							agent: HISTORIAN_AGENT_NAME,
 							systemPrompt: historianSystemPrompt,
-							userMessage: prompt,
-							model: candidate.entry.model,
+							userMessage: fallbackPrompt,
+							model: candidate.model,
 							timeoutMs: historianTimeoutMs,
 							cwd: directory,
 							signal,
-							thinkingLevel: candidate.entry.qualifier,
+							thinkingLevel: candidate.qualifier,
 							temperature,
 							maxOutputTokens,
 							onProgress: buildProgressLogger("fallback"),
 							accountingSessionId: sessionId,
 							accountingSubagent: "historian",
-							accountingTask:
-								candidate.kind === "session" ? "fallback-session" : "fallback",
+							accountingTask: "fallback",
 						},
 					});
 					const fbPass = await validateHistorianResult(

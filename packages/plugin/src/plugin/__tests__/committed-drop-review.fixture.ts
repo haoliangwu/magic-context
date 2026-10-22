@@ -306,8 +306,20 @@ try {
         warm();
         const tags = getTagsBySession(db, sessionId).filter((t) => t.type === "tool");
         if (tags.length !== 8) throw new Error(`expected 8 tool tags, got ${tags.length}`);
-        if (lane !== "pi")
-            for (const t of tags.slice(0, 3)) queuePendingOp(db, sessionId, t.tagNumber, "drop");
+        if (lane !== "pi") {
+            for (const [index, t] of tags.slice(0, 3).entries()) {
+                queuePendingOp(db, sessionId, t.tagNumber, "drop");
+                // Each real drop starts a different 64-operation chunk, preserving
+                // coverage of committed-prefix recovery after a later chunk fails.
+                for (let offset = 0; offset < 63; offset++) {
+                    const number = 100_000 + index * 63 + offset;
+                    db.prepare(
+                        "INSERT INTO tags(session_id,tag_number,message_id,type,status,byte_size) VALUES(?,?,?,'message','compacted',1)",
+                    ).run(sessionId, number, `stale-${number}`);
+                    queuePendingOp(db, sessionId, number, "drop");
+                }
+            }
+        }
         db.exec(
             `CREATE TEMP TRIGGER independent_abort BEFORE UPDATE OF status ON tags WHEN NEW.tag_number=${tags[position - 1]!.tagNumber} AND NEW.status='dropped' BEGIN SELECT RAISE(ABORT,'independent partial write fault'); END`,
         );

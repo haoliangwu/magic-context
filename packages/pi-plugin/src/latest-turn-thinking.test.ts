@@ -1,4 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	getOrCreateSessionMeta,
 	getPendingOps,
@@ -6,6 +9,7 @@ import {
 	queuePendingOp,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
+import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import {
 	addMergedReasoningStrippedIds,
 	appendNoteNudgeAnchor,
@@ -18,7 +22,9 @@ import {
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { buildSyntheticTodoPart } from "@magic-context/core/hooks/magic-context/todo-view";
+import { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import * as autoSearch from "./auto-search-pi";
 import {
 	__test,
@@ -39,6 +45,7 @@ import {
 	createFakePi,
 	createTestDb,
 	fakeContext,
+	heavyReasoningUsage,
 	userMessage,
 } from "./test-utils.test";
 
@@ -101,7 +108,11 @@ test("Pi thinking spans every tool round until the next real user", () => {
 	}
 });
 
-test("Pi Anthropic task retains queued drops at execute, force and 95% without refusing", async () => {
+// Earlier revisions held the queued drop for the whole signed turn, through
+// the force band and 95%. The bounded hold ends at the cap (65% + 10), so the
+// first execute bust above it applies the drop mid-turn and strips every signed
+// block, and later passes replay that result.
+test("Pi Anthropic task applies queued drops mid-turn above the hold cap and strips signed thinking once", async () => {
 	const db = createTestDb();
 	const sessionId = "pi-latest-turn-pipeline";
 	getOrCreateSessionMeta(db, sessionId);
@@ -138,9 +149,12 @@ test("Pi Anthropic task retains queued drops at execute, force and 95% without r
 	};
 	const messages = [
 		userMessage("task", 1),
+		// Heavy steps keep the turn's signed thinking while usage stays below
+		// the 75% cap; the 76% bust below strips it.
 		assistantMessage("spent", 2, {
 			provider: "anthropic",
 			model: "claude-opus-5-5",
+			usage: heavyReasoningUsage(),
 			content: [
 				{
 					type: "thinking",
@@ -153,6 +167,7 @@ test("Pi Anthropic task retains queued drops at execute, force and 95% without r
 		assistantMessage("newest", 3, {
 			provider: "anthropic",
 			model: "claude-opus-5-5",
+			usage: heavyReasoningUsage(),
 			content: [
 				{
 					type: "thinking",
@@ -168,21 +183,22 @@ test("Pi Anthropic task retains queued drops at execute, force and 95% without r
 	try {
 		await pass();
 		const before = JSON.stringify((await pass()).messages);
+		expect(before).toContain("signature-two");
 		queuePendingOp(db, sessionId, 2, "drop");
-		for (const n of [76_000, 85_000]) {
-			tokens = n;
-			expect(JSON.stringify((await pass()).messages)).toBe(before);
-			expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toContain(2);
-		}
-		tokens = 95_000;
-		// Holding the unsafe drop never refuses the turn on its own: the unchanged
-		// turn is served, because only a proven final-wire overflow refuses.
-		expect(JSON.stringify((await pass()).messages)).toBe(before);
-		expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toContain(2);
-		messages.push(userMessage("next real user", 4));
 		tokens = 76_000;
-		await pass();
+		const busted = JSON.stringify((await pass()).messages);
+		expect(busted).not.toBe(before);
 		expect(getPendingOps(db, sessionId)).toHaveLength(0);
+		expect(busted).not.toContain("signature-one");
+		expect(busted).not.toContain("signature-two");
+		expect(busted).toContain("newest");
+		for (const n of [85_000, 95_000]) {
+			tokens = n;
+			// Nothing refuses: the stripped request is served and replayed.
+			const replay = JSON.stringify((await pass()).messages);
+			expect(replay).not.toContain("signature-one");
+			expect(replay).not.toContain("signature-two");
+		}
 	} finally {
 		clearContextHandlerSession(sessionId);
 		closeQuietly(db);
@@ -307,9 +323,21 @@ for (const lane of [
 	"history",
 	"synthetic todo",
 	"thinking strip",
+	"tag hydration",
+	"tag hydration fold",
 ] as const) {
-	test(`Pi 66% signed-prefix hold denies ${lane} until the next user`, async () => {
-		const db = createTestDb();
+	const testName =
+		lane === "tag hydration"
+			? "hydration completion preserves a held signed prefix and queued drops"
+			: lane === "tag hydration fold"
+				? "a genuine fold still drains eligible pending drops"
+				: `Pi 66% signed-prefix hold denies ${lane} until the next user`;
+	test(testName, async () => {
+		const root =
+			lane === "tag hydration"
+				? createTestTempDirFromPath(join(tmpdir(), "pi-held-hydration-"))
+				: undefined;
+		const db = createTestDb(root ? join(root, "context.db") : ":memory:");
 		const sessionId = `pi-execute-prefix-hold-${lane}`;
 		getOrCreateSessionMeta(db, sessionId);
 		updateSessionMeta(db, sessionId, {
@@ -340,10 +368,13 @@ for (const lane of [
 			event: { messages: never[] },
 			ctx: never,
 		) => Promise<{ messages: unknown[] }>;
+		// The active turn's steps are heavy, so the 66% passes are held by the
+		// bounded hold (below 65% + 10).
 		const thought = (n: number) =>
 			assistantMessage(`answer ${n}`, n, {
 				provider: "anthropic",
 				model: "claude-opus-5-5",
+				...(n >= 4 ? { usage: heavyReasoningUsage() } : {}),
 				content: [
 					{
 						type: "thinking",
@@ -426,6 +457,19 @@ for (const lane of [
 					),
 				).toBe(true);
 			tokens = 66_000;
+			if (root) {
+				const foreign = new Database(join(root, "context.db"));
+				try {
+					initializeDatabase(foreign);
+					foreign
+						.prepare(
+							"UPDATE tags SET byte_size = byte_size WHERE session_id = ?",
+						)
+						.run(sessionId);
+				} finally {
+					foreign.close();
+				}
+			}
 			shells.mockClear();
 			for (let n = 0; n < 2; n++) {
 				let gates: unknown;
@@ -486,6 +530,7 @@ for (const lane of [
 			shells.mockRestore();
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);
+			if (root) rmSync(root, { recursive: true, force: true });
 		}
 	});
 }
@@ -522,10 +567,12 @@ for (const cause of ["first render", "idle expiry"] as const) {
 			};
 			registerPiContextHandler(fake.pi as never, options);
 			const handler = fake.handlers.get("context")!;
+			// A heavy active step keeps the 66% passes under the bounded hold.
 			const thought = (n: number) =>
 				assistantMessage(`answer ${n}`, n, {
 					provider: "anthropic",
 					model: "claude-opus-5-5",
+					...(n >= 4 ? { usage: heavyReasoningUsage() } : {}),
 					content: [
 						{
 							type: "thinking",
@@ -969,6 +1016,31 @@ for (const trigger of ["wall", "final fit"] as const)
 				)!;
 				(source[2].content as { text: string }[])[0].text =
 					"RECLAIMABLE ".repeat(60000);
+				// Add newer results so the queued old result is no longer protected
+				// by recency. Fit recovery can reclaim it without yielding the newest result.
+				for (let n = 0; n < 3; n++) {
+					source.push(
+						assistantMessage("", 10 + n * 2, {
+							content: [
+								{
+									type: "toolCall",
+									id: `filler-${n}`,
+									name: "read",
+									arguments: {},
+								},
+							],
+						}),
+						{
+							role: "toolResult",
+							toolCallId: `filler-${n}`,
+							toolName: "read",
+							content: [{ type: "text", text: "filler words ".repeat(1000) }],
+							isError: false,
+							timestamp: 11 + n * 2,
+						},
+					);
+					ids.push(`filler-call-${n}`, `filler-result-${n}`);
+				}
 				source.push(
 					userMessage(
 						outcome === "fits" ? "continue" : "MANDATORY_USER ".repeat(90000),
@@ -989,16 +1061,44 @@ for (const trigger of ["wall", "final fit"] as const)
 					}),
 				);
 				ids.push("active-user", "active");
+				source.push(
+					assistantMessage("", 30, {
+						content: [
+							{
+								type: "toolCall",
+								id: "latest-fit-call",
+								name: "read",
+								arguments: {},
+							},
+						],
+					}),
+					{
+						role: "toolResult",
+						toolCallId: "latest-fit-call",
+						toolName: "read",
+						content: [
+							{ type: "text", text: "LATEST FIT RESULT ".repeat(12000) },
+						],
+						isError: false,
+						timestamp: 31,
+					},
+				);
+				ids.push("latest-fit-call", "latest-fit-result");
 				queuePendingOp(db, sessionId, tag.tagNumber, "drop");
 				percent = trigger === "wall" ? 96 : 75;
 				if (outcome === "fits") {
 					const output = JSON.stringify(await serve());
 					expect(output).not.toContain("fit-signature");
 					expect(output).not.toContain("RECLAIMABLE");
-				} else
-					await expect(serve()).rejects.toMatchObject({
-						name: "EmergencyFailClosedError",
-					});
+					if (trigger === "final fit")
+						expect(output).toContain("LATEST FIT RESULT");
+				} else {
+					// Even when thinking omission is replayed, the outgoing request must fit the model window.
+					for (let attempt = 0; attempt < 2; attempt++)
+						await expect(serve()).rejects.toMatchObject({
+							name: "EmergencyFailClosedError",
+						});
+				}
 				expect(getPendingOps(db, sessionId)).toHaveLength(0);
 				expect(
 					getTagsBySession(db, sessionId).find(

@@ -7,6 +7,10 @@ import {
 import { applyDeferredPiCompactionMarker } from "./compaction-marker-manager-pi";
 import { signalPiDeferredHistoryRefresh } from "./context-handler";
 import {
+	adaptPiAppendCompaction,
+	type PiAppendCompaction,
+} from "./pi-append-compaction";
+import {
 	buildPiCompactionSummary,
 	findFirstKeptEntryId,
 } from "./pi-historian-runner";
@@ -167,28 +171,10 @@ export function queueAndApplyPiRecompMarker(args: {
 
 function resolvePiAppendCompaction(
 	ctx: unknown,
-):
-	| ((
-			summary: string,
-			firstKeptEntryId: string,
-			tokensBefore: number,
-			details?: unknown,
-			fromHook?: boolean,
-	  ) => string | undefined)
-	| undefined {
-	const sm = (ctx as { sessionManager?: unknown })?.sessionManager as
-		| {
-				appendCompaction?: (
-					summary: string,
-					firstKeptEntryId: string,
-					tokensBefore: number,
-					details?: unknown,
-					fromHook?: boolean,
-				) => string | undefined;
-		  }
-		| undefined;
-	if (typeof sm?.appendCompaction !== "function") return undefined;
-	return sm.appendCompaction.bind(sm);
+): PiAppendCompaction | undefined {
+	return adaptPiAppendCompaction(
+		(ctx as { sessionManager?: unknown })?.sessionManager,
+	);
 }
 
 function resolvePiReadBranchEntries(

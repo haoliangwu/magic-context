@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { parsePluginConfig } from "../config";
 
 import {
     normalizeModelEntry,
@@ -9,6 +10,27 @@ import {
 } from "./model-resolution";
 
 describe("model-resolution", () => {
+    test("loader defaults and historian metadata do not configure a primary model", () => {
+        for (const harness of ["opencode", "pi", "omp"] as const) {
+            for (const input of [
+                {},
+                { historian: {} },
+                { historian: { temperature: 0, [harness]: {} } },
+            ]) {
+                expect(
+                    resolveHistorianModel(parsePluginConfig(input), harness).primary,
+                ).toBeUndefined();
+            }
+            for (const model of [" provider/explicit ", { model: "provider/explicit" }]) {
+                expect(
+                    resolveHistorianModel(
+                        parsePluginConfig({ historian: { [harness]: { model } } }),
+                        harness,
+                    ).primary?.model,
+                ).toBe("provider/explicit");
+            }
+        }
+    });
     test("keeps historian temperature opt-in while preserving explicit overrides", () => {
         const fixtures = [
             { temperature: undefined, expected: undefined },

@@ -14,6 +14,7 @@
  */
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { expectedOpenCode2Version } from "../../src/opencode2-runner/cli-resolution";
 import { readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { OpenCode } from "@opencode/client";
@@ -97,7 +98,7 @@ test("OC2 arms thinking recovery for the rejected turn from its event stream and
 		const version = JSON.parse(
 			readFileSync(join(realpathSync(CLI), "..", "..", "package.json"), "utf8"),
 		).version;
-		expect(version).toBe("2.0.22");
+		expect(version).toBe(expectedOpenCode2Version());
 		const session = await client.session.create({
 			title: "issue 630 recovery",
 			location: { directory: host.cwd },

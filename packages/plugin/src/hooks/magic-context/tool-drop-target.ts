@@ -387,7 +387,10 @@ export class ToolMutationBatch {
      * or the sweep removes it and an earlier assistant becomes the end. Models
      * without assistant prefill support reject an assistant-terminated request.
      */
-    wouldStrandConversationEnd(occurrences: readonly IndexedOccurrence[]): boolean {
+    wouldStrandConversationEnd(
+        occurrences: readonly IndexedOccurrence[],
+        plannedRemovals?: ReadonlySet<unknown>,
+    ): boolean {
         const served = this.servedMessages ?? this.messages;
         let end: MessageLike | undefined;
         for (let i = served.length - 1; i >= 0 && end === undefined; i -= 1) {
@@ -395,7 +398,8 @@ export class ToolMutationBatch {
         }
         if (!end || !occurrences.some((occurrence) => occurrence.message === end)) return false;
         const leaving = new Set(occurrences.map(servedPart));
-        const survives = (part: unknown) => !leaving.has(part) && !this.partsToRemove.has(part);
+        const survives = (part: unknown) =>
+            !leaving.has(part) && !this.partsToRemove.has(part) && !plannedRemovals?.has(part);
         return end.info.role === "assistant"
             ? !end.parts.some((part) => partHasCompletedResult(part) && survives(part))
             : !end.parts.some((part) => hasMeaningfulPart(part) && survives(part));
@@ -498,7 +502,8 @@ export function createToolDropTarget(
     skeletonStripped: () => ToolDropResult;
     hasAttachments: () => boolean;
     inputStringBytes: () => number | null;
-    wouldStrandConversationEnd: () => boolean;
+    wouldStrandConversationEnd: (plannedRemovals?: ReadonlySet<unknown>) => boolean;
+    notePlannedRemoval: (plannedRemovals: Set<unknown>) => void;
     /**
      * Non-mutating predicate: would drop()/truncate() actually remove bytes?
      * False for an absent (compacted-away) or incomplete (invocation present,
@@ -671,10 +676,15 @@ export function createToolDropTarget(
             if (!entry || entry.occurrences.length === 0) return null;
             return toolInputStringBytes(readRawInput());
         },
-        wouldStrandConversationEnd: (): boolean => {
+        wouldStrandConversationEnd: (plannedRemovals): boolean => {
             const entry = index.get(compositeKey);
             if (!entry || entry.occurrences.length === 0) return false;
-            return batch.wouldStrandConversationEnd(entry.occurrences);
+            return batch.wouldStrandConversationEnd(entry.occurrences, plannedRemovals);
+        },
+        notePlannedRemoval: (plannedRemovals): void => {
+            for (const occurrence of index.get(compositeKey)?.occurrences ?? []) {
+                plannedRemovals.add(servedPart(occurrence));
+            }
         },
         prepareDrop: (): boolean => {
             const entry = index.get(compositeKey);

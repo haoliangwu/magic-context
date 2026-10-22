@@ -64,13 +64,15 @@ export function contextHost() {
 				messages,
 			);
 		},
-		assertRefused(served: unknown[], pristine: unknown[]) {
+		assertRefused(
+			served: unknown[],
+			pristine: unknown[],
+			expectedMessage = "Magic Context could not safely prepare this turn; send your message again.",
+		) {
 			expect(controller.signal.aborted).toBe(true);
 			expect(entries).toHaveLength(1);
 			const data = entries[0]?.data as { message?: string } | undefined;
-			expect(data?.message).toStartWith(
-				"Magic Context could not safely prepare this turn; send your message again.",
-			);
+			expect(data?.message).toStartWith(expectedMessage);
 			expect(data?.message).toMatch(/stage=.+ elapsed=\d+ms recovery=.+/);
 			expect(renderers.has(entries[0]?.customType ?? "")).toBe(true);
 			expect(served).toBe(original);

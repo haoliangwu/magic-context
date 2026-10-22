@@ -1,20 +1,24 @@
 /// <reference types="bun-types" />
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as recoveryFence from "../../hooks/magic-context/lkg-recovery-fence";
 import { _resetHarnessForTesting, getHarness, setHarness } from "../../shared/harness";
+import { resetOpenCodeDbPathStateForTesting } from "../../shared/opencode-db-path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { openOpenCodeDb } from "./dreamer/open-opencode-db";
-import { recordMessageFtsRowid } from "./message-fts-rowid-map";
+import { recordMessageFtsRowid, runMessageFtsRowidMapBackfill } from "./message-fts-rowid-map";
 import {
     MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS,
     MESSAGE_HISTORY_ORPHAN_UNAVAILABLE_REPROBE_MS,
     sweepOrphanedOpenCodeMessageIndexes,
+    sweepOrphanedOpenCodeMessageIndexesCooperatively,
 } from "./message-index";
+import { sweepOrphanedOpenCodeMessageIndexesOffThread } from "./message-index-async";
 import { runMigrations } from "./migrations";
 import { advanceSessionActivity, readSessionActivity } from "./session-activity";
 import { initializeDatabase } from "./storage-db";
@@ -403,11 +407,10 @@ test("a harness-scoped orphan sweep retains counters until the last harness's co
                 )
                 .get("shared-session"),
         ).toEqual({ ...before, version: before.version + 1 });
-        // OpenCode 2's sweep is parked (it cannot see session_v2), so its row
-        // goes through the same deletion routine the sweep uses, directly.
+        // This fixture has only a v1 source, so OC2 cannot establish liveness.
         _resetHarnessForTesting();
         setHarness("opencode2");
-        expect(sweep()).toMatchObject({ status: "unavailable", deleted: 0 });
+        expect(sweep()).toMatchObject({ status: "source_unavailable", deleted: 0 });
         expect(deleteSessionScopedRows(db, ["shared-session"], "opencode2")).toBe(1);
         expect(
             db
@@ -421,15 +424,7 @@ test("a harness-scoped orphan sweep retains counters until the last harness's co
     }
 });
 
-/**
- * The sweep decides a session is orphaned when OpenCode 1's `session` table has
- * no row for it. OpenCode 2 keeps its sessions in `session_v2`, and a store
- * OpenCode 2 migrated from OpenCode 1 keeps the old `session`, `message` and
- * `part` tables too, so it opens as an OpenCode 1 store. Sweeping from an
- * OpenCode 2 process would then call every OpenCode 2 session orphaned and
- * delete its state. The sweep is parked on OpenCode 2 until it can read
- * `session_v2`.
- */
+// A migrated store retains v1 tables: only session_v2 is authoritative on OC2.
 describe("message history orphan sweep on OpenCode 2", () => {
     beforeEach(() => {
         _resetHarnessForTesting();
@@ -456,6 +451,9 @@ describe("message history orphan sweep on OpenCode 2", () => {
     }
 
     function seedOpenCode2Session(db: Database, sessionId: string, updatedAt: number): void {
+        db.prepare("INSERT INTO session_meta(session_id,harness) VALUES (?, 'opencode2')").run(
+            sessionId,
+        );
         db.prepare(
             `INSERT INTO message_history_index
                 (session_id, last_indexed_ordinal, dirty_floor_ordinal, updated_at, harness)
@@ -467,11 +465,13 @@ describe("message history orphan sweep on OpenCode 2", () => {
         ).run(sessionId);
     }
 
-    test("parks without opening any store, and keeps every OpenCode 2 session's state", () => {
+    test("OC2 sweeps old missing sessions while retaining live and recently indexed sessions", () => {
         setHarness("opencode2");
         const db = createStoreDb();
         const now = 2_000_000_000_000;
         seedOpenCode2Session(db, "ses-v2-live", now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1);
+        seedOpenCode2Session(db, "ses-v2-orphan", now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1);
+        seedOpenCode2Session(db, "ses-v2-young", now - 1000);
         const store = createMigratedStore(["ses-v2-live"]);
         let openAttempts = 0;
         const openSource = () => {
@@ -481,28 +481,26 @@ describe("message history orphan sweep on OpenCode 2", () => {
         try {
             const result = sweepOrphanedOpenCodeMessageIndexes(db, openSource, {
                 now,
-                safetyAgeMs: 0,
             });
-            expect(result).toMatchObject({ status: "unavailable", scanned: 0, deleted: 0 });
-            expect(result.reason).toContain("session_v2");
-            expect(openAttempts).toBe(0);
+            expect(result).toMatchObject({ status: "swept", scanned: 2, deleted: 1 });
+            expect(openAttempts).toBe(1);
             expect(countRows(db, "message_history_index", "ses-v2-live")).toBe(1);
             expect(countRows(db, "compartments", "ses-v2-live")).toBe(1);
+            expect(countRows(db, "compartments", "ses-v2-orphan")).toBe(0);
+            expect(countRows(db, "compartments", "ses-v2-young")).toBe(1);
 
-            // Parked for a day like Pi's, then parked again on the re-probe.
             const reprobed = sweepOrphanedOpenCodeMessageIndexes(db, openSource, {
                 now: now + MESSAGE_HISTORY_ORPHAN_UNAVAILABLE_REPROBE_MS + 1,
-                safetyAgeMs: 0,
             });
-            expect(reprobed.status).toBe("unavailable");
-            expect(openAttempts).toBe(0);
+            expect(reprobed).toMatchObject({ status: "swept", deleted: 1 });
+            expect(openAttempts).toBe(2);
             expect(countRows(db, "compartments", "ses-v2-live")).toBe(1);
         } finally {
             closeQuietly(db);
         }
     });
 
-    test("a migrated store the OpenCode 2 process opens as OpenCode 1's never reaches the sweep", () => {
+    test("OC2 ignores retained v1 liveness when sweeping a migrated store", () => {
         setHarness("opencode2");
         const db = createStoreDb();
         const now = 2_000_000_000_000;
@@ -521,13 +519,251 @@ describe("message history orphan sweep on OpenCode 2", () => {
                 now,
                 safetyAgeMs: 0,
             });
-            expect(result).toMatchObject({ status: "unavailable", deleted: 0 });
+            expect(result).toMatchObject({ status: "swept", deleted: 0 });
             expect(countRows(db, "message_history_index", "ses-v2-live")).toBe(1);
             expect(countRows(db, "compartments", "ses-v2-live")).toBe(1);
         } finally {
             if (previous === undefined) delete process.env.OPENCODE_DB;
             else process.env.OPENCODE_DB = previous;
             closeQuietly(db);
+        }
+    });
+
+    test("OC2 production worker sweeps a native store without opening the v1 source", async () => {
+        setHarness("opencode2");
+        const directory = createTestTempDirFromPath(join(tmpdir(), "orphan-native-worker-"));
+        tempDirectories.push(directory);
+        const db = new Database(join(directory, "context.db"));
+        initializeDatabase(db);
+        runMigrations(db);
+        const now = 2_000_000_000_000;
+        seedOpenCode2Session(db, "orphan", now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1);
+        seedOpenCode2Session(db, "live", now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1);
+        const source = createMigratedStore(["live"]);
+        const host = new Database(source);
+        host.exec("DROP TABLE session; DROP TABLE message; DROP TABLE part");
+        host.close();
+        const original = process.env.OPENCODE_DB;
+        process.env.OPENCODE_DB = source;
+        resetOpenCodeDbPathStateForTesting();
+        try {
+            const result = await sweepOrphanedOpenCodeMessageIndexesOffThread(
+                db,
+                () => {
+                    throw new Error("the v1-only opener must not be used");
+                },
+                { now },
+            );
+            expect(result).toMatchObject({ status: "swept", deleted: 1 });
+            expect(countRows(db, "compartments", "orphan")).toBe(0);
+            expect(countRows(db, "compartments", "live")).toBe(1);
+        } finally {
+            if (original === undefined) delete process.env.OPENCODE_DB;
+            else process.env.OPENCODE_DB = original;
+            resetOpenCodeDbPathStateForTesting();
+            db.close();
+        }
+    });
+
+    for (const source of ["empty", "unreadable"] as const) {
+        test(`OC2 refuses the whole sweep for an ${source} session projection`, () => {
+            setHarness("opencode2");
+            const db = createStoreDb();
+            const now = 2_000_000_000_000;
+            seedOpenCode2Session(db, "orphan", now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1);
+            const store = createMigratedStore([]);
+            if (source === "unreadable") {
+                const writer = new Database(store);
+                writer.exec("DROP TABLE session_v2");
+                writer.close();
+            }
+            try {
+                expect(
+                    sweepOrphanedOpenCodeMessageIndexes(
+                        db,
+                        () => new Database(store, { readonly: true }),
+                        { now },
+                    ),
+                ).toMatchObject({ status: "source_unavailable", scanned: 0, deleted: 0 });
+                expect(countRows(db, "compartments", "orphan")).toBe(1);
+            } finally {
+                db.close();
+            }
+        });
+    }
+
+    for (const huge of [false, true]) {
+        test(`OC2 orphan transactions release the writer between ${huge ? "one 200000-tag session" : "2000 realistically tagged sessions"}`, async () => {
+            setHarness("opencode2");
+            const directory = createTestTempDirFromPath(join(tmpdir(), "orphan-hold-bound-"));
+            tempDirectories.push(directory);
+            const path = join(directory, "context.db");
+            let db = new Database(path);
+            db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL");
+            initializeDatabase(db);
+            runMigrations(db);
+            const now = 2_000_000_000_000;
+            const old = now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1;
+            const tag = db.prepare(
+                "INSERT INTO tags(session_id, tag_number, message_id, type, status, byte_size, harness) VALUES (?, ?, ?, 'message', 'active', 2048, 'opencode2')",
+            );
+            db.transaction(() => {
+                for (let i = 0; i < (huge ? 1 : 2000); i++) {
+                    const id = `orphan-${String(i).padStart(4, "0")}`;
+                    seedOpenCode2Session(db, id, old);
+                    for (let n = 1; n <= (huge ? 200000 : 120); n++)
+                        tag.run(id, n, `${id}-message-${n}`);
+                    for (let n = 1; n <= (huge ? 2000 : 8); n++) {
+                        const row = db
+                            .prepare(
+                                "INSERT INTO message_history_fts(session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, 'user', ?)",
+                            )
+                            .run(
+                                id,
+                                n,
+                                `${id}-message-${n}`,
+                                "realistic searchable message content ".repeat(60),
+                            );
+                        recordMessageFtsRowid(db, id, n, row.lastInsertRowid);
+                    }
+                }
+            }).immediate();
+            await runMessageFtsRowidMapBackfill(db);
+            db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+            // Production sweeps open a worker connection, not the connection that
+            // bulk-created the store. Retire fixture preparations before measuring.
+            db.close();
+            Bun.gc(true);
+            db = new Database(path);
+            db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL");
+            const source = createMigratedStore(["live"]);
+            const holds: number[] = [];
+            const cpuHolds: number[] = [];
+            let started = 0;
+            let cpuStarted = process.cpuUsage();
+            const exec = db.exec.bind(db);
+            const observed = spyOn(db, "exec").mockImplementation((sql) => {
+                if (sql === "BEGIN IMMEDIATE") cpuStarted = process.cpuUsage();
+                const result = exec(sql);
+                if (sql === "BEGIN IMMEDIATE") started = performance.now();
+                if (sql === "COMMIT") {
+                    holds.push(performance.now() - started);
+                    const cpu = process.cpuUsage(cpuStarted);
+                    cpuHolds.push((cpu.user + cpu.system) / 1000);
+                }
+                return result;
+            });
+            const contender = new Database(join(directory, "context.db"));
+            contender.exec("PRAGMA busy_timeout=0");
+            let yieldedWrites = 0;
+            const heartbeat = setInterval(() => {
+                contender
+                    .prepare(
+                        "INSERT OR REPLACE INTO schema_migrations_meta(key,value) VALUES ('sweep-contender','live')",
+                    )
+                    .run();
+                yieldedWrites++;
+            }, 0);
+            try {
+                let deleted = 0;
+                for (;;) {
+                    const result = await sweepOrphanedOpenCodeMessageIndexesCooperatively(
+                        db,
+                        () => new Database(source, { readonly: true }),
+                        { now },
+                    );
+                    deleted += result.deleted;
+                    if (!result.cursor && !result.partial) break;
+                }
+                expect(deleted).toBe(huge ? 1 : 2000);
+                expect(holds.length).toBeGreaterThanOrEqual(
+                    Math.ceil((huge ? 200000 : 240000) / 64),
+                );
+                expect(yieldedWrites).toBeGreaterThanOrEqual(holds.length);
+                const sorted = holds.toSorted((a, b) => a - b);
+                const p50 = sorted[Math.floor(sorted.length * 0.5)]!,
+                    p95 = sorted[Math.floor(sorted.length * 0.95)]!,
+                    max = sorted.at(-1)!;
+                const sortedCpu = cpuHolds.toSorted((a, b) => a - b);
+                const cpu95 = sortedCpu[Math.floor(sortedCpu.length * 0.95)]!,
+                    cpuMax = sortedCpu.at(-1)!;
+                console.log(
+                    `OC2 orphan sweep ${huge ? "huge" : "many"} write-lock ms: n=${holds.length} wall p50=${p50.toFixed(2)} p95=${p95.toFixed(2)} max=${max.toFixed(2)} CPU p95=${cpu95.toFixed(2)} max=${cpuMax.toFixed(2)}; ${huge ? "1 session, 200000 tags, 2000 FTS rows" : "2000 sessions, 240000 tags, 16000 FTS rows"}; competing writes=${yieldedWrites}`,
+                );
+                expect(p95).toBeLessThan(100);
+                expect(cpuMax).toBeLessThan(100);
+                expect(db.prepare("SELECT COUNT(*) AS n FROM tags").get()).toEqual({ n: 0 });
+            } finally {
+                clearInterval(heartbeat);
+                observed.mockRestore();
+                contender.close();
+                db.close();
+            }
+        }, 120000);
+    }
+
+    test("OC2 clears recovery fences after committing orphan rows", async () => {
+        setHarness("opencode2");
+        const db = createStoreDb();
+        const now = 2_000_000_000_000;
+        seedOpenCode2Session(db, "orphan", now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1);
+        const source = createMigratedStore(["live"]);
+        const clear = spyOn(recoveryFence, "clearLkgRecoveryFence").mockImplementation(() => {
+            expect(db.inTransaction).toBe(false);
+            expect(countRows(db, "compartments", "orphan")).toBe(0);
+        });
+        try {
+            const result = await sweepOrphanedOpenCodeMessageIndexesCooperatively(
+                db,
+                () => new Database(source, { readonly: true }),
+                { now },
+            );
+            expect(result.deleted).toBe(1);
+            expect(clear).toHaveBeenCalledTimes(1);
+        } finally {
+            clear.mockRestore();
+            db.close();
+        }
+    });
+
+    test("OC2 resumes a partially deleted orphan after reopening the context store", async () => {
+        setHarness("opencode2");
+        const directory = createTestTempDirFromPath(join(tmpdir(), "orphan-resume-"));
+        tempDirectories.push(directory);
+        const path = join(directory, "context.db");
+        let db = new Database(path);
+        initializeDatabase(db);
+        runMigrations(db);
+        const now = 2_000_000_000_000;
+        seedOpenCode2Session(db, "orphan", now - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1);
+        const insert = db.prepare(
+            "INSERT INTO tags(session_id,tag_number,harness) VALUES ('orphan',?,'opencode2')",
+        );
+        for (let i = 1; i <= 200; i++) insert.run(i);
+        const source = createMigratedStore(["live"]);
+        const openSource = () => new Database(source, { readonly: true });
+        try {
+            const first = await sweepOrphanedOpenCodeMessageIndexesCooperatively(db, openSource, {
+                now,
+                maxSlices: 1,
+            });
+            expect(first).toMatchObject({ status: "swept", deleted: 0, partial: true });
+            expect(countRows(db, "tags", "orphan")).toBe(136);
+            db.close();
+            db = new Database(path);
+            const resumed = await sweepOrphanedOpenCodeMessageIndexesCooperatively(db, openSource, {
+                now,
+            });
+            expect(resumed.deleted).toBe(1);
+            expect(countRows(db, "tags", "orphan")).toBe(0);
+            expect(countRows(db, "session_meta", "orphan")).toBe(0);
+            expect(
+                db
+                    .prepare("SELECT key FROM schema_migrations_meta WHERE key >= ? AND key < ?")
+                    .all(...tagTombstoneOwnerRange("orphan")),
+            ).toHaveLength(0);
+        } finally {
+            db.close();
         }
     });
 });

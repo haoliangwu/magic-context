@@ -425,7 +425,7 @@ describe("tagMessages", () => {
     });
 
     describe("#given user message with file part", () => {
-        it("#when file part is tagged #then assigns tag and tracks byte size of url", () => {
+        it("#when file part is new #then leaves it unnumbered and keeps its URL", () => {
             useTempDataHome("context-tag-file-");
             const db = openDatabase();
             const tagger = createTagger();
@@ -447,14 +447,14 @@ describe("tagMessages", () => {
 
             const { targets } = tagMessages("ses-1", messages, tagger, db);
 
-            expect(targets.size).toBe(2);
+            expect(targets.size).toBe(1);
             const textTagId = tagger.getTag("ses-1", "m-user:p0", "message")!;
             expect(textTagId).toBeDefined();
-            const fileTagId = tagger.getTag("ses-1", "m-user:file1", "file")!;
-            expect(fileTagId).toBeDefined();
+            expect(tagger.getTag("ses-1", "m-user:file1", "file")).toBeUndefined();
+            expect((messages[0].parts[1] as FilePart).url).toBe(fileUrl);
         });
 
-        it("#when file part is dropped #then replaces with text part", () => {
+        it("#when a historical file part is dropped #then replaces with text part", () => {
             useTempDataHome("context-tag-file-drop-");
             const db = openDatabase();
             const tagger = createTagger();
@@ -474,6 +474,8 @@ describe("tagMessages", () => {
                 },
             ];
 
+            // Older sessions retain the file number that their drop operations address.
+            tagger.assignTag("ses-1", "m-user:file1", "file", byteSize(fileUrl), db);
             const { targets } = tagMessages("ses-1", messages, tagger, db);
             const fileTagId = tagger.getTag("ses-1", "m-user:file1", "file")!;
             targets.get(fileTagId)!.setContent(`[dropped §${fileTagId}§]`);

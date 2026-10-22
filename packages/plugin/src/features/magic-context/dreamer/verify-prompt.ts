@@ -19,12 +19,13 @@ import {
     describeUnrecognizedManifestShape,
     extractCompleteManifestBody,
 } from "./manifest-parser";
+import { seedIdentifierCandidates } from "./map-memories-prompt";
 
 export const VERIFY_SYSTEM_PROMPT = `You are a memory verifier for the magic-context system. You verify project memories against the CURRENT code.
 
 Each memory below comes with its backing file(s) — the code it makes a claim about. For EACH memory: use the provided git diff as evidence when present. If no diff is supplied, read its backing files (you may read more if needed) and decide whether the memory is still accurate.
 
-Tools (read-only): read, grep, glob. Request line ranges and keep reads short. You read code only when the evidence requires it; you change nothing.
+Tools (read-only): read, grep, glob, plus any available AFT navigation tools. Use at most 3 tool calls per memory, including searches and reads. Start with the backing files and likely identifier matches. Never read the same file twice in a batch; reuse evidence. Request short useful line ranges unless the claim concerns the file as a whole. If evidence is insufficient when the call budget runs out, SKIP that memory; uncertainty never justifies archival. You change nothing.
 
 Decide ONE of four outcomes per memory:
 - VERIFIED — still accurate. Keep it as-is.
@@ -36,7 +37,7 @@ UPDATE and ARCHIVE are ONLY for claims a repository file can falsify, such as an
 
 BE CONSERVATIVE ABOUT ARCHIVING. Wrong archival of a TRUE memory is the worst possible outcome — far worse than leaving a slightly-stale memory. If you cannot find the code, or you are unsure, or it might still be true somewhere you didn't look: mark it VERIFIED or SKIPPED, never archived. Archive ONLY when you have positive evidence the code contradicts a code fact.
 
-Output ONE XML manifest at the very end and NOTHING else — no narration, no per-memory commentary, no reasoning:
+Output ONE XML manifest and NOTHING else — no narration or reasoning. Open <verify> before investigating and emit each complete verdict immediately before investigating the next memory, so interruption preserves finished work. Close </verify> when done:
 <verify>
 <verified id="N" files="path/a.ts,path/b.ts"/>
 <update id="M" files="path/c.ts">corrected present-tense content</update>
@@ -57,9 +58,22 @@ export interface VerifyPromptMemory {
     mappedFiles: string[];
     verifiedAt?: number;
     verifiedCommit?: string | null;
+    candidates?: string[];
 }
 
 import type { VerifyDiffEvidence } from "./verify-diff";
+
+/** Identifier lookups add paths only; backing mappings remain the verification authority. */
+export async function seedVerifyCandidates(
+    memories: VerifyPromptMemory[],
+    directory: string,
+): Promise<VerifyPromptMemory[]> {
+    const seeded = await seedIdentifierCandidates(
+        memories.map((m) => ({ ...m, candidates: [] })),
+        directory,
+    );
+    return memories.map((m, i) => ({ ...m, candidates: seeded[i].candidates }));
+}
 
 export function buildVerifyPrompt(
     projectPath: string,
@@ -69,14 +83,16 @@ export function buildVerifyPrompt(
     const list = memories
         .map(
             (m) =>
-                `[${m.id}] ${m.category}\nContent: ${m.content}\nBacking files: ${m.mappedFiles.join(", ")}`,
+                `[${m.id}] ${m.category}\nContent: ${m.content}\nBacking files: ${m.mappedFiles.join(", ")}${m.candidates?.length ? `\nLikely files (identifier matches, confirm before using): ${m.candidates.join(", ")}` : ""}`,
         )
         .join("\n\n");
     return `## Verify these memories against the code
 
 Project: ${projectPath}
 
-${evidence ? "The git diff below is the evidence. If changed hunks do not touch a claim, mark it verified without opening files. Open files only when a diff suggests the claim may have changed. A rename or deletion requires an update or archive when positively supported; do not archive on uncertainty." : "Read each memory's backing files to check its claims."} Decide verified / update / archive / skip (default verified; behavioral directives only permit verified or skip), then output ONE <verify> manifest covering every id.
+When available in this session, use aft_outline to outline the backing file and aft_zoom on the claimed symbol (or aft_search to locate it), instead of paging through whole files. Read a whole file only when the claim is about the file as a whole. Otherwise use the available read-only tools.
+
+${evidence ? "The git diff below is the evidence. If changed hunks do not touch a claim, mark it verified without opening files. Open files only when a diff suggests the claim may have changed. A rename or deletion requires an update or archive when positively supported; do not archive on uncertainty." : "Check each memory's claim against its backing files."} Decide verified / update / archive / skip (default verified; behavioral directives only permit verified or skip), then output ONE <verify> manifest covering every id.
 
 <memories>
 ${list}
@@ -173,4 +189,39 @@ export function validateVerifyManifest(
         "verify",
     );
     return parsed;
+}
+
+/** Recover closed individual verdicts only; conflicting ids are never guessed. */
+export function parsePartialVerifyManifest(
+    text: string,
+    expectedIds: ReadonlySet<number>,
+): ParsedVerifyManifest {
+    const out: ParsedVerifyManifest = { verified: [], updated: [], archived: [], skipped: [] };
+    const start = text.lastIndexOf("<verify>");
+    if (start < 0) return out;
+    const entries = new Map<number, ParsedVerifyManifest>();
+    const conflicts = new Set<number>();
+    for (const match of text
+        .slice(start)
+        .matchAll(/<(?:verified|archive|skip)\b[^<>]*\/>|<update\b[^<>]*>[\s\S]*?<\/update>/g)) {
+        try {
+            const parsed = parseVerifyManifest(`<verify>${match[0]}</verify>`);
+            const id = verifyIds(parsed)[0];
+            if (!expectedIds.has(id) || conflicts.has(id)) continue;
+            const previous = entries.get(id);
+            if (previous && JSON.stringify(previous) !== JSON.stringify(parsed)) {
+                entries.delete(id);
+                conflicts.add(id);
+            } else entries.set(id, parsed);
+        } catch {
+            /* An incomplete or malformed verdict is not evidence. */
+        }
+    }
+    for (const parsed of entries.values()) {
+        out.verified.push(...parsed.verified);
+        out.updated.push(...parsed.updated);
+        out.archived.push(...parsed.archived);
+        out.skipped.push(...parsed.skipped);
+    }
+    return out;
 }

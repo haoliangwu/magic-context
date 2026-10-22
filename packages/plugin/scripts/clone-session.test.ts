@@ -253,6 +253,7 @@ function makeFixture(
         CREATE TABLE pending_ops (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, tag_id INTEGER, operation TEXT, queued_at INTEGER, harness TEXT NOT NULL DEFAULT 'opencode');
         CREATE TABLE session_meta (
             session_id TEXT PRIMARY KEY,
+            tags_version INTEGER NOT NULL DEFAULT 0,
             harness TEXT NOT NULL DEFAULT 'opencode',
             counter INTEGER DEFAULT 0,
             cleared_reasoning_through_tag INTEGER DEFAULT 0,
@@ -278,6 +279,7 @@ function makeFixture(
             nudge_anchor_message_id TEXT,
             prior_boundary_ordinal INTEGER DEFAULT 1
         );
+        CREATE TABLE schema_migrations_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE session_projects (session_id TEXT NOT NULL, harness TEXT NOT NULL, project_path TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(session_id, harness));
         CREATE TABLE compression_depth (session_id TEXT NOT NULL, message_ordinal INTEGER NOT NULL, depth INTEGER NOT NULL, harness TEXT NOT NULL, PRIMARY KEY(session_id, message_ordinal));
         CREATE TABLE session_facts (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, category TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, harness TEXT NOT NULL);
@@ -363,6 +365,38 @@ afterEach(() => {
 });
 
 describe("clone-session", () => {
+    it("offline clone and deletion publish session tag revisions", () => {
+        const fixture = makeFixture();
+        const reader = new Database(fixture.contextPath, { readonly: true });
+        try {
+            const sourceBefore = reader.prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+                .get(`tag_revision:${fixture.sourceSessionId}`);
+            const result = cloneSession({
+                sessionId: fixture.sourceSessionId,
+                opencodeDbPath: fixture.opencodePath,
+                contextDbPath: fixture.contextPath,
+                force: true,
+            });
+            const destination = result.plan.destinationSessionId;
+            const revision = () => reader.prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+                .get(`tag_revision:${destination}`) as { value: string } | undefined;
+            const copied = revision();
+            expect(copied?.value).toMatch(/^\d+:[1-9]\d*$/);
+            expect(reader.prepare("SELECT COUNT(*) AS n FROM tags WHERE session_id = ?").get(destination))
+                .toEqual({ n: 2 });
+            deleteClonedSession({
+                sessionId: destination,
+                opencodeDbPath: fixture.opencodePath,
+                contextDbPath: fixture.contextPath,
+            });
+            expect(revision()).not.toEqual(copied);
+            expect(reader.prepare("SELECT COUNT(*) AS n FROM tags WHERE session_id = ?").get(destination))
+                .toEqual({ n: 0 });
+            expect(reader.prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+                .get(`tag_revision:${fixture.sourceSessionId}`)).toEqual(sourceBefore);
+        } finally { reader.close(); }
+    });
+
     it("clones OpenCode and Magic Context state with independent remapped ids", () => {
         const fixture = makeFixture();
         const result = cloneSession({

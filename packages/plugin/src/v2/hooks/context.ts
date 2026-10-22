@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 import { loadPluginConfigDetailed } from "../../config";
 import { isCompactionEnabled, isSmartNoteSurfaceAvailable } from "../../config/agent-disable";
 import { logConfigDependencyNotesOnce } from "../../config/dependency-notes";
@@ -38,6 +39,7 @@ import {
 } from "../../features/magic-context/storage";
 import { getPersistedCompactionMarkerState } from "../../features/magic-context/storage-meta-persisted";
 import { clearSession } from "../../features/magic-context/storage-meta-session";
+import { clearCachedM0 } from "../../features/magic-context/storage-meta-shared";
 import { rebaseSessionCoordinatesAsync } from "../../features/magic-context/store-generation-rebase";
 import { createTagger } from "../../features/magic-context/tagger";
 import {
@@ -73,6 +75,7 @@ import {
     createChatMessageHook,
     createToolExecuteAfterHook,
 } from "../../hooks/magic-context/hook-handlers";
+import { markCoveredInstructionRow } from "../../hooks/magic-context/host-served-rows";
 import { materializeM0 } from "../../hooks/magic-context/inject-compartments";
 import { armLatestThinkingRecoveryFromError } from "../../hooks/magic-context/latest-thinking-recovery";
 import {
@@ -146,6 +149,7 @@ import { v2CompactionMarkerStrategy } from "../fold/markers";
 import { nativeFoldCache } from "../fold/memory-cache";
 import {
     copyNativeInput,
+    forgetNativeFoldProvenance,
     isLocalCheckpoint,
     NativeFoldReplay,
     nativeRowID,
@@ -156,7 +160,11 @@ import { restoreRow } from "../fold/restore";
 import { seedV2ForkFromParent, sessionHasMagicContextState } from "../fork-inheritance";
 import { cleanupLegacyHiddenChildren } from "../hidden-child-cleanup";
 import { nativeSessionRemove } from "../hidden-child-native";
-import { createLateHiddenExecutor, createV2HiddenCompletionExecutor } from "../hidden-completion";
+import {
+    createLateHiddenExecutor,
+    createV2HiddenCompletionExecutor,
+    type V2HiddenCompletionExecutor,
+} from "../hidden-completion";
 import { gaDatabasePath, type V2StoreReader, V2StoreReaderPool } from "../store-reader";
 import {
     clearSyntheticCandidates,
@@ -211,6 +219,12 @@ class V2LkgAdmissionReplay extends Error {}
 
 // The event stream can trail the terminal store row by a scheduler tick; keep failure surfacing fast.
 const HIDDEN_SESSION_ERROR_GRACE_MS = 50;
+/**
+ * How long the disposer waits for cancelled hidden runs to release the store
+ * reader pool. Short, because OpenCode holds every session's new turns while a
+ * plugin reloads.
+ */
+const STORE_POOL_DISPOSE_WAIT_MS = 1_000;
 
 export function isBlockingV2TransformError(error: unknown): boolean {
     return (
@@ -605,6 +619,27 @@ export async function applyV2SystemPrompt(
     );
 }
 
+/**
+ * The instruction-update rows at or before `throughSeq`, rendered the way the
+ * host renders them (id-less system messages) and marked as covered by the
+ * history boundary. After a host checkpoint these rows are hidden from the draft
+ * like every other row before it; restoring them lets every pass, before and
+ * after the checkpoint and on both sides of a boundary move, see the same
+ * instruction rows (see storage-host-instruction-retention.ts).
+ */
+function coveredInstructionRows(
+    reader: Pick<V2StoreReader, "instructionRowsThrough">,
+    sessionID: string,
+    throughSeq: number,
+    model: SessionContext["model"],
+): V2Message[] {
+    if (throughSeq < 0) return [];
+    return reader
+        .instructionRowsThrough(sessionID, throughSeq)
+        .flatMap((row) => restoreRow(row, model))
+        .map((message) => markCoveredInstructionRow(message));
+}
+
 export async function registerContext(context: V2Context) {
     const directory = context.location.directory;
     const config = loadPluginConfigDetailed(directory).config;
@@ -664,7 +699,7 @@ export async function registerContext(context: V2Context) {
             ? nativeFoldCache(() => storage.require())
             : undefined;
     const nativeFoldReplay = nativeFoldMemory
-        ? new NativeFoldReplay(nativeFoldMemory, () => openStoreReader())
+        ? new NativeFoldReplay(nativeFoldMemory, () => openStoreReader(), context.storage)
         : undefined;
     setOutputReserveConfig(config.output_reserve);
     const queriedModels = new Set<string>();
@@ -759,6 +794,7 @@ export async function registerContext(context: V2Context) {
               })
             : undefined;
     const hiddenChildHook = new HiddenChildHook();
+    await context.session.hook("http.request", (draft) => hiddenChildHook.cacheRequest(draft));
     const tools =
         db && isDatabasePersisted(db)
             ? await registerTools(context, db, config, moduleToolBackends?.backends, (id) =>
@@ -865,6 +901,7 @@ export async function registerContext(context: V2Context) {
                 modelCatalog: () => Promise.resolve(context.model.list()),
                 historianTemperature: () => config.historian?.temperature,
                 openReader: openStoreReader,
+                holdStore: () => readerPool.hold(),
             },
         );
     };
@@ -909,7 +946,7 @@ export async function registerContext(context: V2Context) {
         return trigger;
     };
     // Both stay undefined after a refused start until recoverHiddenWork wires them.
-    let hiddenCompletionExecutor: HiddenCompletionExecutor | undefined =
+    let hiddenCompletionExecutor: V2HiddenCompletionExecutor | undefined =
         db &&
         isDatabasePersisted(db) &&
         resolveProjectIdentityForSession(directory, config.allow_home_project)
@@ -1287,90 +1324,130 @@ export async function registerContext(context: V2Context) {
             : undefined;
     const usageController = new AbortController();
     const usageDone = (async () => {
-        try {
-            for await (const value of context.event.subscribe({ signal: usageController.signal })) {
-                if (usageController.signal.aborted) break;
-                const event = value as {
-                    type?: string;
-                    data?: { sessionID?: string; error?: unknown };
-                };
-                if (!event.data?.sessionID) continue;
-                const sessionID = event.data.sessionID;
-                if (
-                    event.type?.startsWith("session.revert.") ||
-                    event.type === "session.message.content.updated"
-                ) {
-                    nativeFoldReplay?.onEvent(event);
-                    restoredRows.forget(sessionID);
-                }
-                if (event.type === "session.error" || event.type === "session.execution.failed") {
-                    const error = hiddenTerminalError(event);
-                    if (error !== undefined) hiddenSessionErrors.set(sessionID, error);
-                    if (error !== undefined && db && !compactionOff) {
-                        const model = liveModels.get(sessionID);
-                        try {
-                            armLatestThinkingRecoveryFromError({
-                                db,
-                                sessionId: sessionID,
-                                error,
-                                providerID: model?.providerID,
-                                modelID: model?.modelID,
-                            });
-                        } catch (armError) {
-                            log("[magic-context] v2 latest-thinking recovery arm failed", armError);
+        let retry = 0;
+        while (!usageController.signal.aborted) {
+            const subscribedAt = Date.now();
+            try {
+                for await (const value of context.event.subscribe({
+                    signal: usageController.signal,
+                })) {
+                    if (usageController.signal.aborted) break;
+                    const event = value as {
+                        type?: string;
+                        data?: { sessionID?: string; error?: unknown };
+                    };
+                    try {
+                        // A provider or model reload can change the limit for the same
+                        // model key. Drop the one-time catalog reads so the next pass
+                        // re-reads the live limit.
+                        if (event.type === "provider.updated" || event.type === "model.updated") {
+                            queriedModels.clear();
+                            continue;
                         }
+                        if (!event.data?.sessionID) continue;
+                        const sessionID = event.data.sessionID;
+                        if (
+                            event.type?.startsWith("session.revert.") ||
+                            event.type === "session.message.content.updated"
+                        ) {
+                            nativeFoldReplay?.onEvent(event);
+                            restoredRows.forget(sessionID);
+                        }
+                        if (
+                            event.type === "session.error" ||
+                            event.type === "session.execution.failed"
+                        ) {
+                            const error = hiddenTerminalError(event);
+                            if (error !== undefined) hiddenSessionErrors.set(sessionID, error);
+                            if (error !== undefined && db && !compactionOff) {
+                                const model = liveModels.get(sessionID);
+                                try {
+                                    armLatestThinkingRecoveryFromError({
+                                        db,
+                                        sessionId: sessionID,
+                                        error,
+                                        providerID: model?.providerID,
+                                        modelID: model?.modelID,
+                                    });
+                                } catch (armError) {
+                                    log(
+                                        "[magic-context] v2 latest-thinking recovery arm failed",
+                                        armError,
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                        if (event.type === "session.deleted") {
+                            clearLkgMeasuredRequest(sessionID);
+                            deletedSessions.add(sessionID);
+                            transform?.clearSessionLogState(sessionID);
+                            if (db) {
+                                markSessionCleanupPending(db, sessionID);
+                                clearSession(db, sessionID);
+                            }
+                            rawProviders.get(sessionID)?.();
+                            rawProviders.delete(sessionID);
+                            usage.delete(sessionID);
+                            hiddenSessionErrors.delete(sessionID);
+                            storageNoticeBySession.delete(sessionID);
+                            liveModels.delete(sessionID);
+                            variants.delete(sessionID);
+                            agents.delete(sessionID);
+                            channel1.delete(sessionID);
+                            commitSeenLastPass.delete(sessionID);
+                            clearEmbedSessionState(sessionID);
+                            historyRefreshSessions.delete(sessionID);
+                            clearPendingMaterialization(pendingMaterializationSessions, sessionID);
+                            lastHeuristicsTurnId.delete(sessionID);
+                            restoredRows.forget(sessionID);
+                            if (nativeFoldReplay) await nativeFoldReplay.forget(sessionID);
+                            else await forgetNativeFoldProvenance(context.storage, sessionID);
+                            generateReplay.forget(sessionID);
+                            systemPromptRefreshSessions.delete(sessionID);
+                            systemPrompt?.clearSession(sessionID);
+                            tagger.cleanup(sessionID);
+                            continue;
+                        }
+                        if (event.type !== "session.execution.succeeded") continue;
+                        const model = liveModels.get(sessionID);
+                        if (model) {
+                            await recordUsage({
+                                sessionID,
+                                model: { providerID: model.providerID, id: model.modelID },
+                            });
+                            // Do not block event handling while the automatic fold runs: idle()
+                            // queues a compaction and then waits for OpenCode to settle it.
+                            if (
+                                !compactionOff &&
+                                typeof (await nativeFoldReplay?.baseline(sessionID)) === "string"
+                            )
+                                void hostFolds?.idle(sessionID);
+                        }
+                    } catch (error) {
+                        log(
+                            `[magic-context] v2 event handler failed (type=${event.type ?? "unknown"}, session=${event.data?.sessionID ?? "none"})`,
+                            error,
+                        );
                     }
-                    continue;
                 }
-                if (event.type === "session.deleted") {
-                    clearLkgMeasuredRequest(sessionID);
-                    deletedSessions.add(sessionID);
-                    transform?.clearSessionLogState(sessionID);
-                    if (db) {
-                        markSessionCleanupPending(db, sessionID);
-                        clearSession(db, sessionID);
-                    }
-                    rawProviders.get(sessionID)?.();
-                    rawProviders.delete(sessionID);
-                    usage.delete(sessionID);
-                    hiddenSessionErrors.delete(sessionID);
-                    storageNoticeBySession.delete(sessionID);
-                    liveModels.delete(sessionID);
-                    variants.delete(sessionID);
-                    agents.delete(sessionID);
-                    channel1.delete(sessionID);
-                    commitSeenLastPass.delete(sessionID);
-                    clearEmbedSessionState(sessionID);
-                    historyRefreshSessions.delete(sessionID);
-                    clearPendingMaterialization(pendingMaterializationSessions, sessionID);
-                    lastHeuristicsTurnId.delete(sessionID);
-                    restoredRows.forget(sessionID);
-                    await nativeFoldReplay?.forget(sessionID);
-                    generateReplay.forget(sessionID);
-                    systemPromptRefreshSessions.delete(sessionID);
-                    systemPrompt?.clearSession(sessionID);
-                    tagger.cleanup(sessionID);
-                    continue;
-                }
-                if (event.type !== "session.execution.succeeded") continue;
-                const model = liveModels.get(sessionID);
-                if (model) {
-                    await recordUsage({
-                        sessionID,
-                        model: { providerID: model.providerID, id: model.modelID },
-                    });
-                    // Do not block event handling while the automatic fold runs: idle()
-                    // queues a compaction and then waits for OpenCode to settle it.
-                    if (
-                        !compactionOff &&
-                        typeof (await nativeFoldReplay?.baseline(sessionID)) === "string"
-                    )
-                        void hostFolds?.idle(sessionID);
-                }
+            } catch (error) {
+                if (!usageController.signal.aborted)
+                    log("[magic-context] v2 usage subscription failed", error);
             }
-        } catch (error) {
-            if (!usageController.signal.aborted)
-                log("[magic-context] v2 usage subscription failed", error);
+            if (usageController.signal.aborted) break;
+            // Only a stable subscription resets the backoff: a stream that ends
+            // immediately, even after yielding an event, must not spin on reconnect.
+            if (Date.now() - subscribedAt >= 30_000) retry = 0;
+            const ceiling = Math.min(30_000, 250 * 2 ** retry);
+            retry = Math.min(retry + 1, 7);
+            try {
+                await delay(ceiling * (0.5 + Math.random() * 0.5), undefined, {
+                    signal: usageController.signal,
+                });
+            } catch (error) {
+                if (!usageController.signal.aborted) throw error;
+            }
         }
     })();
     const materialize = (draft: SessionContext) => {
@@ -1803,6 +1880,8 @@ export async function registerContext(context: V2Context) {
                 // it writes a finished reply), so assistant text restored from a saved
                 // source copy gets the same strip `adaptPayload` gives the live text.
                 normalizeRestoredAssistantText: stripCopiedTagNotation,
+                refreshSourceContents: (sessionID) =>
+                    nativeFoldReplay?.needsHeadRebuild(sessionID) ?? false,
                 // GA owns its native checkpoints; this adapter never writes the v1
                 // synthetic marker rows that the shared off-transition deletes.
                 hostCleanupCompactionMarkers: () => ({
@@ -1941,12 +2020,24 @@ export async function registerContext(context: V2Context) {
                         "boundary_repair",
                     );
                 }
-                const incoming = cut && draft.messages.find((message) => message.id === cut.id);
+                // Provider-native windows have already been selected by the host for
+                // this model. They need not carry the checkpoint id and must not be
+                // replaced with locally reconstructed history.
+                const localCut = cut && isLocalCheckpoint(cut) ? cut : undefined;
+                const incoming =
+                    localCut && draft.messages.find((message) => message.id === localCut.id);
                 postFold = cut !== undefined;
-                if (cut && !incoming)
+                if (localCut && !incoming)
                     throw new Error("The host checkpoint disappeared from the context draft");
                 let nativeRestored: V2Message[] | undefined;
-                if (cut && nativeFoldReplay && isLocalCheckpoint(cut)) {
+                // Validate fold provenance before the cache path or its raw-row
+                // fallback can invisibly replace the checkpoint. Without a valid
+                // local admission, use ordinary managed-history reconstruction instead.
+                if (
+                    cut &&
+                    nativeFoldReplay &&
+                    (await nativeFoldReplay.admits(draft.sessionID, cut, reader))
+                ) {
                     try {
                         nativeRestored = await nativeFoldReplay.restore(
                             draft.sessionID,
@@ -1968,7 +2059,19 @@ export async function registerContext(context: V2Context) {
                         );
                     }
                 }
-                if (nativeRestored && nativeFoldReplay?.sourceChanged(draft.sessionID)) {
+                if (cut && nativeFoldReplay?.sourceChanged(draft.sessionID)) {
+                    // Durable provenance no longer matches the host's pre-checkpoint
+                    // rows. Its cached raw prefix is obsolete even with no compartments.
+                    // Expire it rather than render here: first_render must execute
+                    // in the shared transform and open its normal mutation/drain gate.
+                    if (
+                        db &&
+                        !rustModeModuleClient &&
+                        nativeFoldReplay.needsHeadRebuild(draft.sessionID)
+                    )
+                        clearCachedM0(db, draft.sessionID);
+                    if (nativeFoldReplay.needsHeadRebuild(draft.sessionID))
+                        restoredRows.forget(draft.sessionID);
                     // A host edit or revert changed the restored history, so the
                     // ordinary transform may rebuild the history head (the
                     // <session-history> block in the first head message). Each rebuild
@@ -1997,26 +2100,34 @@ export async function registerContext(context: V2Context) {
                         ...hidden,
                         ...draft.messages.filter((message) => message !== incoming),
                     );
-                } else if (cut && incoming) {
-                    const identity = await folds.observe({
-                        sessionID: draft.sessionID,
-                        cutSeq: cut.seq,
-                        summary: cut.data.summary ?? "",
-                        rendered: incoming,
-                        onHard: (reason) => {
-                            sessionLog(draft.sessionID, `HARD reason=${reason}`);
-                            materialize(draft);
-                            requestPendingMaterialization(
-                                pendingMaterializationSessions,
-                                draft.sessionID,
-                                "host_compaction",
-                            );
-                        },
-                    });
-                    checkpoint = structuredClone(identity.rendered ?? incoming);
-                    submitted = identity.rendered
-                        ? (identity.renderedSummary ?? identity.submitted)
-                        : (cut.data.summary ?? "");
+                } else if (localCut && cut && incoming) {
+                    // A checkpoint without native replay admission still uses our
+                    // ordinary host-row reconstruction below. Let the transform
+                    // render or reuse the history head from our compartments, so
+                    // any rebuild opens the same mutation/drain gate as other folds.
+                    // Keep FoldOwner's host wrapper out of this path: its serialized
+                    // raw context can already be covered by the compartments.
+                    if (!nativeFoldReplay) {
+                        const identity = await folds.observe({
+                            sessionID: draft.sessionID,
+                            cutSeq: cut.seq,
+                            summary: cut.data.summary ?? "",
+                            rendered: incoming,
+                            onHard: (reason) => {
+                                sessionLog(draft.sessionID, `HARD reason=${reason}`);
+                                materialize(draft);
+                                requestPendingMaterialization(
+                                    pendingMaterializationSessions,
+                                    draft.sessionID,
+                                    "host_compaction",
+                                );
+                            },
+                        });
+                        checkpoint = structuredClone(identity.rendered ?? incoming);
+                        submitted = identity.rendered
+                            ? (identity.renderedSummary ?? identity.submitted)
+                            : (cut.data.summary ?? "");
+                    }
                     // Rust mode restores against the boundary the module itself published and
                     // keeps that boundary row, because the array handed to the module has to
                     // begin there — exactly where an OpenCode 1 compaction row would have made
@@ -2056,6 +2167,11 @@ export async function registerContext(context: V2Context) {
                         ? servedBoundaryRow(reader, draft.sessionID, boundaryID)
                         : null;
                     const boundary =
+                        // A changed hidden row may have lived inside the frozen
+                        // prefix. Make it available to the shared-path rebuild too.
+                        (nativeFoldReplay?.sourceChanged(draft.sessionID) && !rustModeModuleClient
+                            ? (reader.earliestSequence(draft.sessionID) ?? 0) - 1
+                            : undefined) ??
                         (moduleBoundarySeq !== undefined ? moduleBoundarySeq - 1 : undefined) ??
                         servedBoundary?.seq ??
                         reader.sequenceForId(draft.sessionID, boundaryID) ??
@@ -2088,6 +2204,17 @@ export async function registerContext(context: V2Context) {
                     draft.messages.splice(
                         0,
                         draft.messages.length,
+                        // Instruction rows the history boundary covers come first,
+                        // in store order; the transform decides whether they are
+                        // served. Rust mode's module owns its own boundary.
+                        ...(rustModeModuleClient
+                            ? []
+                            : coveredInstructionRows(
+                                  reader,
+                                  draft.sessionID,
+                                  Math.min(boundary, cut.seq),
+                                  draft.model,
+                              )),
                         ...restored,
                         ...draft.messages.filter((message) => message !== incoming),
                     );
@@ -2480,19 +2607,34 @@ export async function registerContext(context: V2Context) {
     );
     return {
         async dispose() {
+            usageController.abort();
+            // OpenCode 2 runs this disposer before it removes this instance's hooks
+            // (scope finalizers run in reverse registration order, and the disposer
+            // is added after setup has registered them), and loads the replacing
+            // instance only afterwards. Cancelling hidden runs first interrupts their
+            // children while this instance still shapes their turns, so no step of
+            // them reaches the new instance, which has no record of their prompts.
+            // The disposer cannot wait for those runs to finish instead: the host
+            // holds every new session drain until the reload completes.
+            await hiddenCompletionExecutor?.dispose();
+            await usageDone;
             rpcStopped = true;
             rpcServer.stop();
             transform?.disposeRust();
             tools?.dispose();
-            usageController.abort();
-            await usageDone;
             deletedSessions.clear();
             await dreamTrigger?.dispose();
             await maintenanceTimer?.dispose();
             for (const release of rawProviders.values()) release();
             rawProviders.clear();
             restoredRows.clear();
-            readerPool.close();
+            // A cancelled run still holds the pool until its caller closes it. Wait
+            // briefly so that usually completes here; otherwise the pool closes when
+            // the last hold is released, and the reload is not kept waiting for it.
+            if (!(await readerPool.closeWhenIdle(STORE_POOL_DISPOSE_WAIT_MS)))
+                log(
+                    `[magic-context] v2 store reader pool still held by ${readerPool.holdCount()} hidden run(s) at dispose; it closes when they finish`,
+                );
             clearSyntheticCandidates(context);
         },
     };

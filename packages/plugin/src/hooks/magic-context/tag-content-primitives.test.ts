@@ -48,6 +48,41 @@ describe("dangling-open tag cleanup (§N + improvised closer, no closing §)", (
         expect(stripTagPrefix(`${SECTION}42${SECTION} hi`)).toBe("hi");
     });
 
+    it("preserves full decimal section references at leading and mid-text positions", () => {
+        expect(
+            stripPersistedAssistantText(
+                `${SECTION}12.3 cites the specification; see ${SECTION}123.45 and ${SECTION}5.1.`,
+            ),
+        ).toBe("12.3 cites the specification; see 123.45 and 5.1.");
+        expect(stripPersistedAssistantText(`${SECTION}123.45 begins this citation`)).toBe(
+            "123.45 begins this citation",
+        );
+
+        // This pass removes only dangling tag notation. A decimal citation is
+        // not a tag, so its complete leading text stays intact.
+        expect(stripTagPrefix(`${SECTION}12.3 cites the specification`)).toBe(
+            `${SECTION}12.3 cites the specification`,
+        );
+        expect(stripTagPrefix(`${SECTION}123.45 cites the specification`)).toBe(
+            `${SECTION}123.45 cites the specification`,
+        );
+    });
+
+    it("keeps dangling and well-formed numeric tags distinct from decimal references", () => {
+        expect(stripPersistedAssistantText(`before ${SECTION}12${SECTION} after`)).toBe(
+            "before  after",
+        );
+        expect(stripTagPrefix(`${SECTION}12${SECTION} after`)).toBe("after");
+
+        expect(stripPersistedAssistantText(`end ${SECTION}12`)).toBe("end");
+        expect(stripPersistedAssistantText(`${SECTION}12 before`)).toBe("before");
+        expect(stripTagPrefix(`${SECTION}12 before`)).toBe("before");
+
+        // A period without a following digit is still not part of a tag closer.
+        expect(stripPersistedAssistantText(`${SECTION}12.`)).toBe(".");
+        expect(stripTagPrefix(`${SECTION}12.`)).toBe(".");
+    });
+
     it("does not touch bare digits (no leading §)", () => {
         expect(stripDanglingTagNotationGlobally("99 files, 2024 roadmap")).toBe(
             "99 files, 2024 roadmap",

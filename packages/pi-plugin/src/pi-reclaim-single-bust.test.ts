@@ -52,11 +52,19 @@ describe("Pi execute-threshold reclaim costs one bust", () => {
 		const handler = fake.handlers.get("context") as ContextHandler;
 		const branch: Array<Record<string, unknown>> = [];
 		const appendCompaction = mock(
-			(_summary: unknown, firstKeptEntryId: unknown) => {
+			(
+				_summary: unknown,
+				firstKeptEntryId: unknown,
+				_tokensBefore: unknown,
+				details: unknown,
+				_fromHook: unknown,
+				_usage: unknown,
+			) => {
 				branch.push({
 					type: "compaction",
 					id: "compact-reclaim",
 					firstKeptEntryId,
+					details,
 				});
 				return "compact-reclaim";
 			},
@@ -73,6 +81,7 @@ describe("Pi execute-threshold reclaim costs one bust", () => {
 			) as unknown as {
 				sessionManager: {
 					getBranch: () => unknown[];
+					getEntry?: (id: string) => unknown;
 					appendCompaction?: typeof appendCompaction;
 				};
 				getContextUsage: () => unknown;
@@ -82,6 +91,10 @@ describe("Pi execute-threshold reclaim costs one bust", () => {
 			const messageEntries = ctx.sessionManager.getBranch();
 			ctx.sessionManager.getBranch = () => [...messageEntries, ...branch];
 			ctx.sessionManager.appendCompaction = appendCompaction;
+			ctx.sessionManager.getEntry = (id) =>
+				[...messageEntries, ...branch].find(
+					(entry) => (entry as { id?: string }).id === id,
+				);
 			ctx.getContextUsage = () => ({
 				tokens: usagePercent * 1_000,
 				percent: usagePercent,

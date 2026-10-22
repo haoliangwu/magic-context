@@ -16,14 +16,22 @@ import { insertMemory } from "../features/magic-context/memory/storage-memory";
 import { recordSessionProjectIdentity } from "../features/magic-context/session-project-storage";
 import { markSessionCleanupPending, openDatabase } from "../features/magic-context/storage";
 import { _resetHarnessForTesting, type HarnessId, setHarness } from "../shared/harness";
+import * as logger from "../shared/logger";
 import type { StatusDetail } from "../shared/rpc-types";
 import { statusSummaryFromDetail } from "../shared/status-summary";
 import { createTestTempDirFromPath } from "../shared/test-temp-dir";
 import {
+    _isDreamTimerTickInFlightForTests,
     _resetDreamTimerForTests,
     _setDreamTimerStagesForTests,
     startDreamScheduleTimer,
 } from "./dream-timer";
+
+async function waitForMaintenanceTick(): Promise<void> {
+    const deadline = performance.now() + 5000;
+    while (_isDreamTimerTickInFlightForTests() && performance.now() < deadline) await Bun.sleep(1);
+    expect(_isDreamTimerTickInFlightForTests()).toBe(false);
+}
 
 /**
  * Regression coverage for the schema-fence / null-DB crash:
@@ -67,6 +75,41 @@ describe("schema-fence null-DB contract", () => {
 describe("dream-timer registration cleanup", () => {
     afterEach(() => {
         _resetDreamTimerForTests();
+    });
+    test("disabled dreamer ticks are labelled as general maintenance", async () => {
+        expect(openDatabase()).toBeTruthy();
+        let interval: (() => void) | undefined;
+        const timer = spyOn(globalThis, "setInterval").mockImplementation(((
+            callback: () => void,
+        ) => {
+            interval = callback;
+            return { unref() {} } as unknown as ReturnType<typeof setInterval>;
+        }) as typeof setInterval);
+        const log = spyOn(logger, "log");
+        const restore = _setDreamTimerStagesForTests({
+            runMessageHistoryMaintenance: async () => {},
+            runProjectMaintenance: async () => {},
+        });
+        let cleanup: (() => void) | undefined;
+        try {
+            cleanup = await startDreamScheduleTimer({
+                directory: "/maintenance-label",
+                projectIdentity: "dir:label",
+                harness: "pi",
+                ensureRegistered: async () => {},
+            });
+            interval?.();
+            for (let count = 0; count < 10; count++) await Promise.resolve();
+            const ticks = log.mock.calls
+                .map(([line]) => line)
+                .filter((line) => line.includes("tick (interval)"));
+            expect(ticks).toEqual(["[magic-context] maintenance tick (interval) — projects=1"]);
+        } finally {
+            cleanup?.();
+            restore();
+            timer.mockRestore();
+            log.mockRestore();
+        }
     });
     test("does not overlap maintenance ticks and releases the guard after completion", async () => {
         // Host boot completes the async storage open before registering timers.
@@ -299,10 +342,7 @@ describe("dream-timer registration cleanup", () => {
             cleanup = await startDreamScheduleTimer({ ...registration });
             rmSync(directory, { recursive: true, force: true });
             intervalCallback?.();
-            for (let attempt = 0; attempt < 20; attempt += 1) {
-                if (clearIntervalSpy.mock.calls.length > 0) break;
-                await Promise.resolve();
-            }
+            await waitForMaintenanceTick();
 
             expect(clearIntervalSpy).toHaveBeenCalledTimes(1);
             expect(clearTimeoutSpy).toHaveBeenCalledWith(projectStartupHandle);
@@ -499,9 +539,7 @@ describe("dreamer tick stage containment", () => {
         return {
             tick: async () => {
                 intervalCallback?.();
-                // The tick body is a detached async function; yielding the loop
-                // repeatedly lets it run to completion before assertions.
-                for (let attempt = 0; attempt < 50; attempt += 1) await Bun.sleep(0);
+                await waitForMaintenanceTick();
             },
             dispose: () => {
                 for (const cleanup of cleanups) cleanup?.();

@@ -232,6 +232,41 @@ async function settle(): Promise<void> {
 }
 
 describe("historian host runner", () => {
+    it("rejects provider suggestions outside the claimed historian model chain", async () => {
+        const lane = new FakeClaimLane();
+        lane.queue({
+            runId: "suggestion",
+            sessionId: "ses-a",
+            modelChain: ["prov/cheap", "other/good"],
+        });
+        const models: string[] = [];
+        const executor: HiddenCompletionExecutor = {
+            capabilities: { tools: false, harness: "opencode2" },
+            open: async () => ({ id: "child" }),
+            attempt: async (_handle, request) => {
+                const model = request.body?.model;
+                models.push(`${model?.providerID}/${model?.modelID}`);
+                if (model?.modelID === "cheap")
+                    throw new Error("model not found: prov/cheap. Did you mean: user?");
+            },
+            collect: async () => ({
+                text: "<compartments/>",
+                lengthCapped: false,
+                usage: { input: 120, output: 40, cacheRead: 80, cacheWrite: 10 },
+            }),
+            close: async () => {},
+        };
+        const { runner } = runnerOver(lane, { executors: new Map([["ses-a", executor]]) });
+        await runner.pump("ses-a");
+        await settle();
+        expect(models).toEqual(["prov/cheap", "other/good"]);
+        expect(lane.reports).toHaveLength(1);
+        expect(lane.reports[0]?.body.output).toEqual({
+            text: "<compartments/>",
+            length_capped: false,
+        });
+    });
+
     it("forwards every failed and fallback model attempt with provider usage", async () => {
         const lane = new FakeClaimLane();
         lane.queue({

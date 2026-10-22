@@ -186,6 +186,67 @@ describe("PiRetrospectiveRawProvider", () => {
 		});
 	});
 
+	it("marks a later user line only after an assistant has replied to a user turn", async () => {
+		const provider = new PiRetrospectiveRawProvider({
+			projectCwd: "/repo/project",
+			listSessions: () => [
+				{
+					id: "s1",
+					cwd: "/repo/project",
+					path: "/sessions/s1.jsonl",
+					modified: 30,
+				},
+			],
+			loadEntriesFromFile: () => [
+				{
+					type: "message",
+					message: { role: "assistant", timestamp: 50, content: "not a reply" },
+				},
+				{
+					type: "message",
+					message: { role: "user", timestamp: 100, content: "first request" },
+				},
+				{
+					type: "message",
+					message: {
+						role: "assistant",
+						timestamp: 150,
+						content: "private response",
+					},
+				},
+				{
+					type: "message",
+					message: {
+						role: "user",
+						timestamp: 200,
+						content: "please correct that",
+					},
+				},
+			],
+		});
+
+		await provider.listProjectSessions("identity");
+		expect(
+			(await provider.readUserMessagesSince("s1", 0, 10)).messages,
+		).toEqual([
+			{
+				sessionId: "s1",
+				ordinal: 2,
+				role: "user",
+				text: "first request",
+				ts: 100,
+			},
+			{
+				sessionId: "s1",
+				ordinal: 4,
+				role: "user",
+				text: "please correct that",
+				ts: 200,
+				followsAssistantReply: true,
+			},
+		]);
+	});
+
 	it("inherits the shared clamp and oldest-first prompt budget for JSONL messages", async () => {
 		const start = Date.now() - 1_000;
 		const provider = new PiRetrospectiveRawProvider({

@@ -55,3 +55,68 @@ export function stripTagPrefixFromAssistantMessage(message: {
 
 	return mutated;
 }
+
+/**
+ * Content for an Oh My Pi `assistant_message` result: a copy of `content` with
+ * each text part stripped by the same rule as
+ * {@link stripTagPrefixFromAssistantMessage}, or undefined when nothing changes.
+ * Parts stay in their positions and keep every other field, because Oh My Pi
+ * rejects a replacement that changes anything except text.
+ */
+export function strippedAssistantContent(
+	content: unknown,
+): unknown[] | undefined {
+	if (!Array.isArray(content)) return undefined;
+	let copy: unknown[] | undefined;
+	for (let index = 0; index < content.length; index++) {
+		const part = content[index] as { type?: unknown; text?: unknown } | null;
+		if (part === null || typeof part !== "object" || part.type !== "text") {
+			continue;
+		}
+		if (typeof part.text !== "string") continue;
+		const stripped = stripPersistedAssistantText(part.text);
+		if (stripped === part.text) continue;
+		copy ??= content.slice();
+		copy[index] = { ...part, text: stripped };
+	}
+	return copy;
+}
+
+/** The one Oh My Pi extension call this module needs; stock Pi's types lack the event. */
+type AssistantMessageHookApi = {
+	on(
+		event: "assistant_message",
+		handler: (event: unknown) => { content: unknown[] } | undefined,
+	): unknown;
+};
+
+/**
+ * Strip the tag prefix from the reply Oh My Pi saves.
+ *
+ * Oh My Pi hands `message_end` handlers a detached copy of the message
+ * (`cloneMessageNotification`), so the in-place `message_end` strip changes
+ * nothing there. Its supported hook for editing a finished assistant message
+ * is `assistant_message`: it runs before the message reaches agent context,
+ * `message_end` listeners and session persistence, and takes replacement
+ * `content` whose text parts may differ only in `text`. Stock Pi has no such
+ * event and keeps using the `message_end` strip.
+ */
+export function registerOmpAssistantMessageStrip(
+	pi: unknown,
+	isActive: () => boolean,
+): void {
+	const api = pi as AssistantMessageHookApi;
+	api.on("assistant_message", (event) => {
+		try {
+			if (!isActive()) return undefined;
+			const message = (event as { message?: unknown } | null)?.message as
+				| { role?: unknown; content?: unknown }
+				| undefined;
+			if (message?.role !== "assistant") return undefined;
+			const content = strippedAssistantContent(message.content);
+			return content === undefined ? undefined : { content };
+		} catch {
+			return undefined;
+		}
+	});
+}

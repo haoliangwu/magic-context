@@ -64,6 +64,7 @@ export class HiddenCompletionRefusal extends Error {
             | "hidden_model_unsupported"
             | "hidden_tools_unsupported"
             | "hidden_prompt_unrecognized"
+            | "hidden_instance_disposed"
             | "unsupported_transport",
         message: string,
         readonly terminal = false,

@@ -102,8 +102,9 @@ export function registerIssue423Tests(
                 expect(adapter.cleanup(db, sessionId, growing, 312)).toBeGreaterThan(0);
                 expect(getEmergencyInputSample(db, sessionId)).toBeGreaterThan(0);
                 expect(adapter.cleanup(db, sessionId, issue423Fixture(), 90)).toBe(0);
-                // The absolute emergency arm may drain remaining candidates even in a consumed episode.
-                expect(adapter.cleanup(db, sessionId, issue423Fixture(), 314)).toBeGreaterThan(0);
+                // A later absolute-emergency sample includes a fresh batch of outputs;
+                // do not reuse the pre-drop input count as fixed overhead.
+                expect(adapter.cleanup(db, sessionId, issue423Fixture(150), 95)).toBeGreaterThan(0);
             } finally {
                 closeQuietly(db);
             }

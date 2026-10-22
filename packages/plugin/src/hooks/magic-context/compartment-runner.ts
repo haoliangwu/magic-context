@@ -30,6 +30,10 @@ export interface ActiveCompartmentRun {
     promise: Promise<void>;
     published: boolean;
     kind?: "incremental" | "recomp" | "wrapup" | "other";
+    /** Budget already spent joining this run; later passes must not wait again. */
+    inlineJoinTimedOutBudgetMs?: number;
+    /** A settled run may still be referenced by a transform adopting its publication. */
+    settled?: boolean;
     /**
      * Set to true once the 95%-emergency user-facing notification has been
      * dispatched for this run. Prevents the notification from re-firing on
@@ -77,6 +81,7 @@ export function registerActiveCompartmentRun(
         kind,
     };
     const wrapped = promise.finally(() => {
+        activeRun.settled = true;
         // Only clear if this is still the current entry (another run may have
         // replaced us if the caller overwrote; don't stomp the replacement).
         if (activeRuns.get(sessionId)?.promise === wrapped) {

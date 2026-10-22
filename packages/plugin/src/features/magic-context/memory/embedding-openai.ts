@@ -149,8 +149,8 @@ const FETCH_TIMEOUT_MS = 30_000;
  *     RATE_LIMIT_BACKOFF_JITTER of extra delay so separate processes spread out.
  *   - Passage (stored-content) embeds come from background drains and backfills,
  *     so they wait out each cooldown without sending anything and then resend
- *     the same batch. They stop only when their caller aborts or a real result
- *     arrives; a rate limit never becomes a batch failure.
+ *     the same batch. They yield after eight 429 responses or caller abort,
+ *     leaving unfinished rows for a later sweep without tripping the breaker.
  *   - Query embeds serve ctx_search and auto-search, which must stay fast: they
  *     never wait. During a cooldown they return no vector at once, so that one
  *     search runs lexical-only.
@@ -410,10 +410,11 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
             return Array.from({ length: texts.length }, () => null);
         }
 
-        // Rate-limit cooldown (described above RETRY_AFTER_CAP_MS). Queries never
-        // wait and a 429 never reaches the circuit breaker; passage batches wait
-        // out each cooldown and retry until they succeed or their caller aborts.
+        // Queries never wait and a 429 never reaches the circuit breaker.
+        // Passage batches yield after eight rate-limited responses so a provider
+        // outage cannot monopolize a background maintenance sweep indefinitely.
         const isQuery = purpose === "query";
+        let rateLimitedResponses = 0;
         for (;;) {
             if (Date.now() < this.rateLimit.until) {
                 if (isQuery) return Array.from({ length: texts.length }, () => null);
@@ -424,6 +425,8 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
             const outcome = await this.requestOnce(texts, requestTexts, signal, purpose);
             if (outcome !== RATE_LIMITED) return outcome;
             if (isQuery) return Array.from({ length: texts.length }, () => null);
+            if (++rateLimitedResponses >= 8)
+                return Array.from({ length: texts.length }, () => null);
         }
     }
 

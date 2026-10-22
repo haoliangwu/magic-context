@@ -259,6 +259,15 @@ flushLogger();
 const stages: Array<[string, number]> = [];
 for (const line of readFileSync(logPath, "utf8").slice(warmLogBytes).split("\n")) {
     if (!line.includes(sessionId)) continue;
+    const summary = line.split("transform stages: ")[1];
+    if (summary) {
+        // A summary includes slow stages already emitted on their own lines.
+        stages.length = 0;
+        for (const match of summary.split(" slow>=")[0].matchAll(/(?:^| )([\w.:-]+)=([\d.]+)ms/g)) {
+            stages.push([match[1], Number(match[2])]);
+        }
+        continue;
+    }
     const match = /transform stage: stage=(\S+) elapsed=([\d.]+)ms/.exec(line);
     if (match) stages.push([match[1], Number(match[2])]);
 }

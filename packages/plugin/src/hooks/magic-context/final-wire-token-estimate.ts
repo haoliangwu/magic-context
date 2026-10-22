@@ -515,6 +515,15 @@ export interface FinalWireTokenEstimate {
     /** Unscaled transform-array/system/tool measurement; provider framing is unmeasured. */
     rawTokens?: number;
     rawComponents?: { system: number; tools: number; prose: number };
+    /**
+     * Calibrated provider mass for reading context pressure, not for fit. A
+     * seeded model gets its measured ratios, an unseeded model counts at the
+     * neutral 1:1 ratio, and tool definitions this route has not measured count
+     * at the largest tool set measured on any route, without the fit envelope.
+     * `tokens` keeps the fit envelope for admission and must not be read as a
+     * pressure reading: for an unseeded model it doubles the whole request.
+     */
+    pressureTokens?: number;
     completeness?: "complete" | "partial";
     componentsComplete?: boolean;
 }
@@ -624,6 +633,15 @@ export function estimateFinalWireInputTokens(
         prose: messageTokens.conversation,
     };
     const tokens = providerMass(rawComponents, calibration, true);
+    const pressureToolDefinitions = measuredToolDefinitions ?? largestToolDefinitions ?? 0;
+    const pressureTokens = providerMass(
+        {
+            system: rawComponents.system,
+            tools: pressureToolDefinitions + messageTokens.toolCall,
+            prose: rawComponents.prose,
+        },
+        calibration,
+    );
     const complete =
         Number.isFinite(tokens) &&
         tokens > 0 &&
@@ -680,6 +698,7 @@ export function estimateFinalWireInputTokens(
         refusalBasis: refusalGrade ? (useMeasured ? "provider-prefix" : "calibrated") : undefined,
         rawTokens: rawComponents.system + rawComponents.tools + rawComponents.prose,
         rawComponents,
+        pressureTokens,
         completeness: complete ? "complete" : "partial",
         componentsComplete:
             toolDefinitions !== undefined && input.messages.every(hasCountableParts),

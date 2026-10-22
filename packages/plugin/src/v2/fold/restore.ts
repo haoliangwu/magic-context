@@ -180,24 +180,47 @@ export function restoreRow(
     const reuse = sameModel && data.error === undefined;
     const metadata = (state: unknown) =>
         state === undefined ? undefined : { [model.providerID]: state };
+    const reasoningInterrupted = data.content?.some(
+        (part) =>
+            part.type === "reasoning" &&
+            part.time !== undefined &&
+            (part.time as Part).completed === undefined,
+    );
     const content: Part[] = [];
     const results: V2Message[] = [];
     for (const part of data.content ?? []) {
+        // Raw SQL rows bypass the host's legacy decoder. Current names win even
+        // when explicitly undefined; legacy tool results then shallow-merge over
+        // call data, just as OpenCode's SessionLegacy decoder does.
+        let native =
+            "native" in part ? part.native : part.type === "tool" ? part.providerState : part.state;
+        if (
+            part.type === "tool" &&
+            part.providerResultState !== null &&
+            typeof part.providerResultState === "object" &&
+            !Array.isArray(part.providerResultState)
+        )
+            native = {
+                ...(native !== null && typeof native === "object" && !Array.isArray(native)
+                    ? native
+                    : {}),
+                ...part.providerResultState,
+            };
         if (part.type === "text") {
             if (part.text !== "")
                 content.push({
                     type: "text",
                     text: part.text,
-                    providerMetadata: reuse ? metadata(part.state) : undefined,
+                    providerMetadata: reuse ? metadata(native) : undefined,
                 });
             continue;
         }
         if (part.type === "reasoning") {
-            if (part.text !== "" || (reuse && part.state !== undefined))
+            if (part.text !== "" || (reuse && !reasoningInterrupted && native !== undefined))
                 content.push({
-                    type: reuse || data.error === undefined ? "reasoning" : "text",
+                    type: data.error === undefined && !reasoningInterrupted ? "reasoning" : "text",
                     text: part.text,
-                    providerMetadata: reuse ? metadata(part.state) : undefined,
+                    providerMetadata: reuse && !reasoningInterrupted ? metadata(native) : undefined,
                 });
             continue;
         }
@@ -218,7 +241,7 @@ export function restoreRow(
             name: part.name,
             input,
             providerExecuted: part.executed,
-            providerMetadata: toolReuse ? metadata(part.providerState) : undefined,
+            providerMetadata: toolReuse ? metadata(native) : undefined,
         });
         if (!completed) continue;
         const toolContent = (state.content ?? []) as Part[];
@@ -228,11 +251,9 @@ export function restoreRow(
             id: part.id,
             name: part.name,
             providerExecuted: part.executed,
-            providerMetadata: toolReuse
-                ? metadata(part.providerResultState ?? part.providerState)
-                : sameProvider
-                  ? metadata(part.providerResultState)
-                  : undefined,
+            providerMetadata: (part.executed === true ? sameProvider : reuse)
+                ? metadata(native)
+                : undefined,
             result:
                 state.status === "error"
                     ? { error: state.error, content: toolContent }

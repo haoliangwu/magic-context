@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import versions from "../../opencode2-versions.json";
 
 // Where the OpenCode 2 lane finds the GA CLI binary.
 //
@@ -14,6 +15,17 @@ import { join, resolve } from "node:path";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 const PLUGIN_PACKAGE_JSON = join(REPO_ROOT, "packages/plugin/package.json");
+
+/** Keep version assertions strict when a compatibility run selects another installed CLI. */
+export function expectedOpenCode2Version(
+	override: string | undefined = process.env.MC_E2E_OPENCODE2_VERSION,
+): string {
+	const version = override ?? versions.primary;
+	if (!versions.compatibility.includes(version)) {
+		throw new Error(`OpenCode 2 compatibility version is not listed: ${version}`);
+	}
+	return version;
+}
 
 /** The exact `@opencode/cli` version the plugin package pins as a devDependency. */
 export function pinnedOpenCode2Version(

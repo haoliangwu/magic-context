@@ -36,6 +36,10 @@ If you add the entry by hand, use `plugins` on 2.x. Do not list Magic Context un
 
 ## Updating Magic Context on OpenCode 2
 
+:::caution[Back up before upgrading OpenCode to 2.1]
+Once an OpenCode 2.1 host has compacted a store, OpenCode 2.0.x cannot reopen that store's compacted sessions. Stop OpenCode and back up its data directory before upgrading. To return to 2.0.x, restore the pre-upgrade backup; downgrading Magic Context does not convert the host's compaction format back.
+:::
+
 OpenCode 2 installs an `@latest` plugin once and keeps loading that copy. When a new release is published, OpenCode only marks the plugin "update available" in `/plugins`; it does not install it. Pressing ctrl+r there refreshes that mark, but installs nothing.
 
 To install the new release, do one of these:

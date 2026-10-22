@@ -49,7 +49,13 @@ A historian run publishes a new compartment without immediately rebuilding all o
 
 Summary quality comes from the **historian model**, not the main model answering your coding request. A smaller or less instruction-following historian can produce vague titles, miss decisions, or write confusing paraphrases even when the main model is strong.
 
-Configure the historian independently for each harness. There is no built-in provider-agnostic fallback list: Magic Context tries your explicit `fallback_models`, then can fall back to the live session model. Named user profiles can switch historian model selections as a group; a project may select a profile but cannot define one. See the [generated historian reference](/reference/configuration/#historian) and [model profiles](/reference/configuration/#model-profiles) for the exact schema.
+Configure the historian independently for each harness. A configured historian uses **only its model and its explicit `fallback_models`, in order**. Retries stay on those models; if the chain is exhausted, summarization reports a failure instead of silently using the active session model. This applies to automatic summarization, `/ctx-wrapup`, `/ctx-recomp`, and their staging and compression passes. No extra setting is needed.
+
+With no historian model configured, OpenCode inherits the session model; Pi and Oh My Pi do not summarize. A model is configured when the selected harness block has a non-empty `model` entry, either a string or an object with `model`. Metadata, reasoning settings, and schema defaults do not configure a model. Oh My Pi selects `historian.omp` when present, otherwise `historian.pi`; an explicit OMP block without a model does not inherit Pi's model. `historian.disable: true` stops the historian on every host.
+
+Named user profiles can switch historian model selections as a group; a project may select a profile but cannot define one. See the [generated historian reference](/reference/configuration/#historian) and [model profiles](/reference/configuration/#model-profiles) for the exact schema.
+
+In Rust mode, the module consumes the host-resolved historian chain unchanged and skips summarization when the host supplies no chain or an empty chain.
 
 <Tabs>
   <TabItem label="OpenCode">

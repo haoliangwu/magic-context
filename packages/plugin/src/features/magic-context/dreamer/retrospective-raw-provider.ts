@@ -41,6 +41,8 @@ export interface RetrospectiveRawMessage {
     ordinal: number;
     role: RetrospectiveMessageRole;
     text: string;
+    /** True when an earlier user turn has an assistant reply before this line. */
+    followsAssistantReply?: boolean;
     toolName?: string;
     isError?: boolean;
     ts: number;
@@ -99,6 +101,7 @@ interface OpenCodeMessageRow {
     id: string;
     data: string;
     time_created: number;
+    has_prior_assistant_reply?: number;
 }
 
 interface OpenCodePartRow {
@@ -463,10 +466,28 @@ function readOpenCodeMessagesSince(
     // exist" — the (limit+1)th row's existence is the exact truncation signal.
     const rows = db
         .prepare<[string, number, number], OpenCodeMessageRow>(
-            `SELECT id, data, time_created
-               FROM message
-              WHERE session_id = ? AND time_created > ?
-              ORDER BY time_created ASC, id ASC
+            `SELECT current.id, current.data, current.time_created,
+                    EXISTS (
+                        SELECT 1 FROM message assistant_reply
+                         WHERE assistant_reply.session_id = current.session_id
+                           AND json_valid(assistant_reply.data)
+                           AND json_extract(assistant_reply.data, '$.role') = 'assistant'
+                           AND (assistant_reply.time_created < current.time_created
+                                OR (assistant_reply.time_created = current.time_created
+                                    AND assistant_reply.id < current.id))
+                           AND EXISTS (
+                               SELECT 1 FROM message prior_user
+                                WHERE prior_user.session_id = current.session_id
+                                  AND json_valid(prior_user.data)
+                                  AND json_extract(prior_user.data, '$.role') = 'user'
+                                  AND (prior_user.time_created < assistant_reply.time_created
+                                       OR (prior_user.time_created = assistant_reply.time_created
+                                           AND prior_user.id < assistant_reply.id))
+                           )
+                    ) AS has_prior_assistant_reply
+               FROM message current
+              WHERE current.session_id = ? AND current.time_created > ?
+              ORDER BY current.time_created ASC, current.id ASC
               LIMIT ?`,
         )
         .all(sessionId, sinceMs, limit + 1);
@@ -619,6 +640,7 @@ function normalizeOpenCodeRows(
             role,
             parts,
             ts: row.time_created,
+            followsAssistantReply: row.has_prior_assistant_reply === 1,
         });
     });
 }
@@ -629,6 +651,7 @@ function normalizeOpenCodeMessage(args: {
     role: string;
     parts: unknown[];
     ts: number;
+    followsAssistantReply: boolean;
 }): RetrospectiveRawMessage[] {
     const rows: RetrospectiveRawMessage[] = [];
     // PRIVACY: retrospective reads OTHER sessions' raw history. Only genuine
@@ -648,6 +671,7 @@ function normalizeOpenCodeMessage(args: {
                 role: "user",
                 text,
                 ts: args.ts,
+                ...(args.followsAssistantReply ? { followsAssistantReply: true } : {}),
             });
         }
     }

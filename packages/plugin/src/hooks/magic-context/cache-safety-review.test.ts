@@ -2,6 +2,7 @@ import { afterEach, expect, it, spyOn } from "bun:test";
 import {
     closeDatabase,
     getOrCreateSessionMeta,
+    getTagsBySession,
     openDatabase,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
@@ -520,21 +521,23 @@ it("review: 10:32:20 forced thinking release and 10:32:24 replay use one trim se
     ]);
     const deferred = new Set<string>();
     let decision: "execute" | "defer" = "defer";
-    const transform = createTransform({
-        db,
-        tagger: createTagger(),
-        scheduler: { shouldExecute: () => decision },
-        contextUsageMap: usage,
-        liveModelBySession: new Map([[sessionId, route]]),
-        historyRefreshSessions: new Set(),
-        pendingMaterializationSessions: new Set(),
-        deferredHistoryRefreshSessions: deferred,
-        lastHeuristicsTurnId: new Map(),
-        directory: root.dir,
-        protectedTokens: 0,
-        clearReasoningAge: 0,
-        historianRunnable: false,
-    });
+    const newTransform = () =>
+        createTransform({
+            db,
+            tagger: createTagger(),
+            scheduler: { shouldExecute: () => decision },
+            contextUsageMap: usage,
+            liveModelBySession: new Map([[sessionId, route]]),
+            historyRefreshSessions: new Set(),
+            pendingMaterializationSessions: new Set(),
+            deferredHistoryRefreshSessions: deferred,
+            lastHeuristicsTurnId: new Map(),
+            directory: root.dir,
+            protectedTokens: 0,
+            clearReasoningAge: 0,
+            historianRunnable: false,
+        });
+    let transform = newTransform();
     const msg = (
         id: string,
         role: "user" | "assistant",
@@ -581,7 +584,12 @@ it("review: 10:32:20 forced thinking release and 10:32:24 replay use one trim se
                     state: { status: "completed", input: {}, output: toolOutput },
                 },
             ]),
-            info: { ...msg("msg06", "assistant").info, finish: "tool-calls" },
+            // A heavy step: below the 75% cap the bounded hold keeps the turn.
+            info: {
+                ...msg("msg06", "assistant").info,
+                finish: "tool-calls",
+                tokens: { input: 0, output: 1_600, reasoning: 1_600 },
+            },
         },
     ];
     const compartment = (sequence: number, start: number, end: number) => ({
@@ -613,12 +621,45 @@ it("review: 10:32:20 forced thinking release and 10:32:24 replay use one trim se
         decision = "execute";
         const at = Date.parse("2026-10-13T10:32:20Z");
         clock.mockReturnValue(at);
+        // Just below the hold cap (65% + 10), so the turn is still held.
         usage.set(sessionId, {
-            usage: { percentage: 75.4, inputTokens: 12_064 },
+            usage: { percentage: 74.9, inputTokens: 11_984 },
             updatedAt: at,
             hasUsageTokens: true,
         });
+        // Below the real 95% wall, fit recovery must refuse an oversized
+        // protected result rather than fabricate pressure to erase it.
         toolOutput = "RECLAIMABLE tool result words ".repeat(30_000);
+        await expect(transform({}, { messages: active() })).rejects.toMatchObject({
+            name: "EmergencyFailClosedError",
+        });
+        await expect(transform({}, { messages: active() })).rejects.toMatchObject({
+            name: "EmergencyFailClosedError",
+        });
+        // A fresh transform has no recursive retry flag. Persisted refusal must
+        // still check the outgoing request, even on a low-pressure defer pass.
+        transform = newTransform();
+        decision = "defer";
+        usage.set(sessionId, {
+            usage: { percentage: 20, inputTokens: 3_200 },
+            updatedAt: at,
+            hasUsageTokens: true,
+        });
+        await expect(transform({}, { messages: active() })).rejects.toMatchObject({
+            name: "EmergencyFailClosedError",
+        });
+        expect(
+            getTagsBySession(db, sessionId).find((tag) => tag.messageId === "read-call")?.status,
+        ).toBe("active");
+        expect(logs.mock.calls.map((call) => call.slice(1).join(" ")).join("\n")).not.toContain(
+            "context=95.0%",
+        );
+        decision = "execute";
+        usage.set(sessionId, {
+            usage: { percentage: 96, inputTokens: 15_360 },
+            updatedAt: at,
+            hasUsageTokens: true,
+        });
         const released = active();
         await transform({}, { messages: released });
         expect(logs.mock.calls.map((call) => call.slice(1).join(" ")).join("\n")).toContain(

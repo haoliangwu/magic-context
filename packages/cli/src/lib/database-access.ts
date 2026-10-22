@@ -1,5 +1,5 @@
 import { existsSync, rmSync } from "node:fs";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
     ensureContextStoreUuid,
@@ -10,13 +10,14 @@ import {
     LATEST_SUPPORTED_VERSION,
 } from "@magic-context/core/features/magic-context/storage-db";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
-import { Database } from "@magic-context/core/shared/sqlite";
+import { Database, openImmutableDatabase } from "@magic-context/core/shared/sqlite";
 import { configureContextDatabasePragmas } from "@magic-context/core/shared/sqlite-context-pragmas";
 import {
     ensureStorageDirectorySync,
     shouldEnforcePrivateStoragePermissions,
     writeStorageFileSync,
 } from "@magic-context/core/shared/storage-permissions";
+import { probeHostProcessesUsing } from "../commands/doctor-opencode2-cache";
 
 export function getPersistedSchemaVersion(db: DatabaseType): number {
     return getCorePersistedSchemaVersion(db);
@@ -71,6 +72,28 @@ export function openExistingDatabase(
 ): DatabaseType | null {
     if (!existsSync(path)) return null;
     if (options.readonly) {
+        const name = basename(path);
+        if (
+            (name === "context.db" || name === "store.db") &&
+            !existsSync(`${path}-wal`) &&
+            !existsSync(`${path}-shm`)
+        ) {
+            const probe = probeHostProcessesUsing({
+                files: [path, `${path}-wal`, `${path}-shm`],
+                directories: [],
+            });
+            if (probe.status !== "free") {
+                const reason =
+                    probe.status === "in_use"
+                        ? `database holder PID(s): ${probe.pids.join(", ")}`
+                        : probe.reason;
+                throw new Error(
+                    `Refusing immutable read-only open of ${path}: ${reason}; close every host and ck-mc first.`,
+                );
+            }
+            // Immutable mode is safe here only because the existing doctor holder probe found no writer.
+            return openImmutableDatabase(path);
+        }
         const db = new Database(path, { readonly: true });
         return db;
     }
@@ -191,7 +214,8 @@ export async function backupDatabaseSnapshot(
     if (existsSync(destination)) {
         throw new Error(`Refusing to overwrite existing backup ${destination}`);
     }
-    const reader = new Database(sourcePath, { readonly: true });
+    const reader = openExistingDatabase(sourcePath, { readonly: true });
+    if (!reader) throw new Error(`Backup source disappeared: ${sourcePath}`);
     const previousUmask = shouldEnforcePrivateStoragePermissions()
         ? process.umask(0o077)
         : undefined;

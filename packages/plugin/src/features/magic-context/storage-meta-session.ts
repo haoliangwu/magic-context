@@ -1,8 +1,10 @@
 import { Buffer } from "node:buffer";
+import { clearLkgRecoveryFence } from "../../hooks/magic-context/lkg-recovery-fence";
 import {
     cancelAutoSearchWork,
     clearUnpublishedAutoSearchNoHints,
 } from "../../shared/auto-search-lifecycle";
+import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getHarness } from "../../shared/harness";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import {
@@ -109,9 +111,23 @@ export function readSessionMeta(db: Database, sessionId: string): SessionMeta {
     return findSessionMeta(db, sessionId) ?? getDefaultSessionMeta(sessionId);
 }
 
+const parentReadRetries = new WeakMap<
+    Database,
+    BoundedSessionMap<{ attempts: number; at: number }>
+>();
+const PARENT_READ_ATTEMPTS = 5;
+const PARENT_READ_COOLDOWN_MS = 30_000;
+
 export function getOrCreateSessionMeta(db: Database, sessionId: string): SessionMeta {
     const existing = findSessionMeta(db, sessionId);
-    if (existing) return existing;
+    const harness = getHarness();
+    if (existing) {
+        if (harness !== "opencode2") return existing;
+        const row = db
+            .prepare("SELECT is_subagent FROM session_meta WHERE session_id = ?")
+            .get(sessionId) as { is_subagent: number | null };
+        if (row.is_subagent !== null) return existing;
+    }
 
     // Fresh row creation: bridge the race between OpenCode creating the
     // session (which writes `parent_id` synchronously) and the async
@@ -120,13 +136,26 @@ export function getOrCreateSessionMeta(db: Database, sessionId: string): Session
     // triggering primary guidance, system adjuncts and historian eligibility
     // that then has to be corrected on the next pass — busting prompt-cache.
     //
-    // Read the host's own parent link only at row creation. OC2 has no v1
-    // session.created handler and stores this link in session_v2 instead.
-    // Existing rows (including OC2 children seen by an older plugin) retain
-    // their served mode above: correcting them now would flip prompt bytes
-    // mid-session. Pi-compatible hosts must never open an OpenCode store.
-    const defaults = getDefaultSessionMeta(sessionId);
-    const harness = getHarness();
+    // OC2 stores an unreadable parent as NULL, not primary. Other metadata may
+    // still be written while the host row is not visible. Retry on the next call,
+    // but cool down after five misses so a hot transform cannot hammer the store.
+    // Once is_subagent is known, keep that stored value on later calls.
+    // Pi hosts never open an OpenCode DB.
+    const defaults = existing ?? getDefaultSessionMeta(sessionId);
+    let retries = parentReadRetries.get(db);
+    if (harness === "opencode2") {
+        if (!retries) {
+            retries = new BoundedSessionMap(1000);
+            parentReadRetries.set(db, retries);
+        }
+        const retry = retries.get(sessionId);
+        if (
+            retry &&
+            retry.attempts >= PARENT_READ_ATTEMPTS &&
+            Date.now() - retry.at < PARENT_READ_COOLDOWN_MS
+        )
+            return defaults;
+    }
     const fallbackSubagent =
         harness === "opencode"
             ? resolveIsSubagentFromOpenCodeDb(sessionId)
@@ -136,9 +165,25 @@ export function getOrCreateSessionMeta(db: Database, sessionId: string): Session
     if (fallbackSubagent === true) {
         defaults.isSubagent = true;
     }
-    // OC2's flag is part of the INSERT, so even a concurrent reader cannot
-    // observe a provisional primary row. Leave the v1 event/fallback path alone.
-    ensureSessionMetaRow(db, sessionId, harness === "opencode2" && fallbackSubagent === true);
+    if (harness === "opencode2") {
+        if (fallbackSubagent === null) {
+            const previous = retries?.get(sessionId);
+            const attempts =
+                previous && Date.now() - previous.at < PARENT_READ_COOLDOWN_MS
+                    ? previous.attempts + 1
+                    : 1;
+            retries?.set(sessionId, { attempts, at: Date.now() });
+            ensureSessionMetaRow(db, sessionId, null);
+            return defaults;
+        }
+        retries?.delete(sessionId);
+        ensureSessionMetaRow(db, sessionId, fallbackSubagent);
+        db.prepare(
+            "UPDATE session_meta SET is_subagent = ? WHERE session_id = ? AND is_subagent IS NULL",
+        ).run(fallbackSubagent ? 1 : 0, sessionId);
+        return defaults;
+    }
+    ensureSessionMetaRow(db, sessionId);
     if (harness === "opencode" && fallbackSubagent === true) {
         db.prepare("UPDATE session_meta SET is_subagent = 1 WHERE session_id = ?").run(sessionId);
     }
@@ -334,20 +379,23 @@ export function clearSession(
     cancelAutoSearchWork(sessionId);
     let transactionStartedAt = 0;
     let clearedMarker: PendingPiCompactionMarker | null = null;
+    let eligibleSessions = 0;
     withoutSqliteTransformPass(() =>
         withSqliteBackgroundWriter(() =>
             db
                 .transaction(() => {
                     transactionStartedAt = performance.now();
                     clearedMarker = getPendingPiCompactionMarkerState(db, sessionId);
-                    deleteSessionScopedRows(db, [sessionId], undefined, {
+                    eligibleSessions = deleteSessionScopedRows(db, [sessionId], undefined, {
                         rustModuleCleanupAcknowledged,
                         preserveTagRevisionTombstones: !permanentlyDeleted,
+                        deferRecoveryFenceCleanup: true,
                     });
                 })
                 .immediate(),
         ),
     );
+    if (eligibleSessions > 0) clearLkgRecoveryFence(sessionId);
     if (clearedMarker) logPiCompactionMarkerClear(sessionId, clearedMarker, "session-reset");
     clearUnpublishedAutoSearchNoHints(sessionId);
     logSlowWriteTransaction("clear-session", transactionStartedAt);

@@ -46,3 +46,23 @@ describe("Pi recomp historian output cap", () => {
 		expect(run.mock.calls[0]?.[0].maxOutputTokens).toBeUndefined();
 	});
 });
+
+it("forwards per-call tail admission through Pi recomp without changing prompt bytes", async () => {
+	const { client, run } = makeClient();
+	const session = await client.session.create();
+	for (const cacheTail of ["skip", "write"] as const) {
+		await client.session.prompt({
+			path: { id: session.id },
+			cacheTail,
+			body: { parts: [{ type: "text", text: "same prompt" }] },
+		});
+	}
+	expect(run.mock.calls.map(([options]) => options.cacheTail)).toEqual([
+		"skip",
+		"write",
+	]);
+	expect(run.mock.calls.map(([options]) => options.userMessage)).toEqual([
+		"same prompt",
+		"same prompt",
+	]);
+});

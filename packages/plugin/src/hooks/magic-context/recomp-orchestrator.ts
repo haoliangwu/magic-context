@@ -34,7 +34,7 @@ function resolveLiveModelKey(
  * differently depending on which surface started it.
  *
  * `runManagedRecomp` gives EVERY caller the full set: fallback resilience
- * (config chain + live-session-model last resort), live progress (sidebar /
+ * (only the configured chain, or the session model when unconfigured), live progress (sidebar /
  * status), and consistent terminal-state + messaging.
  */
 
@@ -59,10 +59,10 @@ export interface ManagedRecompContext {
     historianModel?: ModelInput;
     historianContextLimit?: number;
     historianMaxOutputTokens?: number;
-    /** Resolved historian fallback chain (config `fallback_models` → builtin). */
+    /** Resolved explicit historian `fallback_models`, in declaration order. */
     fallbackModels: readonly ModelInput[];
     language?: string;
-    /** Pre-resolved last-resort model key (the live session model). When omitted,
+    /** Live session model key, eligible only without a configured historian primary. When omitted,
      *  the orchestrator resolves it from `liveModelBySession`. The hook path passes
      *  this explicitly so it can include its OpenCode-DB fallback (the live map can
      *  be empty when `/ctx-recomp` runs before the first transform pass). */
@@ -203,7 +203,7 @@ export function buildRecompDeps(
         autoPromote: ctx.autoPromote,
         // Fallback resilience (was missing on the RPC dialog paths):
         //  - fallbackModels: configured chain (e.g. anthropic/claude-sonnet-4-6)
-        //  - fallbackModelId: the live session model as a last-ditch retry
+        //  - fallbackModelId: the live session model, only for an unconfigured historian
         model: ctx.historianModel,
         historianContextLimit: ctx.historianContextLimit,
         historianMaxOutputTokens: ctx.historianMaxOutputTokens,

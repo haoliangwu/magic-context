@@ -4,7 +4,7 @@ import { AUTO_SEARCH_TIMEOUT_MS } from "./auto-search-deadline";
 // Only the operation deadline is controlled. Worker startup and loop callbacks
 // stay real, so the blocked-worker tests also exercise owner-thread progress.
 export function deadlineClock() {
-    expect(AUTO_SEARCH_TIMEOUT_MS).toBe(3_000);
+    expect(AUTO_SEARCH_TIMEOUT_MS).toBe(1_000);
     let now = 0;
     let expire: (() => void) | undefined;
     const realTimeout = globalThis.setTimeout;

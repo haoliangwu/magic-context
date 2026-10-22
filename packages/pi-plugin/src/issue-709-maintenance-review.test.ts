@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MagicContextConfigSchema } from "@magic-context/core/config/schema/magic-context";
@@ -93,7 +93,17 @@ for (const lane of ["OC1", "OC2", "Pi"] as const) {
 			const opened = db.prepare("PRAGMA database_list").all() as Array<{
 				file: string;
 			}>;
-			if (opened.some((row) => row.file && !row.file.startsWith(`${root}/`)))
+			// SQLite reports the resolved path, so on macOS a root under /var reads
+			// back as /private/var. Compare against both spellings of the same folder.
+			const realRoot = realpathSync(root);
+			if (
+				opened.some(
+					(row) =>
+						row.file &&
+						!row.file.startsWith(`${root}/`) &&
+						!row.file.startsWith(`${realRoot}/`),
+				)
+			)
 				throw new Error("maintenance database escaped isolated root");
 			const project = resolveProjectIdentityForSession(root);
 			if (!project)

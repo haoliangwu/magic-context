@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { expectedOpenCode2Version } from "../../src/opencode2-runner/cli-resolution";
 import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { OpenCode } from "@opencode/client";
@@ -29,7 +30,7 @@ test("OC2 task child hides memory and note tools; primary tools and bytes surviv
     const store = new Database(join(host.env.XDG_DATA_HOME!, "opencode", "opencode2.db"), { readonly: true });
     try {
         const version = JSON.parse(readFileSync(join(realpathSync(CLI), "..", "..", "package.json"), "utf8")).version;
-        expect(version).toBe("2.0.22");
+        expect(version).toBe(expectedOpenCode2Version());
         const files = inspectHostOpenFiles(host.pid!, host.root, join(host.env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db"));
         console.log(JSON.stringify({ version, root: host.root, pid: files.pid, lsofDatabases: files.databases }));
         await subagentWriteScenario({ host: "oc2", mock: host.mock, db, parent: parent.id,

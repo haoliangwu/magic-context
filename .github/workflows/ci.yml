@@ -573,12 +573,15 @@ jobs:
            bun test --timeout 600000 $files
 
   e2e-host-opencode2:
-    name: E2E (OpenCode 2.0.22, host behavior ${{ matrix.shard }}/2)
+    name: E2E (OpenCode ${{ matrix.version }}, host behavior ${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         shard: [0, 1]
+        version: [2.0.22, 2.1.0]
+    env:
+      MC_E2E_OPENCODE2_VERSION: ${{ matrix.version }}
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
@@ -603,8 +606,15 @@ jobs:
           OPENCODE_VERSION=1.18.31 bash tests/docker/install-opencode.sh
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
 
+      - name: Install the selected exact host
+        run: |
+          mkdir -p target/oc2-host
+          printf '{"private":true,"dependencies":{"@opencode/cli":"%s"},"trustedDependencies":["@opencode/cli"]}\n' '${{ matrix.version }}' > target/oc2-host/package.json
+          bun install --cwd target/oc2-host
+          echo "MC_E2E_OPENCODE2_CLI=$PWD/target/oc2-host/node_modules/@opencode/cli/bin/opencode.exe" >> "$GITHUB_ENV"
+
       - name: Verify the GA host binary
-        run: bun -e "const { CLI } = await import('./packages/e2e-tests/src/opencode2-runner/spawn.ts'); const { execFileSync } = await import('node:child_process'); const version = execFileSync(CLI, ['--version']).toString().trim(); console.log(CLI, version); if (version !== 'opencode v2.0.22') throw new Error('OpenCode 2 host lane requires 2.0.22')"
+        run: bun -e "const { CLI } = await import('./packages/e2e-tests/src/opencode2-runner/spawn.ts'); const { execFileSync } = await import('node:child_process'); const version = execFileSync(CLI, ['--version']).toString().trim(); console.log(CLI, version); if (version !== 'opencode v' + process.env.MC_E2E_OPENCODE2_VERSION) throw new Error('OpenCode 2 host lane requires its exact matrix version')"
 
       - uses: ./.github/actions/restore-ci-dists
         id: dists

@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +13,7 @@ import {
 import { createTagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import * as tagOwnerWarmup from "./tag-owner-warmup";
 import { createTransform } from "./transform";
 
 type TestPart =
@@ -122,6 +123,7 @@ function stripTagPrefix(value: string): string {
 }
 
 afterEach(() => {
+    mock.restore();
     closeDatabase();
     if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = originalXdgDataHome;
@@ -140,8 +142,26 @@ function makeTestDirectory(prefix: string): string {
     return makeTempDir(prefix);
 }
 
+// The transform waits at most 250 ms for the tag-owner digest, which a worker
+// thread computes. Without the digest there are no reasoning token estimates, so
+// the pass deliberately strips no inline reasoning and leaves that work to the
+// next pass allowed to rewrite the cache. On a loaded machine the worker can miss
+// the deadline, and the execute pass then keeps the <think> block this test
+// expects it to strip. Wait for the digest itself instead of a deadline.
+// The spy is restored in afterEach.
+function awaitTagOwnersWithoutDeadline(): boolean[] {
+    const readiness: boolean[] = [];
+    spyOn(tagOwnerWarmup, "waitForTagOwners").mockImplementation(async (db, sessionId, ratio) => {
+        const ready = await tagOwnerWarmup.prewarmTagOwners(db, sessionId, ratio);
+        readiness.push(ready);
+        return ready;
+    });
+    return readiness;
+}
+
 describe("createTransform heuristic cleanup persistence", () => {
     it("replays caveman compression before inline reasoning strips on defer", async () => {
+        const ownerReadiness = awaitTagOwnersWithoutDeadline();
         useTempDataHome("context-transform-caveman-inline-");
         const sessionId = "ses-caveman-inline";
         const schedulerDecision = mock<Scheduler["shouldExecute"]>(() => "execute");
@@ -202,6 +222,10 @@ describe("createTransform heuristic cleanup persistence", () => {
         ];
         const executed = messages();
         await transform({}, { messages: executed });
+        // Every owner wait of this pass ended with a ready digest, so the strip
+        // below ran on real reasoning estimates rather than deferring.
+        expect(ownerReadiness.length).toBeGreaterThan(0);
+        expect(ownerReadiness.every(Boolean)).toBe(true);
         expect(JSON.stringify(executed)).not.toContain("stale private thought");
         expect(getTagsBySession(db, sessionId).some((tag) => tag.cavemanDepth > 0)).toBe(true);
         schedulerDecision.mockImplementation(() => "defer");

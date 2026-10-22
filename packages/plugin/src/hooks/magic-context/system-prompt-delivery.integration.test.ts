@@ -330,6 +330,8 @@ async function fixture(mode: "rust" | "ts" = "rust", generation: "v1" | "v2" = "
             },
         };
     };
+    // A heavy signed step (1,600 reasoning tokens): the bounded hold keeps the
+    // turn's prefix while usage stays below the cap (65% + 10).
     const hold = () =>
         source.push({
             info: {
@@ -339,6 +341,7 @@ async function fixture(mode: "rust" | "ts" = "rust", generation: "v1" | "v2" = "
                 providerID: route.providerID,
                 modelID: route.modelID,
                 finish: "tool-calls",
+                tokens: { input: 0, output: 1_600, reasoning: 1_600 },
             },
             parts: [
                 {

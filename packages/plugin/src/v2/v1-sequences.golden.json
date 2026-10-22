@@ -344,7 +344,7 @@
           "parts": [
             {
               "type": "text",
-              "text": "Messages 1-2:\n1: U: first\n2: A: second\n\nYour previous XML response was invalid and cannot be persisted.\nValidation error: Historian returned no usable compartments.\nReturn a corrected full XML response for the same existing state and new messages.\nDo not skip any displayed raw ordinal or displayed raw range, even if the message looks trivial.\nEvery displayed message range must belong to exactly one compartment unless it is intentionally left in one trailing suffix marked by <unprocessed_from>.\n\nPrevious invalid XML:\nnot a compartment",
+              "text": "Messages 1-2:\n1: U: first\n2: A: second\n\nYour previous XML response was invalid and cannot be persisted.\nValidation error: Historian returned no usable compartments.\nReturn a corrected full XML response for the same existing state and new messages.\nDo not skip any displayed raw ordinal or displayed raw range, even if the message looks trivial.\nEvery displayed message range must belong to exactly one compartment unless it is intentionally left in one trailing suffix marked by <unprocessed_from>.\nIf every message in the chunk is covered by a compartment, nothing is unprocessed: set `<unprocessed_from>` to the chunk's last message index + 1.\n\nPrevious invalid XML:\nnot a compartment",
               "synthetic": true
             }
           ]

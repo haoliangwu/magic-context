@@ -876,7 +876,7 @@ describe("Pi /ctx-wrapup", () => {
 		});
 	});
 
-	it("passes the active session model as the wrapup historian last-resort fallback", async () => {
+	it("passes the active session model as host context to the wrapup historian", async () => {
 		const db = createDb();
 		try {
 			const sessionId = "pi-wrapup-session-model";

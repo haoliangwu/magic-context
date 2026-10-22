@@ -236,9 +236,9 @@ describe("planEmergencyDrop — target math", () => {
     });
 
     it("latches the whole force-pressure episode across fresh usage samples", () => {
-        // 20 T3 tags × 1000 bytes (≈250 tokens each). currentTotal 100k, ceiling
+        // 20 T3 tags × 20000 bytes (≈5000 tokens each). currentTotal 100k, ceiling
         // 60k. First pass drops down to target and latches the usage sample.
-        const tags = Array.from({ length: 20 }, (_, i) => tag(i + 1, "bash", 1000));
+        const tags = Array.from({ length: 20 }, (_, i) => tag(i + 1, "bash", 20_000));
         const first = planWithFloor({
             tags,
             maxTag: 20,
@@ -418,7 +418,7 @@ describe("planEmergencyDrop — idempotence via status='active' (no scalar water
             // The caller reset the episode latch to 0 because another mutation
             // already priced this pass, so newly eligible tags may ride it.
             priorInputSample: 0,
-            currentTotalInputTokens: 10_000,
+            currentTotalInputTokens: 5_000,
             ceilingTokens: 1_000,
         });
         // dropped tags are never reselected (status guard)…
@@ -466,7 +466,7 @@ describe("planEmergencyDrop — idempotence via status='active' (no scalar water
 
 describe("planEmergencyDrop — token protection window cutoff & >=95% yield (#423 parity)", () => {
     it("consumes exact tag-number cutoff directly in tag-number coordinate space", () => {
-        const tags = Array.from({ length: 10 }, (_, i) => tag(i + 1, "bash", 2000));
+        const tags = Array.from({ length: 10 }, (_, i) => tag(i + 1, "bash", 4000));
         // Cutoff = 8 in tag-number coordinate space. Tags 8, 9, 10 are protected.
         const plan = planWithFloor({
             tags,
@@ -487,7 +487,7 @@ describe("planEmergencyDrop — token protection window cutoff & >=95% yield (#4
     });
 
     it("branches on absent cutoff (null) applying no tag-number threshold (empty window)", () => {
-        const tags = [tag(1, "bash", 10_000), tag(2, "bash", 10_000)];
+        const tags = [tag(1, "bash", 40_000), tag(2, "bash", 40_000)];
         const plan = planWithFloor({
             tags,
             maxTag: 2,
@@ -505,7 +505,7 @@ describe("planEmergencyDrop — token protection window cutoff & >=95% yield (#4
     });
 
     it("yields the window at >=95% usage (#423 parity)", () => {
-        const tags = [tag(1, "bash", 10_000), tag(2, "bash", 10_000), tag(3, "bash", 10_000)];
+        const tags = [tag(1, "bash", 40_000), tag(2, "bash", 40_000), tag(3, "bash", 40_000)];
         // Cutoff 1 would normally protect tags 1, 2, 3
         const plan = planWithFloor({
             tags,
@@ -524,7 +524,7 @@ describe("planEmergencyDrop — token protection window cutoff & >=95% yield (#4
     });
 
     it("at 94% a fully-protected candidate set degrades to noop('no-candidates') without consuming episode latch", () => {
-        const tags = [tag(10, "bash", 10_000), tag(11, "bash", 10_000)];
+        const tags = [tag(10, "bash", 40_000), tag(11, "bash", 40_000)];
         // Cutoff 10 protects all candidate tags
         const plan = planWithFloor({
             tags,
@@ -539,8 +539,6 @@ describe("planEmergencyDrop — token protection window cutoff & >=95% yield (#4
 
         expect(plan.shouldDrop).toBe(false);
         expect(plan.reason.startsWith("no-candidates")).toBe(true);
-        // The fixed floor (15000) alone exceeds the 10000 ceiling; the reason says so.
-        expect(plan.reason).toContain("already exceeds ceiling 10000");
         // Episode latch remains unconsumed (plan returned shouldDrop: false)
     });
 });
@@ -562,9 +560,8 @@ it("reclaim measurement charges retained skeleton tokens instead of original tag
 });
 
 describe("planEmergencyDrop — minimum achievable reclaim", () => {
-    // Shape of the live worker that sat at 100% for an hour: the fixed floor
-    // (~326K) is already above the ceiling (~251K), almost every tool output is
-    // dropped, and the only candidate is a fresh result worth ~149 tokens.
+    // A reachable fixed floor with a tiny candidate isolates the cache-price
+    // minimum from the separate impossible-fixed-overhead guard.
     const workerShape = (extra: Partial<Parameters<typeof planEmergencyDrop>[0]> = {}) => {
         const fresh = tag(330, "bash", 596); // 596 bytes x 0.25 = 149 tokens
         const conversation = tag(1, null, 36_204, { type: "message" }); // ~9,051 tokens
@@ -575,20 +572,19 @@ describe("planEmergencyDrop — minimum achievable reclaim", () => {
             protectedCutoff: null,
             usagePercentage: 100,
             currentTotalInputTokens: 335_200,
-            ceilingTokens: 251_000,
+            ceilingTokens: 327_000,
             priorInputSample: 0,
             hasPriorDrop: false,
             ...extra,
         });
     };
 
-    it("skips a pass whose selection reclaims less than the minimum, and says the floor is above the ceiling", () => {
+    it("skips a pass whose selection reclaims less than the minimum", () => {
         const plan = workerShape();
         expect(plan.shouldDrop).toBe(false);
         expect(plan.tagNumbers).toEqual([]);
         expect(plan.reason).toContain("achievable reclaim below minimum");
         expect(plan.reason).toContain("reclaim≈149 < 2000");
-        expect(plan.reason).toContain("already exceeds ceiling 251000");
     });
 
     it("lets the same small selection ride a pass another mutation already prices", () => {
@@ -608,12 +604,103 @@ describe("planEmergencyDrop — minimum achievable reclaim", () => {
             protectedCutoff: null,
             usagePercentage: 100,
             currentTotalInputTokens: 338_200,
-            ceilingTokens: 251_000,
+            ceilingTokens: 327_000,
             priorInputSample: 0,
             hasPriorDrop: false,
         });
         expect(plan.shouldDrop).toBe(true);
         expect(plan.tagNumbers).toEqual([10, 330]);
-        expect(plan.reason).toContain("already exceeds ceiling 251000");
+    });
+});
+
+// Fixed overhead is not reclaimable by deleting tool results, even if a fit
+// rebuild has already paid for the cache rewrite or real usage reaches 95%.
+describe("issue 731 impossible fixed overhead", () => {
+    for (const fixture of [
+        { name: "subagent sample latch", usage: 90_000, active: 6_407, floor: 83_593, count: 2 },
+        { name: "producer force gate", usage: 90_000, active: 6_407, floor: 83_593, count: 2 },
+        {
+            name: "protected episode at 90%",
+            usage: 90_000,
+            active: 10_195,
+            floor: 79_805,
+            count: 5,
+        },
+        {
+            name: "protected episode at 96%",
+            usage: 96_000,
+            active: 10_195,
+            floor: 85_805,
+            count: 5,
+        },
+    ]) {
+        it(`preserves the Rust ${fixture.name} fixture's impossible fixed floor`, () => {
+            // Use the calibrated active-token totals reported by the Rust transform,
+            // rather than assuming that a long run of one character is token-rich.
+            const tools = Array.from({ length: fixture.count }, (_, n) =>
+                tag(n + 1, "read", 1, { servedTokens: fixture.active / fixture.count }),
+            );
+            const plan = planEmergencyDrop({
+                tags: tools,
+                floorTags: tools,
+                maxTag: fixture.count,
+                protectedCutoff: null,
+                currentTotalInputTokens: fixture.usage,
+                ceilingTokens: 65_000,
+                usagePercentage: fixture.usage / 1000,
+                passAlreadyPriced: true,
+                priorInputSample: 0,
+                hasPriorDrop: false,
+            });
+            expect(plan.shouldDrop).toBe(false);
+            expect(plan.tagNumbers).toEqual([]);
+            expect(plan.reason).toContain(
+                `fixed floor ≈${fixture.floor} already exceeds ceiling 65000`,
+            );
+        });
+    }
+
+    it("preserves every tool result above the ceiling, including on priced and real-95 passes", () => {
+        const tools = [
+            tag(3, "read", 1, { servedTokens: 1_600, reclaimableTokens: 1_350 }),
+            tag(5, "bash", 1, { servedTokens: 1_581, reclaimableTokens: 1_368 }),
+        ];
+        for (const usagePercentage of [72.3, 95]) {
+            for (const passAlreadyPriced of [true, false]) {
+                const plan = planEmergencyDrop({
+                    tags: tools,
+                    floorTags: tools,
+                    maxTag: 5,
+                    protectedCutoff: null,
+                    currentTotalInputTokens: 144_520,
+                    ceilingTokens: 93_938,
+                    usagePercentage,
+                    passAlreadyPriced,
+                    priorInputSample: 0,
+                    hasPriorDrop: false,
+                });
+                expect(plan.shouldDrop).toBe(false);
+                expect(plan.tagNumbers).toEqual([]);
+                expect(plan.reason).toContain("fixed floor ≈141339 already exceeds ceiling 93938");
+            }
+        }
+    });
+
+    it("real 95 percent still yields the protected tail when drops reach the target", () => {
+        const tools = [tag(1, "bash", 40_000), tag(2, "read", 40_000)];
+        const plan = planEmergencyDrop({
+            tags: tools,
+            floorTags: tools,
+            maxTag: 2,
+            protectedCutoff: 1,
+            currentTotalInputTokens: 20_000,
+            ceilingTokens: 13_000,
+            usagePercentage: 95,
+            priorInputSample: 0,
+            hasPriorDrop: false,
+        });
+        expect(plan.shouldDrop).toBe(true);
+        expect(plan.tagNumbers).toEqual([1, 2]);
+        expect(plan.reclaimTokens).toBe(16_100);
     });
 });

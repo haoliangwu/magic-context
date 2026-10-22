@@ -76,7 +76,7 @@ import {
 } from "./compartment-render-epoch";
 import { extractM0Block, renderCompartmentAtTier, renderDecayedCompartments } from "./decay-render";
 import { historyLocalBudget } from "./decision-calibration";
-import { isHostRenderedSystemMessage } from "./host-served-rows";
+import { isHostRenderedSystemMessage, markCoveredInstructionRow } from "./host-served-rows";
 import { compareRawSessionMessageOrder, resolveHostServedBoundaryId } from "./read-session-chunk";
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
@@ -419,11 +419,37 @@ export function selectHiddenMessagesAtCompactionSeam(
     return markerBoundaryIndex < 0 ? [] : trimmed.slice(markerBoundaryIndex + 1);
 }
 
+/**
+ * Remove the first `count` messages, setting aside the id-less instruction rows
+ * among them (OpenCode 2 instruction updates). The caller decides later in the
+ * pass whether those are served; see storage-host-instruction-retention.ts.
+ */
+function cutCoveredPrefix(
+    messages: MessageLike[],
+    count: number,
+    coveredInstructions: MessageLike[],
+): void {
+    const removed = messages.splice(0, count);
+    for (const message of removed) {
+        if (!isHostRenderedSystemMessage(message)) continue;
+        // Marked like a restored covered row, so a request that serves it again
+        // can still be saved as the last-known-good copy (see lkg-replay.ts).
+        markCoveredInstructionRow(message.info);
+        coveredInstructions.push(message);
+    }
+}
+
 export function prepareCompartmentInjection(
     db: Database,
     sessionId: string,
     messages: MessageLike[],
     isCacheBusting: boolean,
+    /**
+     * Receives the covered id-less instruction rows this trim removes. Every
+     * caller in a pass must pass that pass's one list, or a row cut here is
+     * neither served nor set aside (see storage-host-instruction-retention.ts).
+     */
+    coveredInstructions: MessageLike[],
     projectPath?: string,
     injectionBudgetTokens?: number,
     temporalAwareness?: boolean,
@@ -463,7 +489,8 @@ export function prepareCompartmentInjection(
                     prepared.compartmentEndMessageId,
                 );
                 if (cutoffIndex >= 0) {
-                    const remaining = messages.slice(
+                    cutCoveredPrefix(
+                        messages,
                         cutoffIndex +
                             (isPartialCompartmentEnd(
                                 db,
@@ -472,8 +499,8 @@ export function prepareCompartmentInjection(
                             )
                                 ? 0
                                 : 1),
+                        coveredInstructions,
                     );
-                    messages.splice(0, messages.length, ...remaining);
                 } else {
                     // Boundary message not in array — covered messages were already
                     // trimmed by OpenCode (compaction, old history not sent). The splice
@@ -680,8 +707,7 @@ export function prepareCompartmentInjection(
         clearDegradedRebuild(sessionId);
         skippedVisibleMessages =
             cutoffIndex + (isPartialCompartmentEnd(db, sessionId, trimEndMessageId) ? 0 : 1);
-        const remaining = messages.slice(skippedVisibleMessages);
-        messages.splice(0, messages.length, ...remaining);
+        cutCoveredPrefix(messages, skippedVisibleMessages, coveredInstructions);
         resultEndMessageId = trimEndMessageId;
     } else {
         // Degraded: the natural boundary message is not in the visible window.
@@ -717,8 +743,7 @@ export function prepareCompartmentInjection(
                         (isPartialCompartmentEnd(db, sessionId, reAnchorCompartment.endMessageId)
                             ? 0
                             : 1);
-                    const remaining = messages.slice(skippedVisibleMessages);
-                    messages.splice(0, messages.length, ...remaining);
+                    cutCoveredPrefix(messages, skippedVisibleMessages, coveredInstructions);
                     resultEndMessage = reAnchorCompartment.endMessage;
                     resultEndMessageId = reAnchorCompartment.endMessageId;
                     reAnchored = true;

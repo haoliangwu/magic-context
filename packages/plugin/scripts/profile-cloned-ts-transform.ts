@@ -105,7 +105,7 @@ if (process.env.PERF_INJECTION_ONLY === "1") {
     for (let pass = 0; pass < 3; pass++) {
         const wire = structuredClone(messages);
         const start = performance.now();
-        const prepared = prepareCompartmentInjection(db, sessionId, wire, false);
+        const prepared = prepareCompartmentInjection(db, sessionId, wire, false, []);
         console.log(JSON.stringify({ pass, wallMs: performance.now() - start, rebuilt: prepared?.rebuiltFromDb,
             boundary: prepared?.compartmentEndMessageId, blockSha256: hash(prepared?.block), wireSha256: hash(wire) }));
     }

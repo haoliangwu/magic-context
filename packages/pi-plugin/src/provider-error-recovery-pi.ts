@@ -227,6 +227,8 @@ export function applyPiThinkingBindingRecovery(args: {
 	provider?: string;
 	model?: string;
 	report?: (message: string) => void;
+	/** Replay saved omissions without consuming a new provider-rejection flag. */
+	replayOnly?: boolean;
 	/**
 	 * The session strips thinking after the pipeline stages ran (see
 	 * resolvePiBindingStripOrder). New entries are then written together with
@@ -238,12 +240,10 @@ export function applyPiThinkingBindingRecovery(args: {
 	const protectedMessages = latestAssistantTurnMessages(args.messages);
 	const frozenEntryIds = frozenBindingEntryIds(args.db, args.sessionId);
 
-	const flagTargetCandidate = isPrefixBoundThinkingModel(
-		args.provider,
-		args.model,
-	)
-		? getThinkingBindingRecoveryTarget(args.db, args.sessionId)
-		: null;
+	const flagTargetCandidate =
+		!args.replayOnly && isPrefixBoundThinkingModel(args.provider, args.model)
+			? getThinkingBindingRecoveryTarget(args.db, args.sessionId)
+			: null;
 	const flagTarget = flagTargetCandidate?.startsWith(LATEST_THINKING_RESTORE)
 		? null
 		: flagTargetCandidate;

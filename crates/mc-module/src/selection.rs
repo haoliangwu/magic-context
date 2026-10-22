@@ -1303,7 +1303,10 @@ fn select_emergency(
             ctx.ceiling_tokens
         );
     }
-    if reclaim_tokens <= EMERGENCY_REARM_MIN_TOKENS {
+    // Rewriting tools cannot fix oversized fixed overhead. Preserve results and
+    // let final admission handle overflow, even if another mutation already
+    // requires a cache rewrite.
+    if floor_above_ceiling || reclaim_tokens <= EMERGENCY_REARM_MIN_TOKENS {
         *assessment = Some(mc_store::EmergencyDropAssessment {
             fixed_floor_tokens: fixed_floor,
             target_tokens: target,
@@ -2156,7 +2159,7 @@ mod tests {
     fn contract_consumed_episode_emergency95_parity_golden() {
         let items = vec![
             tool_call("protected", 1, "bash", serde_json::json!({}), 100),
-            tool_result("protected", 2, "bash", 20_000),
+            tool_result("protected", 2, "bash", 160_000),
         ];
         let mut ctx = base_ctx(PassClass::EmergencyForce);
         ctx.current_total_input_tokens = 90_000.0;
@@ -2204,8 +2207,8 @@ mod tests {
         }
         // Pressure far past the ceiling so the tiered walk reaches every arc.
         let mut ctx = base_ctx(PassClass::EmergencyForce);
-        ctx.current_total_input_tokens = 400_000.0;
-        ctx.ceiling_tokens = 65_000.0;
+        ctx.current_total_input_tokens = 80_000.0;
+        ctx.ceiling_tokens = 1_000.0;
         ctx.emergency_window_yields = true;
         let decisions =
             select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
@@ -2226,7 +2229,7 @@ mod tests {
     fn contract_legacy_call_only_reduction_does_not_strand_result() {
         let items = vec![
             tool_call("legacy", 1, "bash", serde_json::json!({}), 100),
-            tool_result("legacy", 2, "bash", 20_000),
+            tool_result("legacy", 2, "bash", 160_000),
         ];
         let frozen = HashSet::from([call_block_id("legacy")]);
         let mut ctx = base_ctx(PassClass::EmergencyForce);
@@ -2347,11 +2350,10 @@ mod tests {
         assert!(!report.target_unreachable);
     }
 
-    /// The live worker shape: the fixed floor (~326K) is already above the ceiling
-    /// (~251K) and the only candidate is a fresh result worth ~149 tokens. At the 95%
-    /// backstop production sets both `emergency_window_yields` and `pass_already_busting`;
-    /// neither waives the minimum, so the pass is skipped. Only an independent rebuild
-    /// (`emergency_minimum_waived`) lets the small selection ride. Mirrors the TS tests.
+    /// Isolate the small-selection price gate with a reachable fixed floor.
+    /// Reaching 95% does not itself waive the minimum reclaim needed to justify
+    /// a cache rewrite. Allow this small batch only when another mutation already
+    /// requires that rewrite.
     #[test]
     fn emergency_skips_a_selection_below_the_minimum_achievable_reclaim() {
         let items = vec![
@@ -2363,7 +2365,7 @@ mod tests {
         let arcs = arcs.iter().collect::<Vec<_>>();
         let mut ctx = base_ctx(PassClass::EmergencyForce);
         ctx.current_total_input_tokens = 335_200.0;
-        ctx.ceiling_tokens = 251_000.0;
+        ctx.ceiling_tokens = 327_000.0;
         ctx.emergency_window_yields = true;
         ctx.pass_already_busting = true;
         let mut assessment = None;
@@ -2378,7 +2380,7 @@ mod tests {
         let report = assessment.as_ref().unwrap();
         assert!(selected.is_empty());
         assert!(report.skipped_below_minimum_reclaim);
-        assert!(report.floor_above_ceiling);
+        assert!(!report.floor_above_ceiling);
         assert_eq!(report.selected_reclaim_tokens, 0.0);
 
         ctx.emergency_minimum_waived = true;
@@ -2393,7 +2395,74 @@ mod tests {
         let report = assessment.as_ref().unwrap();
         assert_eq!(selected.len(), 1);
         assert!(!report.skipped_below_minimum_reclaim);
-        assert!(report.floor_above_ceiling);
+        assert!(!report.floor_above_ceiling);
+    }
+
+    #[test]
+    fn issue_731_impossible_fixed_overhead_preserves_tool_results() {
+        let items = vec![
+            tool_call("read", 1, "read", serde_json::json!({}), 0),
+            tool_result("read", 2, "read", 6_400),
+            tool_call("bash", 3, "bash", serde_json::json!({}), 0),
+            tool_result("bash", 4, "bash", 6_324),
+        ];
+        let arcs = group_arcs(&items, &HashSet::new());
+        let arcs = arcs.iter().collect::<Vec<_>>();
+        for yields in [false, true] {
+            for waived in [false, true] {
+                let mut ctx = base_ctx(PassClass::EmergencyForce);
+                ctx.current_total_input_tokens = 144_520.0;
+                ctx.ceiling_tokens = 93_938.0;
+                ctx.emergency_window_yields = yields;
+                ctx.emergency_minimum_waived = waived;
+                ctx.pass_already_busting = true;
+                let mut assessment = None;
+                let selected = select_emergency(
+                    &arcs,
+                    &HashSet::new(),
+                    &ctx,
+                    3_181.0,
+                    &HashMap::new(),
+                    &mut assessment,
+                );
+                assert!(selected.is_empty());
+                let report = assessment.unwrap();
+                assert_eq!(report.fixed_floor_tokens, 141_339.0);
+                assert!(report.floor_above_ceiling);
+                assert!(report.target_unreachable);
+                assert_eq!(report.selected_reclaim_tokens, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn issue_731_real_95_yields_when_reclaim_reaches_target() {
+        let items = vec![
+            tool_call("bash", 1, "bash", serde_json::json!({}), 0),
+            tool_result("bash", 2, "bash", 40_000),
+            tool_call("read", 3, "read", serde_json::json!({}), 0),
+            tool_result("read", 4, "read", 40_000),
+        ];
+        let arcs = group_arcs(&items, &HashSet::new());
+        let arcs = arcs.iter().collect::<Vec<_>>();
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.current_total_input_tokens = 20_000.0;
+        ctx.ceiling_tokens = 13_000.0;
+        ctx.emergency_window_yields = true;
+        ctx.tag_window_protected_block_ids = items.iter().map(|item| item.id.clone()).collect();
+        let mut assessment = None;
+        let selected = select_emergency(
+            &arcs,
+            &HashSet::new(),
+            &ctx,
+            20_000.0,
+            &HashMap::new(),
+            &mut assessment,
+        );
+        assert_eq!(selected.len(), 2);
+        let report = assessment.unwrap();
+        assert!(!report.target_unreachable);
+        assert_eq!(report.required_reclaim_tokens, 16_100.0);
     }
 
     #[test]

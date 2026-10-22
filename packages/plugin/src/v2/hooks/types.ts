@@ -116,6 +116,11 @@ export interface V2Context {
     storage: {
         get(key: string): Promise<unknown>;
         set(key: string, value: unknown): Promise<void>;
+        remove?(key: string): Promise<void>;
+        scan?(options: { prefix: string; after?: string; limit?: number }): Promise<{
+            entries: readonly { key: string; value: unknown }[];
+            next?: string;
+        }>;
     };
     tool: {
         transform?(
@@ -195,6 +200,14 @@ export interface V2Context {
                 model: { providerID: string; id: string };
                 kind: string;
                 response: Response;
+            }) => Promise<void>,
+        ): Promise<unknown>;
+        hook(
+            name: "http.request",
+            callback: (draft: {
+                sessionID: string;
+                kind: string;
+                request: Request;
             }) => Promise<void>,
         ): Promise<unknown>;
         hook(

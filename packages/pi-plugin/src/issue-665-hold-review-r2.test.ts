@@ -5,9 +5,11 @@
 // m[0]/m[1] pairs (first renders), carried tag-identity repairs and restarts.
 //
 // After every pass it checks:
-// - a held pass (unfinished signed thinking turn on a prefix-bound model, below
-//   the force band, with nothing that rewrites the prefix anyway) serves the
-//   previous array byte for byte, with only new raw messages after it;
+// - a held pass (unfinished signed thinking turn on a prefix-bound model whose
+//   last 15 assistant steps include one with more than 1,500 reasoning tokens,
+//   below the execute threshold plus 10 points, with nothing that rewrites the
+//   prefix anyway) serves the previous array byte for byte, with only new raw
+//   messages after it;
 //   an actually rejected, calibrated over-window replay is exempt only after a
 //   declared, permitted rebuild removes every active-turn signed block;
 // - strict thinking binding: a signed thinking block served on two consecutive
@@ -54,6 +56,7 @@ import {
 	createFakePi,
 	createTestDb,
 	fakeContext,
+	heavyReasoningUsage,
 	type PiMessage,
 	toolResultMessage,
 	userMessage,
@@ -211,6 +214,12 @@ export async function runPiHoldDriver(options: {
 	logCalls?: unknown[][];
 }): Promise<{ records: PassRecord[]; violations: Violation[] }> {
 	const random = rng(options.seed);
+	// Reasoning weight and synthetic continuations draw from their own stream,
+	// so a seed keeps the event sequence it had before they were added.
+	const shape = rng(options.seed ^ 0x729);
+	const heavyRate = Number(process.env.R2_HEAVY_RATE ?? 0.12);
+	const continuationRate = Number(process.env.R2_CONTINUATION_RATE ?? 0.12);
+	const recordedRate = Number(process.env.R2_RECORDED_RATE ?? 0.5);
 	const pick = <T>(items: readonly T[]): T =>
 		items[Math.floor(random() * items.length)]!;
 	const modelId =
@@ -286,9 +295,14 @@ export async function runPiHoldDriver(options: {
 		source.push(message);
 		ids.push(id);
 	};
-	const thinking = () => ({
+	// Steps mix light and heavy reasoning. A heavy step either carries Pi's
+	// recorded count (usage.reasoning) or, with none recorded, enough stored
+	// thinking text for the estimate to exceed 1,500 tokens.
+	const thinking = (heavyText = false) => ({
 		type: "thinking",
-		thinking: `signed thought ${++signature}`,
+		thinking: heavyText
+			? `signed thought ${++signature} ${"weighing the next step carefully ".repeat(400)}`
+			: `signed thought ${++signature}`,
 		thinkingSignature: `sig-${signature}`,
 	});
 	const userTurn = () => {
@@ -309,10 +323,25 @@ export async function runPiHoldDriver(options: {
 		}
 		push(userMessage(`task ${clock}`, clock++), `user-${clock}`);
 	};
+	// A todo continuation or background notice: a user message whose parts are
+	// all synthetic. It does not end the turn.
+	const syntheticContinuation = () => {
+		push(
+			{
+				role: "user",
+				content: [{ type: "text", text: `continue ${clock}`, synthetic: true }],
+				timestamp: clock++,
+			} as unknown as PiMessage,
+			`continue-${clock}`,
+		);
+	};
 	const toolStep = () => {
 		const callId = `call-${++callCounter}`;
 		const content: unknown[] = [];
-		if (options.scenario !== "unheld-bound") content.push(thinking());
+		const heavy = options.scenario !== "unheld-bound" && shape() < heavyRate;
+		const recorded = shape() < recordedRate;
+		if (options.scenario !== "unheld-bound")
+			content.push(thinking(heavy && !recorded));
 		content.push({
 			type: "toolCall",
 			id: callId,
@@ -320,7 +349,12 @@ export async function runPiHoldDriver(options: {
 			arguments: { path: `${callCounter}.ts` },
 		});
 		push(
-			assistantMessage("", clock++, assistantExtra(content)),
+			assistantMessage("", clock++, {
+				...assistantExtra(content),
+				...(heavy && recorded
+					? { usage: heavyReasoningUsage(1_600 + Math.floor(shape() * 3_000)) }
+					: {}),
+			}),
 			`assistant-${callId}`,
 		);
 		push(
@@ -328,10 +362,45 @@ export async function runPiHoldDriver(options: {
 			`result-${callId}`,
 		);
 	};
+	const isRealUser = (m: PiMessage) => {
+		const message = m as { role?: string; content?: unknown };
+		if (message.role !== "user") return false;
+		return !(
+			Array.isArray(message.content) &&
+			message.content.every(
+				(p) => (p as { synthetic?: boolean }).synthetic === true,
+			)
+		);
+	};
+	// The bounded hold the handler should apply: a heavy step among the last
+	// 15 assistant steps of the turn, and usage below 65% + 10.
+	const recentHeavyReasoning = () => {
+		let lastUser = -1;
+		source.forEach((m, i) => {
+			if (isRealUser(m)) lastUser = i;
+		});
+		return source
+			.slice(lastUser + 1)
+			.filter((m) => (m as { role?: string }).role === "assistant")
+			.slice(-15)
+			.some((m) => {
+				const message = m as {
+					usage?: { reasoning?: number };
+					content?: Array<{ type?: string; thinking?: string }>;
+				};
+				const text = message.content?.find(
+					(p) => p.type === "thinking",
+				)?.thinking;
+				return (
+					(message.usage?.reasoning ?? 0) > 1_500 ||
+					(typeof text === "string" && text.length > 6_000)
+				);
+			});
+	};
 	const activeTurnThinking = () => {
 		let lastUser = -1;
 		source.forEach((m, i) => {
-			if ((m as { role?: string }).role === "user") lastUser = i;
+			if (isRealUser(m)) lastUser = i;
 		});
 		return source
 			.slice(lastUser + 1)
@@ -459,6 +528,10 @@ export async function runPiHoldDriver(options: {
 				// thinking yet, so this pass is not held and may apply queued work.
 				servedUserTail = random() < 0.4;
 			}
+			if (!servedUserTail && shape() < continuationRate) {
+				syntheticContinuation();
+				events.push("continuation");
+			}
 			if (!servedUserTail) toolStep();
 			if (random() < 0.3) {
 				const tools = getTagsBySession(db, sessionId).filter(
@@ -494,14 +567,15 @@ export async function runPiHoldDriver(options: {
 				// A new historian compartment over an older finished turn, with the
 				// history-refresh signal the historian sends: any m[0] fold from here
 				// on renders different bytes. A held pass must keep replaying the old pair.
+				// Compartments end before real user messages only, so the served
+				// window always starts a turn at a real user; a fold that summarizes
+				// a turn's real user away is covered by its own test.
 				let lastUser = -1;
 				for (let index = 0; index < source.length; index++)
-					if ((source[index] as { role?: string }).role === "user")
-						lastUser = index;
+					if (isRealUser(source[index]!)) lastUser = index;
 				const ends: number[] = [];
 				for (let index = compartmentEnd + 2; index < lastUser - 1; index++)
-					if ((source[index + 1] as { role?: string }).role === "user")
-						ends.push(index);
+					if (isRealUser(source[index + 1]!)) ends.push(index);
 				if (ends.length > 0) {
 					const end = pick(ends);
 					const begin = compartmentEnd + 1;
@@ -572,7 +646,8 @@ export async function runPiHoldDriver(options: {
 		if (events.includes("idle-expiry")) unavoidable.push("idle-expiry");
 		if (carriedBefore > 0 && !lkgBefore)
 			unavoidable.push("carried-repair-no-lkg");
-		if (percent >= 85) unavoidable.push("force-band");
+		if (percent >= 75) unavoidable.push("hold-cap");
+		if (!recentHeavyReasoning()) unavoidable.push("no-recent-heavy-reasoning");
 		const held = heldModel && unavoidable.length === 0 && previous !== null;
 		const pendingBefore = getPendingOps(db, sessionId).length;
 		const pairBefore = pairState();
@@ -850,7 +925,9 @@ for (const seed of SEEDS) {
 					),
 				);
 			heldViolations.set(seed, violations);
-			expect(records.filter((r) => r.held).length).toBeGreaterThan(PASSES / 4);
+			// The hold is bounded (recent heavy reasoning, below the cap), so only
+			// part of the passes of a signed turn are held.
+			expect(records.filter((r) => r.held).length).toBeGreaterThan(PASSES / 8);
 			expect(
 				summarize(
 					violations.filter(
@@ -914,10 +991,13 @@ test("Pi held drivers: m[0]/m[1] is never re-rendered while signed thinking is k
 	expect(aggregate("m0m1-rerendered")).toEqual([]);
 });
 
-// Ruling for all three hosts: inside a signed turn whose thinking is kept, an
-// idle-expired pass replays m[0]/m[1] byte for byte, and the force band (85%)
-// and the 95% emergency may drain under per-target protection but keep
-// m[0]/m[1] frozen. Each case below loads a reason to rebuild m[0]/m[1] (a new
+// Ruling for all three hosts. Every step of the signed turn below spent 1,600
+// reasoning tokens, so the bounded hold applies below the cap (execute
+// threshold 65% plus 10 points). There an idle-expired pass replays m[0]/m[1]
+// byte for byte. At the force band (86%) and the 95% emergency the cap ends the
+// hold: the pass rebuilds m[0]/m[1] mid-turn and strips every signed block of
+// the turn. Earlier revisions held both cases until the next real user message
+// (issue 729). Each case below loads a reason to rebuild m[0]/m[1] (a new
 // compartment with its history-refresh signal, a changed system prompt hash,
 // and optionally a carried tag-identity repair) before the held passes, then
 // checks the cached pair and the served head. The release pass at the end is
@@ -1013,10 +1093,8 @@ async function piRulingFixture(withCarriedRepair: boolean) {
 	const heldStep = () => {
 		step += 1;
 		source.push(
-			assistantMessage(
-				"",
-				10 + 2 * step,
-				extra([
+			assistantMessage("", 10 + 2 * step, {
+				...extra([
 					{
 						type: "thinking",
 						thinking: `active thought ${step}`,
@@ -1029,7 +1107,8 @@ async function piRulingFixture(withCarriedRepair: boolean) {
 						arguments: { path: `${step}.ts` },
 					},
 				]),
-			),
+				usage: heavyReasoningUsage(),
+			}),
 			toolResultMessage(
 				`active-call-${step}`,
 				`result ${step} ${BULK}`,
@@ -1097,7 +1176,8 @@ for (const withCarriedRepair of [false, true]) {
 		"force band 86%",
 		"emergency 96%",
 	] as const) {
-		const name = `Pi ruling${withCarriedRepair ? " with a carried identity repair" : ""}: a held ${cause} pass keeps m[0]/m[1] frozen while signed thinking is kept`;
+		const held = cause === "idle expiry";
+		const name = `Pi ruling${withCarriedRepair ? " with a carried identity repair" : ""}: ${held ? `a held ${cause} pass keeps m[0]/m[1] frozen while signed thinking is kept` : `a ${cause} pass is above the hold cap: it rebuilds m[0]/m[1] mid-turn and strips every signed block`}`;
 		const body = async () => {
 			const logs = spyOn(logger, "sessionLog").mockImplementation(() => {});
 			const fixture = await piRulingFixture(withCarriedRepair);
@@ -1134,6 +1214,16 @@ for (const withCarriedRepair of [false, true]) {
 					for (const call of logs.mock.calls.slice(logStart))
 						if (/m\[[01]\]|fold|identity|LKG|lkg|WILL/i.test(String(call[1])))
 							console.log("  log:", String(call[1]).slice(0, 200));
+				}
+				if (!held) {
+					// Above the cap the rebuild lands mid-turn, and no signed block
+					// is served behind the changed head.
+					expect(fixture.pair()).not.toBe(pairBefore);
+					expect(signedPrefixes(served).size).toBe(0);
+					const wire = JSON.stringify(served);
+					for (const step of [1, 2, 3])
+						expect(wire).toContain(`"active-call-${step}"`);
+					return;
 				}
 				expect(keptActiveSignatures(previous, served).length).toBeGreaterThan(
 					0,

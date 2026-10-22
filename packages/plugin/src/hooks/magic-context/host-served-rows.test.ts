@@ -2,11 +2,15 @@
 
 import { describe, expect, it } from "bun:test";
 import {
+    cloneKeepingCoveredInstructionMarks,
+    isCoveredInstructionRow,
     isHostRenderedSystemMessage,
     isHostUnservedRow,
+    markCoveredInstructionRow,
     markHostUnservedRow,
     retreatPastHostUnservedRows,
     snapTerminalCompartmentToServedRow,
+    takeCoveredInstructionRows,
 } from "./host-served-rows";
 
 const line = (ordinal: number, unserved = false) => {
@@ -72,3 +76,29 @@ describe("host-served rows", () => {
         expect(isHostRenderedSystemMessage({ info: { role: "user" } })).toBe(false);
     });
 });
+
+describe("covered instruction rows", () => {
+    // The signed-thinking fit retry re-runs the pass from a deep copy of its
+    // input. The copy must keep the covered marks, or the retried pass would
+    // serve those rows as ordinary host rows instead of setting them aside.
+    it("a retry copy keeps covered marks and the same bytes", () => {
+        const covered = markCoveredInstructionRowOn({
+            info: { role: "system" },
+            parts: [{ type: "text", text: "Today's date is now: day 2." }],
+        });
+        const user = { info: { id: "u1", role: "user" }, parts: [{ type: "text", text: "hi" }] };
+        const input = [covered, user];
+        const copy = cloneKeepingCoveredInstructionMarks(input);
+        expect(JSON.stringify(copy)).toBe(JSON.stringify(input));
+        expect(copy[0]).not.toBe(covered);
+        expect(isCoveredInstructionRow(copy[0]?.info)).toBe(true);
+        expect(isCoveredInstructionRow(copy[1]?.info)).toBe(false);
+        expect(takeCoveredInstructionRows(copy)).toEqual([covered]);
+        expect(copy).toEqual([user]);
+    });
+});
+
+function markCoveredInstructionRowOn<T extends { info: object }>(message: T): T {
+    markCoveredInstructionRow(message.info);
+    return message;
+}

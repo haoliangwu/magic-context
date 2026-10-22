@@ -249,6 +249,7 @@ test("golden hybrid hint matches master's search for the same stored-vector snap
     const snapshot = spyOn(embedding, "getProjectEmbeddingSnapshot").mockReturnValue(initial);
     const batch = spyOn(embedding, "embedBatchForProject");
     const options = {
+        autoHint: true,
         sources: ["memory" as const],
         countRetrievals: false,
         measurementDisabled: true,

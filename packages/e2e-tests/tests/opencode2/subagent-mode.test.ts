@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { expectedOpenCode2Version } from "../../src/opencode2-runner/cli-resolution";
 import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { OpenCode } from "@opencode/client";
@@ -110,7 +111,7 @@ async function fixture() {
     const version = JSON.parse(
         readFileSync(join(realpathSync(CLI), "..", "..", "package.json"), "utf8"),
     ).version;
-    expect(version).toBe("2.0.22");
+    expect(version).toBe(expectedOpenCode2Version());
     const databases = inspectOpenFiles(host.pid!, host.root, host.env).filter((path) =>
         /\.(?:db|sqlite)(?:-(?:wal|shm))?$/.test(path),
     );

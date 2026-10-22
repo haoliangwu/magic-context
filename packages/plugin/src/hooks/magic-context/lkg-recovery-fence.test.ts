@@ -7,7 +7,7 @@ import {
     LKG_SLOT_CHUNKS_DDL,
     LKG_SLOTS_DDL,
 } from "../../features/magic-context/migration-v94-write-split";
-import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
+import { clearSession, closeDatabase, openDatabase } from "../../features/magic-context/storage";
 import { deleteSessionScopedRows } from "../../features/magic-context/storage-session-tables";
 import type { Database } from "../../shared/sqlite";
 import { writeStorageFileSync } from "../../shared/storage-permissions";
@@ -409,6 +409,43 @@ for (let i=0, attempts=0; i<12;) {
             expect(existsSync(f.path)).toBe(false);
             expect(existsSync(`${f.path}.dead.tmp`)).toBe(false);
             clearLkgRecoveryFence("session");
+        } finally {
+            f.raw.close();
+        }
+    });
+    test("deleting an unfenced session does not create a lock directory or enter the mutex", () => {
+        const f = fixture(false);
+        let mutexCalls = 0;
+        restorers.push(
+            __test.setIoObserver((phase) => {
+                if (phase === "mutex") mutexCalls++;
+            }),
+        );
+        try {
+            clearLkgRecoveryFence("never-fenced");
+            expect(mutexCalls).toBe(0);
+            expect(existsSync(`${lkgRecoveryFencePath("never-fenced")}.locks`)).toBe(false);
+        } finally {
+            f.raw.close();
+        }
+    });
+    test("session deletion clears the fence outside its SQLite transaction and removes the empty lock directory", () => {
+        const f = fixture();
+        try {
+            const full = openDatabase();
+            const transactionStates: boolean[] = [];
+            restorers.push(
+                __test.setIoObserver((phase) => {
+                    if (phase === "mutex")
+                        transactionStates.push(
+                            (full as unknown as { inTransaction: boolean }).inTransaction,
+                        );
+                }),
+            );
+            clearSession(full, "session");
+            expect(transactionStates).toEqual([false]);
+            expect(existsSync(f.path)).toBe(false);
+            expect(existsSync(`${f.path}.locks`)).toBe(false);
         } finally {
             f.raw.close();
         }

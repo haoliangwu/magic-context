@@ -1,4 +1,5 @@
 import { createMemo, createSignal, For, Show } from "solid-js";
+import { pickerAccessibleName, pickerSelectedText } from "./a11y-state";
 import FloatingLayer from "./FloatingLayer";
 
 export interface PickerOption {
@@ -25,18 +26,16 @@ export default function SearchPicker(props: {
     setOpen(false);
     trigger.focus();
   };
-  const displayValue = () =>
-    props.options.find((option) => option.value === props.value)?.label ??
-    props.value ??
-    props.emptyLabel ??
-    "Use harness default";
+  const displayValue = () => selectedText() ?? emptyText();
+  const selectedText = () => pickerSelectedText(props.options, props.value);
+  const emptyText = () => props.emptyLabel ?? "Use harness default";
   return (
     <div class="search-picker">
       <button
         ref={trigger}
         type="button"
         class="model-select-trigger"
-        aria-label={props.label}
+        aria-label={pickerAccessibleName(props.label, selectedText(), emptyText())}
         aria-expanded={open()}
         aria-haspopup="dialog"
         title={displayValue()}
@@ -78,7 +77,7 @@ export default function SearchPicker(props: {
             </div>
             <div class="model-select-options">
               <button type="button" class="model-select-option" onClick={() => choose(undefined)}>
-                {props.emptyLabel ?? "Use harness default"}
+                {emptyText()}
               </button>
               <For each={filtered()}>
                 {(option) => (

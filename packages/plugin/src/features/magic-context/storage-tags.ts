@@ -1565,6 +1565,11 @@ function toTagEntry(row: TagRow): TagEntry {
     };
 }
 
+/** Apply the session reader's validation and legacy defaults to one SQL row. */
+export function normalizeTagSnapshotRow(row: unknown): TagEntry | null {
+    return isTagRow(row) ? toTagEntry(row) : null;
+}
+
 function isTagNumberRow(row: unknown): row is TagNumberRow {
     if (row === null || typeof row !== "object") return false;
     const r = row as Record<string, unknown>;

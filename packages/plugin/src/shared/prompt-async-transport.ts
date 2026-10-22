@@ -130,9 +130,22 @@ export function createPromptAsyncTransport(
         if (!readChildTokenBudget || !session?.prompt) return undefined;
         return Object.assign(
             async (request: PromptArgs) => {
-                await session.prompt?.(request);
-                const state = readChildTokenBudget(childSessionId);
-                if (state) options.onBudgetUpdate?.({ ...state, sessionId: childSessionId });
+                const previous = readChildTokenBudget(childSessionId);
+                const remaining =
+                    options.tokenBudget === undefined
+                        ? undefined
+                        : options.tokenBudget - (previous?.spent ?? 0);
+                if ((remaining !== undefined && remaining <= 0) || previous?.finalizeFired)
+                    throw new DreamTokenBudgetExceeded(childSessionId, previous?.spent ?? 0);
+                try {
+                    await session.prompt?.({
+                        ...request,
+                        ...(remaining === undefined ? {} : { tokenBudget: remaining }),
+                    });
+                } finally {
+                    const state = readChildTokenBudget(childSessionId);
+                    if (state) options.onBudgetUpdate?.({ ...state, sessionId: childSessionId });
+                }
             },
             { childSessionId },
         );

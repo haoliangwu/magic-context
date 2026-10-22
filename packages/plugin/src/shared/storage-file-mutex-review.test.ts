@@ -1,12 +1,32 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, rmdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { __resetRpcIdentityTestHooks, __setRpcIdentityTestHooks } from "./rpc-utils";
 import { withStorageFileMutex } from "./storage-file-mutex";
+import * as permissions from "./storage-permissions";
 import { createTestTempDir } from "./test-temp-dir";
 
 const mutex = join(import.meta.dir, "storage-file-mutex.ts");
+
+test("mutex retries ticket creation when empty-directory cleanup wins the mkdir race", () => {
+    const { dir: root, cleanup } = createTestTempDir("mc-mutex-rmdir-");
+    const directory = join(root, "locks");
+    const write = permissions.writeStorageFileSync;
+    let attempts = 0;
+    const writer = spyOn(permissions, "writeStorageFileSync").mockImplementation((...args) => {
+        if (attempts++ === 0) rmdirSync(directory);
+        return write(...args);
+    });
+    try {
+        expect(withStorageFileMutex(directory, () => "acquired")).toBe("acquired");
+        // The successful contender also rewrites its ticket atomically once.
+        expect(attempts).toBe(3);
+    } finally {
+        writer.mockRestore();
+        cleanup();
+    }
+});
 
 async function holder(root: string) {
     const script = `

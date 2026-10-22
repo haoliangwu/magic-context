@@ -1,10 +1,11 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
 import { resetOpenCodeDbPathStateForTesting } from "../../shared/opencode-db-path";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDir } from "../../shared/test-temp-dir";
+import { V2StoreReader } from "../../v2/store-reader";
 import { initializeDatabase } from "./storage-db";
 import { getOrCreateSessionMeta, updateSessionMeta } from "./storage-meta-session";
 
@@ -74,4 +75,77 @@ test("OC2 existing meta rows keep their mode across upgrades and later parent ch
     expect(getOrCreateSessionMeta(meta, "parent").isSubagent).toBe(false);
     updateSessionMeta(meta, "empty", { isSubagent: true });
     expect(getOrCreateSessionMeta(meta, "empty").isSubagent).toBe(true);
+});
+
+for (const unavailable of ["missing", "throwing"] as const) {
+    test(`OC2 retries a ${unavailable} parent read without persisting primary`, () => {
+        if (unavailable === "throwing")
+            host.exec("ALTER TABLE session_v2 RENAME COLUMN parent_id TO unreadable_parent");
+        const id = unavailable === "missing" ? "late-child" : "child";
+        expect(getOrCreateSessionMeta(meta, id).isSubagent).toBe(false);
+        expect(
+            meta.prepare("SELECT is_subagent FROM session_meta WHERE session_id = ?").get(id),
+        ).toEqual({ is_subagent: null });
+        updateSessionMeta(meta, id, { counter: 7, lastInputTokens: 1234 });
+        expect(
+            meta.prepare("SELECT is_subagent FROM session_meta WHERE session_id = ?").get(id),
+        ).toEqual({ is_subagent: null });
+        if (unavailable === "throwing")
+            host.exec("ALTER TABLE session_v2 RENAME COLUMN unreadable_parent TO parent_id");
+        else host.prepare("INSERT INTO session_v2 VALUES (?, 'parent')").run(id);
+        expect(getOrCreateSessionMeta(meta, id)).toMatchObject({
+            isSubagent: true,
+            counter: 7,
+            lastInputTokens: 1234,
+        });
+        expect(
+            meta.prepare("SELECT is_subagent FROM session_meta WHERE session_id = ?").get(id),
+        ).toEqual({ is_subagent: 1 });
+    });
+}
+
+test("OC2 resolves metadata written before the parent lookup and confirms primary only on a successful read", () => {
+    updateSessionMeta(meta, "late-primary", { counter: 9 });
+    expect(
+        meta
+            .prepare("SELECT is_subagent FROM session_meta WHERE session_id = 'late-primary'")
+            .get(),
+    ).toEqual({ is_subagent: null });
+    expect(getOrCreateSessionMeta(meta, "late-primary")).toMatchObject({
+        isSubagent: false,
+        counter: 9,
+    });
+    host.exec("INSERT INTO session_v2 VALUES ('late-primary', NULL)");
+    expect(getOrCreateSessionMeta(meta, "late-primary")).toMatchObject({
+        isSubagent: false,
+        counter: 9,
+    });
+    expect(
+        meta
+            .prepare("SELECT is_subagent FROM session_meta WHERE session_id = 'late-primary'")
+            .get(),
+    ).toEqual({ is_subagent: 0 });
+});
+
+test("OC2 caps parent read retries, then retries after cooldown without making unknown primary", () => {
+    const read = spyOn(V2StoreReader.prototype, "isSubagent").mockReturnValue(null);
+    const clock = spyOn(Date, "now").mockReturnValue(1000);
+    try {
+        for (let i = 0; i < 20; i++) getOrCreateSessionMeta(meta, "late-child");
+        expect(read).toHaveBeenCalledTimes(5);
+        expect(
+            meta
+                .prepare("SELECT is_subagent FROM session_meta WHERE session_id = 'late-child'")
+                .get(),
+        ).toEqual({ is_subagent: null });
+        clock.mockReturnValue(31_001);
+        read.mockReturnValue(true);
+        expect(getOrCreateSessionMeta(meta, "late-child").isSubagent).toBe(true);
+        expect(read).toHaveBeenCalledTimes(6);
+        expect(getOrCreateSessionMeta(meta, "late-child").isSubagent).toBe(true);
+        expect(read).toHaveBeenCalledTimes(6);
+    } finally {
+        read.mockRestore();
+        clock.mockRestore();
+    }
 });

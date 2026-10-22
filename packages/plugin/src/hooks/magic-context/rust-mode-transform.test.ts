@@ -4587,11 +4587,13 @@ describe("Rust mode authority adapter", () => {
             });
             const runPass = async () => {
                 const messages = wire();
-                await transform.run(
-                    sessionId,
-                    messages,
-                    { messages: messages as unknown[] },
-                    makeMeta(db, sessionId),
+                await withTransformTimingSummary(() =>
+                    transform.run(
+                        sessionId,
+                        messages,
+                        { messages: messages as unknown[] },
+                        makeMeta(db, sessionId),
+                    ),
                 );
             };
             await runPass();
@@ -4622,11 +4624,15 @@ describe("Rust mode authority adapter", () => {
             expect(store.fullReads).toBe(0);
             const ordinalLines = logSpy.mock.calls
                 .map((call) => String(call[1]))
-                .filter((line) => line.includes("stage=rust.ordinal_resolve"));
+                .filter(
+                    (line) =>
+                        line.startsWith("transform stages:") &&
+                        line.includes("rust.ordinal_resolve="),
+                );
             expect(ordinalLines.length).toBeGreaterThanOrEqual(3);
             expect(ordinalLines.some((line) => line.includes("mode=prime"))).toBe(false);
             const elapsedMs = ordinalLines.map((line) =>
-                Number(/elapsed=([\d.]+)ms/.exec(line)?.[1] ?? Number.NaN),
+                Number(/rust\.ordinal_resolve=([\d.]+)ms/.exec(line)?.[1] ?? Number.NaN),
             );
             expect(elapsedMs.every((ms) => ms < 250)).toBe(true);
 
@@ -4642,7 +4648,11 @@ describe("Rust mode authority adapter", () => {
             expect(store.fullReads).toBe(0);
             const removalLines = logSpy.mock.calls
                 .map((call) => String(call[1]))
-                .filter((line) => line.includes("stage=rust.ordinal_resolve"));
+                .filter(
+                    (line) =>
+                        line.startsWith("transform stages:") &&
+                        line.includes("rust.ordinal_resolve="),
+                );
             expect(removalLines.some((line) => line.includes("mode=rewind"))).toBe(true);
             expect(removalLines.some((line) => line.includes("mode=prime"))).toBe(false);
         } finally {
@@ -10685,6 +10695,7 @@ it("Rust-mode typed protected overflow cannot become passthrough or LKG replay",
 });
 
 import { bindSystemDateRequestIdentity } from "./system-date-refresh";
+import { withTransformTimingSummary } from "./transform-stage-logger";
 
 // scripts/test-rust-raw-replay.sh builds the library driver and sets its staged executable path.
 const rawReplayProbe = process.env.MC_RAW_REPLAY_PROBE;

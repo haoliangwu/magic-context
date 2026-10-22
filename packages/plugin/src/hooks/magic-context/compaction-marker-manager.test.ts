@@ -1162,7 +1162,7 @@ describe("assistant-ended marker seam geometry", () => {
             { info: { id: "retained-user", role: "user", sessionID: sessionId }, parts: [] },
         ] as MessageLike[];
         const beforeTrim = [...messages];
-        const prepared = prepareCompartmentInjection(db, sessionId, messages, true);
+        const prepared = prepareCompartmentInjection(db, sessionId, messages, true, []);
         const markerBoundary = findBoundaryUserMessage(sessionId, "assistant-end");
 
         // OpenCode filterCompacted requires the marker part on a user row, so the

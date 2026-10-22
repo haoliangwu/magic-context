@@ -1,6 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as configLoader from "../../config";
@@ -88,7 +88,17 @@ async function fixture(
     const db = openDatabase();
     if (!db) throw new Error("isolated review database unavailable");
     const opened = db.prepare("PRAGMA database_list").all() as Array<{ file: string }>;
-    if (opened.some((row) => row.file && !row.file.startsWith(`${root}/`)))
+    // SQLite reports the resolved path, so on macOS a root under /var reads back
+    // as /private/var. Compare against both spellings of the same folder.
+    const realRoot = realpathSync(root);
+    if (
+        opened.some(
+            (row) =>
+                row.file &&
+                !row.file.startsWith(`${root}/`) &&
+                !row.file.startsWith(`${realRoot}/`),
+        )
+    )
         throw new Error("review database escaped isolated root");
     const config = MagicContextConfigSchema.parse({
         auto_update: false,

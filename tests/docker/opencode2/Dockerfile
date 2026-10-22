@@ -1,8 +1,10 @@
-# Magic Context — pinned OpenCode 2.0.22 end-to-end image.
+# Magic Context — exact OpenCode 2.0.22 and 2.1.0 end-to-end image lanes.
 #
 # Local/CI command (the wrapper builds the exact plugin artifact first):
 #   tests/docker/opencode2/run.sh
 FROM debian:bookworm-slim
+ARG OPENCODE2_VERSION=2.0.22
+ENV OPENCODE2_VERSION=${OPENCODE2_VERSION}
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
@@ -22,9 +24,9 @@ ENV PATH="/root/.bun/bin:/test/host/node_modules/.bin:$PATH"
 # The wrapper and native Linux binary are both explicit exact pins. Installing
 # @opencode/client only equips the lane driver; product code never imports it.
 RUN mkdir -p /test/host && npm install --prefix /test/host --no-audit --no-fund \
-    @opencode/cli@2.0.22 \
-    @opencode/cli-linux-x64@2.0.22 \
-    @opencode/client@2.0.22
+    @opencode/cli@${OPENCODE2_VERSION} \
+    @opencode/cli-linux-x64@${OPENCODE2_VERSION} \
+    @opencode/client@${OPENCODE2_VERSION}
 
 # Reconstruct the files npm publishes. The Docker build consumes the locally
 # built dist plus the raw TUI sources rather than the registry release.

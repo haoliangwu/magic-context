@@ -21,6 +21,7 @@ import {
 	PLUGIN,
 	isolation,
 	spawnOpencode2,
+	type OpenCode2Handoff,
 	waitForPluginActive,
 	waitForPluginLog,
 } from "../../src/opencode2-runner/spawn";
@@ -114,7 +115,12 @@ export default { id: "opencode-magic-context", async setup(context) { mark("setu
 		],
 	});
 	if (!built.success) throw new Error(built.logs.join("\n"));
-	const host = await spawnOpencode2({
+	// Observe HTTP handoff, not fixture readiness, so the guard's activation gate
+	// cannot consume the slow-setup interval before these responsiveness samples.
+	let observe!: (host: OpenCode2Handoff) => void;
+	const handoff = new Promise<OpenCode2Handoff>((resolve) => { observe = resolve; });
+	const ready = spawnOpencode2({
+		onHandoff: observe,
 		existingIsolation: fixture,
 		includeMagicContext: false,
 		probePlugin: plugin,
@@ -125,6 +131,8 @@ export default { id: "opencode-magic-context", async setup(context) { mark("setu
 			memory: { enabled: false },
 		},
 	});
+	const readyResult = ready.then(() => undefined, (error: unknown) => error);
+	const host = await Promise.race([handoff, ready]);
 	const headers = {
 		authorization: `Basic ${btoa(`opencode:${host.password}`)}`,
 	};
@@ -303,6 +311,8 @@ export default { id: "opencode-magic-context", async setup(context) { mark("setu
 		clearTimeout(releaseLock);
 		db.close();
 		await host.stop();
+		const readinessError = await readyResult;
+		if (readinessError) throw readinessError;
 	}
 }
 

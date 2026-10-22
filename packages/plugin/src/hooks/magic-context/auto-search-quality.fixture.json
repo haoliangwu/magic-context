@@ -1,0 +1,7 @@
+[
+  {"label":"good on-topic compartment","cosine":0.91,"title":"Historian cache wiring uses an incremental scope-local pool","accepted":true},
+  {"label":"bad unrelated compartment elevated only by fusion rank","cosine":0.34,"title":"Release lunch arrangements","accepted":false},
+  {"label":"good archived passage beyond a long introductory first line","text":"Historian cache wiring uses an incremental scope-local pool.","accepted":true},
+  {"label":"bad task notification copied into text history","text":"<task id=\"completed\" state=\"completed\"><summary>Historian cache wiring task completed</summary></task>","accepted":false},
+  {"label":"bad partial lexical overlap","text":"The cache contains unrelated asset icons.","accepted":false}
+]

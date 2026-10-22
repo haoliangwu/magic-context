@@ -44,14 +44,19 @@ export function createPiHistorianClient(args: {
 		// fallbackModels: undefined for override attempts. If we ignored body.model
 		// and always ran args.model, every "fallback" attempt would silently re-run
 		// the SAME primary — so an empty/invalid-but-200 primary could never
-		// escalate to the configured fallbacks or the session model. When an
+		// escalate to the configured fallbacks. When an
 		// override is present, let the override own the model and disable the
 		// runner-level chain for this call (the shared layer owns iteration).
 		const modelOverride = readBodyModel(body);
+		const cacheTail =
+			input && typeof input === "object" && "cacheTail" in input
+				? input.cacheTail
+				: undefined;
 		const result = await args.runner.run({
 			agent: "magic-context-historian",
 			systemPrompt: args.systemPrompt,
 			userMessage: promptText,
+			...(cacheTail === "write" || cacheTail === "skip" ? { cacheTail } : {}),
 			model: modelOverride?.model ?? args.model,
 			fallbackModels: modelOverride ? undefined : args.fallbackModels,
 			timeoutMs: args.timeoutMs,

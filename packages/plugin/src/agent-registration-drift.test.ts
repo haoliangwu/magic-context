@@ -34,6 +34,7 @@ import {
 import { SMART_NOTE_COMPILER_AGENT } from "./agents/smart-note-compiler";
 import { permissionDisabled } from "./hooks/magic-context/ctx-reduce-availability";
 import { resolveHistorianAgentOverrides } from "./shared/model-resolution";
+import { hiddenAgentAllowedTools, hiddenChildPermissions } from "./v2/hooks/hidden-child";
 
 function taskRules(task: Record<string, string>) {
     return Object.entries(task).map(([pattern, action]) => ({
@@ -64,6 +65,23 @@ describe("hidden-agent registration drift guard", () => {
         historianDisallowed: [],
     });
     const byId = (id: string) => regs.find((r) => r.id === id);
+
+    for (const [id, tools] of [
+        [DREAMER_MEMORY_MAPPER_AGENT, DREAMER_MEMORY_MAPPER_ALLOWED_TOOLS],
+        [DREAMER_PRIMER_INVESTIGATOR_AGENT, DREAMER_PRIMER_INVESTIGATOR_ALLOWED_TOOLS],
+    ] as const) {
+        test(`OpenCode 2 ${id} navigation tools match the canonical registration`, () => {
+            expect(hiddenAgentAllowedTools(id)).toEqual([...tools]);
+            expect(hiddenAgentAllowedTools(id)).toEqual(byId(id)?.allowedTools);
+            expect(
+                hiddenChildPermissions(id)
+                    .filter((rule) => rule.effect === "allow")
+                    .map((rule) => rule.action),
+            ).toEqual([...tools]);
+            for (const tool of ["aft_outline", "aft_zoom", "aft_search"])
+                expect(hiddenAgentAllowedTools(id)).toContain(tool);
+        });
+    }
 
     test("registers hidden agents with canonical ids", () => {
         expect(regs.map((r) => r.id).sort()).toEqual(

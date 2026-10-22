@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { rmSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -17,7 +17,11 @@ import { getDreamRuns } from "@magic-context/core/features/magic-context/dreamer
 import { getTaskScheduleState } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
 import { leaseKeyFor } from "@magic-context/core/features/magic-context/dreamer/task-registry";
 import { insertMemory } from "@magic-context/core/features/magic-context/memory";
-import { getMemoryVerifications } from "@magic-context/core/features/magic-context/memory/storage-memory-verifications";
+import {
+	getMemoryVerifications,
+	getUnmappedMemoryIds,
+	recordMemoryVerifications,
+} from "@magic-context/core/features/magic-context/memory/storage-memory-verifications";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import {
 	closeDatabase,
@@ -25,11 +29,14 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { getSubagentInvocations } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
+import { extractLatestAssistantText } from "@magic-context/core/shared/assistant-message-extractor";
 import * as logger from "@magic-context/core/shared/logger";
+import { createPromptAsyncTransport } from "@magic-context/core/shared/prompt-async-transport";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import { __setPiHarnessKindForTesting } from "../pi-harness-kind";
+import { ZEN_FREE_TIER_FAILURE } from "../pi-zen-free-tier";
 import { PiSubagentRunner } from "../subagent-runner";
 import {
 	__test,
@@ -2115,4 +2122,354 @@ describe("Pi dreamer wiring", () => {
 
 		expect(timerCleanup).toHaveBeenCalledTimes(1);
 	});
+});
+
+test("Pi facade honors a shared batch envelope across failed and successful attempts", async () => {
+	db = createDb();
+	let captured: CapturedDreamClient | null = null;
+	const budgets: number[] = [];
+	__test.setStartDreamScheduleTimerFactory(async (registration) => {
+		captured = registration.client as unknown as CapturedDreamClient;
+		return mock(() => {});
+	});
+	__test.setPiSubagentRunnerFactory(
+		() =>
+			({
+				run: async (args: { tokenBudget: number }) => {
+					budgets.push(args.tokenBudget);
+					const spent = budgets.length === 1 ? 100_000 : 400_000;
+					return {
+						ok: budgets.length !== 1,
+						reason: "provider_error",
+						error: "fixture refusal",
+						assistantText: "<verify/>",
+						meta: {
+							tokenBudget: {
+								budget: args.tokenBudget,
+								spent,
+								finalizeFired: false,
+								hardStopped: false,
+								refusedCalls: 0,
+							},
+						},
+					};
+				},
+			}) as never,
+	);
+	registerPiDreamerProject(
+		dreamerOptions({ database: db, projectIdentity: "git:pi-batch-budget" }),
+	);
+	const client = requireCapturedClient(captured);
+	const child = (await client.session.create({
+		body: { title: "magic-context-dream-verify" },
+	})) as { id: string };
+	const observed: number[] = [];
+	const transport = createPromptAsyncTransport(client as never, child.id, {
+		tokenBudget: 500_000,
+		onBudgetUpdate: (s) => observed.push(s.spent),
+	});
+	expect(transport).toBeDefined();
+	if (!transport) throw new Error("missing synchronous transport");
+	const request = {
+		path: { id: child.id },
+		body: { parts: [{ text: "fixture" }] },
+	} as never;
+	await expect(transport(request)).rejects.toThrow("fixture refusal");
+	await transport(request);
+	await expect(transport(request)).rejects.toThrow("token_budget");
+	expect(budgets).toEqual([500_000, 400_000]);
+	expect(observed).toEqual([100_000, 500_000]);
+});
+
+test("Pi verify facade preserves complete verdicts before a budget interruption", async () => {
+	db = createDb();
+	let captured: CapturedDreamClient | null = null;
+	__test.setStartDreamScheduleTimerFactory(async (registration) => {
+		captured = registration.client as unknown as CapturedDreamClient;
+		return mock(() => {});
+	});
+	__test.setPiSubagentRunnerFactory(
+		() =>
+			({
+				run: async () => ({
+					ok: false,
+					reason: "token_budget",
+					meta: {
+						tokenBudget: { spent: 500_000 },
+						mappingMessages: [
+							{
+								role: "assistant",
+								content: [
+									{
+										type: "text",
+										text: '<verify><verified id="1" files="src/fact.ts"/>',
+									},
+								],
+							},
+						],
+					},
+				}),
+			}) as never,
+	);
+	registerPiDreamerProject(
+		dreamerOptions({ database: db, projectIdentity: "git:pi-verify-partial" }),
+	);
+	const client = requireCapturedClient(captured);
+	const child = (await client.session.create({
+		body: { title: "magic-context-dream-verify" },
+	})) as { id: string };
+	await expect(
+		client.session.prompt({
+			path: { id: child.id },
+			body: { parts: [{ text: "fixture" }] },
+		}),
+	).rejects.toThrow("token_budget");
+	expect(
+		JSON.stringify(await client.session.messages({ path: { id: child.id } })),
+	).toContain('<verify><verified id=\\"1\\"');
+});
+
+for (const task of ["verify", "verify-broad"] as const) {
+	for (const whitespace of [false, true]) {
+		test(`Pi ${task} host verifies runner text behind ${whitespace ? "whitespace-only" : "tool-only"} streamed messages`, async () => {
+			db = createDb();
+			const directory = createTestTempDirFromPath(
+				join(tmpdir(), "mc-pi-verify-separate-text-"),
+			);
+			const identity = `git:pi-${task}-${whitespace ? "whitespace" : "tools"}`;
+			mkdirSync(join(directory, "src"));
+			writeFileSync(
+				join(directory, "src/fact.ts"),
+				"export const backingFact = 1;\n",
+			);
+			const memory = insertMemory(db, {
+				projectPath: identity,
+				category: "ARCHITECTURE",
+				content: "backingFact is exported by src/fact.ts.",
+			});
+			recordMemoryVerifications(db, memory.id, ["src/fact.ts"], 1_000);
+			const text = `<verify><verified id="${memory.id}" files="src/fact.ts"/></verify>`;
+			let attempts = 0;
+			__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
+			__test.setPiSubagentRunnerFactory(
+				() =>
+					({
+						run: async () => {
+							attempts++;
+							return {
+								ok: true,
+								assistantText: text,
+								meta: {
+									mappingMessages: Array.from({ length: 8 }, (_, i) => ({
+										role: "assistant",
+										content: [
+											{
+												type: "toolCall",
+												id: `read-${i}`,
+												name: "read",
+												arguments: {},
+											},
+											...(whitespace ? [{ type: "text", text: " \n\t " }] : []),
+										],
+									})),
+								},
+							};
+						},
+					}) as never,
+			);
+			const opts = dreamerOptions({
+				database: db,
+				projectIdentity: identity,
+				projectDir: directory,
+			});
+			try {
+				registerPiDreamerProject(opts);
+				const result = await runPiDreamForProject(
+					identity,
+					task,
+					opts.registrationOwner,
+				);
+				expect(result.failed).toEqual([]);
+				expect(result.ran).toContain(task);
+				expect(attempts).toBe(1);
+				expect(
+					getMemoryVerifications(db, [memory.id]).get(memory.id)?.verifiedAt,
+				).toBeGreaterThan(1_000);
+			} finally {
+				unregisterPiDreamerProject(identity, opts.registrationOwner);
+				rmSync(directory, { recursive: true, force: true });
+			}
+		});
+	}
+}
+
+for (const task of ["verify", "map-memories"] as const)
+	test(`Pi ${task} never preserves a classified Zen free-tier refusal as output`, async () => {
+		db = createDb();
+		let captured: CapturedDreamClient | null = null;
+		__test.setStartDreamScheduleTimerFactory(async (registration) => {
+			captured = registration.client as unknown as CapturedDreamClient;
+			return mock(() => {});
+		});
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: async () => ({
+						ok: false,
+						reason: "provider_error",
+						error:
+							"FreeTierError: OpenCode's free tier can only be used from within OpenCode",
+						assistantText:
+							task === "map-memories"
+								? '<mappings><memory id="1" independent="true"/></mappings>'
+								: '<verify><verified id="1" files="src/fact.ts"/></verify>',
+						meta: {
+							failureClass: ZEN_FREE_TIER_FAILURE,
+							mappingMessages: [
+								{
+									role: "assistant",
+									content: [
+										{
+											type: "toolCall",
+											id: "refused-tool",
+											name: "read",
+											arguments: {},
+										},
+									],
+								},
+							],
+						},
+					}),
+				}) as never,
+		);
+		registerPiDreamerProject(
+			dreamerOptions({
+				database: db,
+				projectIdentity: `git:pi-${task}-free-tier`,
+			}),
+		);
+		const client = requireCapturedClient(captured);
+		const child = (await client.session.create({
+			body: { title: `magic-context-dream-${task}` },
+		})) as { id: string };
+		await expect(
+			client.session.prompt({
+				path: { id: child.id },
+				body: { parts: [{ text: "fixture" }] },
+			}),
+		).rejects.toThrow("FreeTierError");
+		expect(await client.session.messages({ path: { id: child.id } })).toEqual({
+			data: [],
+		});
+	});
+
+function mappingToolHistory(whitespace = false) {
+	return Array.from({ length: 8 }, (_, index) => ({
+		role: "assistant",
+		content: [
+			{
+				type: "toolCall",
+				id: `mapping-read-${index}`,
+				name: "read",
+				arguments: {},
+			},
+			...(whitespace ? [{ type: "text", text: " \n\t " }] : []),
+		],
+	}));
+}
+
+for (const whitespace of [false, true]) {
+	test(`Pi mapping host maps eight ${whitespace ? "whitespace-only" : "tool-only"} turns with separate runner text`, async () => {
+		db = createDb();
+		const identity = `git:pi-mapping-separate-${whitespace ? "whitespace" : "tools"}`;
+		const memory = insertMemory(db, {
+			projectPath: identity,
+			category: "ARCHITECTURE",
+			content: "A standalone fixture fact.",
+		});
+		const text = `<mappings><memory id="${memory.id}" independent="true"/></mappings>`;
+		let attempts = 0;
+		__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: async () => {
+						attempts++;
+						return {
+							ok: true,
+							assistantText: text,
+							meta: { mappingMessages: mappingToolHistory(whitespace) },
+						};
+					},
+				}) as never,
+		);
+		const opts = dreamerOptions({
+			database: db,
+			projectIdentity: identity,
+			projectDir: process.cwd(),
+		});
+		expect(getUnmappedMemoryIds(db, [memory.id])).toEqual([memory.id]);
+		registerPiDreamerProject(opts);
+		const result = await runPiDreamForProject(
+			identity,
+			"map-memories",
+			opts.registrationOwner,
+		);
+		expect(result.failed).toEqual([]);
+		expect(result.ran).toContain("map-memories");
+		expect(attempts).toBe(1);
+		expect(getUnmappedMemoryIds(db, [memory.id])).toEqual([]);
+		expect(
+			getMemoryVerifications(db, [memory.id]).get(memory.id)?.hasSentinel,
+		).toBe(true);
+	});
+}
+
+test("Pi mapping keeps meaningful streamed text ahead of separate runner text", async () => {
+	db = createDb();
+	let captured: CapturedDreamClient | null = null;
+	const streamedText =
+		'<mappings><memory id="1" independent="true"/></mappings>';
+	const runnerText = '<mappings><memory id="2" independent="true"/></mappings>';
+	const streamed = mappingToolHistory();
+	streamed[0].content.push({ type: "text", text: streamedText });
+	__test.setStartDreamScheduleTimerFactory(async (registration) => {
+		captured = registration.client as unknown as CapturedDreamClient;
+		return mock(() => {});
+	});
+	__test.setPiSubagentRunnerFactory(
+		() =>
+			({
+				run: async () => ({
+					ok: true,
+					assistantText: runnerText,
+					meta: { mappingMessages: streamed },
+				}),
+			}) as never,
+	);
+	registerPiDreamerProject(
+		dreamerOptions({
+			database: db,
+			projectIdentity: "git:pi-mapping-stream-priority",
+		}),
+	);
+	const client = requireCapturedClient(captured);
+	const child = (await client.session.create({
+		body: { title: "magic-context-dream-map-memories" },
+	})) as { id: string };
+	await client.session.prompt({
+		path: { id: child.id },
+		body: { parts: [{ text: "fixture" }] },
+	});
+	const messages = (
+		(await client.session.messages({ path: { id: child.id } })) as {
+			data: unknown[];
+		}
+	).data;
+	const text = messages
+		.map((message) => extractLatestAssistantText([message]) ?? "")
+		.join("\n");
+	expect(messages).toHaveLength(8);
+	expect(text.trim()).toBe(streamedText);
+	expect(text).not.toContain(runnerText);
 });

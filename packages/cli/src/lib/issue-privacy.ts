@@ -18,7 +18,7 @@ const COMPONENTS = new Set([
     "config",
 ]);
 const NUMERIC_FIELD =
-    /^(?:duration_?ms|elapsed_?ms|latency_?ms|timeout_?ms|retry|retries|attempt|count|total|success|failed|noop|tokens|input_?tokens|output_?tokens|prompt_?tokens|completion_?tokens|bytes|size_?kb|lines|turns|messages|compartments|pruned|kept)$/i;
+    /^(?:duration_?ms|elapsed_?ms|latency_?ms|timeout_?ms|retry|retries|attempt|count|total|success|failed|noop|tokens|input_?tokens|output_?tokens|prompt_?tokens|prompt_?length|completion_?tokens|bytes|size_?kb|lines|turns|messages|compartments|pruned|kept)$/i;
 const ENUMS = new Set([
     "true",
     "false",
@@ -37,6 +37,8 @@ const ENUMS = new Set([
     "warn",
     "error",
     "trace",
+    "validation",
+    "exception",
     "cli",
     "desktop",
     "darwin",
@@ -113,13 +115,50 @@ const SESSION_KEY = /session_?ids?$/i;
 const PROJECT_KEY = /^(?:project|project_?id|projectKey|rootCommit|root_commit|rootCommitHash)$/i;
 const VERSION_KEY = /(?:version|cached|latest|spec)$/i;
 const MODEL_KEY =
-    /^(?:model|models|provider|providerID|modelID|fallback_provider|fallback_model|fallback_models|model_chain)$/i;
+    /^(?:model|models|provider|providerID|modelID|fallback_provider|fallback_model|fallback_models|fallbackModel|fallbackModelId|model_chain)$/i;
 const VERSION = /^(?:(?:opencode|pi|omp)\s+)?v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/;
+const KNOWN_ERROR_CLASSES = new Set([
+    "Error",
+    "TypeError",
+    "SyntaxError",
+    "RangeError",
+    "ReferenceError",
+    "URIError",
+    "AggregateError",
+    "EvalError",
+    "AbortError",
+]);
+
+// Keep fixed template wording; omit inserted log text, while approved diagnostic
+// fields and aliases may remain.
+type SourceLogTemplate = { parts: readonly [string, ...string[]]; exact?: boolean };
+export const ISSUE_LOG_TEMPLATES: readonly SourceLogTemplate[] = [
+    { parts: ["historian prompt failed:"] },
+    { parts: ["historian: prompt attempt ", " failed:"] },
+    {
+        parts: [
+            "historian failure: source=",
+            ' reason="',
+            '" chunkRange=',
+            " fallbackModel=",
+            " twoPass=",
+        ],
+    },
+    { parts: ["historian post-publish step failed; publication stands:"] },
+    { parts: ["Historian failed while processing this session:"] },
+    { parts: ["Historian returned no assistant output."], exact: true },
+    { parts: ["mc-module: store open failed:"] },
+    { parts: ["mc-module: historian firing failed for ", ":"] },
+];
+
+const LOG_PATH = /(?:[A-Za-z]:[\\/]|~\/|\/)[^\s,;) '\x22]+/g;
+const LOG_ID =
+    /\b(?:ses_[A-Za-z0-9_-]+|msg_[A-Za-z0-9_-]+|git:[a-f0-9]{16,64}|pj-[A-Za-z0-9_-]+|dir:[^\s,;) '\x22]+)/gi;
 
 /** Each IssuePrivacy instance assigns aliases for one public report and its full-size copy. */
 export class IssuePrivacy {
     readonly notice =
-        "_Paths and IDs use per-report aliases. Free text, private package names, and source/tool content are omitted; add reproduction steps directly to the issue after reviewing it._";
+        "_Paths and IDs in diagnostic data use per-report aliases. Session titles, private package names, free-text log values, and source/tool content are omitted; fixed Magic Context diagnostic wording and safe diagnostic fields remain. Your issue title and description are shown unchanged._";
     private readonly projects = new Map<string, string>();
     private readonly sessions = new Map<string, string>();
     private readonly paths = new Map<string, string>();
@@ -196,9 +235,17 @@ export class IssuePrivacy {
         const safe = sanitizeDiagnosticText(value);
         const errors = [
             ...new Set(
-                safe.match(
-                    /\b(?:[A-Z][A-Za-z]*Error|Error|SQLITE_[A-Z_]+|EACCES|EPERM|ENOENT|ENOSPC|ECONNRESET|ETIMEDOUT|MC-H[A-Z0-9-]+)\b/g,
-                ) ?? [],
+                (
+                    safe.match(
+                        /\b(?:[A-Z][A-Za-z]*Error|SQLITE_[A-Z_]+|EACCES|EPERM|ENOENT|ENOSPC|ECONNRESET|ETIMEDOUT|MC-H[A-Z0-9-]+)\b/g,
+                    ) ?? []
+                ).filter(
+                    (token) =>
+                        KNOWN_ERROR_CLASSES.has(token) ||
+                        /^(?:SQLITE_[A-Z_]+|EACCES|EPERM|ENOENT|ENOSPC|ECONNRESET|ETIMEDOUT|MC-H[A-Z0-9-]+)$/.test(
+                            token,
+                        ),
+                ),
             ),
         ];
         if (/generation mismatch/i.test(safe)) errors.push("store generation mismatch");
@@ -209,10 +256,7 @@ export class IssuePrivacy {
     }
 
     userText(value: string): string {
-        return value === "Magic Context diagnostic report" ||
-            value === "Generated non-interactively by `doctor --issue --report`."
-            ? value
-            : OMITTED;
+        return value;
     }
 
     logLine(line: string): string {
@@ -223,25 +267,81 @@ export class IssuePrivacy {
             [...COMPONENTS].find((name) => new RegExp(`\\b${name}\\b`).test(parsed?.message ?? ""));
         const logger = component ? `magic-context.${component}` : "magic-context";
         const session = parsed?.session ? ` [${this.session(parsed.session)}]` : "";
-        const fields = Object.entries(parsed?.kv ?? {})
-            .filter(([key, value]) => NUMERIC_FIELD.test(key) && /^\d+(?:\.\d+)?$/.test(value))
-            .map(([key, value]) => `${key}=${value}`);
+        const fields = Object.entries(parsed?.kv ?? {}).flatMap(([key, value]) => {
+            if (NUMERIC_FIELD.test(key) && /^\d+(?:\.\d+)?$/.test(value))
+                return [`${key}=${value}`];
+            if (SESSION_KEY.test(key)) return [`${key}=${this.session(value)}`];
+            if (PROJECT_KEY.test(key)) return [`${key}=${this.project(value)}`];
+            if (PATH_KEY.test(key)) return [`${key}=${this.path(value)}`];
+            if (VERSION_KEY.test(key) && VERSION.test(value)) return [`${key}=${value}`];
+            if (
+                MODEL_KEY.test(key) &&
+                /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value) &&
+                !value.includes("..") &&
+                !/^(?:git:|dir:|pj-)/.test(value)
+            )
+                return [`${key}=${value}`];
+            if (key === "chunkRange" && /^\d+-\d+$/.test(value)) return [`${key}=${value}`];
+            if (key === "source" && ENUMS.has(value)) return [`${key}=${value}`];
+            if (/^(?:enabled|disabled|twoPass)$/i.test(key) && ENUMS.has(value))
+                return [`${key}=${value}`];
+            return [];
+        });
         // Legacy telemetry often writes timings in prose rather than structured fields.
         const timings = safe.match(/\b\d+(?:\.\d+)?(?:ms|µs|us|s)\b/g) ?? [];
-        const identities = [
-            ...safe.matchAll(/\b(?:git:[a-f0-9]{16,64}|pj-[A-Za-z0-9_-]+|dir:[^\s"']+)/g),
-        ].map(([id]) => this.project(id));
+        // The parser removes quotes from reason fields; restore the source template's delimiters.
+        const message = parsed
+            ? [
+                  parsed.message,
+                  ...Object.entries(parsed.kv).map(
+                      ([key, value]) => `${key}=${key === "reason" ? `"${value}"` : value}`,
+                  ),
+              ]
+                  .filter(Boolean)
+                  .join(" ")
+            : line;
+        const identities = [...message.matchAll(LOG_ID)].map(([id]) => {
+            if (id.startsWith("ses_") || id.startsWith("msg_")) return this.session(id);
+            if (id.startsWith("dir:")) return this.path(id.slice(4));
+            return this.project(id);
+        });
+        const paths = [...message.matchAll(LOG_PATH)].map(([path]) => this.path(path));
         return [
             parsed?.ts && /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(parsed.ts) ? parsed.ts : "",
             parsed?.level ?? line.match(/^(TRACE|DEBUG|INFO|WARN|ERROR)\b/)?.[1] ?? "LOG",
             `${logger}${session}`,
-            this.summary(line),
+            this.logMessage(message),
             ...fields,
             ...timings,
             ...identities,
+            ...paths,
         ]
             .filter(Boolean)
             .join(" ");
+    }
+
+    private logMessage(value: string): string {
+        for (const template of ISSUE_LOG_TEMPLATES) {
+            if (template.exact && value === template.parts[0]) return template.parts[0];
+            if (!value.startsWith(template.parts[0])) continue;
+
+            let cursor = template.parts[0].length;
+            let rendered = template.parts[0];
+            let matched = true;
+            for (const part of template.parts.slice(1)) {
+                const next = value.indexOf(part, cursor);
+                if (next < 0) {
+                    matched = false;
+                    break;
+                }
+                rendered += `${OMITTED}${part}`;
+                cursor = next + part.length;
+            }
+            if (!matched) continue;
+            if (cursor < value.length) rendered += ` ${OMITTED}`;
+            return rendered;
+        }
+        return this.summary(value);
     }
 
     healthMessage(value: string): string {
@@ -312,11 +412,13 @@ export class IssuePrivacy {
         if (typeof value !== "string") return value;
         const safe = sanitizeDiagnosticText(value);
         if (/^<[^<>]*REDACTED[^<>]*>$/.test(safe)) return safe as T;
+        if (/^title$/i.test(key)) return OMITTED as T;
         if (SESSION_KEY.test(key)) return this.session(value) as T;
         if (PROJECT_KEY.test(key) || /^(?:git:[a-f0-9]{16,64}|pj-)/.test(value))
             return this.project(value) as T;
         if (PATH_KEY.test(key) || /^(?:~\/|\/|[A-Za-z]:[\\/]|file:)/.test(value))
             return this.path(value) as T;
+        if (key === "$schema" && /^https?:\/\/[^\s]+$/i.test(value)) return safe as T;
         if (VERSION_KEY.test(key) && VERSION.test(value)) return value as T;
         if (
             /^(?:timestamp|lastActiveAt|lastFailureAt|lastRunAt|lastUpdatedAt)$/.test(key) &&

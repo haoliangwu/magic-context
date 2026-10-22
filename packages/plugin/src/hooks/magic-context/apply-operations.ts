@@ -13,6 +13,7 @@ import type { PendingOp, TagEntry } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import type { DroppedTokenReduction } from "./dropped-token-estimate";
+import { capturePendingDropEligibility, pendingDropVeto } from "./pending-drop-eligibility";
 import type { TagTarget } from "./tag-messages";
 import type { ToolDropResult } from "./tool-drop-target";
 import { SKELETON_REAL_INPUT_MAX_BYTES } from "./tool-input-size";
@@ -92,38 +93,58 @@ export function applyNewToolDrop(
         persist?: (mode: NewToolDropOutcome["mode"]) => void;
     },
 ): NewToolDropOutcome {
+    const plan = planNewToolDrop(target, options, !!options.persist);
+    if (!plan) return { result: "incomplete", mode: "full" };
+    options.persist?.(plan.mode);
+    return plan.apply();
+}
+
+/** Choose the frozen replay mode without editing bytes or the live removal batch. */
+function planNewToolDrop(
+    target: TagTarget | undefined,
+    options: { inWindow: boolean; keepSkeleton?: boolean },
+    prepare: boolean,
+    plannedRemovals?: ReadonlySet<unknown>,
+): { mode: NewToolDropOutcome["mode"]; apply: () => NewToolDropOutcome } | undefined {
     // Automatic cleanup protects user answers, but an explicit ctx_reduce can
     // still drop them. Check for a completed result before persisting the drop,
     // not whether automatic cleanup is allowed to select it.
-    if (options.persist && (target?.prepareDrop?.() ?? target?.canDrop?.()) === false) {
-        return { result: "incomplete", mode: "full" };
+    if (prepare && (target?.prepareDrop?.() ?? target?.canDrop?.()) === false) {
+        return undefined;
     }
     if (!target) {
-        options.persist?.("full");
-        return { result: "absent", mode: "full" };
+        return { mode: "full", apply: () => ({ result: "absent", mode: "full" }) };
     }
     if (
         (options.inWindow && hasSmallToolInput(target)) ||
         options.keepSkeleton === true ||
         target.cannotRemove?.() === true ||
-        target.wouldStrandConversationEnd?.() === true
+        target.wouldStrandConversationEnd?.(plannedRemovals) === true
     ) {
         const strip = target.hasAttachments?.() === true;
-        options.persist?.(strip ? "skeleton_stripped" : "skeleton_real");
+        const mode = strip ? "skeleton_stripped" : "skeleton_real";
         return {
-            result: (strip ? target.skeletonStripped?.() : target.skeletonReal?.()) ?? "absent",
-            mode: strip ? "skeleton_stripped" : "skeleton_real",
+            mode,
+            apply: () => ({
+                result: (strip ? target.skeletonStripped?.() : target.skeletonReal?.()) ?? "absent",
+                mode,
+            }),
         };
     }
-    options.persist?.("full");
-    const result = target.drop?.() ?? "absent";
-    // A result at the end of the request cannot be removed without leaving a
-    // dangling call. When drop() keeps that call as a skeleton, strip its media
-    // and persist the choice; older skeleton modes still replay their media.
-    if (result === "truncated" && target.hasAttachments?.() === true) {
-        return { result: target.skeletonStripped?.() ?? "absent", mode: "skeleton_stripped" };
-    }
-    return { result, mode: result === "truncated" ? "skeleton_real" : "full" };
+    return {
+        mode: "full",
+        apply: () => {
+            const result = target.drop?.() ?? "absent";
+            // Older adapters may report that drop() must keep a call as a skeleton only when drop() runs.
+            if (result === "truncated" && target.hasAttachments?.() === true) {
+                return {
+                    result: target.skeletonStripped?.() ?? "absent",
+                    mode: "skeleton_stripped",
+                };
+            }
+            return { result, mode: result === "truncated" ? "skeleton_real" : "full" };
+        },
+    };
 }
 
 /** Persist one drop atomically before applying it; earlier drops survive a later write failure. */
@@ -355,6 +376,10 @@ export interface PendingOperationBatchDiagnostics {
     reasons: Record<string, number>;
 }
 
+// Native Pi authorization can merge a replay document for every selected call.
+// Cap operations per transaction to limit time holding the writer lock.
+const PENDING_OPERATION_CHUNK_SIZE = 64;
+
 export function applyPendingOperations(
     sessionId: string,
     db: ContextDatabase,
@@ -381,6 +406,8 @@ export function applyPendingOperations(
     onTagReduced?: (reduction: DroppedTokenReduction) => void,
     /** Reports why selected operations did or did not change the visible payload. */
     onBatchComplete?: (diagnostics: PendingOperationBatchDiagnostics) => void,
+    /** Supplies a read-only apply view for a later historian trigger. */
+    onEligibilitySnapshot?: (eligible: ReadonlySet<number>) => void,
 ): boolean {
     let didMutateMessage = false;
     let diagnostics: PendingOperationBatchDiagnostics | undefined;
@@ -389,218 +416,257 @@ export function applyPendingOperations(
         diagnostics.reasons[reason] = (diagnostics.reasons[reason] ?? 0) + 1;
     };
     let admitted = false;
-    try {
-        db.transaction(() => {
-            admitted = true;
-        }).immediate();
-        {
-            const pendingOps = preloadedPendingOps ?? getPendingOps(db, sessionId);
-            // Load only the rows this batch reads: the operations' own tags. A
-            // full getTagsBySession load (every tag the session ever had, about
-            // 100k rows on a long session) ran here while this transaction held
-            // the writer lock and cost over a second per call.
-            const tags =
-                preloadedTags ??
-                getTagsByNumbers(db, sessionId, [
-                    ...new Set([
-                        ...pendingOps.map((op) => op.tagId),
-                        ...syntheticPendingOps.map((op) => op.tagId),
-                    ]),
-                ]);
-            const tagById = new Map(tags.map((tag) => [tag.tagNumber, tag] as const));
-            const tagStatusById = new Map(tags.map((tag) => [tag.tagNumber, tag.status] as const));
-            const tagTypeById = new Map(tags.map((tag) => [tag.tagNumber, tag.type] as const));
-            const opsToApply: Array<{ op: PendingOp; synthetic: boolean }> = [
-                ...pendingOps.map((op) => ({ op, synthetic: false })),
-                ...syntheticPendingOps.map((op) => ({ op, synthetic: true })),
-            ];
-            diagnostics = {
-                source:
-                    pendingOps.length > 0 && syntheticPendingOps.length > 0
-                        ? "mixed"
-                        : syntheticPendingOps.length > 0
-                          ? "synthetic"
-                          : "pending",
-                total: opsToApply.length,
-                mutated: 0,
-                persistedWithoutMutation: 0,
-                reasons: {},
-            };
-
-            // Newest-K tool calls at THIS moment — the skeleton window. Computed
-            // once per apply pass over all tool tags (any status: the window
-            // reflects conversation recency, not droppability). Preloaded tags
-            // carry the window rows (getTagsForPendingOperations); otherwise an
-            // index walk reads just those K tag numbers.
-            const skeletonWindow = new Set(
-                preloadedTags
-                    ? tags
-                          .filter((tag) => tag.type === "tool")
-                          .map((tag) => tag.tagNumber)
-                          .sort((left, right) => right - left)
-                          .slice(0, RECENT_TOOL_SKELETON_WINDOW)
-                    : getNewestToolTagNumbers(db, sessionId, RECENT_TOOL_SKELETON_WINDOW),
-            );
-
-            for (const { op: pendingOp, synthetic } of opsToApply) {
-                let operationMutated = false;
-                const tagStatus = tagStatusById.get(pendingOp.tagId);
-                if (tagStatus === "compacted" || tagStatus === "dropped") {
-                    reject("already_reduced");
-                    if (!synthetic) removePendingOp(db, sessionId, pendingOp.tagId);
-                    continue;
+    let startedAt = 0;
+    const mutations: Array<() => void> = [];
+    let drainChunk: (() => void) | undefined;
+    let hasMore = false;
+    do {
+        admitted = false;
+        startedAt = 0;
+        try {
+            db.transaction(() => {
+                admitted = true;
+                startedAt = performance.now();
+                if (drainChunk) {
+                    drainChunk();
+                    return;
                 }
+                const pendingOps = preloadedPendingOps ?? getPendingOps(db, sessionId);
+                onEligibilitySnapshot?.(capturePendingDropEligibility(targets, protectedTagIds));
+                // Load only the rows this batch reads: the operations' own tags. A
+                // full getTagsBySession load would hold the writer lock while reading
+                // every tag the session ever had, not just this pass's operations.
+                const tags =
+                    preloadedTags ??
+                    getTagsByNumbers(db, sessionId, [
+                        ...new Set([
+                            ...pendingOps.map((op) => op.tagId),
+                            ...syntheticPendingOps.map((op) => op.tagId),
+                        ]),
+                    ]);
+                const tagById = new Map(tags.map((tag) => [tag.tagNumber, tag] as const));
+                const tagStatusById = new Map(
+                    tags.map((tag) => [tag.tagNumber, tag.status] as const),
+                );
+                const tagTypeById = new Map(tags.map((tag) => [tag.tagNumber, tag.type] as const));
+                const opsToApply: Array<{ op: PendingOp; synthetic: boolean }> = [
+                    ...pendingOps.map((op) => ({ op, synthetic: false })),
+                    ...syntheticPendingOps.map((op) => ({ op, synthetic: true })),
+                ];
+                diagnostics = {
+                    source:
+                        pendingOps.length > 0 && syntheticPendingOps.length > 0
+                            ? "mixed"
+                            : syntheticPendingOps.length > 0
+                              ? "synthetic"
+                              : "pending",
+                    total: opsToApply.length,
+                    mutated: 0,
+                    persistedWithoutMutation: 0,
+                    reasons: {},
+                };
 
-                if (protectedTagIds.has(pendingOp.tagId)) {
-                    reject("protected");
-                    continue;
-                }
+                // Newest-K tool calls at THIS moment — the skeleton window. Computed
+                // once per apply pass over all tool tags (any status: the window
+                // reflects conversation recency, not droppability). Preloaded tags
+                // carry the window rows (getTagsForPendingOperations); otherwise an
+                // index walk reads just those K tag numbers.
+                const skeletonWindow = new Set(
+                    preloadedTags
+                        ? tags
+                              .filter((tag) => tag.type === "tool")
+                              .map((tag) => tag.tagNumber)
+                              .sort((left, right) => right - left)
+                              .slice(0, RECENT_TOOL_SKELETON_WINDOW)
+                        : getNewestToolTagNumbers(db, sessionId, RECENT_TOOL_SKELETON_WINDOW),
+                );
 
-                const target = targets.get(pendingOp.tagId);
-                if (target?.thinkingDropProtected) {
-                    reject("active_thinking");
-                    continue;
-                }
-                const isToolTag = tagTypeById.get(pendingOp.tagId) === "tool";
+                // Planned removals let later calls preserve the request's final tool
+                // result just as sequential drops would, without editing bytes before COMMIT.
+                const plannedRemovals = new Set<unknown>();
+                const removedTagIds = new Set<number>();
+                const record = (mutated: boolean): void => {
+                    if (!diagnostics) return;
+                    if (mutated) {
+                        didMutateMessage = true;
+                        diagnostics.mutated += 1;
+                    } else diagnostics.persistedWithoutMutation += 1;
+                };
+                let cursor = 0;
+                drainChunk = () => {
+                    const chunk = opsToApply.slice(cursor, cursor + PENDING_OPERATION_CHUNK_SIZE);
+                    cursor += chunk.length;
+                    hasMore = cursor < opsToApply.length;
+                    for (const { op: pendingOp, synthetic } of chunk) {
+                        const tagStatus = tagStatusById.get(pendingOp.tagId);
+                        if (tagStatus === "compacted" || tagStatus === "dropped") {
+                            reject("already_reduced");
+                            if (!synthetic) removePendingOp(db, sessionId, pendingOp.tagId);
+                            continue;
+                        }
+                        if (removedTagIds.has(pendingOp.tagId)) {
+                            reject("drop_incomplete");
+                            continue;
+                        }
 
-                if (synthetic) {
-                    // Synthetic two-pass reclaim must never persist a DB-only drop for
-                    // a tag that is absent/incomplete on this pass's visible wire. It
-                    // only rides an already-mutating pass when the target can actually
-                    // reclaim bytes right now; real pending ops keep their legacy
-                    // absent persistence semantics for user-requested ctx_reduce.
-                    if (!isToolTag) {
-                        reject("synthetic_non_tool");
-                        continue;
-                    }
-                    if (target?.canDrop?.() !== true) {
-                        reject("synthetic_target_not_droppable");
-                        continue;
-                    }
-                }
+                        const target = targets.get(pendingOp.tagId);
+                        const veto = pendingDropVeto(pendingOp.tagId, target, protectedTagIds);
+                        if (veto) {
+                            reject(veto);
+                            continue;
+                        }
+                        const isToolTag = tagTypeById.get(pendingOp.tagId) === "tool";
 
-                const persistDrop = (mode?: TagEntry["dropMode"]): void => {
-                    let startedAt = 0;
-                    try {
-                        db.transaction(() => {
-                            startedAt = performance.now();
+                        if (synthetic) {
+                            // Synthetic reclaim persists only when a visible tool target can
+                            // reclaim bytes. User-requested ctx_reduce may instead persist a
+                            // drop for a target absent from this pass's messages.
+                            if (!isToolTag) {
+                                reject("synthetic_non_tool");
+                                continue;
+                            }
+                            if (target?.canDrop?.() !== true) {
+                                reject("synthetic_target_not_droppable");
+                                continue;
+                            }
+                        }
+
+                        const persistDrop = (mode?: TagEntry["dropMode"]): void => {
                             markTagDropped(db, sessionId, pendingOp.tagId, mode);
                             if (!synthetic) removePendingOp(db, sessionId, pendingOp.tagId);
-                        }).immediate();
-                    } finally {
-                        if (startedAt)
-                            logSlowWriteTransaction("apply_pending_operation", startedAt);
+                        };
+                        if (isToolTag) {
+                            if (editMarkerTagIds.has(pendingOp.tagId)) {
+                                // Superseded edit/write: compress to a filePath-preserving
+                                // marker even when the tag is inside the recent skeleton
+                                // window. Freeze the chosen render mode for later replay.
+                                const strip = target?.hasAttachments?.() === true;
+                                if (
+                                    target?.canDrop?.() === false ||
+                                    target?.prepareDrop?.() === false ||
+                                    !target
+                                ) {
+                                    reject("edit_marker_incomplete");
+                                    continue;
+                                }
+                                persistDrop(strip ? "edit_marker_stripped" : "edit_marker");
+                                mutations.push(() => {
+                                    const markResult =
+                                        (strip
+                                            ? target?.editMarkerStripped?.()
+                                            : target?.editMarker?.()) ?? "absent";
+                                    if (markResult === "incomplete" || markResult === "absent") {
+                                        reject(`edit_marker_${markResult}`);
+                                        return;
+                                    }
+                                    record(true);
+                                    onTagReduced?.({
+                                        tagNumber: pendingOp.tagId,
+                                        mode: "edit_marker",
+                                    });
+                                });
+                            } else {
+                                // Real-or-absent: a small input inside the newest-call
+                                // window keeps its real arguments; everything else is
+                                // removed, except a call whose removal would leave the request
+                                // ending on an assistant turn. Persist the mode
+                                // applied so replays match this pass.
+                                const plan = planNewToolDrop(
+                                    target,
+                                    { inWindow: skeletonWindow.has(pendingOp.tagId) },
+                                    true,
+                                    plannedRemovals,
+                                );
+                                if (!plan) {
+                                    reject("drop_incomplete");
+                                    continue;
+                                }
+                                persistDrop(plan.mode);
+                                if (plan.mode === "full" && target?.drop) {
+                                    target.notePlannedRemoval?.(plannedRemovals);
+                                    removedTagIds.add(pendingOp.tagId);
+                                }
+                                mutations.push(() => {
+                                    const { result: dropResult, mode: appliedMode } = plan.apply();
+                                    if (
+                                        dropResult === "incomplete" ||
+                                        (synthetic &&
+                                            dropResult !== "removed" &&
+                                            dropResult !== "truncated")
+                                    ) {
+                                        reject(`drop_${dropResult}`);
+                                        return;
+                                    }
+                                    if (dropResult === "removed" || dropResult === "truncated") {
+                                        record(true);
+                                        onTagReduced?.({
+                                            tagNumber: pendingOp.tagId,
+                                            mode: appliedMode === "full" ? "full" : "truncated",
+                                        });
+                                    } else {
+                                        reject(`drop_${dropResult}`);
+                                        record(false);
+                                    }
+                                });
+                            }
+                        } else if (target) {
+                            const replacement = buildReplacementContent(pendingOp.tagId);
+                            persistDrop();
+                            mutations.push(() => {
+                                const priorContent = target.getContent?.();
+                                const changed = target.setContent(replacement);
+                                record(changed);
+                                if (changed) {
+                                    const originalCharacters =
+                                        typeof priorContent === "string"
+                                            ? priorContent.length
+                                            : (tagById.get(pendingOp.tagId)?.byteSize ??
+                                              replacement.length);
+                                    onTagReduced?.({
+                                        tagNumber: pendingOp.tagId,
+                                        mode: "partial",
+                                        removedCharacters: Math.max(
+                                            0,
+                                            originalCharacters - replacement.length,
+                                        ),
+                                    });
+                                } else {
+                                    reject("content_unchanged");
+                                }
+                            });
+                        } else if (!synthetic) {
+                            reject("target_absent");
+                            persistDrop();
+                            mutations.push(() => record(false));
+                        }
                     }
                 };
-                let shouldPersistDrop = false;
-                if (isToolTag) {
-                    if (editMarkerTagIds.has(pendingOp.tagId)) {
-                        // Superseded edit/write: compress to a filePath-preserving
-                        // marker even when the tag is inside the recent skeleton
-                        // window. Freeze the chosen render mode for later replay.
-                        const strip = target?.hasAttachments?.() === true;
-                        if (
-                            target?.canDrop?.() === false ||
-                            target?.prepareDrop?.() === false ||
-                            !target
-                        ) {
-                            reject("edit_marker_incomplete");
-                            continue;
-                        }
-                        persistDrop(strip ? "edit_marker_stripped" : "edit_marker");
-                        const markResult =
-                            (strip ? target?.editMarkerStripped?.() : target?.editMarker?.()) ??
-                            "absent";
-                        if (markResult === "incomplete" || markResult === "absent") {
-                            reject(`edit_marker_${markResult}`);
-                            continue;
-                        }
-                        didMutateMessage = true;
-                        operationMutated = true;
-                        onTagReduced?.({ tagNumber: pendingOp.tagId, mode: "edit_marker" });
-                        shouldPersistDrop = true;
-                    } else {
-                        // Real-or-absent: a small input inside the newest-call
-                        // window keeps its real arguments; everything else is
-                        // removed, except the call whose result ends the request
-                        // (drop() keeps it with real arguments). Persist the mode
-                        // applied so replays match this pass.
-                        const { result: dropResult, mode: appliedMode } = applyNewToolDrop(target, {
-                            inWindow: skeletonWindow.has(pendingOp.tagId),
-                            persist: persistDrop,
-                        });
-                        if (
-                            dropResult === "incomplete" ||
-                            (synthetic && dropResult !== "removed" && dropResult !== "truncated")
-                        ) {
-                            reject(`drop_${dropResult}`);
-                            continue;
-                        }
-                        if (dropResult === "removed" || dropResult === "truncated") {
-                            didMutateMessage = true;
-                            operationMutated = true;
-                            onTagReduced?.({
-                                tagNumber: pendingOp.tagId,
-                                mode: appliedMode === "full" ? "full" : "truncated",
-                            });
-                        } else {
-                            reject(`drop_${dropResult}`);
-                        }
-                        shouldPersistDrop = true;
-                    }
-                } else if (target) {
-                    const replacement = buildReplacementContent(pendingOp.tagId);
-                    const priorContent = target.getContent?.();
-                    persistDrop();
-                    const changed = target.setContent(replacement);
-                    if (changed) {
-                        didMutateMessage = true;
-                        operationMutated = true;
-                        const originalCharacters =
-                            typeof priorContent === "string"
-                                ? priorContent.length
-                                : (tagById.get(pendingOp.tagId)?.byteSize ?? replacement.length);
-                        onTagReduced?.({
-                            tagNumber: pendingOp.tagId,
-                            mode: "partial",
-                            removedCharacters: Math.max(0, originalCharacters - replacement.length),
-                        });
-                    } else {
-                        reject("content_unchanged");
-                    }
-                    shouldPersistDrop = true;
-                } else if (!synthetic) {
-                    reject("target_absent");
-                    persistDrop();
-                    shouldPersistDrop = true;
-                }
-
-                if (!shouldPersistDrop) {
-                    reject("not_persisted");
-                    continue;
-                }
-                if (operationMutated) diagnostics.mutated += 1;
-                else diagnostics.persistedWithoutMutation += 1;
+                drainChunk();
+            }).immediate();
+        } catch (error) {
+            // Acquire the writer before reading tags or changing wire bytes. A WAL
+            // read-to-write upgrade cannot wait under busy_timeout. Failed admission
+            // cannot change bytes or queue entries belonging to the unstarted chunk.
+            if (
+                !admitted &&
+                /database (?:table )?is locked|sqlite_(busy|locked)/i.test(String(error))
+            ) {
+                sessionLog(
+                    sessionId,
+                    "pending operations write admission busy; retaining remaining operations for retry",
+                );
+                hasMore = false;
+            } else {
+                // If a chunk's transaction fails, none of its message mutations run.
+                // Earlier chunks remain committed; a later pass replays their stored
+                // drop modes on newly built targets.
+                throw error;
             }
+        } finally {
+            if (startedAt) logSlowWriteTransaction("apply_pending_operations", startedAt);
         }
-    } catch (error) {
-        // Acquire the writer before reading tags or changing wire bytes. A WAL
-        // read-to-write upgrade cannot wait under busy_timeout. Failed admission
-        // leaves both the pending queue and this pass's representation untouched.
-        if (
-            !admitted &&
-            /database (?:table )?is locked|sqlite_(busy|locked)/i.test(String(error))
-        ) {
-            sessionLog(
-                sessionId,
-                "pending operations write admission busy; retaining prior bytes for retry",
-            );
-            return false;
-        }
-        // Earlier operations are already durable; stop before applying the failed
-        // operation or inspecting later operations. The next admitted pass retries.
-        throw error;
-    }
+        for (const mutate of mutations.splice(0)) mutate();
+    } while (hasMore);
     if (diagnostics) {
         onBatchComplete?.(diagnostics);
         if (diagnostics.total > 0 && diagnostics.mutated === 0) {

@@ -486,7 +486,9 @@ Each hidden agent (historian and dreamer) uses the `model` you configure for it.
 For OMP, harness selection is whole-block precedence: `historian.omp ?? historian.pi` and `dreamer.omp ?? dreamer.pi` (including task overrides). An explicit OMP block is authoritative even if it omits a model; only an absent block falls back to Pi. Within the selected block, if the configured primary fails (auth, transient, or returns unusable output), the fallback order is:
 
 1. Your explicit `fallback_models` for that agent, in order.
-2. **Historian only:** your active session model, as a last resort (a model you're already using). The dreamer uses only its configured `fallback_models`.
+2. Report failure when those attempts are exhausted. A configured historian never adds the active session model, on any host, including automatic summarization, `/ctx-wrapup`, `/ctx-recomp`, and compression/staging passes.
+
+With no historian model in the selected harness block, OpenCode inherits the session model; Pi and OMP do not summarize. A non-empty string or object `model` entry configures the historian; metadata and schema defaults do not. `historian.disable: true` stops it on every host.
 
 If you set no `fallback_models`, a failing primary simply retries — it never jumps to an unconfigured model. Set `fallback_models` to add alternates of your own (each `"provider/model-id"`).
 

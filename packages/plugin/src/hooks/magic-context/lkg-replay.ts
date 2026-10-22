@@ -1,4 +1,5 @@
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
+import { isCoveredInstructionRow } from "./host-served-rows";
 import { claimLkgRequestIdentity, noteCapturedLkgRequest } from "./lkg-measured-request";
 import {
     captureSlot,
@@ -285,6 +286,9 @@ function outputMessageIsPostAnchor(
         }
         return false;
     }
+    // A covered OpenCode 2 instruction row put back by postprocess has no id but
+    // always comes before every retained row, so it belongs to the saved prefix.
+    if (isCoveredInstructionRow(message.info)) return false;
     if (!isSyntheticOutput(message)) return null;
     const linked = ["sourceMessageId", "ownerMessageId", "anchorMessageId"]
         .map((key) => recordValue(message.info, key))

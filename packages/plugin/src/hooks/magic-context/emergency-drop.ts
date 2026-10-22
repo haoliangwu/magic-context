@@ -224,16 +224,18 @@ export function planEmergencyDrop(input: {
     const workingSpan = Math.max(ceilingTokens - fixedFloor, 0);
     const target = fixedFloor + TARGET_FRACTION * workingSpan;
     const reclaimTokens = Math.round(currentTotalInputTokens - target);
-    // When the fixed floor alone is already above the ceiling, dropping tool
-    // outputs cannot bring the request under it; say so in every reason.
-    const floorNote =
-        fixedFloor > ceilingTokens
-            ? `; fixed floor ≈${Math.round(fixedFloor)} already exceeds ceiling ${Math.round(ceilingTokens)}: tool drops cannot reach the target`
-            : "";
+    // Tool drops cannot repair oversized fixed overhead. Preserve the working
+    // results and leave admission to the overflow/refusal path, even on a pass
+    // whose cache rewrite is already priced by another mutation.
+    if (fixedFloor > ceilingTokens) {
+        return noop(
+            `fixed floor ≈${Math.round(fixedFloor)} already exceeds ceiling ${Math.round(ceilingTokens)}: tool drops cannot reach the target`,
+        );
+    }
 
     // Already at/under target, or reclaim too small to justify a cache bust.
     if (reclaimTokens <= EMERGENCY_REARM_MIN_TOKENS) {
-        return noop(`reclaim<=min (${reclaimTokens} <= ${EMERGENCY_REARM_MIN_TOKENS})${floorNote}`);
+        return noop(`reclaim<=min (${reclaimTokens} <= ${EMERGENCY_REARM_MIN_TOKENS})`);
     }
 
     // Union projection form: exact tag-number cutoff directly.
@@ -313,14 +315,14 @@ export function planEmergencyDrop(input: {
     if (selected.length === 0) {
         // No cache rewrite occurred; the caller leaves the episode armed so
         // later completed outputs can form a batch.
-        return noop(`no-candidates${floorNote}`);
+        return noop("no-candidates");
     }
 
     // Price the selection before committing it. Skipping leaves the episode
     // armed, so the candidates can still ride a later rewrite.
     if (!input.passAlreadyPriced && reclaimed < EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS) {
         return noop(
-            `achievable reclaim below minimum (${selected.length} tags, reclaim≈${Math.round(reclaimed)} < ${EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS} against gap ${reclaimTokens})${floorNote}`,
+            `achievable reclaim below minimum (${selected.length} tags, reclaim≈${Math.round(reclaimed)} < ${EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS} against gap ${reclaimTokens})`,
         );
     }
 
@@ -328,7 +330,7 @@ export function planEmergencyDrop(input: {
         shouldDrop: true,
         tagNumbers: selected,
         reclaimTokens,
-        reason: `tiered drop: ${selected.length} tags, reclaim≈${reclaimed}/${reclaimTokens} tokens (floor≈${fixedFloor}, ceiling=${Math.round(ceilingTokens)})${floorNote}`,
+        reason: `tiered drop: ${selected.length} tags, reclaim≈${reclaimed}/${reclaimTokens} tokens (floor≈${fixedFloor}, ceiling=${Math.round(ceilingTokens)})`,
     };
 }
 

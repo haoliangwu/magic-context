@@ -27,9 +27,16 @@ import {
     formatProjectedPostDropPercentage,
     type InMemoryTailSource,
 } from "./compartment-trigger";
+import { projectLkgEntry } from "./lkg-replay";
+import {
+    capturePendingDropEligibility,
+    createPendingDropEligibilityCache,
+    pendingDropEligibilityKey,
+} from "./pending-drop-eligibility";
 import { resolveOpenCodeProtectedTailBoundary } from "./protected-tail-boundary";
 import { withRawMessageProvider } from "./read-session-chunk";
 import type { RawMessage } from "./read-session-raw";
+import type { TagTarget } from "./tag-messages";
 import { prewarmTagOwners } from "./tag-owner-warmup";
 
 it("does not fire at 88.3% for a tiny capped head even when later eligible history is large", () => {
@@ -605,6 +612,19 @@ describe("checkCompartmentTrigger", () => {
         insertTag(db, "ses-projected", "m-1", "message", 800, 1);
         insertTag(db, "ses-projected", "m-2", "message", 200, 2);
         queuePendingOp(db, "ses-projected", 1, "drop", 1);
+        let content = "a".repeat(800);
+        const targets = new Map<number, TagTarget>([
+            [
+                1,
+                {
+                    getContent: () => content,
+                    setContent: (replacement) => {
+                        content = replacement;
+                        return true;
+                    },
+                },
+            ],
+        ]);
 
         const evaluate = (ride: "none" | "publishedHistory" | "explicitFlush") =>
             checkCompartmentTrigger(
@@ -628,6 +648,7 @@ describe("checkCompartmentTrigger", () => {
                     explicitFlush: ride === "explicitFlush",
                     publishedHistory: ride === "publishedHistory",
                 },
+                capturePendingDropEligibility(targets, new Set()),
             );
         const log = spyOn(logger, "sessionLog").mockImplementation(() => {});
         try {
@@ -640,7 +661,8 @@ describe("checkCompartmentTrigger", () => {
             // Published history permits the pending drop to apply on the publication pass.
             expect(evaluate("explicitFlush")).toEqual({ shouldFire: false });
             expect(evaluate("publishedHistory")).toEqual({ shouldFire: false });
-            applyPendingOperations("ses-projected", db, new Map(), new Set());
+            applyPendingOperations("ses-projected", db, targets, new Set());
+            expect(content).toBe("[dropped §1§]");
             expect(getPendingOps(db, "ses-projected")).toHaveLength(0);
             expect(
                 getTagsBySession(db, "ses-projected").find((tag) => tag.tagNumber === 1)?.status,
@@ -652,6 +674,83 @@ describe("checkCompartmentTrigger", () => {
                         String(message).includes("ride=publishedHistory"),
                 ),
             ).toBe(true);
+        } finally {
+            log.mockRestore();
+        }
+    });
+
+    it("the redundancy skip never credits a ride a held pass cannot take", () => {
+        useTempDataHome("compartment-trigger-held-ride-");
+        createOpenCodeDb("ses-held-ride", [
+            { id: "m-1", role: "user", text: "a ".repeat(3500) },
+            { id: "m-2", role: "assistant", text: "done" },
+            { id: "m-3", role: "user", text: "b ".repeat(3500) },
+            { id: "m-4", role: "assistant", text: "done" },
+            { id: "m-5", role: "user", text: "c ".repeat(3500) },
+            { id: "m-6", role: "assistant", text: "done" },
+            ...Array.from({ length: 5 }, (_, i) => ({
+                id: `m-${i + 7}`,
+                role: "user",
+                text: `protected ${i}`,
+            })),
+        ]);
+        const db = openDatabase();
+        insertTag(db, "ses-held-ride", "m-1", "message", 800, 1);
+        insertTag(db, "ses-held-ride", "m-2", "message", 200, 2);
+        queuePendingOp(db, "ses-held-ride", 1, "drop", 1);
+        const targets = new Map<number, TagTarget>([
+            [1, { getContent: () => "a".repeat(800), setContent: () => true }],
+        ]);
+        const evaluate = (gate?: { signedThinkingHold: boolean; emergency?: boolean }) =>
+            checkCompartmentTrigger(
+                db,
+                "ses-held-ride",
+                makeSessionMeta("ses-held-ride", 60),
+                { percentage: 61, inputTokens: 122_000 },
+                60,
+                63,
+                6500,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                {
+                    hardFold: false,
+                    force: false,
+                    explicitFlush: true,
+                    publishedHistory: true,
+                    ...(gate
+                        ? {
+                              permission: {
+                                  signedThinkingHold: gate.signedThinkingHold,
+                                  firstRender: false,
+                                  idleExpiry: false,
+                                  emergency: gate.emergency === true,
+                              },
+                          }
+                        : {}),
+                },
+                capturePendingDropEligibility(targets, new Set()),
+            );
+        const log = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            // An unheld pass takes the flush ride, so the queued drop makes the
+            // summarizer redundant on this pass.
+            expect(evaluate({ signedThinkingHold: false })).toEqual({ shouldFire: false });
+            // A held pass cancels its flush and history rides: the drop stays queued,
+            // so the skip must not count it and the historian fires.
+            expect(evaluate({ signedThinkingHold: true })).toMatchObject({
+                shouldFire: true,
+                reason: "projected_headroom",
+            });
+            // Emergency pressure admits work even on a held pass.
+            expect(evaluate({ signedThinkingHold: true, emergency: true })).toEqual({
+                shouldFire: false,
+            });
+            expect(getPendingOps(db, "ses-held-ride")).toHaveLength(1);
         } finally {
             log.mockRestore();
         }
@@ -756,6 +855,18 @@ describe("checkCompartmentTrigger", () => {
             undefined,
             undefined,
             { hardFold: false, force: true, explicitFlush: false, publishedHistory: false },
+            capturePendingDropEligibility(
+                new Map([
+                    [
+                        1,
+                        {
+                            getContent: () => "a".repeat(800),
+                            setContent: () => true,
+                        },
+                    ],
+                ]),
+                new Set(),
+            ),
         );
 
         expect(result).toEqual({ shouldFire: false });
@@ -767,6 +878,120 @@ describe("checkCompartmentTrigger", () => {
             ),
         ).toBe(true);
         log.mockRestore();
+    });
+
+    it("does not skip the historian at 95% when queued drops are active_thinking or protected", () => {
+        useTempDataHome("compartment-trigger-blocked-drops-");
+        const sessionId = "ses-blocked-drops";
+        createOpenCodeDb(sessionId, [
+            { id: "m-1", role: "user", text: "a ".repeat(3500) },
+            { id: "m-2", role: "assistant", text: "b ".repeat(3500) },
+            { id: "m-3", role: "user", text: "live prompt" },
+            { id: "m-4", role: "assistant", text: "live response" },
+        ]);
+        const db = openDatabase();
+        insertTag(db, sessionId, "m-1", "message", 800, 1);
+        insertTag(db, sessionId, "m-2", "message", 200, 2);
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+        queuePendingOp(db, sessionId, 2, "drop", 1);
+        const targets = new Map<number, TagTarget>([
+            [
+                1,
+                {
+                    thinkingDropProtected: true,
+                    getContent: () => "a".repeat(800),
+                    setContent: () => false,
+                },
+            ],
+            [2, { getContent: () => "b".repeat(200), setContent: () => false }],
+        ]);
+        let eligible: ReadonlySet<number> | undefined;
+        const diagnostics: Record<string, number>[] = [];
+        expect(
+            applyPendingOperations(
+                sessionId,
+                db,
+                targets,
+                new Set([2]),
+                undefined,
+                undefined,
+                [],
+                new Set(),
+                undefined,
+                (batch) => diagnostics.push(batch.reasons),
+                (snapshot) => {
+                    eligible = snapshot;
+                },
+            ),
+        ).toBe(false);
+        expect(diagnostics).toEqual([{ active_thinking: 1, protected: 1 }]);
+        expect(eligible?.size).toBe(0);
+        const evaluate = (snapshot?: ReadonlySet<number>) =>
+            checkCompartmentTrigger(
+                db,
+                sessionId,
+                makeSessionMeta(sessionId, 95),
+                { percentage: 95, inputTokens: 19_000 },
+                95,
+                75,
+                6500,
+                undefined,
+                undefined,
+                undefined,
+                20_000,
+                undefined,
+                undefined,
+                { canClearReasoning: false },
+                { hardFold: false, force: true, explicitFlush: true, publishedHistory: false },
+                snapshot,
+            );
+        expect(evaluate(eligible)).toMatchObject({ shouldFire: true, reason: "force_band" });
+        // Before any apply view exists, an optimistic queue alone cannot suppress history.
+        expect(evaluate()).toMatchObject({ shouldFire: true, reason: "force_band" });
+    });
+
+    it("invalidates queued-drop credit on a new turn or changed protection inputs", () => {
+        useTempDataHome("compartment-trigger-drop-epoch-");
+        const db = openDatabase();
+        const sessionId = "ses-drop-epoch";
+        insertTag(db, sessionId, "m1", "message", 800, 1);
+        const input = projectLkgEntry([
+            { info: { id: "u1", role: "user" }, parts: [{ type: "text", text: "request" }] },
+        ]);
+        const nextTurn = projectLkgEntry([
+            { info: { id: "u2", role: "user" }, parts: [{ type: "text", text: "next request" }] },
+        ]);
+        const key = () => pendingDropEligibilityKey(db, sessionId, input, { protectedTools: 3 });
+        const cache = createPendingDropEligibilityCache();
+        const targets = new Map<number, TagTarget>([
+            [1, { getContent: () => "a".repeat(800), setContent: () => true }],
+        ]);
+        const liveView = capturePendingDropEligibility(targets, new Set());
+        expect(liveView.has(1)).toBe(true);
+        cache.record(sessionId, key(), liveView);
+        expect(cache.read(sessionId, key())?.has(1)).toBe(true);
+        expect(
+            cache.read(
+                sessionId,
+                pendingDropEligibilityKey(db, sessionId, nextTurn, { protectedTools: 3 }),
+            ),
+        ).toBeUndefined();
+        // A formerly blocked drop gets credit only after the current apply view admits it.
+        cache.record(sessionId, key(), capturePendingDropEligibility(targets, new Set([1])));
+        expect(cache.read(sessionId, key())?.has(1)).toBe(false);
+        const nextKey = pendingDropEligibilityKey(db, sessionId, nextTurn, { protectedTools: 3 });
+        expect(cache.read(sessionId, nextKey)).toBeUndefined();
+        cache.record(sessionId, nextKey, capturePendingDropEligibility(targets, new Set()));
+        expect(cache.read(sessionId, nextKey)?.has(1)).toBe(true);
+        expect(
+            cache.read(
+                sessionId,
+                pendingDropEligibilityKey(db, sessionId, nextTurn, { protectedTools: 4 }),
+            ),
+        ).toBeUndefined();
+        cache.record(sessionId, key(), liveView);
+        insertTag(db, sessionId, "tool-owner", "tool", 50, 2);
+        expect(cache.read(sessionId, key())).toBeUndefined();
     });
 
     it("keeps raised-threshold usage below the force band on the proactive ladder", () => {

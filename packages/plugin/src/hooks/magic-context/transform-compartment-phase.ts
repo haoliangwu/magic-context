@@ -101,6 +101,12 @@ interface RunCompartmentPhaseArgs {
     fallbackModels?: readonly ModelInput[];
     compartmentDirectory: string;
     messages: MessageLike[];
+    /**
+     * The pass's list of covered id-less instruction rows set aside by the history
+     * trim. A re-preparation after a historian join cuts again and must add to the
+     * same list, so the rows it cuts are served or dropped like the first cut's.
+     */
+    coveredInstructions: MessageLike[];
     pendingCompartmentInjection: PreparedCompartmentInjection | null;
     fallbackModelId?: string;
     ensureProjectRegistered?: (directory: string, db: ContextDatabase) => Promise<void>;
@@ -315,6 +321,18 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
         activeRun: ActiveCompartmentRun,
         reason: string,
     ): Promise<"completed" | "timed_out"> {
+        // Let a just-completed run settle before deciding whether its exhausted
+        // foreground budget should leave this pass on the background-only path.
+        await Promise.resolve();
+        if (activeRun.inlineJoinTimedOutBudgetMs !== undefined && !activeRun.settled) {
+            historianJoinTimedOut = true;
+            historianJoinBudgetMs = activeRun.inlineJoinTimedOutBudgetMs;
+            sessionLog(
+                args.sessionId,
+                "transform: compartment inline join budget already exhausted for this run — not waiting again",
+            );
+            return "timed_out";
+        }
         sessionLog(args.sessionId, reason);
         const timeoutMs = resolveHistorianInlineJoinBudget(args.historianTimeoutMs);
         historianJoinBudgetMs = timeoutMs;
@@ -329,6 +347,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             if (timer !== undefined) clearTimeout(timer);
         }
         if (result === "timeout") {
+            activeRun.inlineJoinTimedOutBudgetMs = timeoutMs;
             historianJoinTimedOut = true;
             sessionLog(
                 args.sessionId,
@@ -349,6 +368,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             args.resolvedSessionId,
             args.messages,
             historyReprepareShouldBust,
+            args.coveredInstructions,
             args.projectPath,
             args.injectionBudgetTokens,
             args.experimentalTemporalAwareness,

@@ -59,7 +59,7 @@ function seedConvertedTail(path: string, sessionID: string): void {
     }
 }
 
-async function flush(host: Awaited<ReturnType<typeof spawnOpencode2>>, sessionID: string): Promise<void> {
+async function flush(host: Awaited<ReturnType<typeof spawnOpencode2>>, sessionID: string): Promise<string> {
     const directory = rpcPortDir(join(host.env.XDG_DATA_HOME!, "cortexkit", "magic-context"), host.cwd);
     let discovery: { port: number; token: string } | undefined;
     for (let attempt = 0; attempt < 100; attempt++) {
@@ -80,6 +80,9 @@ async function flush(host: Awaited<ReturnType<typeof spawnOpencode2>>, sessionID
         body: JSON.stringify({ sessionId: sessionID, directory: host.cwd }),
     });
     expect(response.status).toBe(200);
+    const result = await response.json() as { ok?: unknown; message?: unknown };
+    expect(result.ok).toBe(true);
+    return typeof result.message === "string" ? result.message : "";
 }
 
 test("converted 750k session explicit flush exercises reporter emergency drop path", async () => {
@@ -155,8 +158,8 @@ test("converted 750k session explicit flush exercises reporter emergency drop pa
         } finally { contextDb.close(); }
         // The copied tool row retains its original (pre-warmup) completion time.
         // The stale-reading guard correctly refuses to record its copied 820k
-        // usage again. Check the provider-proven reading before the restarted
-        // host resets first-pass pressure and prices the converted wire instead.
+        // usage again. Check the provider-proven reading saved before the
+        // restart, before the host starts again.
         const usageDb = new Database(fixture.contextDbPath, { readonly: true });
         try {
             const usage = usageDb.prepare(`SELECT last_input_tokens AS inputTokens,
@@ -177,17 +180,70 @@ test("converted 750k session explicit flush exercises reporter emergency drop pa
         client2 = OpenCode.make({ baseUrl: v2.url,
             headers: { authorization: `Basic ${btoa(`opencode:${v2.password}`)}` } });
         await waitForPluginActive(client2, fixture.cwd);
-        await flush(v2, sessionID);
+        const usageLogPath = fixture.logPath("v2-reporter");
+        const previousUsageEvents = (existsSync(usageLogPath)
+            ? readFileSync(usageLogPath, "utf8").match(/v2 usage: inputTokens=820000/g) ?? []
+            : []).length;
+        const usageBeforeDb = new Database(fixture.contextDbPath, { readonly: true });
+        let responseTimeBefore: number;
+        try {
+            const row = usageBeforeDb.prepare(
+                "SELECT last_response_time AS responseTime FROM session_meta WHERE session_id = ?",
+            ).get(sessionID) as { responseTime: number | null } | undefined;
+            responseTimeBefore = row?.responseTime ?? 0;
+        } finally { usageBeforeDb.close(); }
+        // The restarted host begins with an empty in-memory usage window. Prime
+        // it again with provider-reported pressure before the reporter pass.
+        mock.setDefault({ text: "re-prime reporter usage", usage: { input_tokens: 820_000, output_tokens: 20 } });
+        await client2.session.prompt({ sessionID, text: "re-establish provider usage" });
+        await client2.session.wait({ sessionID }, { signal: AbortSignal.timeout(30_000) });
+        const usageDeadline = Date.now() + 15_000;
+        let recordedFreshUsage = false;
+        while (!recordedFreshUsage && Date.now() < usageDeadline) {
+            const usageDb = new Database(fixture.contextDbPath, { readonly: true });
+            try {
+                const row = usageDb.prepare(`SELECT last_response_time AS responseTime,
+                    last_input_tokens AS inputTokens, last_context_percentage AS percentage
+                    FROM session_meta WHERE session_id = ?`).get(sessionID) as {
+                    responseTime: number | null; inputTokens: number; percentage: number;
+                } | undefined;
+                recordedFreshUsage = !!row &&
+                    row.responseTime !== null &&
+                    row.responseTime > responseTimeBefore &&
+                    row.inputTokens === 820_000 &&
+                    row.percentage > 100;
+            } finally { usageDb.close(); }
+            if (!recordedFreshUsage) await Bun.sleep(50);
+        }
+        expect(recordedFreshUsage).toBe(true);
+        // Provider usage arrives on a host event after the reply. Wait until it is
+        // logged so the next transform uses the fresh usage, not the prior low value.
+        const usageLogDeadline = Date.now() + 15_000;
+        let loggedFreshUsage = false;
+        while (!loggedFreshUsage && Date.now() < usageLogDeadline) {
+            const currentLog = existsSync(usageLogPath) ? readFileSync(usageLogPath, "utf8") : "";
+            loggedFreshUsage =
+                (currentLog.match(/v2 usage: inputTokens=820000/g) ?? []).length >
+                previousUsageEvents;
+            if (!loggedFreshUsage) await Bun.sleep(50);
+        }
+        expect(loggedFreshUsage).toBe(true);
+        mock.setDefault({ text: "ok", usage: { input_tokens: 1_200, output_tokens: 20 } });
         const pendingDb = new Database(fixture.contextDbPath);
         try {
+            pendingDb.exec("PRAGMA busy_timeout=5000");
             const tag = pendingDb.prepare("SELECT tag_number FROM tags WHERE session_id = ? AND status = 'active' ORDER BY tag_number LIMIT 1")
                 .get(sessionID) as { tag_number: number } | undefined;
             if (!tag) throw new Error("warmup did not create an active tag");
             const queued = pendingDb.prepare("INSERT INTO pending_ops (session_id, tag_id, operation, queued_at, harness) VALUES (?, ?, 'drop', ?, 'opencode2')");
             // Repeated intent tests queue depth without removing extra converted arcs
             // before the emergency selector sees the 155 completed tool calls.
-            for (let i = 0; i < 46; i++) queued.run(sessionID, tag.tag_number, Date.now() + i);
+            pendingDb.transaction(() => {
+                for (let i = 0; i < 46; i++) queued.run(sessionID, tag.tag_number, Date.now() + i);
+            }).immediate();
         } finally { pendingDb.close(); }
+        const flushMessage = await flush(v2, sessionID);
+        expect(flushMessage).toMatch(/^(?:Flushed: \d+ dropped|No pending operations to flush)\./);
         await client2.session.prompt({ sessionID, text: "reporter explicit flush" });
         await client2.session.wait({ sessionID }, { signal: AbortSignal.timeout(120_000) });
         const deadline = Date.now() + 30_000;
@@ -204,12 +260,24 @@ test("converted 750k session explicit flush exercises reporter emergency drop pa
         expect(schemaPasses.length).toBeGreaterThanOrEqual(2);
         const milestones = log.split("\n").filter((line) => /v2 usage:|emergency tiered drop:|heuristic cleanup:|pending ops WILL APPLY|prefix trim:|rematerialized=true/.test(line));
         console.log("REPORTER_V2_USAGE", milestones.filter((line) => line.includes("v2 usage:")).join("\n"));
-        expect(milestones.some((line) => line.includes("pending ops WILL APPLY — reason=pending_materialization origin=user_flush, pendingOps=46"))).toBe(true);
-        // Restart discards the stale provider reading, so the seeded tool outputs
-        // themselves must price above the usable window without opaque signatures.
-        const pricedInputs = [...log.matchAll(/using wire estimate for priced pass inputTokens=(\d+) .*trusted=true/g)]
-            .map((match) => Number(match[1]));
-        expect(Math.max(...pricedInputs)).toBeGreaterThan(CONTEXT_LIMIT - 1_024);
+        const drained = new Database(fixture.contextDbPath, { readonly: true });
+        try {
+            expect(drained.prepare("SELECT tag_id FROM pending_ops WHERE session_id = ?").all(sessionID)).toHaveLength(0);
+        } finally { drained.close(); }
+        // The reporter pass is the first priced pass after the restart. Its
+        // reading is the provider's own, saved by the re-prime request above
+        // (same model and limit, cache still warm), so that 820k reading, above
+        // the usable window, is what puts the pass in the emergency band. The
+        // pass still counts the converted wire, but only to check whether the
+        // request grew past the saved reading: counted with calibrated ratios
+        // it reads about half the window, so it does not override the reading.
+        // Only the doubled fit envelope, which pressure sizing no longer uses,
+        // priced that wire above the window.
+        const pricedReadings = [...log.matchAll(
+            /using saved provider reading for priced pass inputTokens=(\d+) percentage=([\d.]+)/g,
+        )].map((match) => ({ inputTokens: Number(match[1]), percentage: Number(match[2]) }));
+        expect(Math.max(...pricedReadings.map((reading) => reading.inputTokens))).toBeGreaterThan(CONTEXT_LIMIT - 1_024);
+        expect(Math.max(...pricedReadings.map((reading) => reading.percentage))).toBeGreaterThan(100);
         // Private paths and tool definitions can move the final selected tag across
         // the reclaim boundary. Assert the reclaimed budget, not an exact tag count.
         const v1Log = readFileSync(fixture.logPath("v1-reporter"), "utf8");

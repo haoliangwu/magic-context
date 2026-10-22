@@ -12,12 +12,12 @@ export OPENCODE_DISABLE_DEFAULT_PLUGINS=true
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
 
 command -v opencode2 >/dev/null || { echo "FAIL opencode2 binary missing"; exit 1; }
-[[ "$(opencode2 --version)" == "opencode v2.0.22" ]] || {
+[[ "$(opencode2 --version)" == "opencode v${OPENCODE2_VERSION}" ]] || {
     echo "FAIL unexpected OpenCode version: $(opencode2 --version)"
     exit 1
 }
-[[ "$(node -p "require('/test/host/node_modules/@opencode/cli/package.json').version")" == "2.0.22" ]]
-[[ "$(node -p "require('/test/host/node_modules/@opencode/cli-linux-x64/package.json').version")" == "2.0.22" ]]
+[[ "$(node -p "require('/test/host/node_modules/@opencode/cli/package.json').version")" == "$OPENCODE2_VERSION" ]]
+[[ "$(node -p "require('/test/host/node_modules/@opencode/cli-linux-x64/package.json').version")" == "$OPENCODE2_VERSION" ]]
 
 PLUGIN_PACKAGE=/test/mc-install/node_modules/@cortexkit/opencode-magic-context
 PLUGIN_VERSION=$(node -p "require('$PLUGIN_PACKAGE/package.json').version")
@@ -93,6 +93,6 @@ if [[ $TUI_MARKER_SEEN -eq 0 ]]; then
     exit 1
 fi
 
-echo "PASS @opencode/cli@2.0.22 and @opencode/cli-linux-x64@2.0.22 exact pins"
+echo "PASS @opencode/cli@$OPENCODE2_VERSION and @opencode/cli-linux-x64@$OPENCODE2_VERSION exact pins"
 echo "PASS GA TUI executed setup and painted the RPC-backed sidebar component"
-echo "All OpenCode 2.0.22 Docker E2E checks passed."
+echo "All OpenCode $OPENCODE2_VERSION Docker E2E checks passed."

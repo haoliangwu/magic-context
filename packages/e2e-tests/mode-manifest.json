@@ -3,6 +3,38 @@
     "header": "CI push workflows run the manifest-derived TypeScript suites and Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh; tag releases run the same Rust invocation. Cargo.lock pins the Rust dependency versions and git revisions. CI mc-module daemon tests and push/release builders use the locked subconscious source to build ck-subc; the scheduled CI builder intentionally probes default-branch HEAD as drift, while test shards consume its prebuilt artifact.",
     "entries": [
         {
+            "path": "tests/omp-compaction-marker.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "A real OMP host supersedes shifted compaction markers with a verified entry-id boundary; the next provider request omits older raw history and duplicate summaries. Host PID lsof proves throwaway-store containment.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["omp"]
+        },
+        {
+            "path": "tests/opencode2/native-fold-hidden-edit.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "A real hidden-row edit under unchanged checkpoint coordinates revokes cold provenance and renders current history through one executed shared fold, then replays unchanged through defer and restart. PID lsof proves isolated stores.",
+            "contract_refs": ["OC2-S1", "FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/opencode2/native-fold-fork-cache-review.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "An invisible-fold fork inherits managed compartments without reviving the host checkpoint's obsolete raw context. Mock provider and PID lsof prove isolated real-host coverage.",
+            "contract_refs": ["OC2-S1", "FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/opencode2/native-fold-provenance.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real host plugin KV stores digest-only fold provenance and removes it on deletion before any post-restart context pass; PID lsof proves throwaway containment.",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
             "path": "tests/processed-images.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
@@ -22,7 +54,7 @@
             "path": "tests/latest-turn-thinking.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
-            "rationale": "Real OpenCode 1 task child and primary long tool loop at execute and force against a provider-side thinking oracle; negative controls reject edited, removed and reordered latest-turn blocks, a plain real user turn preserves the primary signed prefix and queued drop until explicit flush, accepted legacy strips replay unchanged, a provider rejection restores the original thinking once, and host PID lsof proves throwaway containment.",
+            "rationale": "Real OpenCode 1 task child and primary long tool loop at execute and force against a provider-side thinking oracle; negative controls reject edited, partly removed and reordered latest-turn blocks and accept removing all of them; above the bounded signed-thinking hold's cap the task and the primary force band apply the queued drop mid-turn and strip the turn's thinking, a task held for heavy reasoning below the cap preserves it, a plain real user turn preserves the primary signed prefix and queued drop until explicit flush, accepted legacy strips replay unchanged, a provider rejection restores the original thinking once, and host PID lsof proves throwaway containment.",
             "contract_refs": ["FOLD-UNDER-PRESSURE"],
             "hosts": ["opencode"]
         },
@@ -138,6 +170,14 @@
             "contract_refs": ["S2-MIGRATION"],
             "hosts": ["opencode", "pi", "omp", "opencode2"],
             "behavior": true
+        },
+        {
+            "path": "tests/issue-752-restart-first-pass.test.ts",
+            "tier": "excluded",
+            "invocation": { "ts": false, "rust": false },
+            "rationale": "opt-in reproduction probe (MC_REPRO_752=1): the first pass after a real host restart, warm and idle-expired, with one queued drop on a session at about 60%; records decision rows, the queued drop, the served bytes against the last pre-restart request and the usage reading, with PID lsof throwaway-store containment. Its red cases name the defects that are real, so it runs by hand, outside the mode lanes",
+            "contract_refs": ["S2-MIGRATION"],
+            "hosts": ["opencode", "opencode2", "pi"]
         },
         {
             "path": "tests/rust-plugin-stage-cache.test.ts",
@@ -1331,6 +1371,21 @@
             "contract_refs": [
                 "R44",
                 "R44b"
+            ],
+            "hosts": [
+                "opencode2"
+            ]
+        },
+        {
+            "path": "tests/opencode2/hidden-mapping-transcript.test.ts",
+            "tier": "excluded",
+            "invocation": {
+                "ts": false,
+                "rust": false
+            },
+            "rationale": "Issue 725: a real OpenCode 2 host mock drives the dreamer mapper's tool loop and verifies that complete, incremental and replacement mapping replies are committed and the offered reasoning variant is used; dedicated v2 lane",
+            "contract_refs": [
+                "OC2-S1"
             ],
             "hosts": [
                 "opencode2"

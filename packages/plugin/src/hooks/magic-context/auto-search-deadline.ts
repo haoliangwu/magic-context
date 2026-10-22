@@ -8,7 +8,10 @@ import {
 } from "../../shared/auto-search-lifecycle";
 import { assertTransformWrite, type Database } from "../../shared/sqlite";
 
-export const AUTO_SEARCH_TIMEOUT_MS = 3_000;
+export const AUTO_SEARCH_TIMEOUT_MS = 1_000;
+// Measured Voyage round trips exceed the warm hint budget. Late vectors must
+// yield to stored keyword results rather than keeping the user turn waiting.
+export const AUTO_SEARCH_VECTOR_TIMEOUT_MS = 200;
 const operationDeadlines = new WeakMap<AbortSignal, number>();
 
 export function autoSearchDeadlineUnixMs(signal?: AbortSignal): number {

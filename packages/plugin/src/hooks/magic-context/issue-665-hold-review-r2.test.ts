@@ -7,9 +7,11 @@
 // pairs (first renders) and restarts.
 //
 // After every pass it checks:
-// - a held pass (unfinished signed thinking turn on a prefix-bound model, below
-//   the force band, with nothing that rewrites the prefix anyway) serves the
-//   previous array unchanged for every message both arrays hold;
+// - a held pass (unfinished signed thinking turn on a prefix-bound model whose
+//   last 15 assistant steps include one with more than 1,500 reasoning tokens,
+//   below the execute threshold plus 10 points, with nothing that rewrites the
+//   prefix anyway) serves the previous array unchanged for every message both
+//   arrays hold;
 // - strict thinking binding: a reasoning block served on two consecutive passes
 //   must have identical provider-visible bytes before it on both.
 //
@@ -177,6 +179,12 @@ export async function runOpenCodeHoldDriver(options: {
     trace?: string;
 }): Promise<{ records: PassRecord[]; violations: Violation[] }> {
     const random = rng(options.seed);
+    // Reasoning weight and synthetic continuations draw from their own stream,
+    // so a seed keeps the event sequence it had before they were added.
+    const shape = rng(options.seed ^ 0x729);
+    const heavyRate = Number(process.env.R2_HEAVY_RATE ?? 0.12);
+    const continuationRate = Number(process.env.R2_CONTINUATION_RATE ?? 0.12);
+    const recordedRate = Number(process.env.R2_RECORDED_RATE ?? 0.5);
     const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)]!;
     const modelID = options.scenario === "unheld-unbound" ? UNBOUND : PREFIX_BOUND;
     const model = { providerID: "anthropic", modelID };
@@ -193,10 +201,17 @@ export async function runOpenCodeHoldDriver(options: {
     let percent = 20;
     let compartmentEnd = -1;
     let compartmentSequence = 0;
+    // hasUsageTokens marks each entry as live provider usage. Without it the
+    // transform ignores the entry and reads the persisted usage (none here), so
+    // every pass would run at 0%.
     const usage = new Map([
         [
             sessionId,
-            { usage: { percentage: percent, inputTokens: percent * 1000 }, updatedAt: Date.now() },
+            {
+                usage: { percentage: percent, inputTokens: percent * 1000 },
+                updatedAt: Date.now(),
+                hasUsageTokens: true,
+            },
         ],
     ]);
     const historyRefreshSessions = new Set<string>();
@@ -236,9 +251,15 @@ export async function runOpenCodeHoldDriver(options: {
     let clock = 1;
     let call = 0;
     let thought = 0;
-    const reasoning = () => ({
+    // Steps mix light and heavy reasoning. A heavy step either carries the
+    // host's recorded count (OpenCode's tokens.reasoning) or, with no recorded
+    // count, enough stored thinking text for the estimate to exceed 1,500.
+    const reasoning = (heavy = false, recorded = true) => ({
         type: "reasoning",
-        text: `signed thought ${++thought}`,
+        text:
+            heavy && !recorded
+                ? `signed thought ${++thought} ${"weighing the next step carefully ".repeat(400)}`
+                : `signed thought ${++thought}`,
         metadata: { anthropic: { signature: `sig-${thought}` } },
     });
     const userTurn = () => {
@@ -267,10 +288,25 @@ export async function runOpenCodeHoldDriver(options: {
             parts: [{ type: "text", text: `task ${clock}` }],
         });
     };
+    // A todo continuation or background notice: a user message whose parts are
+    // all synthetic. It does not end the turn.
+    const syntheticContinuation = () => {
+        source.push({
+            info: {
+                id: `continue-${clock}`,
+                role: "user",
+                sessionID: sessionId,
+                time: { created: clock++ },
+            },
+            parts: [{ type: "text", text: `continue ${clock}`, synthetic: true }],
+        });
+    };
     const toolStep = () => {
         const callID = `call-${++call}`;
         const parts: Array<Record<string, unknown>> = [];
-        if (options.scenario !== "unheld-bound") parts.push(reasoning());
+        const heavy = options.scenario !== "unheld-bound" && shape() < heavyRate;
+        const recorded = shape() < recordedRate;
+        if (options.scenario !== "unheld-bound") parts.push(reasoning(heavy, recorded));
         parts.push({
             type: "tool",
             callID,
@@ -289,14 +325,38 @@ export async function runOpenCodeHoldDriver(options: {
                 time: { created: clock++ },
                 finish: "tool-calls",
                 ...model,
+                tokens: {
+                    input: 0,
+                    output: 0,
+                    reasoning: heavy && recorded ? 1_600 + Math.floor(shape() * 3_000) : 0,
+                    cache: { read: 0, write: 0 },
+                },
             },
             parts,
+        });
+    };
+    // The bounded hold the transform should apply: a heavy step among the last
+    // 15 assistant steps of the turn, and usage below 65% + 10.
+    const recentHeavyReasoning = () => {
+        let lastRealUser = -1;
+        source.forEach((m, i) => {
+            if (m.info.role === "user" && !m.parts.every((p) => p.synthetic === true))
+                lastRealUser = i;
+        });
+        const steps = source
+            .slice(lastRealUser + 1)
+            .filter((m) => m.info.role === "assistant")
+            .slice(-15);
+        return steps.some((m) => {
+            const recorded = (m.info.tokens as { reasoning?: number } | undefined)?.reasoning ?? 0;
+            const text = m.parts.find((p) => p.type === "reasoning")?.text;
+            return recorded > 1_500 || (typeof text === "string" && text.length > 6_000);
         });
     };
     const activeTurnThinking = () => {
         let lastUser = -1;
         source.forEach((m, i) => {
-            if (m.info.role === "user") lastUser = i;
+            if (m.info.role === "user" && !m.parts.every((p) => p.synthetic === true)) lastUser = i;
         });
         return source
             .slice(lastUser + 1)
@@ -339,6 +399,10 @@ export async function runOpenCodeHoldDriver(options: {
                 // Sometimes serve the new user message as the tail: the turn has no
                 // thinking yet, so this pass is not held and may apply queued work.
                 servedUserTail = random() < 0.4;
+            }
+            if (!servedUserTail && shape() < continuationRate) {
+                syntheticContinuation();
+                events.push("continuation");
             }
             if (!servedUserTail) toolStep();
             if (random() < 0.3) {
@@ -430,13 +494,15 @@ export async function runOpenCodeHoldDriver(options: {
         usage.set(sessionId, {
             usage: { percentage: percent, inputTokens: percent * 1000 },
             updatedAt: Date.now(),
+            hasUsageTokens: true,
         });
         const meta = getOrCreateSessionMeta(db, sessionId);
         const pairMissing = !(meta.cachedM0Bytes && meta.cachedM1Bytes);
         const heldModel = modelID === PREFIX_BOUND && activeTurnThinking();
         if (pairMissing) unavoidable.push("first-render");
         if (events.includes("idle-expiry")) unavoidable.push("idle-expiry");
-        if (percent >= 85) unavoidable.push("force-band");
+        if (percent >= 75) unavoidable.push("hold-cap");
+        if (!recentHeavyReasoning()) unavoidable.push("no-recent-heavy-reasoning");
         const held = heldModel && unavoidable.length === 0 && previous !== null;
         const pendingBefore = getPendingOps(db, sessionId).length;
         const pairBefore = pairState();
@@ -594,7 +660,9 @@ for (const host of ["opencode1", "opencode2"] as const) {
                         ),
                     );
                 heldViolations.set(`${host}-${seed}`, violations);
-                expect(records.filter((r) => r.held).length).toBeGreaterThan(PASSES / 4);
+                // The hold is bounded (recent heavy reasoning, below the cap), so
+                // only part of the passes of a signed turn are held.
+                expect(records.filter((r) => r.held).length).toBeGreaterThan(PASSES / 8);
                 expect(summarize(violations.filter((v) => v.kind !== "strict-binding"))).toEqual(
                     [],
                 );
@@ -647,17 +715,21 @@ it("held drivers: no kept signed thinking is served behind changed bytes", () =>
     expect(broken).toEqual([]);
 });
 
-// Ruling for all three hosts: inside a signed turn whose thinking is kept, an
-// idle-expired pass replays m[0]/m[1] byte for byte, and the force band (85%)
-// and the 95% emergency may drain under per-target protection but keep
-// m[0]/m[1] frozen. Each case loads reasons to rebuild m[0]/m[1] (a new
-// compartment with its history-refresh signal and a changed system prompt hash)
-// before the held pass, then checks the cached pair and the served head. The
-// release pass at the end is the positive control: once the turn ends the same
-// inputs do rebuild the pair.
+// Ruling for all three hosts. Every step of the signed turn below spent 1,600
+// reasoning tokens, so the bounded hold applies below the cap (execute
+// threshold 65% plus 10 points). There an idle-expired pass replays m[0]/m[1]
+// byte for byte. At the force band (86%) and the 95% emergency the cap ends
+// the hold: the pass rebuilds m[0]/m[1] mid-turn and strips every signed block
+// of the turn. Earlier revisions held both cases until the next real user
+// message (issue 729: a long autonomous turn sat in the force band for hours).
+// Each case loads reasons to rebuild m[0]/m[1] (a new compartment with its
+// history-refresh signal and a changed system prompt hash) before the pass,
+// then checks the cached pair and the served head. The release pass at the end
+// is the positive control: once the turn ends the same inputs rebuild the pair.
 for (const host of ["opencode1", "opencode2"] as const) {
     for (const cause of ["idle expiry", "force band 86%", "emergency 96%"] as const) {
-        it(`${host} ruling: a held ${cause} pass keeps m[0]/m[1] frozen while signed thinking is kept`, async () => {
+        const held = cause === "idle expiry";
+        it(`${host} ruling: ${held ? `a held ${cause} pass keeps m[0]/m[1] frozen while signed thinking is kept` : `a ${cause} pass is above the hold cap: it rebuilds m[0]/m[1] mid-turn and strips every signed block`}`, async () => {
             const logs = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
             const sessionId = `r2-${host}-ruling`;
             const dataHome = createTestTempDir("mc-r2-ruling-data-").dir;
@@ -677,13 +749,18 @@ for (const host of ["opencode1", "opencode2"] as const) {
                 const usage = new Map([
                     [
                         sessionId,
-                        { usage: { percentage: 40, inputTokens: 40_000 }, updatedAt: Date.now() },
+                        {
+                            usage: { percentage: 40, inputTokens: 40_000 },
+                            updatedAt: Date.now(),
+                            hasUsageTokens: true,
+                        },
                     ],
                 ]);
                 const setPercent = (percentage: number) =>
                     usage.set(sessionId, {
                         usage: { percentage, inputTokens: percentage * 1000 },
                         updatedAt: Date.now(),
+                        hasUsageTokens: true,
                     });
                 const historyRefreshSessions = new Set<string>();
                 const pendingMaterializationSessions = new Set<string>();
@@ -727,6 +804,9 @@ for (const host of ["opencode1", "opencode2"] as const) {
                         sessionID: sessionId,
                         time: { created },
                         ...(role === "assistant" ? { finish: "stop", ...model } : {}),
+                        ...(id.startsWith("active-")
+                            ? { tokens: { input: 0, output: 0, reasoning: 1_600 } }
+                            : {}),
                     },
                     parts,
                 });
@@ -819,15 +899,32 @@ for (const host of ["opencode1", "opencode2"] as const) {
                 const kept = [...signedPrefixes(served).keys()].filter(
                     (text) => text.startsWith("active thought") && before.has(text),
                 );
-                expect(kept.length).toBeGreaterThan(0);
-                expect(pair()).toBe(pairBefore);
-                expect(heads(served)).toBe(heads(previous));
-                // Positive control: the turn ends and the same pending inputs rebuild the pair.
-                source.push(message("u4", "user", [{ type: "text", text: "next task" }], 99));
-                setPercent(70);
-                pendingMaterializationSessions.add(sessionId);
-                await serve();
+                if (held) {
+                    expect(kept.length).toBeGreaterThan(0);
+                    expect(pair()).toBe(pairBefore);
+                    expect(heads(served)).toBe(heads(previous));
+                    // Positive control: the turn ends and the same pending inputs rebuild the pair.
+                    source.push(message("u4", "user", [{ type: "text", text: "next task" }], 99));
+                    setPercent(70);
+                    pendingMaterializationSessions.add(sessionId);
+                    await serve();
+                    expect(pair()).not.toBe(pairBefore);
+                    return;
+                }
+                // Above the cap: the rebuild lands mid-turn, and no signed block of
+                // any turn is served behind the changed head.
                 expect(pair()).not.toBe(pairBefore);
+                expect(heads(served)).not.toBe(heads(previous));
+                expect(signedPrefixes(served).size).toBe(0);
+                // The strip removes thinking only: every step of the turn is still
+                // served with its tool call.
+                for (const step of [1, 2, 3]) {
+                    const parts = served.find((m) => m.info.id === `active-${step}`)?.parts ?? [];
+                    expect(
+                        parts.some((p) => p.type === "tool" && p.callID === `active-call-${step}`),
+                    ).toBe(true);
+                }
+                return;
             } finally {
                 logs.mockRestore();
             }

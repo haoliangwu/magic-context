@@ -183,6 +183,18 @@ describe("OpenAICompatibleEmbeddingProvider HTTP 429 back-pressure", () => {
         expect(server.arrivals).toHaveLength(1);
     });
 
+    test("background passage batches yield after eight 429 responses without tripping the breaker", async () => {
+        server = startFakeEmbeddingServer((index) =>
+            index < 8 ? { status: 429, headers: { "Retry-After": "0.001" } } : { status: 200 },
+        );
+        const provider = providerFor(server.endpoint, 8_000);
+        expect(await provider.embedBatch(["stored passage"])).toEqual([null]);
+        expect(server.arrivals).toHaveLength(8);
+        expect(provider._getCircuitState()).toBe("closed");
+        expect(provider._getFailureCount()).toBe(0);
+        expect(await provider.embedBatch(["stored passage"])).not.toEqual([null]);
+    });
+
     test("429 without Retry-After starts a 1 s jittered backoff", async () => {
         server = startFakeEmbeddingServer(() => ({ status: 429 }));
         const provider = providerFor(server.endpoint, 8_000);

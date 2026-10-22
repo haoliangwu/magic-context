@@ -22,6 +22,28 @@ The runner never reads the operator's live database or configuration for a snaps
 
 The lane is pinned to OpenCode 2.0.22 (`@opencode/cli`, `@opencode/plugin` and `@opencode/client` in `packages/plugin`, `@opencode/client` in `packages/e2e-tests`, and the Docker lane under `tests/docker/opencode2`). `MC_E2E_OPENCODE2_CLI` points the lane at another installed build without touching `node_modules`. The OpenCode 1 arms (conversion and mixed-generation tests) need the v1 CLI on `PATH` and in `MC_E2E_OPENCODE1_CLI`.
 
+## Additional compatibility versions
+
+`packages/e2e-tests/opencode2-versions.json` lists the primary package pin and
+compatibility targets. CI runs the same manifest-derived suite on both 2.0.22
+and 2.1.0; the Docker wrapper also runs both exact versions. To test either
+version locally, install its CLI separately and set both
+`MC_E2E_OPENCODE2_CLI=/absolute/path/to/opencode.exe` and
+`MC_E2E_OPENCODE2_VERSION=2.1.0`. The version assertions still require an exact
+match; changing only the binary override will not bypass them.
+
+Each fixture bundles an independent validator for OpenCode's LLM message schema, with the dependency tree
+matching its CLI generation: `@opencode/ai` for 2.0.x, `@opencode/ai-2-1` for
+2.1.0. Bundling prevents foreign Effect imports into the host runtime. The
+fixture is not ready until that guard is active; a failed guard fails startup.
+
+Select the same files as the CI host lane with
+`bun scripts/validate-mode-manifest.ts --mode ts --harness opencode2` from
+`packages/e2e-tests`, then run that list with `MC_E2E_MODE=ts`,
+`MC_E2E_HOST=opencode2`, `NODE_ENV=''` and `bun test --timeout 600000`.
+Set `TMPDIR` to a private throwaway root before running the lane. Do not export
+`OPENCODE_DB` for unit suites; each host runner supplies its own isolated value.
+
 ## 2.0.15 lane run
 
 The whole lane on 2.0.15 with the OpenCode 1 arms enabled (v1 CLI 1.18.30): 89 of 90 tests passed.

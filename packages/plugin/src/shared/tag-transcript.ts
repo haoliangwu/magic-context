@@ -835,12 +835,17 @@ class ConversationEndGuard {
         }
     }
 
-    wouldStrand(occurrences: readonly ToolOccurrence[]): boolean {
+    wouldStrand(
+        occurrences: readonly ToolOccurrence[],
+        plannedRemovals?: ReadonlySet<unknown>,
+    ): boolean {
         const end = this.end;
         if (!end || !occurrences.some((occ) => occ.message === end)) return false;
         const leaving = new Set(occurrences.map((occ) => partKey(occ.part)));
         const survives = (part: TranscriptPart) =>
-            !leaving.has(partKey(part)) && !this.removed.has(partKey(part));
+            !leaving.has(partKey(part)) &&
+            !this.removed.has(partKey(part)) &&
+            !plannedRemovals?.has(partKey(part));
         return end.info.role === "assistant"
             ? !end.parts.some((part) => part.kind === "tool_result" && survives(part))
             : !end.parts.some((part) => partHasContent(part) && survives(part));
@@ -1380,8 +1385,11 @@ function buildAggregateTarget(
             }
             return null;
         },
-        wouldStrandConversationEnd(): boolean {
-            return conversationEnd?.wouldStrand(occurrences) ?? false;
+        wouldStrandConversationEnd(plannedRemovals): boolean {
+            return conversationEnd?.wouldStrand(occurrences, plannedRemovals) ?? false;
+        },
+        notePlannedRemoval(plannedRemovals): void {
+            for (const occ of occurrences) plannedRemovals.add(partKey(occ.part));
         },
         editMarker(): "truncated" | "absent" {
             // Edit-marker: preserve the tool_use input's filePath + a region

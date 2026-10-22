@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { V2Context } from "../hooks/types";
 import type { StoreRow, V2StoreReader } from "../store-reader";
 import type { NativeFoldCache } from "./memory-cache";
-import { isLocalCheckpoint } from "./native-replay";
+import { isAdmittedLocalCheckpoint } from "./native-replay";
 import { foldDigest } from "./owner";
 
 interface Attempt {
@@ -33,26 +33,7 @@ export class HostFoldPolicy {
         },
     ) {}
     private owned(sessionID: string, cut: StoreRow<"compaction">, id: string): boolean {
-        const row = this.deps.storage.admission(sessionID, id);
-        if (
-            !isLocalCheckpoint(cut) ||
-            cut.id !== id ||
-            !row?.payload ||
-            row.digest !== foldDigest(row.payload)
-        )
-            return false;
-        const snapshot = JSON.parse(row.payload) as {
-            summary: string;
-            source: string;
-            sessionID: string;
-            admissionID: string;
-        };
-        return (
-            snapshot.summary === cut.data.summary &&
-            snapshot.source === this.deps.storage.sourceID &&
-            snapshot.sessionID === sessionID &&
-            snapshot.admissionID === id
-        );
+        return cut.id === id && isAdmittedLocalCheckpoint(this.deps.storage, sessionID, cut);
     }
     async idle(sessionID: string): Promise<void> {
         const { storage, session, threshold } = this.deps;

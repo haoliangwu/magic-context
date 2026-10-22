@@ -151,6 +151,7 @@ const SECTION_ORDER: Array<{ keys: string[]; title: string; intro: string; outro
         ],
         title: "Context management",
         intro: "When and how aggressively Magic Context manages the session's context window. Per-model keys accept `provider/model` map form where noted.",
+        outro: "If `cache_ttl` is shorter than the provider's real cache lifetime (for example, a locally hosted model whose prefix cache doesn't expire), idle expiry rebuilds the prompt onto a cache that is still warm and pays for the rewrite for nothing. Set `cache_ttl` to match the provider, or to `\"never\"` for a cache that doesn't expire.",
     },
     {
         keys: ["profile", "profiles"],

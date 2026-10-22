@@ -8,7 +8,7 @@ import { runIssueFlow } from "../commands/doctor-opencode";
 import { runDoctor as runPiDoctor } from "../commands/doctor-pi";
 import type { DiagnosticReport } from "./diagnostics-opencode";
 import type { PiDiagnosticReport } from "./diagnostics-pi";
-import { IssuePrivacy } from "./issue-privacy";
+import { ISSUE_LOG_TEMPLATES, IssuePrivacy } from "./issue-privacy";
 
 const roots: string[] = [];
 const savedEnv = { ...process.env };
@@ -57,6 +57,7 @@ function fixture() {
     ];
     writeFileSync(env.MAGIC_CONTEXT_LOG_PATH, logs.join("\n"));
     const flags = {
+        $schema: "https://cortexkit.dev/schemas/magic-context.json",
         compaction: { enabled: true },
         historian: { model: "anthropic/claude-sonnet-4-5", max_tokens: 4096 },
         embedding: {
@@ -318,6 +319,7 @@ it("public issue reports remove seeded identifying strings and retain diagnostic
         expect(body).toContain("## Log (last 400 lines, sanitized)");
         expect(body).toContain("ERROR magic-context.historian");
         expect(body).toContain("TypeError");
+        expect(body).toContain("historian prompt failed:");
         expect(body).toContain("durationMs=125");
         expect(body).toContain("retry=2");
         expect(body).toContain("count=7");
@@ -328,6 +330,7 @@ it("public issue reports remove seeded identifying strings and retain diagnostic
             expect(body).toContain("17.1.7");
             expect(body).toContain("OMP native compaction is disabled");
         } else {
+            expect(body).toContain('"$schema": "https://cortexkit.dev/schemas/magic-context.json"');
             expect(body).toContain('"enabled": true');
             expect(body).toContain("anthropic/claude-sonnet-4-5");
             expect(body).toContain("openai-compatible");
@@ -365,6 +368,9 @@ it("correlates paths and identities within a report without reusable hashes", ()
     expect(privacy.report("ses_private700", "sessionId")).toBe(
         privacy.report("ses_private700", "parentSessionId"),
     );
+    expect(new IssuePrivacy({}).report("TypeError failed: customer secret", "title")).toBe(
+        "<text omitted>",
+    );
     expect(new IssuePrivacy({}).report("ses_other", "sessionId")).toBe("session-1");
 });
 
@@ -380,6 +386,107 @@ it("does not trust legacy envelope text or unknown log fields", () => {
             '2026-09-05T10:41:03.130Z WARN  magic-context: payload="private-source.ts" durationMs=125',
         ),
     ).toBe("2026-09-05T10:41:03.130Z WARN magic-context <text omitted> durationMs=125");
+});
+
+it("keeps source-owned log wording while omitting interpolated content", () => {
+    const privacy = new IssuePrivacy({});
+    const output = [
+        privacy.logLine(
+            "[2026-09-05T10:41:03.130Z] [magic-context][ses_private700] historian prompt failed: read /Users/avery/Work/private-repo/.env API_KEY=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890 tool-output-secret",
+        ),
+        privacy.logLine(
+            "[2026-09-05T10:41:04.130Z] [magic-context][ses_private700] historian: prompt attempt 2 failed: private provider message /home/avery/secret-orchard/password.txt",
+        ),
+        privacy.logLine(
+            '[2026-09-05T10:41:05.130Z] [magic-context][ses_private700] historian failure: source=validation reason="sensitive tool output marker" chunkRange=12-18 fallbackModel=vertex-eu-google/gemini-3.8-flash twoPass=true',
+        ),
+        privacy.logLine(
+            "[2026-09-05T10:41:06.130Z] [magic-context][ses_private700] CustomerPayrollError: private message body",
+        ),
+    ].join("\n");
+
+    expect(output).toContain("historian prompt failed: <text omitted>");
+    expect(output).toContain("historian: prompt attempt <text omitted> failed: <text omitted>");
+    expect(output).toContain('historian failure: source=<text omitted> reason="<text omitted>"');
+    expect(output).toContain("source=validation");
+    expect(output).toContain("chunkRange=12-18");
+    expect(output).toContain("fallbackModel=vertex-eu-google/gemini-3.8-flash");
+    expect(output).toContain("twoPass=true");
+    expect(output).toContain("~/path-");
+    expect(output).not.toContain("private-repo");
+    expect(output).not.toContain("secret-orchard");
+    expect(output).not.toContain(".env");
+    expect(output).not.toContain("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890");
+    expect(output).not.toContain("tool-output-secret");
+    expect(output).not.toContain("sensitive tool output marker");
+    expect(output).not.toContain("CustomerPayrollError");
+});
+
+it("keeps the allowlisted log templates tied to their source wording", () => {
+    const sources = [
+        {
+            path: new URL(
+                "../../../plugin/src/hooks/magic-context/compartment-runner-historian.ts",
+                import.meta.url,
+            ),
+            fragments: [
+                "historian prompt failed:",
+                "historian: prompt attempt ",
+                " failed:",
+                "Historian failed while processing this session:",
+                "Historian returned no assistant output.",
+            ],
+        },
+        {
+            path: new URL(
+                "../../../plugin/src/hooks/magic-context/compartment-runner-incremental.ts",
+                import.meta.url,
+            ),
+            fragments: [
+                "historian failure: source=",
+                ' reason="',
+                '" chunkRange=',
+                " fallbackModel=",
+                " twoPass=",
+                "historian post-publish step failed; publication stands:",
+            ],
+        },
+        {
+            path: new URL("../../../../crates/mc-module/src/lib.rs", import.meta.url),
+            fragments: [
+                "mc-module: store open failed:",
+                "mc-module: historian firing failed for ",
+                ":",
+            ],
+        },
+    ];
+
+    const sourceFragments = sources.flatMap(({ fragments }) => fragments);
+    const configuredFragments = ISSUE_LOG_TEMPLATES.flatMap(({ parts }) => parts);
+    expect([...configuredFragments].sort()).toEqual([...sourceFragments].sort());
+
+    for (const { path, fragments } of sources) {
+        const source = readFileSync(path, "utf8");
+        for (const fragment of fragments) expect(source).toContain(fragment);
+    }
+
+    const privacy = new IssuePrivacy({});
+    for (const template of ISSUE_LOG_TEMPLATES) {
+        const message = template.exact
+            ? template.parts[0]
+            : `${template.parts
+                  .join("SENSITIVE-INTERPOLATION")
+                  .replace(
+                      "fallbackModel=SENSITIVE-INTERPOLATION",
+                      'fallbackModel="sensitive tool output"',
+                  )} SENSITIVE-TAIL`;
+        const line = privacy.logLine(
+            `[2026-09-05T10:41:07.130Z] [magic-context][ses_private700] ${message}`,
+        );
+        for (const part of template.parts) expect(line).toContain(part);
+        expect(line).not.toContain("SENSITIVE-INTERPOLATION");
+        expect(line).not.toContain("SENSITIVE-TAIL");
+    }
 });
 
 it("health check summaries retain configuration labels and measurements", () => {

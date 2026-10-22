@@ -302,6 +302,8 @@ export async function runValidatedHistorianPass(args: {
     parentSessionId: string;
     sessionDirectory: string;
     prompt: string;
+    /** Use `write` to retain message-block cache markers for a later conversational turn. */
+    cacheTail?: import("../../shared/historian-cache").HistorianCacheTail;
     chunk: HistorianValidationChunk;
     priorCompartments: StoredCompartmentRange[];
     sequenceOffset: number;
@@ -314,8 +316,8 @@ export async function runValidatedHistorianPass(args: {
     /**
      * Resolved historian fallback chain ("provider/modelID" entries). When the
      * primary historian model fails (auth, model-not-found, transient network),
-     * each fallback is tried in order. Independent of `fallbackModelId` (which
-     * is a last-ditch single-model retry against the active session model).
+     * each fallback is tried in order. The active session model is eligible
+     * only when no historian primary was configured.
      */
     fallbackModels?: readonly ModelInput[];
     callbacks?: HistorianProgressCallbacks;
@@ -530,6 +532,8 @@ async function runHistorianPrompt(args: {
     dumpLabel?: string;
     language?: string;
     modelOverride?: ModelInput;
+    /** Use `write` to retain cache markers when a later turn can reuse the complete user block. */
+    cacheTail?: import("../../shared/historian-cache").HistorianCacheTail;
     /** Agent identifier to route the request to. Defaults to HISTORIAN_AGENT.
      *  Use HISTORIAN_EDITOR_AGENT for the second pass in two-pass mode. */
     agentId?: string;
@@ -563,6 +567,10 @@ async function runHistorianPrompt(args: {
         sessionDirectory,
         "historian",
     );
+    // OpenCode 1 keeps the host's historical cache behavior; OpenCode 2 can
+    // omit the one-shot body tail while still caching its configured system prompt.
+    const cacheTail =
+        args.cacheTail ?? (executor.capabilities.harness === "opencode2" ? "skip" : undefined);
     let promptSettled = false;
     let hadUnsettledPrompt = false;
     const startedAt = Date.now();
@@ -685,6 +693,9 @@ async function runHistorianPrompt(args: {
                     client,
                     {
                         path: { id: agentSessionId },
+                        ...(cacheTail !== undefined
+                            ? { cacheTail: retryIndex > 0 ? "write" : cacheTail }
+                            : {}),
                         query: { directory: sessionDirectory },
                         body: {
                             // Use the specified agent (HISTORIAN_AGENT by default, or
@@ -718,6 +729,9 @@ async function runHistorianPrompt(args: {
                             { childSessionId: opened.childSessionId },
                         ),
                         timeoutMs: timeoutMs ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
+                        // A provider's spelling suggestion may name an unconfigured, costly model.
+                        // Only the configured historian fallback chain may select a different model.
+                        allowModelSuggestions: false,
                         // When modelOverride is set we're already in the last-ditch retry
                         // path; iterating fallbacks again would be redundant.
                         fallbackModels: modelOverride ? undefined : fallbackModels,
@@ -859,7 +873,7 @@ async function runFallbackHistorianPass(args: {
     model?: ModelInput;
     /**
      * Configured historian fallback chain (e.g. `anthropic/claude-sonnet-4-6`),
-     * tried IN ORDER before the session-model last resort. Each candidate's
+     * tried in order without adding the session model. Each candidate's
      * output is validated — empty or unparseable output (e.g. a misconfigured
      * primary that returns nothing, or a model that replies conversationally
      * instead of emitting compartments) escalates to the next candidate rather
@@ -867,8 +881,7 @@ async function runFallbackHistorianPass(args: {
      */
     fallbackModels?: readonly ModelInput[];
     /**
-     * The live session provider/model, used as the absolute last resort AFTER
-     * the configured chain is exhausted.
+     * The live session provider/model, used only when no primary is configured.
      */
     fallbackModelId?: string;
     callbacks?: HistorianProgressCallbacks;
@@ -879,7 +892,8 @@ async function runFallbackHistorianPass(args: {
     dumpPaths: Array<string | undefined>;
 }): Promise<ValidatedHistorianPassResult> {
     // Ordered escalation that matches the intended fallback policy:
-    //   configured fallback_models (in order)  →  live session model (last resort)
+    //   configured fallback_models (in order); only an absent primary permits
+    //   the session model. A configured primary owns the complete allowed chain.
     // The primary model already ran (and was repaired) before we get here.
     // Validation gates EVERY candidate, so a model that returns no usable
     // compartments escalates to the next instead of ending the pass — this is
@@ -891,7 +905,7 @@ async function runFallbackHistorianPass(args: {
     const primary = toModelEntry(args.model);
     for (const candidateInput of [
         ...(args.fallbackModels ?? []),
-        ...(args.fallbackModelId ? [{ model: args.fallbackModelId }] : []),
+        ...(!primary && args.fallbackModelId ? [{ model: args.fallbackModelId }] : []),
     ]) {
         const candidate = toModelEntry(candidateInput);
         if (!candidate) continue;

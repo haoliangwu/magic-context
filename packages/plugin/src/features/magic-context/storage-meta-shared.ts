@@ -12,7 +12,7 @@ export interface SessionMetaRow {
     last_nudge_tokens: number;
     last_nudge_band: string;
     last_transform_error: string;
-    is_subagent: number;
+    is_subagent: number | null;
     last_context_percentage: number;
     last_input_tokens: number;
     observed_safe_input_tokens: number;
@@ -250,7 +250,7 @@ export function isSessionMetaRow(row: unknown): row is SessionMetaRow {
         typeof r.last_nudge_tokens === "number" &&
         isStringOrNull(r.last_nudge_band) &&
         isStringOrNull(r.last_transform_error) &&
-        typeof r.is_subagent === "number" &&
+        isNumberOrNull(r.is_subagent) &&
         typeof r.last_context_percentage === "number" &&
         typeof r.last_input_tokens === "number" &&
         isNumberOrNull(r.observed_safe_input_tokens) &&
@@ -368,8 +368,10 @@ const sessionMetaExistsStatements = new WeakMap<Database, Statement>();
 export function ensureSessionMetaRow(
     db: Database,
     sessionId: string,
-    initialIsSubagent = false,
+    initialIsSubagent: boolean | null = getHarness() === "opencode2" ? null : false,
 ): void {
+    // OC2 callers that only write metadata have not read the host parent yet.
+    // Keep that classification unknown until getOrCreateSessionMeta resolves it.
     let exists = sessionMetaExistsStatements.get(db);
     if (!exists) {
         exists = prepareCachedStatement(db, "SELECT 1 FROM session_meta WHERE session_id = ?");
@@ -393,7 +395,7 @@ export function ensureSessionMetaRow(
         defaults.lastNudgeTokens,
         defaults.lastNudgeBand ?? "",
         defaults.lastTransformError ?? "",
-        initialIsSubagent ? 1 : 0,
+        initialIsSubagent === null ? null : initialIsSubagent ? 1 : 0,
         defaults.lastContextPercentage,
         defaults.lastInputTokens,
         defaults.observedSafeInputTokens,

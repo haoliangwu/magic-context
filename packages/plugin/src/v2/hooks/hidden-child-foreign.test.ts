@@ -99,7 +99,7 @@ describe("the hidden-child tool guard", () => {
 
     test("lets a hidden agent use exactly its own allowlist", () => {
         const hook = new HiddenChildHook(() => {});
-        for (const tool of ["read", "grep", "glob"]) {
+        for (const tool of ["read", "grep", "glob", "aft_outline", "aft_zoom", "aft_search"]) {
             expect(
                 hiddenToolCallRefusal({ tool, sessionID: "ses_x", agent: MAPPER }, hook),
             ).toBeUndefined();
@@ -138,6 +138,9 @@ describe("hidden-child permission rules", () => {
             { action: "read", resource: "*", effect: "allow" },
             { action: "grep", resource: "*", effect: "allow" },
             { action: "glob", resource: "*", effect: "allow" },
+            { action: "aft_outline", resource: "*", effect: "allow" },
+            { action: "aft_zoom", resource: "*", effect: "allow" },
+            { action: "aft_search", resource: "*", effect: "allow" },
         ]);
     });
 

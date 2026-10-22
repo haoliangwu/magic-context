@@ -72,6 +72,7 @@ export class V2RetrospectiveRawProvider implements RetrospectiveRawProvider {
                 role: "user" as const,
                 text: cleanUserText(row.text),
                 ts: row.time_created,
+                ...(row.follows_assistant_reply === 1 ? { followsAssistantReply: true } : {}),
             }));
     }
 

@@ -30,9 +30,12 @@ const bytes = (value: unknown) =>
 	);
 const sha = (value: unknown) =>
 	createHash("sha256").update(bytes(value)).digest("hex");
+// Every step is heavy: OpenCode 2 records no reasoning-token count, so the
+// thinking text itself must estimate above 1,500 tokens for the bounded
+// signed-thinking hold to apply at 66% (below the 75% cap).
 const thinking = (n: number) => ({
 	type: "thinking",
-	thinking: `Thought ${n}`,
+	thinking: `Thought ${n} ${"weighing the next step carefully ".repeat(400)}`,
 	signature: `sig-${n}`,
 });
 type Body = {
@@ -45,7 +48,7 @@ type Body = {
 // Run this same real-host scenario against a before/after plugin build. The mock
 // reports 66% usage after ctx_reduce, inside the signed thinking tool loop.
 test.skipIf(!supportedHost)(
-	"OC2 execute-threshold thinking loop holds the prefix until one next-user bust",
+	"OC2 execute-threshold thinking loop holds the prefix through a next user until explicit flush",
 	async () => {
 		const version = HOST_VERSION;
 		expect(supportedHost).toBe(true);
@@ -262,7 +265,7 @@ test.skipIf(!supportedHost)(
 				}
 			})();
 			expect(pendingBeforeUser).toHaveLength(2);
-			await prompt("NEXT-USER apply deferred work");
+			await prompt("NEXT-USER keep deferred work queued");
 			const requests = host.mock
 				.requests()
 				.map((request) => request.body as Body)
@@ -325,9 +328,17 @@ test.skipIf(!supportedHost)(
 				);
 			}
 			expect(report.loopPrefixChanges).toBe(0);
-			expect(report.totalPrefixChanges).toBe(1);
-			expect(pendingAfterUser).toHaveLength(0);
+			// A plain user turn is not permission to rewrite a served signed prefix.
+			// Only a separately authorized bust, such as ctx-flush, drains these drops.
+			expect(report.totalPrefixChanges).toBe(0);
+			expect(pendingAfterUser).toEqual(pendingBeforeUser);
 			expect(report.activeHoldLogs).toHaveLength(2);
+			await client.session.command({ sessionID: session.id, name: "ctx-flush", text: "" });
+			await prompt("EXPLICIT-FLUSH apply deferred work");
+			const flushed = contextDb();
+			try {
+				expect(flushed.query("SELECT tag_id FROM pending_ops WHERE session_id = ?").all(session.id)).toHaveLength(0);
+			} finally { flushed.close(); }
 		} catch (error) {
 			console.error(
 				host.stderr().slice(-3000),

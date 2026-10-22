@@ -1,5 +1,24 @@
 import { isTransientSqliteError } from "../../shared/sqlite";
-import { renderUserFacingFailure } from "../../shared/user-facing-codes";
+import { userFacingFailureCode } from "../../shared/user-facing-codes";
+
+/** Preserve the failing stage and underlying cause without suggesting a futile retry. */
+export function describeDegradedPassFailure(site: string, cause: unknown): string {
+    const details = [site];
+    const seen = new Set<unknown>();
+    while (cause !== undefined && cause !== null && !seen.has(cause)) {
+        seen.add(cause);
+        const current = cause as { site?: unknown; message?: unknown; cause?: unknown };
+        const detail =
+            typeof current.site === "string"
+                ? current.site
+                : typeof current.message === "string"
+                  ? current.message
+                  : String(cause);
+        if (!details.includes(detail)) details.push(detail);
+        cause = current.cause;
+    }
+    return `Magic Context could not safely prepare this turn [${userFacingFailureCode("transform_pass_degraded")}] (${details.join(": ")}). This request was not sent.`;
+}
 
 /**
  * A transform pass failed at a stage whose output the request depends on: the
@@ -25,7 +44,7 @@ export class DegradedPassRefusalError extends Error {
             contextLimitTokens?: number;
         },
     ) {
-        super(renderUserFacingFailure("transform_pass_degraded", "plain"), {
+        super(describeDegradedPassFailure(site, options?.cause), {
             cause: options?.cause,
         });
         this.name = "DegradedPassRefusalError";

@@ -17,6 +17,7 @@ import {
 	registerPiContextHandler,
 	signalPiPendingMaterialization,
 } from "./context-handler";
+import * as snapshots from "./tag-snapshot-pi";
 import {
 	assistantMessage,
 	assistantToolCall,
@@ -27,7 +28,7 @@ import {
 	userMessage,
 } from "./test-utils.test";
 
-test("pending drops use one tag update and commit each decision before wire mutation", () => {
+test("pending drops use one tag update each and one batch commit before wire mutation", () => {
 	const db = createTestDb();
 	try {
 		const insert = db.prepare(
@@ -69,7 +70,7 @@ test("pending drops use one tag update and commit each decision before wire muta
 					getInputStringBytes: () => 10_000,
 					drop: () => {
 						expect(db.inTransaction).toBe(false);
-						expect(commits).toBe(mutations + 2);
+						expect(commits).toBe(1);
 						expect(
 							getTagsBySession(db, "s").find((t) => t.tagNumber === n)
 								?.dropMode,
@@ -83,7 +84,7 @@ test("pending drops use one tag update and commit each decision before wire muta
 		try {
 			expect(applyPendingOperations("s", db, targets, new Set())).toBe(true);
 			expect(updates).toBe(2);
-			expect(commits).toBe(3);
+			expect(commits).toBe(1);
 			expect(mutations).toBe(2);
 		} finally {
 			statements.mockRestore();
@@ -156,6 +157,7 @@ scaleTest(
 );
 
 test("randomized Pi differential records 320 passes with restart and LKG replay", async () => {
+	const warmOnly = process.env.PI_LONG_WARM_ONLY === "1";
 	const directory = createTestTempDirFromPath(join(tmpdir(), "pi-long-diff-"));
 	const path = join(directory, "context.db");
 	const sessionId = "pi-long-differential";
@@ -181,10 +183,20 @@ test("randomized Pi differential records 320 passes with restart and LKG replay"
 	const messages = [userMessage("Review the synthetic implementation.", 1)];
 	const records: {
 		wire: string;
+		system: string;
 		tags: string;
 		pending: string;
 		event: string;
+		gates: unknown[];
 	}[] = [];
+	let gates: unknown[] = [];
+	const restoreGates = __test.setMutationGateObserverForTests((gate) =>
+		gates.push(gate),
+	);
+	const restoreResults = __test.setPipelineResultObserverForTests(
+		(_session, result) => gates.push(result),
+	);
+	let coldStartsDuringRecords = 0;
 	let seed = 0x6f1a083;
 	const random = (n: number) => {
 		seed ^= seed << 13;
@@ -202,9 +214,56 @@ test("randomized Pi differential records 320 passes with restart and LKG replay"
 		if (line.includes("LKG replay served")) replayLogs++;
 	});
 	try {
+		if (warmOnly) {
+			const ctx = Object.assign(
+				fakeContext(
+					sessionId,
+					"/synthetic/pi-long-differential",
+					["entry-0"],
+					messages,
+				),
+				{
+					getSystemPrompt: () => "Synthetic system prompt.",
+					model: {
+						provider: "anthropic",
+						id: "claude-sonnet-4-5",
+						contextWindow: 200_000,
+					},
+					getContextUsage: () => ({
+						tokens: 1000,
+						percent: 1,
+						contextWindow: 200_000,
+					}),
+				},
+			);
+			expect(
+				(
+					await handler(
+						{ messages: structuredClone(messages) } as never,
+						ctx as never,
+					)
+				)?.messages,
+			).toBeDefined();
+			// This same driver also runs against 0.49.12, which has no worker hook.
+			// The call above primes this connection before recording; a worker
+			// during the next 320 passes would invalidate the warm-only comparison.
+			const installWorker = (
+				snapshots as unknown as {
+					__setPiTagSnapshotWorkerForTests?: (
+						connection: typeof db,
+						factory: () => never,
+					) => void;
+				}
+			).__setPiTagSnapshotWorkerForTests;
+			installWorker?.(db, () => {
+				coldStartsDuringRecords++;
+				throw new Error("warm differential started a cold worker");
+			});
+		}
 		for (let pass = 0; pass < 320; pass++) {
+			gates = [];
 			let event = "ordinary";
-			if (pass > 0 && pass % 73 === 0) {
+			if (!warmOnly && pass > 0 && pass % 73 === 0) {
 				await new Promise<void>((resolve) => setImmediate(resolve));
 				clearContextHandlerSession(sessionId);
 				resetLkgSlotsForTest();
@@ -291,8 +350,10 @@ test("randomized Pi differential records 320 passes with restart and LKG replay"
 				replays++;
 				event = "LKG";
 			}
+			expect(result?.messages).toBeDefined();
 			records.push({
-				wire: sha(result?.messages ?? raw),
+				wire: JSON.stringify(result?.messages),
+				system: ctx.getSystemPrompt(),
 				tags: sha(
 					db
 						.prepare(
@@ -303,18 +364,20 @@ test("randomized Pi differential records 320 passes with restart and LKG replay"
 				pending: sha(
 					db
 						.prepare(
-							"SELECT tag_id,operation FROM pending_ops WHERE session_id = ? ORDER BY tag_id",
+							"SELECT tag_id,operation FROM pending_ops WHERE session_id = ? ORDER BY queued_at ASC, id ASC",
 						)
 						.all(sessionId),
 				),
 				event,
+				gates,
 			});
 			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
-		expect(restarts).toBe(4);
+		expect(restarts).toBe(warmOnly ? 0 : 4);
 		expect(replays).toBe(11);
 		expect(replayLogs).toBe(11);
 		expect(drops).toBeGreaterThan(40);
+		expect(coldStartsDuringRecords).toBe(0);
 		if (process.env.PI_LONG_DIFFERENTIAL_OUTPUT)
 			writeFileSync(
 				process.env.PI_LONG_DIFFERENTIAL_OUTPUT,
@@ -324,6 +387,8 @@ test("randomized Pi differential records 320 passes with restart and LKG replay"
 			`Pi differential: ${records.length} passes, ${restarts} connection restarts, ${replays} admission-denial recoveries, ${drops} queued drops`,
 		);
 	} finally {
+		restoreGates();
+		restoreResults();
 		restoreObserver();
 		clearContextHandlerSession(sessionId);
 		resetLkgSlotsForTest();

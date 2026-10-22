@@ -85,9 +85,16 @@ test("OC2 retrospective reads native oldest-first bounded user history, not stal
         ]);
         const page = provider.readUserMessagesSince("root", 0, 2);
         expect(page.truncated).toBe(true);
-        expect(page.messages.map((row) => [row.ts, row.ordinal, row.text])).toEqual([
-            [100, 4, "first real user"],
-            [200, 10, "second real user"],
+        expect(
+            page.messages.map((row) => [
+                row.ts,
+                row.ordinal,
+                row.text,
+                row.followsAssistantReply === true,
+            ]),
+        ).toEqual([
+            [100, 4, "first real user", false],
+            [200, 10, "second real user", true],
         ]);
         expect(provider.readOldestMessageTimesSince(["root"], 100).get("root")).toBe(200);
         expect(provider.readUserMessagesBefore("root", 200, 2).map((row) => row.ts)).toEqual([

@@ -1,14 +1,24 @@
 import { describe, expect, test } from "bun:test";
+import { parsePluginConfig } from "../config";
+import { parseMapMemoriesCompletion } from "../features/magic-context/dreamer/map-memories";
 import { inspectCurateMemoryOperations } from "../features/magic-context/dreamer/task-executor";
+import { closeDatabase } from "../features/magic-context/storage";
+import { runValidatedHistorianPass } from "../hooks/magic-context/compartment-runner-historian";
 import {
     HiddenCompletionRefusal,
     type HiddenRunIdentity,
 } from "../hooks/magic-context/compartment-runner-types";
 import {
+    clearProducerModelObservations,
+    observeProducerModelsForTest,
+} from "../hooks/magic-context/producer-window-test-support";
+import { resolveHistorianModel } from "../shared/model-resolution";
+import {
     getPromptFailureDetail,
     promptSyncWithValidatedOutputRetry,
 } from "../shared/model-suggestion-retry";
 import { Database } from "../shared/sqlite";
+import { createTestTempDir } from "../shared/test-temp-dir";
 import {
     createV2HiddenCompletionExecutor,
     type HiddenChildHost,
@@ -443,6 +453,148 @@ async function close(
 }
 
 describe("OpenCode 2 hidden child completion", () => {
+    for (const stage of ["initial", "repair", "fallback", "editor"] as const) {
+        test(`OpenCode 2 historian rejects unconfigured model suggestions during ${stage}`, async () => {
+            const { dir: dataHome, cleanup } = createTestTempDir("v2-historian-suggestion-");
+            const previous = process.env.XDG_DATA_HOME;
+            process.env.XDG_DATA_HOME = dataHome;
+            const state = await setup();
+            try {
+                await observeProducerModelsForTest(["mock/cheap", "mock/fallback", "mock/user"]);
+                const valid =
+                    '<compartment start="1" end="2" title="Allowed"><p1>Summary</p1></compartment>';
+                const prompt = state.host.prompt.bind(state.host);
+                let calls = 0;
+                state.host.prompt = async (input) => {
+                    calls += 1;
+                    const shouldSuggest = calls === (stage === "initial" ? 1 : 2);
+                    state.setCompletion(stage === "repair" && calls === 1 ? "not XML" : valid);
+                    state.setPromptError(
+                        shouldSuggest
+                            ? new Error(
+                                  `model not found: mock/${stage === "fallback" ? "fallback" : "cheap"}. Did you mean: user?`,
+                              )
+                            : stage === "fallback" && calls === 1
+                              ? new Error("invalid credentials for configured primary")
+                              : undefined,
+                    );
+                    await prompt(input);
+                };
+                const result = await runValidatedHistorianPass({
+                    client: undefined,
+                    hiddenCompletionExecutor: state.executor,
+                    db: state.db,
+                    parentSessionId: "user-session",
+                    sessionDirectory: "/project",
+                    prompt: "Summarize history",
+                    chunk: {
+                        startIndex: 1,
+                        endIndex: 2,
+                        lines: [
+                            { ordinal: 1, messageId: "m1" },
+                            { ordinal: 2, messageId: "m2" },
+                        ],
+                    },
+                    priorCompartments: [],
+                    sequenceOffset: 0,
+                    dumpLabelBase: `v2-suggestion-${stage}`,
+                    model: { model: "mock/cheap", qualifier: "high" },
+                    fallbackModels: stage === "fallback" ? ["mock/fallback"] : [],
+                    fallbackModelId: "mock/user",
+                    twoPass: stage === "editor",
+                });
+                expect(
+                    state.requests.map(
+                        (request) => `${request.model.providerID}/${request.model.id}`,
+                    ),
+                ).toEqual(
+                    stage === "initial"
+                        ? ["mock/cheap"]
+                        : ["mock/cheap", stage === "fallback" ? "mock/fallback" : "mock/cheap"],
+                );
+                expect(state.switches.some((input) => input.model.id === "user")).toBe(false);
+                expect(result.ok).toBe(stage === "editor");
+                if (result.ok) expect(result.compartments[0]?.title).toBe("Allowed");
+            } finally {
+                state.db.close();
+                closeDatabase();
+                clearProducerModelObservations();
+                if (previous === undefined) delete process.env.XDG_DATA_HOME;
+                else process.env.XDG_DATA_HOME = previous;
+                cleanup();
+            }
+        });
+    }
+    for (const scenario of ["exhausted", "success", "unconfigured"] as const) {
+        test(`OpenCode 2 historian ${scenario} respects configured model ownership`, async () => {
+            const { dir: dataHome, cleanup } = createTestTempDir("v2-historian-chain-");
+            const previous = process.env.XDG_DATA_HOME;
+            process.env.XDG_DATA_HOME = dataHome;
+            const state = await setup();
+            try {
+                await observeProducerModelsForTest(["mock/cheap", "mock/fallback", "mock/user"]);
+                const config = parsePluginConfig(
+                    scenario === "unconfigured"
+                        ? {}
+                        : {
+                              historian: {
+                                  opencode: {
+                                      model: "mock/cheap",
+                                      fallback_models: ["mock/fallback"],
+                                  },
+                              },
+                          },
+                );
+                const models = resolveHistorianModel(config, "opencode");
+                if (scenario === "unconfigured") expect(models.primary).toBeUndefined();
+                state.setCompletion(
+                    scenario === "exhausted"
+                        ? ""
+                        : '<compartment start="1" end="2" title="Allowed"><p1>Summary</p1></compartment>',
+                );
+                const result = await runValidatedHistorianPass({
+                    client: undefined,
+                    hiddenCompletionExecutor: state.executor,
+                    db: state.db,
+                    parentSessionId: "user-session",
+                    sessionDirectory: "/project",
+                    prompt: "Summarize history",
+                    chunk: {
+                        startIndex: 1,
+                        endIndex: 2,
+                        lines: [
+                            { ordinal: 1, messageId: "m1" },
+                            { ordinal: 2, messageId: "m2" },
+                        ],
+                    },
+                    priorCompartments: [],
+                    sequenceOffset: 0,
+                    dumpLabelBase: "v2-chain-policy",
+                    model: models.primary,
+                    fallbackModels: models.fallbacks,
+                    fallbackModelId: "mock/user",
+                });
+                expect(
+                    state.requests.map(
+                        (request) => `${request.model.providerID}/${request.model.id}`,
+                    ),
+                ).toEqual(
+                    scenario === "exhausted"
+                        ? ["mock/cheap", "mock/fallback"]
+                        : [scenario === "unconfigured" ? "mock/user" : "mock/cheap"],
+                );
+                expect(result.ok).toBe(scenario !== "exhausted");
+                if (!result.ok) expect(result.error).toBeTruthy();
+            } finally {
+                state.db.close();
+                closeDatabase();
+                clearProducerModelObservations();
+                if (previous === undefined) delete process.env.XDG_DATA_HOME;
+                else process.env.XDG_DATA_HOME = previous;
+                cleanup();
+            }
+        });
+    }
     test("names retrospective and curate at the missed context-shaping stage without model fallback", async () => {
         for (const [task, agent] of [
             ["retrospective", "dreamer-retrospective"],
@@ -985,8 +1137,23 @@ describe("OpenCode 2 hidden child completion", () => {
                 [HIDDEN_HISTORIAN_AGENT]: ["read"],
                 [HIDDEN_DREAMER_AGENT]: ["read"],
                 [HIDDEN_CURATE_AGENT]: ["ctx_memory"],
-                "dreamer-memory-mapper": ["read", "grep", "glob"],
-                "dreamer-primer-investigator": ["read", "grep", "glob", "ctx_search"],
+                "dreamer-memory-mapper": [
+                    "read",
+                    "grep",
+                    "glob",
+                    "aft_outline",
+                    "aft_zoom",
+                    "aft_search",
+                ],
+                "dreamer-primer-investigator": [
+                    "read",
+                    "grep",
+                    "glob",
+                    "aft_outline",
+                    "aft_zoom",
+                    "aft_search",
+                    "ctx_search",
+                ],
                 "dreamer-retrospective": ["ctx_search"],
             };
             expect(agent.permissions).toEqual([
@@ -1064,6 +1231,86 @@ describe("OpenCode 2 hidden child completion", () => {
             state.db.close();
         }
     });
+
+    test.each([
+        "bare array",
+        "data envelope",
+    ])("uses catalog variant ids from a %s at creation and model switch", async (shape) => {
+        const logs: string[] = [];
+        const state = await setup("array-variants", {
+            logs,
+            modelCatalog: async () => {
+                const data = [
+                    {
+                        id: "cheap",
+                        providerID: "mock",
+                        variants: [
+                            { id: "high", settings: {} },
+                            { id: "medium", settings: {} },
+                        ],
+                    },
+                ];
+                return shape === "bare array" ? data : { data };
+            },
+        });
+        try {
+            const handle = await state.executor.open({
+                ...dreamerRun,
+                model: { model: "mock/cheap", qualifier: "high" },
+            });
+            expect(state.creates[0]?.model.variant).toBe("high");
+            await state.executor.attempt(handle, request("cheap", { variant: "medium" }));
+            expect(state.switches.at(-1)?.model.variant).toBe("medium");
+            await state.executor.attempt(handle, request("cheap", { variant: "not-offered" }));
+            expect(state.switches.at(-1)?.model.variant).toBeUndefined();
+            expect(logs.filter((line) => line.includes("variant '"))).toEqual([
+                expect.stringContaining("variant 'not-offered' not offered"),
+            ]);
+            await close(state.executor, handle, true);
+        } finally {
+            state.db.close();
+        }
+    });
+});
+
+test("OC2 mapper retains the persisted incremental transcript and final reply without reasoning", async () => {
+    const state = await setup();
+    const final = '<memory id="1" files="src/fact.ts"/>\n</mappings>';
+    const prefix = '<mappings>\n<memory id="2" independent="true"/>\n';
+    state.host.prompt = async ({ sessionID, text }) => {
+        state.hook.apply({
+            sessionID,
+            agent: "dreamer-memory-mapper",
+            model: { providerID: "mock", id: "cheap" },
+            system: [],
+            tools: {},
+            options: {},
+            messages: [{ role: "user", content: [{ type: "text", text }] }],
+        });
+        const first = state.rows.append(sessionID, prefix, { finish: "tool-calls" });
+        first.data.content?.push({
+            type: "reasoning",
+            text: "private <mappings>reasoning</mappings>",
+        });
+        state.rows.append(sessionID, final);
+    };
+    try {
+        const handle = await state.executor.open({ ...dreamerRun, agent: "dreamer-memory-mapper" });
+        await state.executor.attempt(handle, request());
+        const completion = await state.executor.collect(handle, 50);
+        expect(completion.text).toBe(final);
+        expect(completion.messages).toEqual([
+            { info: { role: "assistant" }, parts: [{ type: "text", text: prefix }] },
+            { info: { role: "assistant" }, parts: [{ type: "text", text: final }] },
+        ]);
+        expect(parseMapMemoriesCompletion(final, completion, new Set([1, 2]))).toEqual([
+            { id: 2, files: [], independent: true },
+            { id: 1, files: ["src/fact.ts"], independent: false },
+        ]);
+        await close(state.executor, handle, true);
+    } finally {
+        state.db.close();
+    }
 });
 
 test("hidden tool-loop hard-stops at soft prompt budget when the host has no pre-tool hook", async () => {
@@ -1099,14 +1346,38 @@ test("hidden tool-loop hard-stops at soft prompt budget when the host has no pre
 });
 
 describe("curate validation over the OpenCode 2 tool-loop transcript", () => {
-    // These tool results use the shapes `v2/fold/restore.ts` builds when it restores a
-    // child's transcript into provider messages, which is what toolLoopMessages reads.
+    // The wire fallback uses the shapes `v2/fold/restore.ts` builds when it restores
+    // a child's transcript into provider messages. Persisted tool parts differ.
     const call = (id: string, action: string) => ({
         role: "assistant",
         content: [{ type: "tool-call", id, name: "ctx_memory", input: { action, ids: [1] } }],
     });
     const transcript = (results: unknown[]) =>
         toolLoopMessages({ observedMessages: results } as never);
+
+    test.each([
+        "completed",
+        "error",
+    ])("preserves a persisted %s tool result for curate validation", (status) => {
+        const rows = new Rows();
+        const row = rows.append("child", "");
+        row.data.content = [
+            {
+                type: "tool",
+                id: "c1",
+                name: "ctx_memory",
+                state: {
+                    status,
+                    input: { action: "archive", ids: [1] },
+                    content: [{ type: "text", text: "Archived memory [ID: 1]." }],
+                },
+            },
+        ];
+        expect(inspectCurateMemoryOperations(toolLoopMessages({} as never, [row]))).toEqual({
+            totalCalls: 1,
+            completedActions: status === "completed" ? ["archive"] : [],
+        });
+    });
 
     test("counts an applied operation from a single text result", () => {
         const messages = transcript([

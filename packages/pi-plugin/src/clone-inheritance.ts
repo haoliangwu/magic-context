@@ -45,6 +45,7 @@ export type PiCloneTransitionRegistrar = (
 ) => void;
 
 export interface PiCloneInheritanceDeps {
+	onInherited?: (sessionId: string) => void;
 	db: ContextDatabase;
 	signalPendingMarker: (sessionId: string) => void;
 	writeLog?: (message: string) => void;
@@ -316,6 +317,7 @@ async function inheritPiCloneSession(
 		writeLog(
 			`[magic-context][pi] clone-inheritance: migrated compartments=${result.compartmentsCopied} tags=${result.tagsCopied} notes=${result.notesCopied} facts=${result.factsCopied} source=${sourceSessionId} dest=${destinationSessionId} reason=${isStartup ? "startup" : event.reason}`,
 		);
+		deps.onInherited?.(destinationSessionId);
 		return result;
 	} catch (error) {
 		logCloneStartFailureOnce(destinationSessionId, () =>

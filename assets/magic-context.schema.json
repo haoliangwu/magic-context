@@ -733,7 +733,7 @@
           "type": "object",
           "properties": {
             "model": {
-              "description": "Primary OpenCode model entry.",
+              "description": "Primary historian OpenCode model entry. When set, only this model and fallback_models are used; exhaustion reports failure, never the session model. When absent, OpenCode inherits the session model.",
               "x-mc-live-reload": true,
               "anyOf": [
                 {
@@ -759,7 +759,7 @@
               ]
             },
             "fallback_models": {
-              "description": "Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+              "description": "Ordered historian fallback OpenCode entries. A configured primary never adds the session model after this list. Requires an array; legacy singleton values migrate to a one-element array.",
               "x-mc-live-reload": true,
               "type": "array",
               "items": {
@@ -800,7 +800,7 @@
           "type": "object",
           "properties": {
             "model": {
-              "description": "Primary Pi model entry.",
+              "description": "Primary historian Pi model entry. When set, only this model and fallback_models are used; exhaustion reports failure, never the session model. When absent, Pi does not run the historian.",
               "x-mc-live-reload": true,
               "anyOf": [
                 {
@@ -835,7 +835,7 @@
               ]
             },
             "fallback_models": {
-              "description": "Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+              "description": "Ordered historian fallback Pi entries. The session model is never appended. Requires an array; legacy singleton values migrate to a one-element array.",
               "x-mc-live-reload": true,
               "type": "array",
               "items": {
@@ -894,7 +894,7 @@
           "type": "object",
           "properties": {
             "model": {
-              "description": "Primary OMP model entry.",
+              "description": "Primary historian OMP model entry. When set, only this model and fallback_models are used; exhaustion reports failure, never the session model. An absent OMP block inherits the Pi block; a selected block without a model does not run the historian.",
               "x-mc-live-reload": true,
               "anyOf": [
                 {
@@ -931,7 +931,7 @@
               ]
             },
             "fallback_models": {
-              "description": "Ordered fallback OMP entries.",
+              "description": "Ordered historian fallback OMP entries. The session model is never appended.",
               "x-mc-live-reload": true,
               "type": "array",
               "items": {

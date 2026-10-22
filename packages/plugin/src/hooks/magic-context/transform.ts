@@ -29,6 +29,7 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import {
+    addMergedReasoningStrippedIds,
     casChannel2NudgeState,
     clearDetectedContextLimit,
     clearEmergencyDropSample,
@@ -41,6 +42,7 @@ import {
     getEmergencyInputSample,
     getHistorianFailureState,
     getLastNudgeUndropped,
+    getMergedReasoningStrippedIds,
     getOverflowState,
     getPersistedCompactionMarkerState,
     loadTransformPassStateSnapshot,
@@ -110,6 +112,7 @@ import {
     resolveModelKey,
     resolveTrustedContextLimit,
 } from "./event-resolvers";
+import { omitIncompleteFileTokenTotals } from "./file-token-coverage";
 import {
     createFinalWireUsageTracker,
     describeFinalWireTail,
@@ -118,6 +121,10 @@ import {
 } from "./final-wire-token-estimate";
 import { isHistorianDrainBudgetSpent } from "./historian-drain-gate";
 import type { LiveModelBySession } from "./hook-handlers";
+import {
+    cloneKeepingCoveredInstructionMarks,
+    takeCoveredInstructionRows,
+} from "./host-served-rows";
 import {
     capturePrefixTrimSourceOrder,
     findHostCompactionWindow,
@@ -157,7 +164,14 @@ import {
     type PassDegradationKind,
     type PassDegradationSite,
 } from "./pass-outcome";
-import { requestPendingMaterialization } from "./pending-materialization";
+import {
+    createPendingDropEligibilityCache,
+    pendingDropEligibilityKey,
+} from "./pending-drop-eligibility";
+import {
+    hasPendingMaterializationOrigin,
+    requestPendingMaterialization,
+} from "./pending-materialization";
 import {
     createDefaultBoundarySnapshotForTests,
     hasRunnableCompartmentWindow,
@@ -169,6 +183,7 @@ import {
 import { noteTransformPassForExactOrdinalReads } from "./raw-exact-ordinal-read";
 import { prepareRawSessionOrdinals, readRawSessionMessages } from "./read-session-chunk";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
+import { estimateTokens } from "./read-session-formatting";
 import { extractInMemoryMessageViews } from "./read-session-raw";
 import {
     projectOpencodeReasoningBudgetCutoff,
@@ -178,6 +193,7 @@ import { createM0RenderOptions } from "./render-options";
 import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
 import { sendStatusNotification } from "./send-session-notification";
 import { isAnthropicFamilyRoute, modelAcceptsEmptyContent } from "./sentinel";
+import { decideSignedThinkingHold, type SignedThinkingHoldDecision } from "./signed-thinking-hold";
 import {
     replayClearedReasoning,
     replayStrippedInlineThinking,
@@ -195,6 +211,7 @@ import {
     loadContextUsage,
     resolveSchedulerDecision,
     resolveUnknownUsageFromWireEstimate,
+    savedProviderReadingForPass,
 } from "./transform-context-state";
 import { findLastUserMessageId, findSessionId } from "./transform-message-helpers";
 import {
@@ -213,7 +230,7 @@ import {
     evaluateEmergencyFailClosed,
     runPostTransformPhase,
 } from "./transform-postprocess-phase";
-import { logTransformTiming } from "./transform-stage-logger";
+import { logTransformTiming, withTransformTimingSummary } from "./transform-stage-logger";
 import { isClearlyOverWindow, UnmanagedOverWindowError } from "./unmanaged-over-window";
 import {
     storedHistoryBoundaryPresence,
@@ -697,6 +714,7 @@ export interface TransformDeps {
      * adapter supplies it.
      */
     normalizeRestoredAssistantText?: (text: string) => string;
+    refreshSourceContents?: (sessionId: string) => boolean;
 }
 
 export function resolveTransformHostSeams(
@@ -723,6 +741,10 @@ export function resolveTransformHostSeams(
         hostRefuse: deps.hostRefuse ?? abortSessionFailClosed,
     };
 }
+
+// A control entry for the thinking-omission ledger, not a message id. After a
+// signed-fit refusal, check later requests against the model window even if thinking was omitted.
+const SIGNED_FIT_REFUSED_MARKER = "signed_fit:refused:v1";
 
 export function createTransform(deps: TransformDeps) {
     registerSystemDateRefresh(deps.historyRefreshSessions);
@@ -752,6 +774,7 @@ export function createTransform(deps: TransformDeps) {
               })
             : undefined;
     let entryReuse: { reused: number; retained: number; retainedBytes: number } | undefined;
+    const pendingDropEligibility = createPendingDropEligibilityCache();
     const projectEntry = createLkgEntryProjector({
         onReuse: (stats) => {
             entryReuse = stats;
@@ -791,8 +814,11 @@ export function createTransform(deps: TransformDeps) {
                     ["reasoning", "thinking", "redacted_thinking"].includes(String(part.type)),
             ),
         )
-            ? structuredClone(messages)
+            ? cloneKeepingCoveredInstructionMarks(messages)
             : null;
+        // Covered instruction rows restored by the OpenCode 2 hook stay out of
+        // every stage until postprocess decides whether this session serves them.
+        const coveredHostInstructions = takeCoveredInstructionRows(messages);
         const passOutcome = createPassOutcome();
         const tSessionId = performance.now();
         const sessionId = findSessionId(messages);
@@ -1251,13 +1277,12 @@ export function createTransform(deps: TransformDeps) {
                     return true;
                 }
             })();
-        let activeThinkingPrefixHold =
-            activeThinkingTurn &&
-            isPrefixBoundThinkingModel(
-                activeThinkingModel?.providerID,
-                activeThinkingModel?.modelID,
-            );
-        let freezeM0M1 = unresolvedDirectoryHold || activeThinkingPrefixHold;
+        // Whether this pass is held for recent heavy signed thinking is decided
+        // once the execute threshold and the pass's usage are known (see
+        // decideSignedThinkingHold below). Until then only the directory freeze
+        // applies.
+        let activeThinkingPrefixHold = false;
+        let freezeM0M1 = unresolvedDirectoryHold;
         const compartmentDirectory = sessionDirectory;
         const historianRunnable = deps.historianRunnable !== false;
         const canRunCompartments =
@@ -1616,20 +1641,13 @@ export function createTransform(deps: TransformDeps) {
             resolvedProviderID,
             modelForBudget?.modelID,
         );
-        activeThinkingPrefixHold ||=
+        const signedThinkingPrefixBound =
             activeThinkingTurn &&
-            isPrefixBoundThinkingModel(resolvedProviderID, modelForBudget?.modelID);
-        freezeM0M1 ||= activeThinkingPrefixHold;
-        if (freezeM0M1 && prefixHoldLogTurnIds.get(sessionId) !== currentTurnId) {
-            prefixHoldLogTurnIds.set(sessionId, currentTurnId);
-            const reason = activeThinkingPrefixHold
-                ? "active thinking turn (prefix-bound model)"
-                : "session directory unresolved";
-            sessionLog(
-                sessionId,
-                `m[0]/m[1] frozen: ${reason}; replaying the frozen prefix and deferring any rebuild`,
-            );
-        }
+            (isPrefixBoundThinkingModel(
+                activeThinkingModel?.providerID,
+                activeThinkingModel?.modelID,
+            ) ||
+                isPrefixBoundThinkingModel(resolvedProviderID, modelForBudget?.modelID));
         const canUseEmptySentinels = modelAcceptsEmptyContent(resolvedProviderID);
         const protectedThinkingMessages =
             activeThinkingTurn ||
@@ -1761,6 +1779,55 @@ export function createTransform(deps: TransformDeps) {
         const { forceMaterializationPercentage } = escalationBands(
             effectiveExecuteThresholdPercentage,
         );
+        // Prefix-bound thinking models hold prefix changes only right after heavy
+        // reasoning and only below the cap; every other pass busts as on any
+        // other model and strips the turn's signed thinking when it does.
+        let holdProseRatio: number | undefined;
+        const signedThinkingHold: SignedThinkingHoldDecision | null = signedThinkingPrefixBound
+            ? decideSignedThinkingHold({
+                  messages,
+                  usagePercentage: contextUsageEarly.percentage,
+                  executeThresholdPercentage: effectiveExecuteThresholdPercentage,
+                  // The session's frozen calibration, read without adopting a new one.
+                  estimateTextTokens: (text) => {
+                      holdProseRatio ??= sessionDecisionCalibration(db, sessionId).proseRatio;
+                      return estimateTokens(text) * holdProseRatio;
+                  },
+              })
+            : null;
+        // Compaction-off has no bust permission, so nothing could strip a turn
+        // whose prefix changes (an idle-expiry or memory fold still re-renders
+        // m[0] there). It keeps the blanket hold for every open signed turn, as
+        // before the hold was bounded; it has no history reclaim for the hold to
+        // delay.
+        activeThinkingPrefixHold =
+            signedThinkingPrefixBound && (compactionOff || signedThinkingHold?.held === true);
+        freezeM0M1 ||= activeThinkingPrefixHold;
+        const prefixHoldLogKey = signedThinkingHold
+            ? `${currentTurnId}:${signedThinkingHold.reason}:${signedThinkingHold.heavyStepsBack ?? "none"}`
+            : freezeM0M1
+              ? `${currentTurnId}:directory`
+              : null;
+        if (prefixHoldLogKey !== null && prefixHoldLogTurnIds.get(sessionId) !== prefixHoldLogKey) {
+            prefixHoldLogTurnIds.set(sessionId, prefixHoldLogKey);
+            if (signedThinkingHold) {
+                sessionLog(
+                    sessionId,
+                    `signed thinking hold: held=${signedThinkingHold.held} reason=${signedThinkingHold.reason} heavyStepsBack=${signedThinkingHold.heavyStepsBack ?? "none"} heavyStepTokens=${signedThinkingHold.heavyStepTokens} usage=${contextUsageEarly.percentage.toFixed(1)}% cap=${signedThinkingHold.capPercentage}%`,
+                );
+            }
+            if (freezeM0M1) {
+                const reason = activeThinkingPrefixHold
+                    ? compactionOff
+                        ? "active thinking turn in compaction-off mode (prefix-bound model)"
+                        : "recent heavy reasoning in the active thinking turn (prefix-bound model)"
+                    : "session directory unresolved";
+                sessionLog(
+                    sessionId,
+                    `m[0]/m[1] frozen: ${reason}; replaying the frozen prefix and deferring any rebuild`,
+                );
+            }
+        }
         const persistedUsageFreshForBoundary =
             persistedUsageBeforeResets &&
             Date.now() - persistedUsageBeforeResets.updatedAt <= 10 * 60 * 1000 &&
@@ -2166,6 +2233,22 @@ export function createTransform(deps: TransformDeps) {
         void prewarmTagOwners(db, sessionId, ownerRatio);
         const tagOwnersReady = isTagOwnerSummaryReady(db, sessionId, ownerRatio);
         let triggerBoundarySnapshot: ProtectedTailBoundarySnapshot | undefined;
+        let dropProjectionEmergency = contextUsageEarly.percentage >= 95;
+        // The historian decision runs before tagMessages builds mutation targets.
+        // Reuse the previous applyPendingOperations eligibility only for identical
+        // host input bytes, persisted thinking omissions and protection settings.
+        const dropProjectionKey = () =>
+            pendingDropEligibilityKey(db, sessionId, lkgInput, {
+                currentTurnId,
+                model: modelForBudget,
+                protectedTokens: deps.protectedTokens,
+                protectedTokenTierOverrides: deps.protectedTokenTierOverrides,
+                protectedTools: deps.protectedTools,
+                keepReasoningTokens: deps.keepReasoningTokens,
+                usableSoft: windowGeometry?.usableSoft ?? boundaryContextLimit,
+                emergency: dropProjectionEmergency,
+                clearedReasoningThroughTag: sessionMeta?.clearedReasoningThroughTag,
+            });
         if (
             fullFeatureMode &&
             !compactionOff &&
@@ -2217,9 +2300,26 @@ export function createTransform(deps: TransformDeps) {
                             contextUsageEarly.percentage >= forceMaterializationPercentage &&
                             (contextUsageEarly.percentage >= 95 ||
                                 getEmergencyInputSample(db, sessionId) === 0),
-                        explicitFlush: deps.pendingMaterializationSessions.has(sessionId),
+                        // Postprocess counts a pending materialization as the flush
+                        // ride only when a user flush requested it.
+                        explicitFlush: hasPendingMaterializationOrigin(
+                            deps.pendingMaterializationSessions,
+                            sessionId,
+                            "user_flush",
+                        ),
                         publishedHistory: isCacheBusting,
+                        // The same gate postprocess applies. First render and idle
+                        // expiry are not known yet, so a held pass is credited no
+                        // ride here unless it is under emergency pressure.
+                        permission: {
+                            signedThinkingHold: activeThinkingPrefixHold,
+                            firstRender: false,
+                            idleExpiry: false,
+                            emergency:
+                                contextUsageEarly.percentage >= forceMaterializationPercentage,
+                        },
                     },
+                    pendingDropEligibility.read(sessionId, dropProjectionKey()),
                 );
                 if (triggerResult.shouldFire) {
                     sessionLog(
@@ -2254,6 +2354,7 @@ export function createTransform(deps: TransformDeps) {
                 sessionId,
                 messages,
                 isCacheBusting,
+                coveredHostInstructions,
                 projectIdentity,
                 deps.memoryConfig?.injectionBudgetTokens,
                 deps.experimentalTemporalAwareness,
@@ -2345,6 +2446,7 @@ export function createTransform(deps: TransformDeps) {
                       skipPrefixInjection: !ctxReduceCallable,
                       servedMessages: messages,
                       normalizeRestoredAssistantText: deps.normalizeRestoredAssistantText,
+                      refreshSourceContents: deps.refreshSourceContents?.(sessionId),
                   });
                   for (const [number, target] of tagged.targets) targets.set(number, target);
                   for (const [message, parts] of tagged.reasoningByMessage)
@@ -2410,6 +2512,7 @@ export function createTransform(deps: TransformDeps) {
                         scopedToolSweep,
                         servedMessages: messages,
                         normalizeRestoredAssistantText: deps.normalizeRestoredAssistantText,
+                        refreshSourceContents: deps.refreshSourceContents?.(sessionId),
                     },
                 );
                 targets = result.targets;
@@ -2631,6 +2734,7 @@ export function createTransform(deps: TransformDeps) {
             fallbackModels: historianRun?.fallbackModels ?? deps.fallbackModels,
             compartmentDirectory,
             messages,
+            coveredInstructions: coveredHostInstructions,
             pendingCompartmentInjection,
             fallbackModelId,
             projectPath: projectIdentity,
@@ -2770,26 +2874,90 @@ export function createTransform(deps: TransformDeps) {
             bustReason: calibrationBustReason,
             onAdopt: (message) => sessionLog(sessionId, message),
         });
-        // A cache-busting pass can lack input-token usage for the selected model
-        // after a switch or overflow. Estimate from the transformed payload so
-        // emergency tool-output reclaim does not skip the pass as unknown usage.
+        // A cache-busting pass can lack input-token usage for the selected model:
+        // the first pass after a process restart resets the reading, and a model
+        // switch clears it. Emergency tool-output reclaim needs a reading, so
+        // size the pass here. This is a pressure reading, not a fit check: the
+        // over-window first-pass check, the overflow-recovery bump and the final
+        // refusal check stay the fit guards.
+        //
+        // The request is counted with calibrated ratios (`pressureTokens`): an
+        // unseeded model counts neutrally. The fit envelope (`tokens`) doubles
+        // an unseeded model's count; read as pressure it put healthy sessions
+        // in the force band after a restart.
+        //
+        // The provider's own last reading, saved in session_meta, is preferred
+        // when it is for this model and limit and the cache is still warm. The
+        // one exception is a count at or past the 95% emergency line while the
+        // saved reading is lower: the request grew after that reading was taken
+        // (a long paste or tool output while the host was down), and waiting for
+        // the provider would send a request that may not fit.
+        let contextUsageFromEstimate = false;
         if (contextUsage.inputTokens <= 0 && protectionCacheBustingPass) {
+            // Overflow recovery sizes the request the provider just rejected, so
+            // the saved reading (the last accepted request, which predates it) is
+            // never used here, and the request is counted with the fit envelope
+            // as before: recovery is a fit decision, and the emergency planner
+            // must plan its reclaim against the whole rejected request.
+            const overflowRecoveryPass = usagePercentageSynthetic || emergencyRecoveryArmed;
+            const savedProviderReading = overflowRecoveryPass
+                ? null
+                : savedProviderReadingForPass({
+                      persisted: persistedUsageBeforeResets,
+                      currentModelKey: currentModelKeyForBoundary ?? (hardModelKey || undefined),
+                      contextLimit: resolvedContextLimit,
+                      lastResponseTime: sessionMeta.lastResponseTime,
+                      cacheExpired: hardCacheExpired,
+                  });
+            let pressureEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
             try {
-                const pressureEstimate = estimateFinalWireInputTokens({
+                pressureEstimate = estimateFinalWireInputTokens({
                     messages,
                     systemPromptTokens: sessionMeta.systemPromptTokens,
                     providerID: modelForBudget?.providerID,
                     modelID: modelForBudget?.modelID,
                     agentName: notificationParams.agent,
                 });
+            } catch (error) {
+                sessionLog(
+                    sessionId,
+                    `transform: wire-estimate pressure fallback unavailable: ${getErrorMessage(error)}`,
+                );
+            }
+            const usableHard = windowGeometry?.usableHard;
+            const countPercentage =
+                pressureEstimate?.pressureTokens !== undefined &&
+                Number.isFinite(pressureEstimate.pressureTokens) &&
+                typeof usableHard === "number" &&
+                usableHard > 0
+                    ? (pressureEstimate.pressureTokens / usableHard) * 100
+                    : 0;
+            const grewPastSavedReading =
+                savedProviderReading !== null &&
+                countPercentage >= 95 &&
+                countPercentage > savedProviderReading.percentage;
+            if (savedProviderReading && !grewPastSavedReading) {
+                // Never lower a reading this pass already raised (the overflow-recovery bump).
+                contextUsage = {
+                    inputTokens: savedProviderReading.inputTokens,
+                    percentage: Math.max(contextUsage.percentage, savedProviderReading.percentage),
+                };
+                sessionLog(
+                    sessionId,
+                    `transform: unknown provider usage; using saved provider reading for priced pass inputTokens=${contextUsage.inputTokens} percentage=${contextUsage.percentage.toFixed(1)} countPercentage=${countPercentage.toFixed(1)}`,
+                );
+            } else if (pressureEstimate) {
+                const percentageBeforeEstimate = contextUsage.percentage;
                 contextUsage = resolveUnknownUsageFromWireEstimate({
                     usage: contextUsage,
                     pricedPass: true,
-                    wireEstimateTokens: pressureEstimate.tokens,
+                    wireEstimateTokens: overflowRecoveryPass
+                        ? pressureEstimate.tokens
+                        : pressureEstimate.pressureTokens,
                     wireEstimateTrusted: pressureEstimate.trusted,
                     providerProvenInputTokens: providerProvenInputForRecovery,
                     providerProvenLimitTokens: providerProvenLimitForRecovery,
-                    usableHardLimit: windowGeometry?.usableHard,
+                    usableHardLimit: usableHard,
                 });
                 if (contextUsage.inputTokens > 0) {
                     const usedProviderInput =
@@ -2797,16 +2965,18 @@ export function createTransform(deps: TransformDeps) {
                         providerProvenLimitForRecovery !== undefined &&
                         providerProvenInputForRecovery !== undefined &&
                         contextUsage.inputTokens >= providerProvenInputForRecovery;
+                    // A reading raised only by the local count, with no provider
+                    // measurement and no overflow latch behind it.
+                    contextUsageFromEstimate =
+                        !overflowRecoveryPass &&
+                        !usedProviderInput &&
+                        !usagePercentageSynthetic &&
+                        contextUsage.percentage > percentageBeforeEstimate;
                     sessionLog(
                         sessionId,
-                        `transform: unknown provider usage; using ${usedProviderInput ? "provider-proven input" : "wire estimate"} for priced pass inputTokens=${contextUsage.inputTokens} percentage=${contextUsage.percentage.toFixed(1)} trusted=${pressureEstimate.trusted} wireTokens=${pressureEstimate.tokens}`,
+                        `transform: unknown provider usage; using ${usedProviderInput ? "provider-proven input" : "wire estimate"} for priced pass inputTokens=${contextUsage.inputTokens} percentage=${contextUsage.percentage.toFixed(1)} trusted=${pressureEstimate.trusted} wireTokens=${pressureEstimate.tokens} pressureTokens=${pressureEstimate.pressureTokens}${grewPastSavedReading ? ` grewPastSavedReading=${savedProviderReading?.percentage.toFixed(1)}` : ""}`,
                     );
                 }
-            } catch (error) {
-                sessionLog(
-                    sessionId,
-                    `transform: wire-estimate pressure fallback unavailable: ${getErrorMessage(error)}`,
-                );
             }
         }
         const protectionUsableSoft = windowGeometry?.usableSoft ?? boundaryContextLimit;
@@ -2839,6 +3009,7 @@ export function createTransform(deps: TransformDeps) {
         const protectedCutoff = protectionWindow.cutoff;
 
         const tPostProcess = performance.now();
+        dropProjectionEmergency = contextUsage.percentage >= 95;
         const postTransformResult = await runPostTransformPhase({
             opencode2: deps.storeGeneration === "v2",
             normalizeRecoveryTail,
@@ -2867,9 +3038,10 @@ export function createTransform(deps: TransformDeps) {
             client: deps.client,
             activeAgent,
             batch,
-            contextUsage: thinkingFitRetries.has(sessionId)
-                ? { ...contextUsage, percentage: Math.max(95, contextUsage.percentage) }
-                : contextUsage,
+            // A fit retry permits rebuilding signed thinking, not yielding the
+            // protected tool tail. Only real pressure may open the 95% drop lane.
+            contextUsage,
+            contextUsageFromEstimate,
             usableWindow: resolvedContextLimit ?? 0,
             schedulerDecision,
             schedulerDeferReason,
@@ -2915,12 +3087,15 @@ export function createTransform(deps: TransformDeps) {
                 currentModelKeyForBoundary,
             ),
             protectedTagIds,
+            onPendingDropEligibility: (eligible) =>
+                pendingDropEligibility.record(sessionId, dropProjectionKey(), eligible),
             protectedTagNumbers,
             protectedCutoff,
             protectedCount: protectionWindow.status.protectedCount,
             emergencyCeilingTokens,
             pendingCompartmentInjection,
             prefixTrimSourceOrder,
+            coveredHostInstructions,
             hiddenMessagesAtCompactionSeam,
             trimmedMessagesAtCompactionBoundary,
             didMutateFromFlushedStatuses,
@@ -2991,6 +3166,9 @@ export function createTransform(deps: TransformDeps) {
         // A persisted latch is cleared by the off-transition, never consumed
         // here; overflow propagates to native compaction instead of blocking.
         const finalWireTail = describeFinalWireTail(messages);
+        const signedFitPreviouslyRefused =
+            !compactionOff &&
+            getMergedReasoningStrippedIds(db, sessionId).has(SIGNED_FIT_REFUSED_MARKER);
         let finalWireEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
         if (postTransformResult.bustedThisPass) {
             try {
@@ -3023,7 +3201,9 @@ export function createTransform(deps: TransformDeps) {
                   : contextUsage.percentage;
             finalWireEstimate =
                 finalWireEstimate ??
-                (emergencyUsagePercentage >= 95 || schedulerDecision === "execute"
+                (emergencyUsagePercentage >= 95 ||
+                schedulerDecision === "execute" ||
+                signedFitPreviouslyRefused
                     ? finalWireUsage.estimate(
                           sessionId,
                           {
@@ -3074,10 +3254,27 @@ export function createTransform(deps: TransformDeps) {
                     }
                     return;
                 }
-                if (thinkingFitRetries.has(sessionId) || postTransformResult.thinkingReleasedForFit)
+                // Only a held turn refuses on an estimated overflow: it cannot
+                // reclaim anything, so sending would loop on provider rejections.
+                // An unheld pass has already stripped and drained like any other
+                // model's bust; if it is still over, the ordinary overflow path
+                // (provider error, learned limit, emergency reclaim) takes over.
+                if (
+                    thinkingFitRetries.has(sessionId) ||
+                    postTransformResult.thinkingReleasedForFit ||
+                    signedFitPreviouslyRefused
+                ) {
+                    // The omission ledger outlives the recursive retry flag and host restarts.
+                    // Remember refusal there without granting another prefix rewrite or tool drop.
+                    if (
+                        !signedFitPreviouslyRefused &&
+                        !addMergedReasoningStrippedIds(db, sessionId, [SIGNED_FIT_REFUSED_MARKER])
+                    )
+                        throw contextRefusalError("Cannot persist the signed-fit refusal");
                     throw contextRefusalError(
                         "The request remains over the model window after stripping signed thinking and reclaiming context",
                     );
+                }
             }
             // The prefix trim could not find the history boundary, so the whole
             // window is about to go out uncut. That is harmless while it fits and
@@ -3312,10 +3509,16 @@ export function createTransform(deps: TransformDeps) {
             );
         }
 
+        // The system date rides a bust, but on a prefix-bound model only one
+        // that leaves no open-turn signed thinking behind the system prompt: an
+        // unheld bust that kept the turn's thinking (it edited nothing in front
+        // of it) must not change the system prompt in front of it either.
         finishSystemDateRefresh(
             deps.historyRefreshSessions,
             dateRequest,
-            (postTransformResult.bustedThisPass && !activeThinkingPrefixHold) ||
+            (postTransformResult.bustedThisPass &&
+                !activeThinkingPrefixHold &&
+                postTransformResult.openTurnSignedThinkingKept !== true) ||
                 postTransformResult.thinkingReleasedForFit === true,
         );
         if (
@@ -3539,10 +3742,13 @@ export function createTransform(deps: TransformDeps) {
         });
         if (uncachedMessageIds.length > 0) {
             try {
-                storedByMessage = getActiveTagTokenTotalsByMessage(
+                storedByMessage = omitIncompleteFileTokenTotals(
                     db,
                     sessionId,
-                    uncachedMessageIds,
+                    messages.flatMap((message) =>
+                        message.info.id ? [{ id: message.info.id, parts: message.parts }] : [],
+                    ),
+                    getActiveTagTokenTotalsByMessage(db, sessionId, uncachedMessageIds),
                 );
             } catch {
                 storedByMessage = new Map();
@@ -3668,7 +3874,9 @@ export function createTransform(deps: TransformDeps) {
             });
     };
 
-    return Object.assign(transform, {
+    const timedTransform: typeof transform = (input, output) =>
+        withTransformTimingSummary(() => transform(input, output));
+    return Object.assign(timedTransform, {
         clearSessionLogState,
         invalidateRustWireState(sessionId: string): void {
             rustModeTransform?.invalidateWireState(sessionId);

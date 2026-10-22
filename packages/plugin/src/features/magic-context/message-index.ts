@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { clearLkgRecoveryFence } from "../../hooks/magic-context/lkg-recovery-fence";
 import {
     cleanUserText,
     extractTexts,
@@ -6,8 +7,10 @@ import {
 } from "../../hooks/magic-context/read-session-chunk";
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
 import { getHarness, type HarnessId } from "../../shared/harness";
+import { removeTaskNotifications } from "../../shared/search-text";
 import {
     type Database,
+    getSqliteDatabasePath,
     type Statement as PreparedStatement,
     withoutSqliteTransformPass,
     withSqliteBackgroundWriter,
@@ -15,6 +18,7 @@ import {
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { removeSystemReminders } from "../../shared/system-directive";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+import { V2StoreReader } from "../../v2/store-reader";
 import { clearCompressionDepth } from "./compression-depth-storage";
 import {
     deleteUnmappedMessageFtsRows,
@@ -22,7 +26,7 @@ import {
     recordIndexedMessageTime,
     recordMessageFtsRowid,
 } from "./message-fts-rowid-map";
-import { deleteSessionScopedRows, SESSION_SCOPED_TABLES } from "./storage-session-tables";
+import { deleteSessionScopedRowsSlice, SESSION_SCOPED_TABLES } from "./storage-session-tables";
 import { TAG_TOMBSTONE_OWNER_PREFIX } from "./storage-tag-identity-revision";
 
 interface MessageHistoryIndexRow {
@@ -47,6 +51,8 @@ export interface MessageHistoryOrphanSweepResult {
     scanned: number;
     deleted: number;
     cursor: string;
+    /** A row-slice budget ended this call; the unchanged cursor is retried next time. */
+    partial?: boolean;
     /** Why a parked sweep did not run, when that is not simply a host without an OpenCode store. */
     reason?: string;
 }
@@ -57,6 +63,7 @@ export interface MessageHistoryOrphanSweepOptions {
     safetyAgeMs?: number;
     cooldownMs?: number;
     unavailableReprobeMs?: number;
+    maxSlices?: number;
 }
 
 export const MESSAGE_HISTORY_ORPHAN_SWEEP_BATCH_SIZE = 200;
@@ -588,6 +595,7 @@ export function getIndexableContent(role: string, parts: unknown[]): string {
         }
 
         return extractTexts(parts)
+            .map(removeTaskNotifications)
             .map(cleanUserText)
             .map(normalizeIndexText)
             .filter((text) => text.length > 0)
@@ -596,6 +604,7 @@ export function getIndexableContent(role: string, parts: unknown[]): string {
 
     if (role === "assistant") {
         return extractTexts(parts)
+            .map(removeTaskNotifications)
             .map(removeSystemReminders)
             .map(normalizeIndexText)
             .filter((text) => text.length > 0)
@@ -921,15 +930,12 @@ export function ensureMessagesIndexed(
  * the sweep to compare against — that is an absent source, not an error, and
  * the caller parks the sweep instead of failing the maintenance pass.
  *
- * OpenCode 2 is parked too. This sweep judges a session orphaned when OpenCode
- * 1's `session` table has no row for it, but OpenCode 2 keeps its sessions in
- * `session_v2`. A store OpenCode 2 migrated from OpenCode 1 still carries the
- * old `session` table, so the OpenCode 1 store opens cleanly and every
- * OpenCode 2 session looks orphaned: sweeping there would delete live session
- * state. Sweeping OpenCode 2 needs a check against `session_v2` instead.
+ * OpenCode 2 must use session_v2, never a retained OpenCode 1 session table.
  */
-function harnessSupportsOpenCodeOrphanSweep(harness: HarnessId): harness is "opencode" {
-    return harness === "opencode";
+function harnessSupportsOpenCodeOrphanSweep(
+    harness: HarnessId,
+): harness is "opencode" | "opencode2" {
+    return harness === "opencode" || harness === "opencode2";
 }
 
 function getMessageHistoryOrphanSweepState(
@@ -990,11 +996,11 @@ function getOpenCodeSessionScopedCandidateSourceSql(harness: "opencode" | "openc
  * the cursor survives restarts and only resets after a complete pass. Pi rows
  * need a separate sweep against Pi's session files and are excluded here.
  */
-function sweepOrphanedOpenCodeMessageIndexesInBackground(
+function* sweepOrphanedOpenCodeMessageIndexesInBackground(
     db: Database,
     openReadableOpenCodeDb: () => Database | null,
     options: MessageHistoryOrphanSweepOptions = {},
-): MessageHistoryOrphanSweepResult {
+): Generator<void, MessageHistoryOrphanSweepResult> {
     const now = options.now ?? Date.now();
     const batchSize = Math.max(
         1,
@@ -1026,15 +1032,6 @@ function sweepOrphanedOpenCodeMessageIndexesInBackground(
             now + unavailableReprobeMs - cooldownMs,
             harness,
         );
-        if (harness === "opencode2") {
-            return {
-                status: "unavailable",
-                scanned: 0,
-                deleted: 0,
-                cursor,
-                reason: "OpenCode 2 keeps its sessions in session_v2, which this sweep does not read",
-            };
-        }
         return { status: "unavailable", scanned: 0, deleted: 0, cursor };
     }
 
@@ -1056,7 +1053,32 @@ function sweepOrphanedOpenCodeMessageIndexesInBackground(
         return { status: "source_unavailable", scanned: 0, deleted: 0, cursor };
     }
 
+    let v2Reader: V2StoreReader | undefined;
     try {
+        let sessionExists: (id: string) => boolean;
+        if (harness === "opencode2") {
+            try {
+                const path = getSqliteDatabasePath(openCodeDb);
+                if (!path) throw new Error("OpenCode 2 source has no durable path");
+                v2Reader = new V2StoreReader(path);
+                const liveIds = new Set(v2Reader.sessionIds());
+                // An empty projection can mean an incomplete conversion or a
+                // wrong store. Never interpret it as permission to delete all state.
+                if (liveIds.size === 0) throw new Error("OpenCode 2 source has no sessions");
+                sessionExists = (id) => liveIds.has(id);
+            } catch {
+                persistMessageHistoryOrphanSweepState(
+                    db,
+                    cursor,
+                    now + unavailableReprobeMs - cooldownMs,
+                    harness,
+                );
+                return { status: "source_unavailable", scanned: 0, deleted: 0, cursor };
+            }
+        } else {
+            const query = openCodeDb.prepare("SELECT 1 FROM session WHERE id = ? LIMIT 1");
+            sessionExists = (id) => !!query.get(id);
+        }
         const cutoff = now - safetyAgeMs;
         const candidateSourceSql = getOpenCodeSessionScopedCandidateSourceSql(harness);
         const candidates = db
@@ -1075,9 +1097,8 @@ function sweepOrphanedOpenCodeMessageIndexesInBackground(
                  LIMIT ?`,
             )
             .all(cursor, cutoff, batchSize) as Array<{ session_id: string }>;
-        const sessionExists = openCodeDb.prepare("SELECT 1 FROM session WHERE id = ? LIMIT 1");
         const missingSessionIds = candidates
-            .filter((candidate) => !sessionExists.get(candidate.session_id))
+            .filter((candidate) => !sessionExists(candidate.session_id))
             .map((candidate) => candidate.session_id);
         const nextCursor =
             candidates.length < batchSize
@@ -1085,46 +1106,68 @@ function sweepOrphanedOpenCodeMessageIndexesInBackground(
                 : (candidates[candidates.length - 1]?.session_id ?? cursor);
         const completedAt = candidates.length < batchSize ? now : null;
 
-        db.exec("BEGIN IMMEDIATE");
-        const transactionStartedAt = performance.now();
-        let committed = false;
         let deleted = 0;
-        try {
-            const stillEligible = db.prepare(
-                `SELECT 1
-                 FROM (${candidateSourceSql}) AS session_candidates
-                 WHERE session_id = ?
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM message_history_index
-                       WHERE message_history_index.session_id = session_candidates.session_id
-                          AND message_history_index.harness = '${harness}'
-                         AND message_history_index.updated_at > ?
-                   )
-                 LIMIT 1`,
-            );
-            // A session absent from OpenCode's first probe may have been imported
-            // while this worker waited for the context writer lock. Recheck just
-            // those IDs in OpenCode's session table before deleting their context
-            // rows, including any tags written since the initial probe.
-            const eligibleSessionIds = missingSessionIds.filter(
-                (sessionId) =>
-                    !sessionExists.get(sessionId) && stillEligible.get(sessionId, cutoff),
-            );
-            deleted = deleteSessionScopedRows(db, eligibleSessionIds, harness);
-            persistMessageHistoryOrphanSweepState(db, nextCursor, completedAt, harness);
-            db.exec("COMMIT");
-            committed = true;
-            logSlowWriteTransaction("message_index_orphan_sweep", transactionStartedAt);
-        } finally {
-            if (!committed) {
+        let slices = 0;
+        const stillEligible = db.prepare(
+            `SELECT 1 WHERE NOT EXISTS (
+                SELECT 1 FROM message_history_index
+                WHERE session_id = ? AND harness = '${harness}' AND updated_at > ?
+            )`,
+        );
+        for (const sessionId of missingSessionIds) {
+            let complete = false;
+            do {
+                let removed = 0;
+                db.exec("BEGIN IMMEDIATE");
+                const transactionStartedAt = performance.now();
+                let committed = false;
                 try {
-                    db.exec("ROLLBACK");
-                } catch {
-                    // already rolled back / no active transaction
+                    // A session absent from OpenCode's first probe may have been imported
+                    // while this worker waited for the context writer lock. Recheck just
+                    // those IDs in OpenCode's session table before deleting their context
+                    // rows, including any tags written since the initial probe.
+                    const hostStillMissing = v2Reader
+                        ? !v2Reader.sessionExists(sessionId)
+                        : !sessionExists(sessionId);
+                    if (hostStillMissing && stillEligible.get(sessionId, cutoff)) {
+                        const slice = deleteSessionScopedRowsSlice(db, sessionId, harness);
+                        removed = slice.deleted;
+                        complete = slice.complete;
+                    } else complete = true;
+                    db.exec("COMMIT");
+                    committed = true;
+                    logSlowWriteTransaction("message_index_orphan_sweep", transactionStartedAt);
+                } finally {
+                    if (!committed) {
+                        try {
+                            db.exec("ROLLBACK");
+                        } catch {
+                            // already rolled back / no active transaction
+                        }
+                    }
                 }
-            }
+                deleted += removed;
+                // Recovery files use a filesystem lock and directory fsync. Neither
+                // belongs under SQLite's writer lock, even for a single session.
+                if (removed) clearLkgRecoveryFence(sessionId);
+                // A fixed row slice bounds work even for a very large session.
+                // Production drains this generator with a yield
+                // after each commit so live turns can acquire the writer between them.
+                yield;
+                if (++slices >= Math.max(1, options.maxSlices ?? 512)) {
+                    // Do not advance over a partially purged session. Its durable
+                    // owner marker also keeps it discoverable if no table rows remain.
+                    return {
+                        status: "swept",
+                        scanned: candidates.length,
+                        deleted,
+                        cursor,
+                        partial: true,
+                    };
+                }
+            } while (!complete);
         }
+        persistMessageHistoryOrphanSweepState(db, nextCursor, completedAt, harness);
 
         return {
             status: "swept",
@@ -1133,6 +1176,7 @@ function sweepOrphanedOpenCodeMessageIndexesInBackground(
             cursor: nextCursor,
         };
     } finally {
+        v2Reader?.close();
         closeQuietly(openCodeDb);
     }
 }
@@ -1143,8 +1187,38 @@ export function sweepOrphanedOpenCodeMessageIndexes(
     options: MessageHistoryOrphanSweepOptions = {},
 ): MessageHistoryOrphanSweepResult {
     return withoutSqliteTransformPass(() =>
-        withSqliteBackgroundWriter(() =>
-            sweepOrphanedOpenCodeMessageIndexesInBackground(db, openReadableOpenCodeDb, options),
-        ),
+        withSqliteBackgroundWriter(() => {
+            const sweep = sweepOrphanedOpenCodeMessageIndexesInBackground(
+                db,
+                openReadableOpenCodeDb,
+                options,
+            );
+            for (;;) {
+                const step = sweep.next();
+                if (step.done) return step.value;
+            }
+        }),
+    );
+}
+
+/** Release the writer and yield between orphan deletions, including on the worker. */
+export async function sweepOrphanedOpenCodeMessageIndexesCooperatively(
+    db: Database,
+    openSource: () => Database | null,
+    options: MessageHistoryOrphanSweepOptions = {},
+): Promise<MessageHistoryOrphanSweepResult> {
+    return withoutSqliteTransformPass(() =>
+        withSqliteBackgroundWriter(async () => {
+            const sweep = sweepOrphanedOpenCodeMessageIndexesInBackground(db, openSource, options);
+            try {
+                for (;;) {
+                    const step = sweep.next();
+                    if (step.done) return step.value;
+                    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+                }
+            } finally {
+                sweep.return({ status: "source_unavailable", scanned: 0, deleted: 0, cursor: "" });
+            }
+        }),
     );
 }

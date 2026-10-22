@@ -5,7 +5,7 @@
 // cache contract requires the defer pass to send the same bytes the execute
 // pass sent.
 
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +19,7 @@ import {
 import { createTagger } from "../../features/magic-context/tagger";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { requestPendingMaterialization } from "./pending-materialization";
+import * as tagOwnerWarmup from "./tag-owner-warmup";
 import { createTransform } from "./transform";
 
 type TestMessage = {
@@ -36,6 +37,7 @@ function makeTempDir(prefix: string): string {
 }
 
 afterEach(() => {
+    mock.restore();
     closeDatabase();
     if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = originalXdgDataHome;
@@ -128,8 +130,25 @@ function makeTransform(
     });
 }
 
+// The transform waits at most 250 ms for the tag-owner digest, which a worker
+// thread computes. When the worker misses that deadline, the pass defers
+// reasoning removal by design, so on a loaded machine the first pass could leave
+// a1's inline <think> block intact and fail the assertion that it was stripped.
+// Wait for the digest itself instead of a deadline.
+// The spy is restored in afterEach.
+function awaitTagOwnersWithoutDeadline(): boolean[] {
+    const readiness: boolean[] = [];
+    spyOn(tagOwnerWarmup, "waitForTagOwners").mockImplementation(async (db, sessionId, ratio) => {
+        const ready = await tagOwnerWarmup.prewarmTagOwners(db, sessionId, ratio);
+        readiness.push(ready);
+        return ready;
+    });
+    return readiness;
+}
+
 describe("caveman replay order review", () => {
     it("serves the same a1 bytes on the defer pass after a raised clear_reasoning_age lets an execute pass deepen caveman below the persisted watermark", async () => {
+        const ownerReadiness = awaitTagOwnersWithoutDeadline();
         process.env.XDG_DATA_HOME = makeTempDir("context-caveman-order-review-");
         const sessionId = "ses-caveman-age-raise";
         const schedulerDecision = mock<Scheduler["shouldExecute"]>(() => "execute");
@@ -141,6 +160,10 @@ describe("caveman replay order review", () => {
         const before = makeTransform(sessionId, db, schedulerDecision, 1);
         const first = conversation(sessionId, 1);
         await before({}, { messages: first });
+        // Every owner wait of this pass ended with a ready digest, so the strip
+        // below ran on real reasoning estimates rather than deferring.
+        expect(ownerReadiness.length).toBeGreaterThan(0);
+        expect(ownerReadiness.every(Boolean)).toBe(true);
         expect(a1Text(first)).not.toContain("stale private thought");
         const watermark = getOrCreateSessionMeta(db, sessionId).clearedReasoningThroughTag;
         const a1Tag = getTagsBySession(db, sessionId).find((tag) => tag.messageId === "a1:p0");

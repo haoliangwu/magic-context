@@ -31,7 +31,11 @@ import {
     getSqliteDatabasePath,
     isTransientSqliteError,
 } from "../../shared/sqlite";
-import { AUTO_SEARCH_TIMEOUT_MS, autoSearchDeadlineUnixMs } from "./auto-search-deadline";
+import {
+    AUTO_SEARCH_TIMEOUT_MS,
+    AUTO_SEARCH_VECTOR_TIMEOUT_MS,
+    autoSearchDeadlineUnixMs,
+} from "./auto-search-deadline";
 
 const pendingRegistrations = new WeakMap<Database, Set<string>>();
 const pendingTurns = new WeakMap<
@@ -177,6 +181,7 @@ export function retryUnpublishedAutoSearchNoHint(
 }
 
 export interface AutoSearchWorkerInput {
+    persistent?: boolean;
     job?: "search" | "backfill" | "messages";
     path: string;
     harness: HarnessId;
@@ -223,8 +228,10 @@ export type AutoSearchEmbeddingReply = {
 
 /**
  * Keep every search SELECT and vector scan off the prompt thread.
- * Termination is deliberately not awaited: a blocked SQLite worker must not hold
- * the served turn hostage. It owns its connection and cannot persist hint decisions.
+ * Workers are cached by database, harness, project, job and entry URL so matching
+ * searches reuse their SQLite connection and incremental decoded-vector pool.
+ * On abort, discard the worker without awaiting termination. Only the owner
+ * appends hint decisions; search workers return results on read-only connections.
  * All provider calls stay with the owner and share the caller's abort signal.
  */
 export async function searchAutoHint(
@@ -244,6 +251,85 @@ export async function searchAutoHint(
 }
 
 const pendingBackfills = new WeakMap<Database, Map<string, Promise<void>>>();
+
+interface SearchWorkerSlot {
+    worker: Worker;
+    busy?: Promise<void>;
+    release?: () => void;
+    idleTimer?: ReturnType<typeof setTimeout>;
+    dispose(): void;
+}
+const searchWorkers = new WeakMap<Database, Map<string, SearchWorkerSlot>>();
+const liveSearchWorkers = new Set<SearchWorkerSlot>();
+const MAX_IDLE_SEARCH_WORKERS = 4;
+const SEARCH_WORKER_IDLE_MS = 5 * 60_000;
+let workersCreated = 0;
+let workersReused = 0;
+
+export function getAutoSearchWorkerStats(): { created: number; reused: number } {
+    return { created: workersCreated, reused: workersReused };
+}
+
+export function disposeIdleAutoSearchWorkers(): void {
+    for (const slot of liveSearchWorkers) if (!slot.busy) slot.dispose();
+}
+
+async function acquireSearchWorker(
+    db: Database,
+    key: string,
+    entry: URL,
+    input: AutoSearchWorkerInput,
+    signal: AbortSignal,
+): Promise<{ slot: SearchWorkerSlot; fresh: boolean } | null> {
+    const pool = searchWorkers.get(db) ?? new Map<string, SearchWorkerSlot>();
+    searchWorkers.set(db, pool);
+    while (!signal.aborted) {
+        let slot = pool.get(key);
+        if (slot?.busy) {
+            const current = slot;
+            await new Promise<void>((resolve) => {
+                const done = () => {
+                    signal.removeEventListener("abort", done);
+                    resolve();
+                };
+                signal.addEventListener("abort", done, { once: true });
+                void current.busy?.then(done);
+                if (signal.aborted) done();
+            });
+            continue;
+        }
+        const fresh = !slot;
+        if (!slot) {
+            const worker = inRootAsyncContext(
+                () => new Worker(entry, { workerData: { ...input, persistent: true } }),
+            );
+            slot = {
+                worker,
+                dispose() {
+                    clearTimeout(this.idleTimer);
+                    if (pool.get(key) === this) pool.delete(key);
+                    liveSearchWorkers.delete(this);
+                    void worker.terminate();
+                    worker.unref();
+                },
+            };
+            workersCreated++;
+            pool.set(key, slot);
+            liveSearchWorkers.add(slot);
+            const current = slot;
+            worker.on("error", () => current.dispose());
+            worker.on("exit", () => current.dispose());
+        } else workersReused++;
+        clearTimeout(slot.idleTimer);
+        const current = slot;
+        current.busy = new Promise<void>((resolve) => {
+            current.release = resolve;
+        });
+        current.worker.ref();
+        return { slot: current, fresh };
+    }
+    return null;
+}
 
 /** Called only after the owner has decided the hint. No background result can
  * change that decision, and cleanup cancels both queued and active jobs. */
@@ -339,6 +425,7 @@ async function executeAutoSearchWorker(
         query,
         options: {
             ...serializable,
+            autoHint: true,
             backfillMemoryEmbeddings: false,
             countRetrievals: false,
             measurementDisabled: true,
@@ -348,8 +435,26 @@ async function executeAutoSearchWorker(
         snapshot,
         deadlineUnixMs: autoSearchDeadlineUnixMs(deadlineSignal),
     };
+    let lease: Awaited<ReturnType<typeof acquireSearchWorker>>;
+    try {
+        lease = await acquireSearchWorker(
+            db,
+            `${input.harness}\0${projectPath}\0${job}\0${entry.href}`,
+            entry,
+            input,
+            signal,
+        );
+    } catch (error) {
+        lifecycle.done();
+        throw error;
+    }
+    if (!lease) {
+        lifecycle.done();
+        return [];
+    }
+    const { slot, fresh } = lease;
+    const worker = slot.worker;
     return new Promise((resolve, reject) => {
-        const worker = inRootAsyncContext(() => new Worker(entry, { workerData: input }));
         let settled = false;
         const finish = (results: UnifiedSearchResult[], error?: Error) => {
             if (settled) return;
@@ -357,7 +462,24 @@ async function executeAutoSearchWorker(
             signal?.removeEventListener("abort", abort);
             lifecycle.signal.removeEventListener("abort", abort);
             lifecycle.done();
-            void worker.terminate();
+            worker.off("message", onMessage);
+            worker.off("error", onError);
+            worker.off("exit", onExit);
+            if (error || signal.aborted || entry.href !== defaultAutoSearchWorkerEntry().href)
+                slot.dispose();
+            else {
+                slot.idleTimer = setTimeout(() => slot.dispose(), SEARCH_WORKER_IDLE_MS);
+                slot.idleTimer.unref?.();
+            }
+            const release = slot.release;
+            slot.busy = undefined;
+            slot.release = undefined;
+            release?.();
+            const reusable = liveSearchWorkers.delete(slot);
+            if (reusable) liveSearchWorkers.add(slot);
+            const idle = [...liveSearchWorkers].filter((candidate) => !candidate.busy);
+            for (const prior of idle.slice(0, Math.max(0, idle.length - MAX_IDLE_SEARCH_WORKERS)))
+                prior.dispose();
             worker.unref();
             if (error) reject(error);
             else resolve(results);
@@ -365,9 +487,10 @@ async function executeAutoSearchWorker(
         const abort = () => finish([]);
         signal?.addEventListener("abort", abort, { once: true });
         lifecycle.signal.addEventListener("abort", abort, { once: true });
-        worker.on("error", (error) => finish([], error));
-        worker.on("exit", (code) => finish([], new Error(`auto-search worker exited (${code})`)));
-        worker.on("message", async (reply: AutoSearchWorkerReply) => {
+        const onError = (error: Error) => finish([], error);
+        const onExit = (code: number) =>
+            finish([], new Error(`auto-search worker exited (${code})`));
+        const onMessage = async (reply: AutoSearchWorkerReply) => {
             if (settled) return;
             if (reply.kind === "result") {
                 // A registration can change while the worker is ranking. Never serve
@@ -392,7 +515,7 @@ async function executeAutoSearchWorker(
                     response.result =
                         (await (job === "backfill"
                             ? embedTextForProject(projectPath, reply.text, signal, "query")
-                            : embedQuery?.(reply.text, signal))) ?? null;
+                            : boundedHintEmbedding(embedQuery, reply.text, signal))) ?? null;
                 else {
                     const passage = await embedBatchForProject(
                         projectPath,
@@ -419,10 +542,49 @@ async function executeAutoSearchWorker(
             response.embeddingHostBusy = isEmbeddingHostBusy();
             // Providers that ignore abort can complete late. Never send their
             // continuation into a dead worker or a subsequent turn's request.
-            if (!settled && !signal?.aborted) worker.postMessage(response);
-        });
+            if (!settled && !signal?.aborted) {
+                try {
+                    worker.postMessage(response);
+                } catch (error) {
+                    finish([], error instanceof Error ? error : new Error(String(error)));
+                }
+            }
+        };
+        worker.on("error", onError);
+        worker.on("exit", onExit);
+        worker.on("message", onMessage);
         if (signal?.aborted) abort();
+        else if (!fresh) {
+            try {
+                worker.postMessage({ kind: "run", input });
+            } catch (error) {
+                finish([], error instanceof Error ? error : new Error(String(error)));
+            }
+        }
     });
+}
+
+async function boundedHintEmbedding(
+    embed: UnifiedSearchOptions["embedQuery"],
+    text: string,
+    signal: AbortSignal,
+): Promise<CapturedQueryEmbedding | Float32Array | null> {
+    const controller = new AbortController();
+    const combined = AbortSignal.any([signal, controller.signal]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([
+            Promise.resolve().then(() => embed?.(text, combined) ?? null),
+            new Promise<null>((resolve) => {
+                timer = setTimeout(() => {
+                    resolve(null);
+                    controller.abort();
+                }, AUTO_SEARCH_VECTOR_TIMEOUT_MS);
+            }),
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 function defaultAutoSearchWorkerEntry(): URL {

@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import {
 	copyFileSync,
 	mkdirSync,
@@ -103,6 +103,10 @@ async function withArgv1<T>(
  */
 describe("loadDefaultPiSessionApi", () => {
 	beforeEach(() => {
+		clearCachedModule();
+	});
+
+	afterEach(() => {
 		clearCachedModule();
 	});
 

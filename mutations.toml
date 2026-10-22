@@ -382,21 +382,19 @@ expect_message = '/isFailClosedBlockingError\(thrown\)\)\.toBe\(true\)/'
 # store file readable by other users: none of these announces itself.
 
 [[control]]
-id = 'ts-opencode2-orphan-sweep-parked'
-guards = "the OpenCode 1 orphan sweep is parked on OpenCode 2 (issue 627): it cannot read session_v2 and would delete every live OpenCode 2 session's state"
+id = 'ts-opencode2-orphan-sweep-reads-session-v2'
+guards = "the OpenCode 2 orphan sweep reads liveness from session_v2 (issue 627): reading the retained OpenCode 1 session table instead would delete every live OpenCode 2 session's state"
 file = 'packages/plugin/src/features/magic-context/message-index.ts'
 old = '''
-    return harness === "opencode";
-}'''
+        if (harness === "opencode2") {'''
 new = '''
-    return harness === "opencode" || harness === "opencode2";
-}'''
+        if (false) {'''
 test_file = 'packages/plugin/src/features/magic-context/message-index-maintenance.test.ts'
 runner = 'command'
 command = ['bun', 'test', 'packages/plugin/src/features/magic-context/message-index-maintenance.test.ts', '--timeout', '30000', '-t', '{test}']
 test_count_pattern = 'Ran {count} test'
-expect_red = ["^message\\shistory\\sorphan\\ssweep\\son\\sOpenCode\\s2\\sparks\\swithout\\sopening\\sany\\sstore,\\sand\\skeeps\\severy\\sOpenCode\\s2\\ssession's\\sstate$"]
-expect_message = '"status": "swept"'
+expect_red = ["^message\\shistory\\sorphan\\ssweep\\son\\sOpenCode\\s2\\sOC2\\ssweeps\\sold\\smissing\\ssessions\\swhile\\sretaining\\slive\\sand\\srecently\\sindexed\\ssessions$"]
+expect_message = '"deleted": 2'
 
 [[control]]
 id = 'ts-schema-fence-refuses-newer-database'

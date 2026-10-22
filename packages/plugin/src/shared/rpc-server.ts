@@ -1,7 +1,8 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { readdirSync, readFileSync, unlinkSync } from "node:fs";
+import { readdirSync, readFileSync, rmdirSync, unlinkSync } from "node:fs";
 import type { Server, ServerWebSocket } from "bun";
 import { log } from "./logger";
+import { reapDeadRpcDiscovery } from "./rpc-discovery-cleanup";
 import {
     acknowledgeNotifications,
     drainNotifications,
@@ -82,6 +83,7 @@ export class MagicContextRpcServer {
     private portFilePath: string;
     private portDir: string;
     private startedAt = Date.now();
+    private stopped = false;
     private readonly instanceId = randomBytes(8).toString("hex");
     private unregisterOwnInstance: (() => void) | null = null;
     /** Every authenticated WS socket, so dispose can close them all. */
@@ -93,7 +95,10 @@ export class MagicContextRpcServer {
     // discovers/guesses the port.
     private readonly token = randomBytes(32).toString("hex");
 
-    constructor(storageDir: string, directory: string) {
+    constructor(
+        private storageDir: string,
+        directory: string,
+    ) {
         this.portFilePath = rpcPortFilePath(storageDir, directory, process.pid, this.instanceId);
         this.portDir = rpcPortDir(storageDir, directory);
     }
@@ -131,6 +136,9 @@ export class MagicContextRpcServer {
             log("rpc server skipped: Bun runtime not available (no TUI consumer)");
             return 0;
         }
+        this.stopped = false;
+        await reapDeadRpcDiscovery(this.storageDir);
+        if (this.stopped) return 0;
         this.startedAt = Date.now();
         const self = this;
         const server = inRootAsyncContext(() =>
@@ -172,17 +180,26 @@ export class MagicContextRpcServer {
             // The discovery file carries the RPC bearer token. The shared writer
             // creates its directory and temporary file with owner-only modes.
             this.unregisterOwnInstance ??= registerOwnRpcServerInstance(this.instanceId);
-            writeStorageFileAtomicSync(
-                this.portFilePath,
-                JSON.stringify({
-                    port: this.port,
-                    pid: process.pid,
-                    started_at: this.startedAt,
-                    kind: "OpenCode server",
-                    token: this.token,
-                    instance_id: this.instanceId,
-                }),
-            );
+            const publish = () =>
+                writeStorageFileAtomicSync(
+                    this.portFilePath,
+                    JSON.stringify({
+                        port: this.port,
+                        pid: process.pid,
+                        started_at: this.startedAt,
+                        kind: "OpenCode server",
+                        token: this.token,
+                        instance_id: this.instanceId,
+                    }),
+                );
+            try {
+                publish();
+            } catch (error) {
+                // An empty-directory reaper can race the writer before its temp
+                // file exists. Recreate the directory and retry that case only.
+                if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+                publish();
+            }
             log(`[rpc] server listening on 127.0.0.1:${this.port}`);
         } catch (err) {
             log(`[rpc] failed to write port file: ${err}`);
@@ -193,6 +210,7 @@ export class MagicContextRpcServer {
 
     /** Stop the server: close every socket, stop accepting, remove port file. */
     stop(): void {
+        this.stopped = true;
         for (const ws of this.sockets) {
             try {
                 if (ws.data.authTimer) clearTimeout(ws.data.authTimer);
@@ -212,6 +230,11 @@ export class MagicContextRpcServer {
             unlinkSync(this.portFilePath);
         } catch {
             // Intentional: port file may already be gone
+        }
+        try {
+            rmdirSync(this.portDir);
+        } catch {
+            // Other instances' discovery records must survive this server's stop.
         }
         this.unregisterOwnInstance?.();
         this.unregisterOwnInstance = null;

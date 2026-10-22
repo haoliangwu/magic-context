@@ -40,6 +40,18 @@ function createArgs(model?: { providerID: string; modelID: string }) {
 }
 
 describe("promptSyncWithModelSuggestionRetry", () => {
+    test("synchronous prompt completion retains await semantics with cancellation", async () => {
+        const prompt = mock(() => undefined);
+        const abort = mock(async () => ({}));
+
+        await promptSyncWithModelSuggestionRetry(createClient(prompt, abort), createArgs(), {
+            signal: new AbortController().signal,
+        });
+
+        expect(prompt).toHaveBeenCalledTimes(1);
+        expect(abort).not.toHaveBeenCalled();
+    });
+
     test("primary succeeds, no fallback iteration", async () => {
         const prompt = mock(async () => ({}));
         const client = createClient(prompt);
@@ -798,4 +810,26 @@ test("DeepSeek unsupported-model 400 preserves provider status and message rathe
     expect((caught as Error).message).toContain("status=400");
     expect((caught as Error).message).not.toContain("no output");
     expect(getPromptFailureDetail(caught)).toMatchObject({ failureClass: "provider_error" });
+});
+
+test("timeout rejects an uncooperative carrier and aborts its child", async () => {
+    const abort = mock(async () => ({}));
+    const client = createClient(
+        mock(() => new Promise(() => {})),
+        abort,
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        await expect(
+            Promise.race([
+                promptSyncWithModelSuggestionRetry(client, createArgs(), { timeoutMs: 10 }),
+                new Promise((_, reject) => {
+                    timer = setTimeout(() => reject(new Error("carrier remained stuck")), 200);
+                }),
+            ]),
+        ).rejects.toThrow("prompt timed out after 10ms");
+        expect(abort).toHaveBeenCalledTimes(1);
+    } finally {
+        clearTimeout(timer);
+    }
 });

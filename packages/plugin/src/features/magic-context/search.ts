@@ -1,4 +1,5 @@
 import { log } from "../../shared/logger";
+import { cleanSearchText, keywordRelevance, matchedSearchSnippet } from "../../shared/search-text";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import {
     loadCompartmentChunkEmbeddingsForSearch,
@@ -133,6 +134,9 @@ export function createUnifiedSearchDiagnostics(): UnifiedSearchDiagnostics {
 
 export interface UnifiedSearchOptions {
     limit?: number;
+    /** For automatic hints, score the share of query terms present instead of their relative FTS rank. */
+    autoHint?: boolean;
+    excludeMessageId?: string;
     /** Explicit searches alone may rerank; automatic hints never enter this path. */
     rerank?: boolean;
     rerankConnectionFile?: string;
@@ -327,13 +331,14 @@ export interface NoteSearchResult {
     sourceSessionId: string | null;
 }
 
-export type UnifiedSearchResult =
+export type UnifiedSearchResult = (
     | MemorySearchResult
     | MessageSearchResult
     | CompartmentSearchResult
     | GitCommitSearchResult
     | PrimerSearchResult
-    | NoteSearchResult;
+    | NoteSearchResult
+) & { relevanceScore?: number };
 
 function normalizeLimit(limit?: number): number {
     if (typeof limit !== "number" || !Number.isFinite(limit)) {
@@ -1419,7 +1424,8 @@ function searchMessagesInSnapshot(
             return filtered.map(
                 (row, rank): MessageSearchResult => ({
                     source: "message",
-                    content: previewText(row.content),
+                    content:
+                        matchedSearchSnippet(row.content, args.query) || previewText(row.content),
                     score: linearDecayScore(rank, filtered.length),
                     messageOrdinal: row.messageOrdinal,
                     messageId: row.messageId,
@@ -1536,7 +1542,9 @@ function searchMessagesInSnapshot(
         // message FTS results, preserving comparability with the other sources.
         return ranked.map((entry, rank) => ({
             source: "message" as const,
-            content: previewText(entry.row.content),
+            content:
+                matchedSearchSnippet(entry.row.content, args.query) ||
+                previewText(entry.row.content),
             score: linearDecayScore(rank, ranked.length),
             messageOrdinal: entry.row.messageOrdinal,
             messageId: entry.row.messageId,
@@ -1860,10 +1868,9 @@ function mergeMessageAndCompartmentResults(args: {
         )
         .slice(0, args.limit);
 
-    return ranked.map((entry, rank) => ({
-        ...entry.result,
-        score: linearDecayScore(rank, ranked.length),
-    }));
+    // Fusion decides ordering, not relevance. In particular, rank one must not
+    // turn a weak cosine match into a perfect similarity score.
+    return ranked.map((entry) => entry.result);
 }
 
 function getSourceBoost(result: UnifiedSearchResult): number {
@@ -2324,7 +2331,9 @@ export async function unifiedSearch(
         if (options.diagnostics) {
             options.diagnostics.suppressedLiveMessageMatches = outcome.suppressedLiveMessageMatches;
         }
-        messageResults = outcome.results;
+        messageResults = outcome.results.filter(
+            (result) => result.messageId !== options.excludeMessageId,
+        );
         if (lanes) lanes.message_fts = (outcome.laneResults ?? outcome.results).slice(0, 25);
     }
 
@@ -2510,6 +2519,21 @@ export async function unifiedSearch(
         }
     }
 
+    if (options.autoHint) {
+        return results.map((result) => ({
+            ...result,
+            relevanceScore:
+                cleanSearchText(result.source === "compartment" ? result.title : result.content)
+                    .length === 0
+                    ? 0
+                    : result.source === "message" ||
+                        ("matchType" in result &&
+                            result.source !== "compartment" &&
+                            result.matchType !== "semantic")
+                      ? keywordRelevance(trimmedQuery, result.content)
+                      : result.score,
+        }));
+    }
     return results;
 }
 

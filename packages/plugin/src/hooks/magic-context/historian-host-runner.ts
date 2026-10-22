@@ -750,6 +750,7 @@ export class HistorianHostRunner {
                 undefined as never,
                 {
                     path: { id: handle.id },
+                    cacheTail: "skip",
                     query: { directory: sessionDirectory },
                     body: {
                         agent: "historian",
@@ -786,6 +787,8 @@ export class HistorianHostRunner {
                     timeoutMs: attemptMs,
                     signal,
                     fallbackModels: rest.map(withVariant),
+                    // Rust supplies the complete allowed chain; provider suggestions are not entries.
+                    allowModelSuggestions: false,
                     callContext: `historian-host:${claim.runId}`,
                     fetchOutput: () =>
                         withinAttempt(

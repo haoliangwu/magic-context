@@ -2,6 +2,7 @@ import type { Scheduler } from "../../features/magic-context/scheduler";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { loadPersistedUsage, type PersistedUsageState } from "../../features/magic-context/storage";
 import type { ContextUsage, SessionMeta } from "../../features/magic-context/types";
+import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { sessionLog } from "../../shared/logger";
 
 type ContextUsageCacheEntry = {
@@ -43,6 +44,56 @@ export function contextUsagePassSnapshot(sessionMeta: SessionMeta): ContextUsage
               }
             : null,
     };
+}
+
+/**
+ * The provider's last usage reading, saved in session_meta, when it still
+ * describes this pass's request: the same model, the same context limit, and a
+ * last response recent enough that the provider cache is still warm. A pass
+ * whose in-memory reading was reset (the first pass after a process restart)
+ * reads its pressure from this before falling back to a local estimate.
+ *
+ * Both the model key and the limit must be known and equal. A reading taken
+ * on another model or against another limit is a different percentage basis,
+ * so it is not used. The TTL check mirrors the scheduler's idle clock: once the
+ * TTL has elapsed the prefix is rebuilt anyway and the reading may be stale.
+ */
+export function savedProviderReadingForPass(input: {
+    persisted: PersistedUsageState | null | undefined;
+    currentModelKey: string | undefined;
+    contextLimit: number | undefined;
+    lastResponseTime: number;
+    cacheExpired: boolean;
+}): ContextUsage | null {
+    const persisted = input.persisted;
+    if (!persisted) return null;
+    const { percentage, inputTokens } = persisted.usage;
+    if (
+        !Number.isFinite(percentage) ||
+        percentage <= 0 ||
+        !Number.isFinite(inputTokens) ||
+        inputTokens <= 0
+    ) {
+        return null;
+    }
+    if (!(input.lastResponseTime > 0) || input.cacheExpired) return null;
+    if (
+        persisted.lastObservedModelKey === null ||
+        input.currentModelKey === undefined ||
+        input.currentModelKey.length === 0 ||
+        piModelRefToCanonical(persisted.lastObservedModelKey) !==
+            piModelRefToCanonical(input.currentModelKey)
+    ) {
+        return null;
+    }
+    if (
+        typeof input.contextLimit !== "number" ||
+        !(input.contextLimit > 0) ||
+        persisted.lastUsageContextLimit !== input.contextLimit
+    ) {
+        return null;
+    }
+    return { percentage, inputTokens };
 }
 
 export function resolveUnknownUsageFromWireEstimate(input: {

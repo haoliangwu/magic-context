@@ -167,9 +167,10 @@ export function backfillMessageTimesBatch(
 export async function runMessageTimeBackfill(
     db: Database,
     reader: MessageTimeBackfillReader,
+    signal?: AbortSignal,
 ): Promise<void> {
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    for (;;) {
+    while (!signal?.aborted) {
         const progress = backfillMessageTimesBatch(db, reader);
         if (progress.completed) return;
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -179,11 +180,12 @@ export async function runMessageTimeBackfill(
 export function startMessageTimeBackfill(
     db: Database,
     reader: MessageTimeBackfillReader,
+    signal?: AbortSignal,
 ): Promise<void> {
     const active = activeBackfills.get(db);
     if (active) return active;
     const run = withoutSqliteTransformPass(() =>
-        withSqliteBackgroundWriter(() => runMessageTimeBackfill(db, reader)),
+        withSqliteBackgroundWriter(() => runMessageTimeBackfill(db, reader, signal)),
     ).finally(() => activeBackfills.delete(db));
     activeBackfills.set(db, run);
     return run;

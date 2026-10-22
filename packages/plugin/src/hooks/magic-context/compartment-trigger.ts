@@ -16,7 +16,13 @@ import { escalationBands } from "../../shared/escalation-bands";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { contentTagOwnerMessageId } from "../../shared/tag-owner-id";
-import { hasReclaimRide, type ReclaimRideSignals, reclaimRideLabel } from "./cache-busting-signals";
+import {
+    hasReclaimRide,
+    type ReclaimRidePermissionGate,
+    type ReclaimRideSignals,
+    reclaimRideLabel,
+    reclaimRidePermitted,
+} from "./cache-busting-signals";
 import { isHistorianDrainBudgetSpent } from "./historian-drain-gate";
 import {
     createDefaultBoundarySnapshotForTests,
@@ -223,6 +229,7 @@ function estimateProjectedPostDropPercentage(
     clearedReasoningThroughTag: number | undefined,
     canClearReasoning: boolean,
     liveBudgetCutoff?: number,
+    eligiblePendingDropTagIds?: ReadonlySet<number>,
 ): number | null {
     // Denominator must include both text/tool bytes and reasoning bytes to match the numerator
     const totalActiveBytes = activeTags.reduce(
@@ -235,7 +242,9 @@ function estimateProjectedPostDropPercentage(
 
     // 1. Pending user-queued drops (from ctx_reduce) — include both text and reasoning bytes
     //    because dropping a message tag also clears its associated reasoning parts
-    const pendingDrops = getPendingOps(db, sessionId).filter((op) => op.operation === "drop");
+    const pendingDrops = getPendingOps(db, sessionId).filter(
+        (op) => op.operation === "drop" && eligiblePendingDropTagIds?.has(op.tagId) === true,
+    );
     const pendingDropTagIds = new Set(pendingDrops.map((op) => op.tagId));
     if (pendingDrops.length > 0) {
         droppableBytes += activeTags
@@ -471,7 +480,8 @@ export function checkCompartmentTrigger(
     inMemoryTail?: InMemoryTailSource | LazyInMemoryTailSource,
     taggerFloorOverride?: number,
     reasoningProjection?: ReasoningProjectionCapability,
-    reclaimRide?: ReclaimRideSignals,
+    reclaimRide?: ReclaimRideSignals & { permission?: ReclaimRidePermissionGate },
+    eligiblePendingDropTagIds?: ReadonlySet<number>,
 ): CompartmentTriggerResult {
     if (sessionMeta.compartmentInProgress) {
         sessionLog(
@@ -673,12 +683,20 @@ export function checkCompartmentTrigger(
         sessionMeta.clearedReasoningThroughTag,
         canClearReasoning,
         reasoningProjection?.budgetCutoff,
+        eligiblePendingDropTagIds,
     );
     const relativePostDropTarget = executeThresholdPercentage * POST_DROP_TARGET_RATIO;
     // Queued drops need an existing cache-busting event to apply. A future history
-    // publication cannot justify skipping the historian that would produce it.
+    // publication cannot justify skipping the historian that would produce it,
+    // and neither can a ride this pass is not permitted to take: a pass held for
+    // recent signed thinking keeps its queued drops queued.
+    const ridePermitted =
+        reclaimRide !== undefined &&
+        (reclaimRide.permission
+            ? reclaimRidePermitted(reclaimRide, reclaimRide.permission)
+            : hasReclaimRide(reclaimRide));
     const rideLabel = reclaimRide ? reclaimRideLabel(reclaimRide) : "ride=none";
-    const dropsCanLand = reclaimRide !== undefined && hasReclaimRide(reclaimRide);
+    const dropsCanLand = ridePermitted;
 
     const forceMaterializationPercentage = escalationBands(
         executeThresholdPercentage,

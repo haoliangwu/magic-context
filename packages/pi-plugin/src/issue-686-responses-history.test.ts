@@ -355,12 +355,14 @@ test("issue 686 Responses grouping: same-model signed thinking, text and tool ca
 				name: "Read",
 				arguments: "{}",
 			},
-			item("follow-up answer", "commentary"),
+			// The follow-up assistant closes the call's window, so Oh My Pi moves
+			// the later result ahead of it (transformMessages takeRealToolResult).
 			{
 				type: "function_call_output",
 				call_id: "call_686",
 				output: "read result",
 			},
+			item("follow-up answer", "commentary"),
 			{ role: "user", content: "current prompt" },
 		],
 	});

@@ -8,7 +8,7 @@ const text = await Bun.file(resolve(root, ".github/workflows/ci.yml")).text();
 const releaseText = await Bun.file(resolve(root, ".github/workflows/release.yml")).text();
 const waitActionText = await Bun.file(resolve(root, ".github/actions/wait-ci-artifact/action.yml")).text();
 type Step = { name?: string; run?: string; if?: string; uses?: string; with?: Record<string, string>; env?: Record<string, string> };
-type Job = { name: string; needs?: string[]; if?: string; "timeout-minutes"?: number; permissions?: Record<string, string>; steps: Step[]; strategy?: { "fail-fast": boolean; matrix: { shard: number[]; mode?: string[] } } };
+type Job = { name: string; needs?: string[]; if?: string; "timeout-minutes"?: number; permissions?: Record<string, string>; steps: Step[]; strategy?: { "fail-fast": boolean; matrix: { shard: number[]; mode?: string[]; version?: string[] } } };
 const workflow = Bun.YAML.parse(text) as { jobs: Record<string, Job> };
 const releaseWorkflow = Bun.YAML.parse(releaseText) as { jobs: Record<string, Job> };
 const allWorkflowDocuments = await Promise.all(
@@ -52,7 +52,7 @@ test("artifact consumers start setup immediately and gate tests on artifacts", (
         }
     }
     expect(workflow.jobs["e2e-host-opencode"]!.strategy).toEqual({ "fail-fast": false, matrix: { shard: [0, 1, 2, 3] } });
-    expect(workflow.jobs["e2e-host-opencode2"]!.strategy).toEqual({ "fail-fast": false, matrix: { shard: [0, 1] } });
+    expect(workflow.jobs["e2e-host-opencode2"]!.strategy).toEqual({ "fail-fast": false, matrix: { shard: [0, 1], version: ["2.0.22", "2.1.0"] } });
 });
 
 test("same-run artifact downloads retry transient failures and guard consumers", () => {

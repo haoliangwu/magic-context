@@ -205,12 +205,14 @@ export type OmpEntry = z.infer<typeof OmpEntrySchema>;
 /** Strict model-resolution block used by historian.opencode. */
 export const OpenCodeHarnessBlockSchema = z
     .object({
-        model: OcEntrySchema.optional().describe("Primary OpenCode model entry."),
+        model: OcEntrySchema.optional().describe(
+            "Primary historian OpenCode model entry. When set, only this model and fallback_models are used; exhaustion reports failure, never the session model. When absent, OpenCode inherits the session model.",
+        ),
         fallback_models: z
             .array(OcEntrySchema)
             .optional()
             .describe(
-                "Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+                "Ordered historian fallback OpenCode entries. A configured primary never adds the session model after this list. Requires an array; legacy singleton values migrate to a one-element array.",
             ),
         variant: z
             .string()
@@ -226,12 +228,14 @@ export type OpenCodeHarnessBlock = z.infer<typeof OpenCodeHarnessBlockSchema>;
 /** Strict model-resolution block used by historian.pi. */
 export const PiHarnessBlockSchema = z
     .object({
-        model: PiEntrySchema.optional().describe("Primary Pi model entry."),
+        model: PiEntrySchema.optional().describe(
+            "Primary historian Pi model entry. When set, only this model and fallback_models are used; exhaustion reports failure, never the session model. When absent, Pi does not run the historian.",
+        ),
         fallback_models: z
             .array(PiEntrySchema)
             .optional()
             .describe(
-                "Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+                "Ordered historian fallback Pi entries. The session model is never appended. Requires an array; legacy singleton values migrate to a one-element array.",
             ),
         thinking_level: PiThinkingLevelSchema.describe(
             "Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
@@ -244,11 +248,15 @@ export type PiHarnessBlock = z.infer<typeof PiHarnessBlockSchema>;
 /** Strict model-resolution block used by historian.omp. */
 export const OmpHarnessBlockSchema = z
     .object({
-        model: OmpEntrySchema.optional().describe("Primary OMP model entry."),
+        model: OmpEntrySchema.optional().describe(
+            "Primary historian OMP model entry. When set, only this model and fallback_models are used; exhaustion reports failure, never the session model. An absent OMP block inherits the Pi block; a selected block without a model does not run the historian.",
+        ),
         fallback_models: z
             .array(OmpEntrySchema)
             .optional()
-            .describe("Ordered fallback OMP entries."),
+            .describe(
+                "Ordered historian fallback OMP entries. The session model is never appended.",
+            ),
         thinking_level: OmpThinkingLevelSchema.describe(
             "OMP thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
         ),

@@ -188,6 +188,10 @@ const KNOWN_SLOTS: Record<string, KnownSlot> = {
         classification: "DIAGNOSTIC",
         reason: "Most-recent diagnostic: every open attempt clears or overwrites it.",
     },
+    "packages/pi-plugin/src/pi-append-compaction.ts:loggedIncompatibleHost": {
+        classification: "DIAGNOSTIC",
+        reason: "Log-once flag for the incompatible-host error line only: the binding and getEntry checks run again on every adaptPiAppendCompaction call, so a host that becomes compatible gets markers without a restart.",
+    },
     "packages/plugin/src/shared/models-dev-cache.ts:apiCache": {
         classification: "PUBLICATION",
         reason: "Publishes last-known-good model metadata, not a failure verdict; refresh writes a later successful value.",

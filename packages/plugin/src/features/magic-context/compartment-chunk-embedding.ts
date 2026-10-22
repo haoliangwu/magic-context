@@ -1281,6 +1281,7 @@ export async function loadUnembeddedCompartmentChunkCandidatesPolite(
     limit: number,
     maxInputTokens = DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS,
     leaseHeldRenumber = false,
+    isEligible?: (candidate: CompartmentChunkBackfillCandidate) => boolean,
 ): Promise<CompartmentChunkBackfillCandidate[]> {
     const rows = getBackfillCandidateStatement(db).all(projectPath) as unknown[];
     const candidates = mapBackfillCandidateRows(rows);
@@ -1288,6 +1289,10 @@ export async function loadUnembeddedCompartmentChunkCandidatesPolite(
     const stale: CompartmentChunkBackfillCandidate[] = [];
     let sliceStarted = performance.now();
     for (const candidate of candidates) {
+        if (isEligible && !isEligible(candidate)) {
+            sliceStarted = await yieldCoverageSlice(sliceStarted);
+            continue;
+        }
         const classification = classifyChunkCoverageDefect(
             db,
             projectPath,
@@ -1351,12 +1356,26 @@ export function deleteChunkEmbedBackoffForCompartments(db: Database, ids: readon
 }
 
 /** Also removes the session's recorded window sources (see recordChunkWindowSource). */
-export function deleteChunkEmbedBackoffForSession(db: Database, sessionId: string): void {
-    db.prepare(`DELETE FROM schema_migrations_meta WHERE key IN (
+export function deleteChunkEmbedBackoffForSession(
+    db: Database,
+    sessionId: string,
+    limit?: number,
+): number {
+    if (limit !== undefined)
+        return db
+            .prepare(`DELETE FROM schema_migrations_meta WHERE key IN (
+        SELECT key FROM schema_migrations_meta JOIN compartments
+        ON key = ? || compartments.id OR key = ? || compartments.id
+        WHERE compartments.session_id = ? LIMIT ?
+    )`)
+            .run(BACKOFF_PREFIX, WINDOW_SOURCE_PREFIX, sessionId, limit).changes;
+    return db
+        .prepare(`DELETE FROM schema_migrations_meta WHERE key IN (
         SELECT ? || id FROM compartments WHERE session_id = ?
         UNION ALL
         SELECT ? || id FROM compartments WHERE session_id = ?
-    )`).run(BACKOFF_PREFIX, sessionId, WINDOW_SOURCE_PREFIX, sessionId);
+    )`)
+        .run(BACKOFF_PREFIX, sessionId, WINDOW_SOURCE_PREFIX, sessionId).changes;
 }
 
 export function recordChunkEmbedBackoff(
@@ -1606,7 +1625,7 @@ function memoizedCoverageWindows(
 
 // Do not let a long catch-up monopolize the host between HTTP requests.
 async function yieldCoverageSlice(started: number): Promise<number> {
-    if (performance.now() - started < 35) return started;
+    if (performance.now() - started < 8) return started;
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     return performance.now();
 }
@@ -1889,6 +1908,9 @@ export async function loadUnembeddedSessionChunkCandidatesPolite(
         else if (leaseHeldRenumber) {
             applyLeaseHeldCoverageRepair(db, candidate, projectPath, modelId, classification);
         }
+        // Missing windows outrank stale rows. Once the batch is full, scanning
+        // newer history cannot change the selection and only delays host work.
+        if (missing.length >= Math.max(1, limit)) return missing;
         started = await yieldCoverageSlice(started);
     }
     return [...missing, ...stale].slice(0, Math.max(1, limit));

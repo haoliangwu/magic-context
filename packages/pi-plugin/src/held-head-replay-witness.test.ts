@@ -14,6 +14,12 @@ test("held-head witness: over-window replay requires a stripped, permitted rebui
 		R2_PASSES: "69",
 		R2_WINDOW: "100000",
 		R2_REBUILD_EVIDENCE: "1",
+		// Every step heavy and no synthetic continuations, so the seed's turns are
+		// held below the cap. Half the steps are heavy by their stored thinking
+		// text, which makes the wire larger than the usage reading: a held pass
+		// below the cap whose replay no longer fits the window.
+		R2_HEAVY_RATE: "1",
+		R2_CONTINUATION_RATE: "0",
 	};
 	delete env.OPENCODE_DB;
 	const result = spawnSync(
@@ -39,7 +45,7 @@ test("held-head witness: over-window replay requires a stripped, permitted rebui
 		.map((line) => JSON.parse(line.slice(prefix.length)));
 	expect(evidence).toHaveLength(1);
 	expect(evidence[0]).toMatchObject({
-		tokens: 100186,
+		tokens: 101876,
 		limit: 100000,
 		activeSignedBlocks: 0,
 		declaredRebuild: true,

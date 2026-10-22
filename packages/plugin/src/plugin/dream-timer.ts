@@ -48,6 +48,7 @@ import {
     getProjectEmbeddingSnapshot,
 } from "../features/magic-context/memory/embedding";
 import { isUsableProjectIdentity } from "../features/magic-context/memory/project-identity";
+import { pruneMissingProjectIdentities } from "../features/magic-context/memory/project-identity-cache";
 import { sweepOrphanedOpenCodeMessageIndexesOffThread } from "../features/magic-context/message-index-async";
 import {
     drainCommitBacklogForProject,
@@ -381,7 +382,7 @@ function runTick(origin: "startup" | "interval"): void {
     // One tick already covers every project, so do not start duplicate work.
     if (tickInFlight) return;
     tickInFlight = true;
-    log(`[dreamer] timer tick (${origin}) — projects=${registeredProjects.size}`);
+    log(`[magic-context] maintenance tick (${origin}) — projects=${registeredProjects.size}`);
     void (async () => {
         try {
             const db = openTimerDatabaseOrNull("maintenance tick");
@@ -448,6 +449,9 @@ function persistTickOutcome(db: Database, failure: DreamerTickFailure | null): v
 }
 
 async function runMessageHistoryMaintenance(db: Database): Promise<void> {
+    const prunedIdentities = await pruneMissingProjectIdentities();
+    if (prunedIdentities > 0)
+        log(`[magic-context] pruned ${prunedIdentities} missing project identities`);
     try {
         await drainStaleLkgSlots(db);
     } catch (error) {
@@ -748,6 +752,10 @@ export function _getDreamTimerStateForTests(): { active: boolean; directories: s
     return { active: activeTimer !== null, directories: [...registeredProjects.keys()] };
 }
 
+export function _isDreamTimerTickInFlightForTests(): boolean {
+    return tickInFlight;
+}
+
 export function _resetDreamTimerForTests(): void {
     if (activeTimer) {
         clearInterval(activeTimer);
@@ -822,7 +830,7 @@ function startGitSweepLeaseRenewal(
     return () => clearInterval(timer);
 }
 
-async function sweepGitCommits(args: {
+export async function sweepGitCommits(args: {
     directory: string;
     projectIdentity: string;
     db: Database;
@@ -832,11 +840,20 @@ async function sweepGitCommits(args: {
     const holderId = crypto.randomUUID();
     const lease = acquireGitSweepLease(db, projectIdentity, holderId);
     if (!lease.acquired) {
-        const reason =
-            lease.reason === "cooldown_active"
-                ? `cooldown active until ${lease.nextAllowedAt}`
-                : `lease held by ${lease.leaseHolder ?? "another holder"} until ${lease.leaseExpiresAt ?? "unknown"}`;
+        if (lease.reason === "cooldown_active") return;
+        const reason = `lease held by ${lease.leaseHolder ?? "another holder"} until ${lease.leaseExpiresAt ?? "unknown"}`;
         log(`[git-commits] sweep skipped for ${projectIdentity}: ${reason}`);
+        return;
+    }
+
+    if (projectIdentity.startsWith("dir:")) {
+        if (parkGitSweepNonIndexable(db, projectIdentity, holderId)) {
+            log(
+                `[git-commits] sweep parked for ${projectIdentity}: directory identity has no commits`,
+            );
+        } else {
+            releaseGitSweepLease(db, projectIdentity, holderId);
+        }
         return;
     }
 

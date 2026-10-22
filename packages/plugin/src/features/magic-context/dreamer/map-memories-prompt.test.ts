@@ -3,6 +3,7 @@ import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
+import { extractCompleteManifestBody } from "./manifest-parser";
 
 import {
     buildMapMemoriesPrompt,
@@ -65,6 +66,34 @@ const DEEPSEEK_NESTED_FILE = `<mappings>
 </mappings>`;
 
 describe("parseMapMemoriesManifest", () => {
+    const eighty =
+        '<mappings>\n<memory id="123456" files="src/example-backing-file.ts"/>\n</mappings>';
+    it.each([
+        eighty,
+        ` \n${eighty}\n\t `,
+        eighty.replaceAll("\n", "\r\n"),
+    ])("accepts a complete self-closing mapping with surrounding or CRLF whitespace: %j", (text) => {
+        expect(eighty.length).toBe(80);
+        expect(validateMapMemoriesManifest(text, new Set([123456]))).toEqual([
+            { id: 123456, files: ["src/example-backing-file.ts"], independent: false },
+        ]);
+    });
+    it.each([
+        "src/a&b.ts",
+        "src/a<b.ts",
+        'src/a"b.ts',
+        "src/a'b.ts",
+        "src/a.ts,src/b.ts",
+        "src/a b.ts",
+        "src/a&amp;b.ts",
+        "src/a&lt;b.ts",
+        "src/a&quot;b.ts",
+    ])("attribute characters do not affect complete-root extraction: %s", (files) => {
+        const entry = `<memory id="123456" files="${files.padEnd(27, "x")}"/>`;
+        const text = `<mappings>\n${entry}\n</mappings>`;
+        expect(text.length).toBe(80);
+        expect(extractCompleteManifestBody(text, "mappings")).toBe(`\n${entry}\n`);
+    });
     it("parses files and independent flags, tolerant of attribute order", () => {
         const text = `prose before
 <mappings>

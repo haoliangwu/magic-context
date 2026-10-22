@@ -4,9 +4,8 @@ import { modelBodyField, parseProviderModel, resolveFallbackChain } from "./reso
 
 describe("resolveFallbackChain", () => {
     // Policy: user-config-only. There is NO builtin provider-agnostic chain —
-    // when the user configures no fallback_models the result is EMPTY, and the
-    // runner's session-model last resort (a model the user actually has) is the
-    // only fallback. A hardcoded chain named providers the user may not have and
+    // when the user configures no fallback_models the result is empty.
+    // A hardcoded chain named providers the user may not have and
     // produced `Model not found` retry storms.
     test("returns empty when user provides nothing (no builtin chain)", () => {
         expect(resolveFallbackChain(undefined)).toEqual([]);

@@ -260,8 +260,8 @@ export function registerCtxRecompCommand(
 							// path computes chunk embeddings, else rebuilt rows get
 							// none and drop out of ctx_search semantic results.
 							ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
-							// Recomp-runner model chain parity with OpenCode: configured
-							// fallbacks + the session's own model as last-ditch retry.
+							// The shared runner tries only these configured fallbacks;
+							// the live session model is not an extra configured attempt.
 							fallbackModels: currentDeps.historianFallbacks,
 							language: currentDeps.language,
 							fallbackModelId,

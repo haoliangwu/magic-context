@@ -11,8 +11,30 @@ import {
 	assertPiRawFallbackFits,
 	classifyPiOutgoingFit,
 	estimatePiOutgoingInputTokens,
+	piFallbackRefusal,
 } from "./pi-raw-fallback";
 import { tokenizePiMessages } from "./tokenize-pi-messages";
+
+it("fallback busy refusals require SQLite contention even through a wrapped cause", () => {
+	for (const lock of [
+		{ code: "SQLITE_BUSY" },
+		{ code: "SQLITE_LOCKED_SHAREDCACHE" },
+		{ errcode: 517 },
+	]) {
+		const error = piFallbackRefusal(
+			"identity",
+			new Error("identity unavailable", { cause: lock }),
+		);
+		expect(error.name).toBe("PiStorageBusyError");
+	}
+	const persistent = piFallbackRefusal(
+		"fallback-metadata-incomplete",
+		new Error("corrupt ledger"),
+	);
+	expect(persistent.name).toBe("PiDegradedPassError");
+	expect(persistent.message).toContain("corrupt ledger");
+	expect(persistent.message).not.toContain("send your message again");
+});
 
 it("known text, thinking and tool fields survive unsupported sibling parts in the lower bound", () => {
 	const envelope = {

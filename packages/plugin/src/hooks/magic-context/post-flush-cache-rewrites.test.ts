@@ -336,7 +336,7 @@ it("fresh prefix and replay cut at the same removed assistant seam", () => {
         },
     });
     const replay = structuredClone(source);
-    prepareCompartmentInjection(db, sessionId, replay, false);
+    prepareCompartmentInjection(db, sessionId, replay, false, []);
     expect(replay.map((m) => m.info.id)).toEqual(["retained-user"]);
     expect(delivered.preparedTrimBoundaryId).toBe("assistant-boundary");
     expect(fresh.map((m) => m.info.id)).toEqual(replay.map((m) => m.info.id));
@@ -511,10 +511,17 @@ for (const contentChange of [false, true]) {
             ]);
             const deferredHistoryRefreshSessions = new Set<string>();
             let decision: "execute" | "defer" = "defer";
+            // The content-miss case runs a held signed turn: its thinking step spent
+            // 1,600 reasoning tokens and usage stays below the hold cap (65% + 10).
             const usage = new Map([
                 [
                     sessionId,
-                    { usage: { percentage: 75.4, inputTokens: 657_477 }, updatedAt: Date.now() },
+                    {
+                        usage: contentChange
+                            ? { percentage: 70, inputTokens: 610_400 }
+                            : { percentage: 75.4, inputTokens: 657_477 },
+                        updatedAt: Date.now(),
+                    },
                 ],
             ]);
             const log = spyOn(logger, "sessionLog");
@@ -559,6 +566,9 @@ for (const contentChange of [false, true]) {
                             role: "assistant",
                             sessionID: sessionId,
                             finish: "tool-calls",
+                            ...(contentChange
+                                ? { tokens: { input: 0, output: 0, reasoning: 1_600 } }
+                                : {}),
                         },
                         parts: [
                             ...Array.from({ length: 98 }, (_, index) => ({

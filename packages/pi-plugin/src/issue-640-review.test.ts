@@ -166,11 +166,23 @@ test("review: adoption discovers a racing drop for an already-served historical 
 		});
 		restore = () => spy.mockRestore();
 		const raw = [structuredClone(historical), userMessage("new tail", 2)];
-		// Re-discovery carries the sibling's drop as queued debt while preserving
-		// the already-returned active representation on this repair pass.
+		// A legacy write invalidates fallback metadata after the readiness gate.
+		// Refuse this pass instead of synchronously rereading the whole session;
+		// a ready retry must still discover and queue the same durable drop.
+		await expect(
+			handler(
+				{ messages: raw },
+				fakeContext(sessionId, dir, ["historical", "tail"], raw),
+			),
+		).rejects.toThrow("Pi tag hydration");
+		expect(inserted).toBe(true);
+		expect(getPendingOps(db, sessionId)).toHaveLength(0);
+		restore();
+		restore = undefined;
+		const retry = structuredClone(raw);
 		const result = await handler(
-			{ messages: raw },
-			fakeContext(sessionId, dir, ["historical", "tail"], raw),
+			{ messages: retry },
+			fakeContext(sessionId, dir, ["historical", "tail"], retry),
 		);
 		expect(inserted).toBe(true);
 		expect(textOf(result.messages[0])).toBe("§1§ historical text");

@@ -213,6 +213,55 @@ describe("OpenCodeRetrospectiveRawProvider", () => {
         });
     });
 
+    it("marks only user lines that follow an assistant reply in the same session", () => {
+        const contextDb = setupContextDb();
+        const opencodeDb = setupOpenCodeDb();
+        insertMessage(opencodeDb, {
+            id: "assistant-before-first-user",
+            ts: 50,
+            role: "assistant",
+            parts: [{ type: "text", text: "not a reply to a user" }],
+        });
+        insertMessage(opencodeDb, {
+            id: "first-user",
+            ts: 100,
+            role: "user",
+            parts: [{ type: "text", text: "first request" }],
+        });
+        insertMessage(opencodeDb, {
+            id: "assistant-reply",
+            ts: 150,
+            role: "assistant",
+            parts: [{ type: "text", text: "private assistant response" }],
+        });
+        insertMessage(opencodeDb, {
+            id: "correction",
+            ts: 200,
+            role: "user",
+            parts: [{ type: "text", text: "please correct that" }],
+        });
+
+        const provider = new OpenCodeRetrospectiveRawProvider({ contextDb, opencodeDb });
+
+        expect(provider.readUserMessagesSince("s1", 0, 10).messages).toEqual([
+            {
+                sessionId: "s1",
+                ordinal: 2,
+                role: "user",
+                text: "first request",
+                ts: 100,
+            },
+            {
+                sessionId: "s1",
+                ordinal: 4,
+                role: "user",
+                text: "please correct that",
+                ts: 200,
+                followsAssistantReply: true,
+            },
+        ]);
+    });
+
     it("sets truncated=true only when the raw read hits its cap", () => {
         const contextDb = setupContextDb();
         const opencodeDb = setupOpenCodeDb();

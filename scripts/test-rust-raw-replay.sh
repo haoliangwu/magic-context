@@ -10,10 +10,18 @@ if [[ -n ${MC_RAW_REPLAY_BASELINE_ARCHIVE:-} ]]; then
     tar -xf "$MC_RAW_REPLAY_BASELINE_ARCHIVE" -C "$scratch/base"
     ln -s "$PWD/node_modules" "$scratch/base/node_modules"
     ln -s "$PWD/packages/plugin/node_modules" "$scratch/base/packages/plugin/node_modules"
-    cp crates/mc-module/src/transform.rs "$scratch/current-transform.rs"
-    restore() { cp "$scratch/current-transform.rs" crates/mc-module/src/transform.rs; touch crates/mc-module/src/transform.rs; }
+    # Swap the whole mc-module source tree, not one file: a change that adds a
+    # request field in transform.rs and reads it in lib.rs would otherwise
+    # build the baseline transform.rs against the current lib.rs and fail.
+    cp -R crates/mc-module/src "$scratch/current-mc-module-src"
+    restore() {
+        rm -rf crates/mc-module/src
+        cp -R "$scratch/current-mc-module-src" crates/mc-module/src
+        find crates/mc-module/src -type f -exec touch {} +
+    }
     trap 'restore; rm -rf "$scratch"' EXIT
-    cp "$scratch/base/crates/mc-module/src/transform.rs" crates/mc-module/src/transform.rs
+    rm -rf crates/mc-module/src
+    cp -R "$scratch/base/crates/mc-module/src" crates/mc-module/src
     if [[ ${MC_RAW_REPLAY_BASELINE_RELEASE:-0} == 1 ]]; then
         cargo build --release -p mc-module --example transform_replay
         baseline_probe="${CARGO_TARGET_DIR:-target}/release/examples/transform_replay"

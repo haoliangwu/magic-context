@@ -19,6 +19,18 @@ test("one monotonic budget charges preparation before writer admission and reser
 	expect(() => budget.assertOutcome()).toThrow(PiContextDeadlineError);
 });
 
+test("hydration uses remaining pass clocks with the completion reserve, not a two second cap", () => {
+	let now = 0;
+	const budget = new PiContextBudget(0, () => now);
+	expect(budget.hydrationAllowance()).toBe(19000);
+	now = 5000;
+	expect(budget.hydrationAllowance()).toBe(14000);
+	now = 18800;
+	expect(budget.hydrationAllowance()).toBe(200);
+	now = 19100;
+	expect(budget.hydrationAllowance()).toBe(0);
+});
+
 test("elapsed time fences a commit after an event-loop stall without a timer firing", () => {
 	const db = createTestDb();
 	let now = 0;

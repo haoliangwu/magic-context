@@ -19,6 +19,7 @@
  *     message is a fresh turn anyway, no provider cache to preserve yet.
  */
 
+import { getLastCompartmentEndMessage } from "../../features/magic-context/compartment-storage";
 import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
@@ -44,9 +45,10 @@ import {
     wasAutoSearchSkipped,
     withAutoSearchDeadline,
 } from "./auto-search-deadline";
-import { buildAutoSearchHint } from "./auto-search-hint";
+import { buildAutoSearchHint, selectAutoSearchResults } from "./auto-search-hint";
 import {
     coalesceAutoSearchTurn,
+    disposeIdleAutoSearchWorkers,
     persistAutoSearchDecision,
     queueAutoSearchBackfill,
     queueAutoSearchRegistration,
@@ -341,6 +343,8 @@ export async function runAutoSearchHint(args: {
                         embeddingSnapshot?.gitCommitEnabled ?? options.gitCommitsEnabled ?? false;
                     const searchOptions: UnifiedSearchOptions = {
                         limit: 10,
+                        maxMessageOrdinal: Math.max(0, getLastCompartmentEndMessage(db, sessionId)),
+                        excludeMessageId: userMsgId,
                         memoryEnabled,
                         embeddingEnabled,
                         gitCommitsEnabled,
@@ -400,15 +404,19 @@ export async function runAutoSearchHint(args: {
                 if (results.length === 0) {
                     return writeNoHintAndReconcile("empty");
                 }
-                if (results[0].score < options.scoreThreshold) {
+                results = selectAutoSearchResults(results, options.scoreThreshold);
+                if (results.length === 0) {
                     sessionLog(
                         sessionId,
-                        `auto-search: top score ${results[0].score.toFixed(3)} below threshold ${options.scoreThreshold}`,
+                        `auto-search: no fragment meets relevance threshold ${options.scoreThreshold}`,
                     );
                     return writeNoHintAndReconcile("below-threshold");
                 }
 
-                const hintText = buildAutoSearchHint(results, { wordRules: options.wordRules });
+                const hintText = buildAutoSearchHint(results, {
+                    wordRules: options.wordRules,
+                    query: rawPrompt,
+                });
                 if (!hintText) {
                     return writeNoHintAndReconcile("empty");
                 }
@@ -467,6 +475,7 @@ export async function runAutoSearchHint(args: {
 export function _resetAutoSearchCache(): void {
     clearAutoSearchTimeoutForSession();
     clearUnpublishedAutoSearchNoHints();
+    disposeIdleAutoSearchWorkers();
 }
 
 /** Session cleanup hook — call on session.deleted. */

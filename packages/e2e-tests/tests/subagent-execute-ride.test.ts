@@ -277,7 +277,9 @@ test("issue 619 task subagent drops ride execute once and replay the provider pr
             ),
         );
         expect(passes).toHaveLength(11);
-        expect(passes.slice(2).every((pass) => pass.decision === "execute")).toBe(true);
+        // The fourth provider request returns the first explicit drop, which is
+        // queued after that request. Require execute from the next request onward.
+        expect(passes.slice(4).every((pass) => pass.decision === "execute")).toBe(true);
         expect(passes[4].prefixChanged).toBe(true);
         expect(passes[4].requestBytes).toBeLessThan(passes[3].requestBytes - 20_000);
         expect(bytes(passes[4].messages)).not.toContain("SPENT-A");

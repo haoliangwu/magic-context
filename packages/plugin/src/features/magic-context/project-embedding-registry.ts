@@ -2,12 +2,17 @@ import { createHash, randomUUID } from "node:crypto";
 
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../../config/schema/magic-context";
+import {
+    activeEmbeddingSessions,
+    embedPauseBySession,
+} from "../../hooks/magic-context/embed-session-state";
 import { setBootQuietPeriodForTests } from "../../plugin/boot-quiet";
 import { drainBackgroundBatches } from "../../shared/background-batch-drain";
 import { isEmbeddingHostBusy } from "../../shared/embedding-activity";
 import { log } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+import { createChunkEmbeddingWriter } from "./chunk-embedding-writer";
 import {
     buildCanonicalChunkTextFromFts,
     buildCompartmentSummaryFallbackText,
@@ -2952,6 +2957,9 @@ async function embedCompartmentChunkBatch(
     if (!snapshot?.historyEnabled || snapshot.chunkModelId === "off") return 0;
 
     repairMisScopedCompartmentChunkEmbeddingsForProject(db, projectIdentity);
+    const priorModels = db.prepare(`SELECT COUNT(*) AS total,
+        COALESCE(MAX(model_id = ?), 0) AS current
+        FROM compartment_chunk_embeddings WHERE compartment_id = ?`);
     const candidates = await loadUnembeddedCompartmentChunkCandidatesPolite(
         db,
         projectIdentity,
@@ -2959,6 +2967,22 @@ async function embedCompartmentChunkBatch(
         batchSize,
         getProjectEmbeddingMaxInputTokens(projectIdentity),
         true,
+        (candidate) => {
+            const activity = activeEmbeddingSessions.get(candidate.sessionId);
+            if (
+                activity?.project === projectIdentity &&
+                activity.model === snapshot.chunkModelId &&
+                !embedPauseBySession.has(candidate.sessionId)
+            )
+                return true;
+            const prior = priorModels.get(snapshot.chunkModelId, candidate.id) as {
+                total: number;
+                current: number;
+            };
+            // Failed first-time publication remains project-wide catch-up work.
+            // Only replacement of old-model-only history requires an active session.
+            return prior.total === 0 || prior.current !== 0;
+        },
     );
     if (candidates.length === 0) return 0;
     // Passive sweep ignores `failed`/`noWork` — it's bounded per tick and re-runs
@@ -3005,6 +3029,7 @@ async function embedCandidateChunkBatch(
     modelId: string,
     candidates: CompartmentChunkBackfillCandidate[],
     signal?: AbortSignal,
+    writer?: ReturnType<typeof createChunkEmbeddingWriter>,
 ): Promise<CandidateChunkBatchResult> {
     const noWork: number[] = [];
     const failed: number[] = [];
@@ -3033,7 +3058,8 @@ async function embedCandidateChunkBatch(
         if (mappedText === null) continue;
         const canonicalText = mappedText || buildCompartmentSummaryFallbackText(db, candidate.id);
         if (canonicalText.length === 0) {
-            recordChunkEmbedBackoff(db, candidate, projectIdentity, modelId);
+            if (writer) await writer.backoff(candidate, projectIdentity, modelId);
+            else recordChunkEmbedBackoff(db, candidate, projectIdentity, modelId);
             noWork.push(candidate.id);
             continue;
         }
@@ -3138,6 +3164,11 @@ async function embedCandidateChunkBatch(
             if (result) {
                 let writeSliceStarted = performance.now();
                 for (const item of slice) {
+                    if (
+                        signal?.aborted ||
+                        getProjectChunkEmbeddingModelId(projectIdentity) !== modelId
+                    )
+                        break;
                     if (persistedIds.has(item.candidate.id)) continue;
                     const vectors = item.windows.map((window) =>
                         result.vectors.get(`chunk:${item.candidate.id}:${window.windowIndex}`),
@@ -3155,7 +3186,8 @@ async function embedCandidateChunkBatch(
                             vector: vectors[index] as Float32Array,
                         }),
                     );
-                    replaceCompartmentChunkEmbeddings(db, rows, item.windowSourceKey);
+                    if (writer) await writer.replace(rows, item.windowSourceKey);
+                    else replaceCompartmentChunkEmbeddings(db, rows, item.windowSourceKey);
                     persistedIds.add(item.candidate.id);
                     enqueueShadowEmbeddingItems(projectIdentity, "chunk", [
                         String(item.candidate.id),
@@ -3188,7 +3220,8 @@ async function embedCandidateChunkBatch(
         if (!signal?.aborted) {
             for (const item of slice) {
                 if (!persistedIds.has(item.candidate.id)) {
-                    recordChunkEmbedBackoff(db, item.candidate, projectIdentity, modelId);
+                    if (writer) await writer.backoff(item.candidate, projectIdentity, modelId);
+                    else recordChunkEmbedBackoff(db, item.candidate, projectIdentity, modelId);
                     failed.push(item.candidate.id);
                 }
             }
@@ -3310,27 +3343,50 @@ export async function embedSessionCompartmentChunks(
         signal?: AbortSignal;
         onProgress?: (p: SessionChunkBackfillProgress) => void;
         batchSize?: number;
+        /** Active-session catch-up delays busy batches instead of abandoning the drain. */
+        automatic?: boolean;
+        /** Shared only by the recursive worker-backed automatic run. */
+        databaseWorker?: NonNullable<ReturnType<typeof createChunkEmbeddingWriter>>;
     },
 ): Promise<SessionChunkBackfillOutcome> {
     const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
     if (!snapshot?.historyEnabled || snapshot.chunkModelId === "off") {
         return { status: "disabled", embedded: 0, total: 0 };
     }
+    if (options?.automatic && !options.databaseWorker) {
+        const worker = createChunkEmbeddingWriter(db);
+        if (worker) {
+            try {
+                return await embedSessionCompartmentChunks(db, projectIdentity, sessionId, {
+                    ...options,
+                    databaseWorker: worker,
+                });
+            } finally {
+                await worker.close();
+            }
+        }
+    }
+    const writer = options?.databaseWorker ?? null;
     // The session command path resolves this identity from the host session;
     // persist it before counting so stale rows under another project cannot make
     // this session look already embedded forever.
-    recordSessionProjectIdentity(db, sessionId, projectIdentity);
+    if (writer) await writer.project(projectIdentity, sessionId);
+    else recordSessionProjectIdentity(db, sessionId, projectIdentity);
     const maxInputTokens = getProjectEmbeddingMaxInputTokens(projectIdentity);
-    const total = await countUnembeddedSessionCompartmentsPolite(
-        db,
-        projectIdentity,
-        sessionId,
-        snapshot.chunkModelId,
-        maxInputTokens,
-    );
+    const total = writer
+        ? await writer.count(projectIdentity, sessionId, snapshot.chunkModelId, maxInputTokens)
+        : await countUnembeddedSessionCompartmentsPolite(
+              db,
+              projectIdentity,
+              sessionId,
+              snapshot.chunkModelId,
+              maxInputTokens,
+          );
 
     const holderId = `session-embed-${randomUUID()}`;
-    const lease = acquireGitSweepLease(db, projectIdentity, holderId, { ignoreCooldown: true });
+    const lease = writer
+        ? await writer.acquire(projectIdentity, holderId)
+        : acquireGitSweepLease(db, projectIdentity, holderId, { ignoreCooldown: true });
     if (!lease.acquired) return { status: "busy", embedded: 0, total };
 
     // Unbounded run → renew the lease before the TTL lapses so a sibling process
@@ -3342,9 +3398,13 @@ export async function embedSessionCompartmentChunks(
     if (options?.signal?.aborted) drainAbort.abort();
     else options?.signal?.addEventListener("abort", forwardCallerAbort, { once: true });
     const renewal = inRootAsyncContext(() =>
-        setInterval(() => {
+        setInterval(async () => {
             try {
-                if (!renewGitSweepLease(db, projectIdentity, holderId)) {
+                if (
+                    !(writer
+                        ? await writer.renew(projectIdentity, holderId)
+                        : renewGitSweepLease(db, projectIdentity, holderId))
+                ) {
                     leaseLost = true;
                     drainAbort.abort();
                 }
@@ -3378,20 +3438,45 @@ export async function embedSessionCompartmentChunks(
         // denominator; `embedded` is clamped to it in the callback in case the
         // historian published mid-run.
         for (;;) {
-            if (leaseLost || drainAbort.signal.aborted || isEmbeddingHostBusy()) {
+            if (
+                leaseLost ||
+                drainAbort.signal.aborted ||
+                (!options?.automatic && isEmbeddingHostBusy()) ||
+                getProjectEmbeddingSnapshot(projectIdentity)?.generation !== snapshot.generation
+            ) {
                 aborted = true;
                 break;
             }
-            const candidates = await loadUnembeddedSessionChunkCandidatesPolite(
-                db,
-                projectIdentity,
-                sessionId,
-                snapshot.chunkModelId,
-                batchSize,
-                [...skipIds, ...failedIds],
-                maxInputTokens,
-                true,
-            );
+            // An active agent can stay busy for hours. Give host work a gap before
+            // each eight-compartment batch, but do not require a global idle event
+            // that may never arrive. Provider calls still send at most two chunk
+            // texts each, using the existing token budget per chunk.
+            if (options?.automatic && isEmbeddingHostBusy()) {
+                await new Promise<void>((resolve) => setTimeout(resolve, 100));
+                if (drainAbort.signal.aborted) {
+                    aborted = true;
+                    break;
+                }
+            }
+            const candidates = writer
+                ? await writer.candidates(
+                      projectIdentity,
+                      sessionId,
+                      snapshot.chunkModelId,
+                      batchSize,
+                      [...skipIds, ...failedIds],
+                      maxInputTokens,
+                  )
+                : await loadUnembeddedSessionChunkCandidatesPolite(
+                      db,
+                      projectIdentity,
+                      sessionId,
+                      snapshot.chunkModelId,
+                      batchSize,
+                      [...skipIds, ...failedIds],
+                      maxInputTokens,
+                      true,
+                  );
             if (candidates.length === 0) break;
             const {
                 embedded: n,
@@ -3404,8 +3489,14 @@ export async function embedSessionCompartmentChunks(
                 snapshot.chunkModelId,
                 candidates,
                 drainAbort.signal,
+                writer,
             );
-            if (leaseLost || !renewGitSweepLease(db, projectIdentity, holderId)) {
+            if (
+                leaseLost ||
+                !(writer
+                    ? await writer.renew(projectIdentity, holderId)
+                    : renewGitSweepLease(db, projectIdentity, holderId))
+            ) {
                 leaseLost = true;
                 drainAbort.abort();
                 aborted = true;
@@ -3444,7 +3535,8 @@ export async function embedSessionCompartmentChunks(
         clearInterval(renewal);
         options?.signal?.removeEventListener("abort", forwardCallerAbort);
         try {
-            releaseGitSweepLease(db, projectIdentity, holderId);
+            if (writer) await writer.release(projectIdentity, holderId);
+            else releaseGitSweepLease(db, projectIdentity, holderId);
         } catch (error) {
             // A release-time SQLite error (e.g. lock contention) must not mask the
             // drain's own result/throw. The lease TTL-expires on its own.
@@ -3460,13 +3552,20 @@ export async function embedSessionCompartmentChunks(
     if (providerDown || failedIds.length > 0) {
         const remaining = Math.max(
             failedIds.length,
-            (await countUnembeddedSessionCompartmentsPolite(
-                db,
-                projectIdentity,
-                sessionId,
-                snapshot.chunkModelId,
-                maxInputTokens,
-            )) - skipIds.length,
+            (writer
+                ? await writer.count(
+                      projectIdentity,
+                      sessionId,
+                      snapshot.chunkModelId,
+                      maxInputTokens,
+                  )
+                : await countUnembeddedSessionCompartmentsPolite(
+                      db,
+                      projectIdentity,
+                      sessionId,
+                      snapshot.chunkModelId,
+                      maxInputTokens,
+                  )) - skipIds.length,
         );
         if (remaining > 0) {
             return {

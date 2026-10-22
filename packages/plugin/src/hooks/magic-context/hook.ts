@@ -34,11 +34,7 @@ import {
     resolveProjectIdentityForSession,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
-import {
-    getAutoEmbeddingSessionCoverage,
-    getEmbeddingCoverageStatus,
-    getProjectEmbeddingSnapshot,
-} from "../../features/magic-context/project-embedding-registry";
+import { getEmbeddingCoverageStatus } from "../../features/magic-context/project-embedding-registry";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import {
     getDatabasePersistenceError,
@@ -60,13 +56,13 @@ import { buildStatusDetail } from "../../plugin/rpc-handlers";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../plugin/types";
 import type { ConfigParseFailure } from "../../shared/config-diagnostics";
-import { isEmbeddingHostBusy } from "../../shared/embedding-activity";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
 import { resolveHistorianModel } from "../../shared/model-resolution";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import type { Database } from "../../shared/sqlite";
+import { maybeAutoEmbedSessionBackfill } from "./auto-embed-session";
 import { cavemanWordRulesForLanguage } from "./caveman";
 import { createMagicContextCommandHandler } from "./command-handler";
 import { clearToolPermissionDenied } from "./ctx-reduce-availability";
@@ -81,14 +77,7 @@ import {
     pauseEmbedHistoryDrain,
     runEmbedHistoryDrain,
 } from "./embed-history-runner";
-import {
-    autoEmbedAttemptedBySession,
-    autoEmbedIdentityBySession,
-    clearEmbedSessionState,
-    embedPauseBySession,
-    getEmbedDrainUiStatus,
-    invalidateAutoEmbedSession,
-} from "./embed-session-state";
+import { clearEmbedSessionState, getEmbedDrainUiStatus } from "./embed-session-state";
 import { createEventHandler } from "./event-handler";
 import {
     resolveContextLimit,
@@ -463,7 +452,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // builds this so it runs through the exact same runner as the RPC dialog path
     // — identical fallback, progress, and terminal state. `fallbackModelId` is
     // resolved here with the OpenCode-DB recovery (resolveLiveModel) so the
-    // last-resort fallback model is known even when a command is invoked before
+    // unconfigured historian's session model is known even when a command is invoked before
     // the first transform pass populates the map.
     const buildManagedRecompCtx = (sessionId: string): ManagedRecompContext => {
         const historianRun = sampleHistorian();
@@ -589,79 +578,23 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     };
 
     const maybeAutoEmbedSession = (sessionId: string): void => {
-        if (isEmbeddingHostBusy()) return;
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
         const identity = resolveProjectIdentityForSession(
             directory,
             deps.config.allow_home_project,
         );
-        const snapshot = identity ? getProjectEmbeddingSnapshot(identity) : undefined;
-        const embedIdentity = snapshot
-            ? JSON.stringify([
-                  snapshot.providerIdentity,
-                  snapshot.chunkModelId,
-                  snapshot.runtimeFingerprint,
-              ])
-            : "off";
-        if (autoEmbedIdentityBySession.get(sessionId) !== embedIdentity) {
-            invalidateAutoEmbedSession(sessionId);
-        }
-        if (autoEmbedAttemptedBySession.has(sessionId)) return;
-        if (embedPauseBySession.has(sessionId)) return;
-        // No `memory.enabled` gate: history embedding runs whenever an embedding
-        // provider is configured and not `off` (checked via coverage below).
-        autoEmbedAttemptedBySession.add(sessionId);
-        autoEmbedIdentityBySession.set(sessionId, embedIdentity);
-        void (async () => {
-            // The autoEmbedAttemptedBySession claim is cleared on compartment
-            // writes or embedding-identity changes, not when coverage is already
-            // complete or a scan fails. Rechecking then would scan every turn.
-            try {
-                // Defer off the transform thread BEFORE any DB/config work.
-                // ensureProjectRegisteredFromOpenCodeDirectory is `async` but does
-                // its config load + stale-embedding wipe SYNCHRONOUSLY (no internal
-                // await), so awaiting it as the first statement would run that work
-                // on the transform's return path. A macrotask yield lets the
-                // transform return first, keeping the hot path clean.
-                await new Promise((resolve) => setTimeout(resolve, 0));
-                if (isEmbeddingHostBusy()) {
-                    invalidateAutoEmbedSession(sessionId);
-                    return;
-                }
-                await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
-                const sessionProjectIdentity = resolveProjectIdentityForSession(
-                    directory,
-                    deps.config.allow_home_project,
-                );
-                if (!sessionProjectIdentity) {
-                    invalidateAutoEmbedSession(sessionId);
-                    return;
-                }
-                maybeSendProjectIdentitySessionWarning(sessionId, directory);
-                const coverage = await getAutoEmbeddingSessionCoverage(
-                    db,
-                    sessionProjectIdentity,
-                    sessionId,
-                );
-                if (!coverage.enabled) {
-                    invalidateAutoEmbedSession(sessionId);
-                    return;
-                }
-                const remaining = coverage.total - coverage.embedded;
-                if (remaining <= 0) return;
-                // The auto lane is a silent bootstrap trigger: no pre-announce, no
-                // busy/zero-work chatter, and the once-per-process latch never
-                // resets. Announce-then-drain looped every turn on large backlogs —
-                // the project-level passive backfill holds the drain lock for the
-                // whole (bounded, deferred-span) catch-up, so this drain returned
-                // "busy"/zero-work each pass, reset its own latch, and re-announced
-                // the same count forever. Retries belong to the passive backfill;
-                // progress lives in /ctx-embed status and the sidebar.
-                await executeEmbedHistory(sessionId, { silent: true });
-            } catch (error) {
-                log("[magic-context] auto-embed drain failed:", error);
-            }
-        })();
+        if (!identity) return;
+        maybeAutoEmbedSessionBackfill(
+            {
+                db,
+                projectIdentity: identity,
+                ensureRegistered: async () => {
+                    await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
+                    maybeSendProjectIdentitySessionWarning(sessionId, directory);
+                },
+            },
+            sessionId,
+        );
     };
 
     const rustMemorySyncRequestedSessions = new Set<string>();

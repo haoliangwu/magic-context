@@ -23,6 +23,8 @@ import { pinnedOpenCode2Version, resolveOpenCode2CLI, sharedOpenCode2Root } from
 import { isolateStoreDirectories } from "./store-directories";
 import { assertWriteFenceUnchanged, snapshotWriteFence } from "./write-fence";
 import { MockProvider, type MockResponse } from "../mock-provider/server";
+import { OpenCode } from "@opencode/client";
+import { prepareSchemaGuard, requireSchemaGuard } from "./schema-guard";
 import {
 	awaitPluginActivation,
 	type PluginActivationClient,
@@ -73,7 +75,6 @@ function resolveCLI(): string {
 }
 export const CLI = resolveCLI();
 export const PLUGIN = resolve(import.meta.dir, "../../../plugin");
-const SCHEMA_GUARD = resolve(import.meta.dir, "schema-guard");
 const groups = new Set<number>();
 function killGroup(pid: number): void {
 	try {
@@ -255,10 +256,26 @@ export async function waitForPluginActive(
 	timeoutMs = 60_000,
 ): Promise<void> {
 	await awaitPluginActivation(client, directory, pluginID, timeoutMs);
+    await requireSchemaGuard(client, directory);
 }
 
+export interface OpenCode2Handoff {
+    url: string;
+    password: string;
+    root: string;
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    pid?: number;
+    mock: MockProvider;
+    stderr(): string;
+    stop(): Promise<void>;
+}
 
 export interface OpenCode2SpawnOptions {
+    /** Observe transport startup while plugins are still loading. This is not
+     * fixture readiness: spawn still requires the schema guard before returning.
+     */
+    onHandoff?(host: OpenCode2Handoff): void;
     /** Explicit host binary for a same-store upgrade scenario. */
     cli?: string;
     /** Built plugin snapshot used before a same-store upgrade. */
@@ -340,6 +357,7 @@ export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 	    }
 		const schemaTrace = join(fixture.root, "llm-schema-guard.jsonl");
 		fixture.env.MC_E2E_SCHEMA_TRACE_PATH = schemaTrace;
+        const schemaGuard = await prepareSchemaGuard(options.cli ?? CLI, fixture.root, fixture.env);
 		const defaultModelID = options.defaultModelID ?? "mock-model";
 		const modelIDs = new Set([
 			defaultModelID,
@@ -358,7 +376,7 @@ export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 					...(options.prePlugin ? [options.prePlugin] : []),
 					...(options.includeMagicContext === false ? [] : [options.magicContextPlugin ?? PLUGIN]),
 					...(options.probePlugin ? [options.probePlugin] : []),
-					SCHEMA_GUARD,
+					schemaGuard,
 				],
 				model: `${providerID}/${defaultModelID}`,
 				compaction: { auto: options.compactionAuto ?? true, buffer: 1024, keep: { tokens: 1024 } },
@@ -538,6 +556,12 @@ export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 				},
 			);
 			if (child.pid) inspectOpenFiles(child.pid, fixture.root, fixture.env);
+            options.onHandoff?.({ ...ready, ...fixture, pid: child.pid, mock, stderr: () => stderr, stop });
+            const readinessClient = OpenCode.make({
+                baseUrl: ready.url,
+                headers: { authorization: `Basic ${btoa(`opencode:${ready.password}`)}` },
+            });
+            await requireSchemaGuard(readinessClient, fixture.cwd);
 			return {
 				...ready,
 				...fixture,

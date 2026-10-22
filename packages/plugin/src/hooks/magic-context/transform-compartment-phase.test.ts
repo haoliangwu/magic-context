@@ -166,6 +166,7 @@ describe("runCompartmentPhase boundary handoff", () => {
                 historianChunkTokens: 20_000,
                 compartmentDirectory: "/tmp",
                 messages,
+                coveredInstructions: [],
                 pendingCompartmentInjection: null,
                 deferredHistoryRefreshSessions: new Set(),
                 client: {} as PluginContext["client"],
@@ -235,6 +236,7 @@ describe("runCompartmentPhase boundary handoff", () => {
                 historianChunkTokens: 20_000,
                 compartmentDirectory: "/tmp",
                 messages: [],
+                coveredInstructions: [],
                 pendingCompartmentInjection: null,
                 deferredHistoryRefreshSessions: new Set(),
                 client: {} as PluginContext["client"],
@@ -302,6 +304,7 @@ describe("runCompartmentPhase boundary handoff", () => {
                 historianChunkTokens: 25_000,
                 compartmentDirectory: "/tmp",
                 messages: messages as never,
+                coveredInstructions: [],
                 pendingCompartmentInjection: null,
                 deferredHistoryRefreshSessions: new Set(),
                 preResolvedBoundarySnapshot: {
@@ -385,6 +388,7 @@ describe("runCompartmentPhase - 95% emergency notification idempotency", () => {
             historianChunkTokens: 25_000,
             compartmentDirectory: "/tmp",
             messages: [],
+            coveredInstructions: [],
             pendingCompartmentInjection: null,
             deferredHistoryRefreshSessions: new Set<string>(),
             // historianTimeoutMs short so the await returns "timed_out" quickly
@@ -458,6 +462,7 @@ describe("runCompartmentPhase - 95% emergency notification idempotency", () => {
                 { info: { id: "m2", role: "assistant" }, parts: [] },
                 { info: { id: "m3", role: "user" }, parts: [] },
             ],
+            coveredInstructions: [],
             pendingCompartmentInjection: null,
             deferredHistoryRefreshSessions,
         };
@@ -493,6 +498,95 @@ describe("runCompartmentPhase - 95% emergency notification idempotency", () => {
             expect(nextPass.pendingCompartmentInjection?.block).toContain("Published later");
         } finally {
             finishHistorian();
+        }
+    });
+
+    it("does not repeat an exhausted inline join while the same historian run remains in flight", async () => {
+        const sessionId = "ses-once-per-run-inline-join";
+        const db = openDatabase();
+        let finish!: () => void;
+        const first = registerActiveCompartmentRun(
+            sessionId,
+            new Promise<void>((resolve) => {
+                finish = resolve;
+            }),
+        );
+        const args = {
+            canRunCompartments: true,
+            fullFeatureMode: true,
+            sessionMeta: { compartmentInProgress: true },
+            contextUsage: { percentage: 97 },
+            boundaryContextLimit: 100_000,
+            boundaryExecuteThresholdPercentage: 65,
+            boundaryUsage: { percentage: 97, inputTokens: 97_000 },
+            boundaryUsageSource: "live" as const,
+            db,
+            sessionId,
+            resolvedSessionId: sessionId,
+            historianChunkTokens: 25_000,
+            historianTimeoutMs: 13,
+            compartmentDirectory: "/tmp",
+            messages: [],
+            coveredInstructions: [],
+            pendingCompartmentInjection: null,
+            deferredHistoryRefreshSessions: new Set<string>(),
+        };
+        const timers = spyOn(globalThis, "setTimeout");
+        const joinTimerCount = () =>
+            timers.mock.calls.filter(([, budget]) => budget === 13 || budget === 17).length;
+        let second: ReturnType<typeof registerActiveCompartmentRun> | undefined;
+        let finishSecond: (() => void) | undefined;
+        try {
+            const initial = await runCompartmentPhase(args);
+            expect(initial.historianJoinTimedOut).toBe(true);
+            expect(joinTimerCount()).toBe(1);
+            const repeated = await runCompartmentPhase({ ...args, historianTimeoutMs: 17 });
+            expect(joinTimerCount()).toBe(1);
+            expect(repeated.historianJoinTimedOut).toBe(true);
+            expect(repeated.historianJoinBudgetMs).toBe(13);
+            expect(repeated.awaitedCompartmentRun).toBe(false);
+            expect(repeated.compartmentInProgress).toBe(true);
+            expect(
+                historianJoinFailClosedMessage({
+                    timedOut: repeated.historianJoinTimedOut,
+                    budgetMs: repeated.historianJoinBudgetMs,
+                    contextLimitTokens: 100_000,
+                    finalWireEstimate: { trusted: true, tokens: 90_000 },
+                }),
+            ).toBeNull();
+            expect(
+                historianJoinFailClosedMessage({
+                    timedOut: repeated.historianJoinTimedOut,
+                    budgetMs: repeated.historianJoinBudgetMs,
+                    contextLimitTokens: 100_000,
+                    finalWireEstimate: { trusted: false, tokens: 90_000 },
+                }),
+            ).toContain("historian did not complete within");
+            expect(
+                historianJoinFailClosedMessage({
+                    timedOut: repeated.historianJoinTimedOut,
+                    budgetMs: repeated.historianJoinBudgetMs,
+                    contextLimitTokens: 100_000,
+                    finalWireEstimate: { trusted: true, tokens: 101_000 },
+                }),
+            ).toContain("historian did not complete within");
+            finish();
+            await first.promise;
+            second = registerActiveCompartmentRun(
+                sessionId,
+                new Promise<void>((resolve) => {
+                    finishSecond = resolve;
+                }),
+            );
+            const nextRun = await runCompartmentPhase(args);
+            expect(nextRun.historianJoinTimedOut).toBe(true);
+            expect(joinTimerCount()).toBe(2);
+        } finally {
+            timers.mockRestore();
+            finish();
+            finishSecond?.();
+            await first.promise;
+            await second?.promise;
         }
     });
 
@@ -569,6 +663,7 @@ describe("runCompartmentPhase - 95% emergency notification idempotency", () => {
                 { info: { id: "m2", role: "assistant" }, parts: [] },
                 { info: { id: "m3", role: "user" }, parts: [] },
             ],
+            coveredInstructions: [],
             pendingCompartmentInjection: null,
             deferredHistoryRefreshSessions,
         });
@@ -624,6 +719,7 @@ describe("runCompartmentPhase - 95% emergency notification idempotency", () => {
             historyBudgetTokens: 1,
             compartmentDirectory: "/tmp",
             messages: [],
+            coveredInstructions: [],
             pendingCompartmentInjection: null,
             deferredHistoryRefreshSessions: new Set<string>(),
             safeForBackgroundCompression: true,

@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:te
 import { mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { parsePluginConfig } from "../../config";
 import {
     acquireCompartmentLease,
     releaseCompartmentLease,
@@ -41,6 +42,7 @@ import { rebaseSessionCoordinates } from "../../features/magic-context/store-gen
 import { createTagger } from "../../features/magic-context/tagger";
 import type { PluginContext } from "../../plugin/types";
 import * as shared from "../../shared";
+import { resolveHistorianModel } from "../../shared/model-resolution";
 import { refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { Database, withPrivilegedWriter, withSqliteTransformPass } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -53,6 +55,7 @@ import {
     runCompartmentAgent as runCompartmentAgentImpl,
     startCompartmentAgent as startCompartmentAgentImpl,
 } from "./compartment-runner";
+import { runValidatedHistorianPass } from "./compartment-runner-historian";
 import { resolveHistorianProducerWindow } from "./historian-prompt-fit";
 import { renderHistorianMemoryBlock } from "./inject-compartments";
 import { producerPromptFailureReason } from "./producer-window-guard";
@@ -129,6 +132,89 @@ afterEach(() => {
         rmSync(dumpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     } catch {
         // Ignore EBUSY on Windows
+    }
+});
+
+describe("OpenCode 1 historian chain policy", () => {
+    for (const scenario of ["exhausted", "success", "unconfigured"] as const) {
+        it(`OpenCode 1 historian ${scenario} respects configured model ownership`, async () => {
+            useTempDataHome("historian-chain-policy-");
+            const db = openDatabase();
+            const config = parsePluginConfig(
+                scenario === "unconfigured"
+                    ? {}
+                    : {
+                          historian: {
+                              opencode: {
+                                  model: "test/fixture-historian",
+                                  fallback_models: ["test/allowed-fallback"],
+                              },
+                          },
+                      },
+            );
+            const resolved = resolveHistorianModel(config, "opencode");
+            if (scenario === "unconfigured") expect(resolved.primary).toBeUndefined();
+            await observeProducerModelsForTest(["test/allowed-fallback", "test/session"]);
+            const models: string[] = [];
+            const prompt = mock(
+                async (request: { body?: { model?: { providerID: string; modelID: string } } }) => {
+                    const model = request.body?.model;
+                    models.push(model ? `${model.providerID}/${model.modelID}` : "test/session");
+                    return {};
+                },
+            );
+            const client = {
+                session: {
+                    create: mock(async () => ({ data: { id: `child-${models.length}` } })),
+                    prompt,
+                    messages: mock(async () => ({
+                        data: [
+                            {
+                                info: { role: "assistant", time: { created: 1 } },
+                                parts: [
+                                    {
+                                        type: "text",
+                                        text:
+                                            scenario === "exhausted"
+                                                ? ""
+                                                : '<compartment start="1" end="2" title="Allowed"><p1>Summary</p1></compartment>',
+                                    },
+                                ],
+                            },
+                        ],
+                    })),
+                    delete: mock(async () => ({})),
+                },
+            } as unknown as PluginContext["client"];
+            const result = await runValidatedHistorianPass({
+                client,
+                db,
+                parentSessionId: "chain-policy",
+                sessionDirectory: "/tmp",
+                prompt: "Summarize this history",
+                chunk: {
+                    startIndex: 1,
+                    endIndex: 2,
+                    lines: [
+                        { ordinal: 1, messageId: "m1" },
+                        { ordinal: 2, messageId: "m2" },
+                    ],
+                },
+                priorCompartments: [],
+                sequenceOffset: 0,
+                dumpLabelBase: "chain-policy",
+                model: resolved.primary,
+                fallbackModels: resolved.fallbacks,
+                fallbackModelId: "test/session",
+            });
+            expect(models).toEqual(
+                scenario === "exhausted"
+                    ? ["test/fixture-historian", "test/allowed-fallback"]
+                    : [scenario === "unconfigured" ? "test/session" : "test/fixture-historian"],
+            );
+            expect(result.ok).toBe(scenario !== "exhausted");
+            if (!result.ok) expect(result.error).toBeTruthy();
+        });
     }
 });
 
@@ -2219,7 +2305,7 @@ describe("runCompartmentAgent", () => {
         });
     });
 
-    it("falls back to the primary session model after historian and repair output both fail validation", async () => {
+    it("reports failure after configured historian and repair fail without calling the session model", async () => {
         useTempDataHome("compartment-runner-fallback-");
         createOpenCodeDb("ses-fallback", [
             { id: "m-1", role: "user", text: "First" },
@@ -2298,18 +2384,12 @@ describe("runCompartmentAgent", () => {
         >;
         expect(fallbackPrompts[0]?.[0]?.body?.agent).toBe("historian");
         expect(fallbackPrompts[1]?.[0]?.body?.agent).toBe("historian");
-        // Fallback now includes both agent (for system prompt) and model (for override)
-        expect(fallbackPrompts[2]?.[0]?.body?.agent).toBe("historian");
-        expect(fallbackPrompts[2]?.[0]?.body?.model).toEqual({
-            providerID: "openai",
-            modelID: "gpt-4o",
-        });
-        expect(getCompartments(db, "ses-fallback")).toEqual([
-            expect.objectContaining({ title: "Fallback", startMessage: 1, endMessage: 2 }),
-        ]);
+        expect(fallbackPrompts).toHaveLength(2);
+        expect(getCompartments(db, "ses-fallback")).toEqual([]);
+        expect(getHistorianFailureState(db, "ses-fallback").failureCount).toBe(1);
     });
 
-    it("escalates through configured fallback_models before the session-model last resort", async () => {
+    it("recovers with a configured fallback without calling the session model", async () => {
         useTempDataHome("compartment-runner-chain-");
         createOpenCodeDb("ses-chain", [
             { id: "m-1", role: "user", text: "First" },
@@ -2324,8 +2404,7 @@ describe("runCompartmentAgent", () => {
 
         // Primary (call 0) + repair (call 1) both return invalid output → escalate.
         // First configured fallback "anthropic/claude-sonnet-4-6" (call 2) returns
-        // a VALID compartment. The session-model last resort "openai/gpt-4o" must
-        // therefore NEVER be reached.
+        // a valid compartment. The unrelated session model must never run.
         const promptSession = mock(async () => ({}));
         const messages = mock(async () => {
             const callIndex = messages.mock.calls.length;
@@ -2397,7 +2476,7 @@ describe("runCompartmentAgent", () => {
             providerID: "anthropic",
             modelID: "claude-sonnet-4-6",
         });
-        // Session-model last resort (gpt-4o) must never be reached.
+        // The session model is not part of the configured chain.
         const usedGpt4o = calls.some(
             (c) =>
                 c[0]?.body?.model?.providerID === "openai" &&
@@ -2570,6 +2649,8 @@ describe("runCompartmentAgent", () => {
                 ],
             },
         ];
+        // A pre-existing file row must still be queued with its summarized message.
+        createTagger().assignTag("ses-tag-drops", "m-1:file1", "file", 20, db);
         tagMessages("ses-tag-drops", messages, createTagger(), db);
 
         const client = {

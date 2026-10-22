@@ -849,7 +849,7 @@ describe("Pi doctor", () => {
             logged.push(...args);
         };
         const prompts = new MockPrompts({
-            texts: ["Bug title", `Failure in ${root}`],
+            texts: ["Bug title", "Failure after running the command"],
         });
         const diagnosticReport: PiDiagnosticReport = {
             timestamp: "2026-04-28T12:34:56.000Z",
@@ -929,13 +929,14 @@ describe("Pi doctor", () => {
         }
 
         expect(ghCreateCalled).toBe(false);
-        expect(logged.join("\n")).toContain("[pi] <text omitted>");
+        expect(logged.join("\n")).toContain("[pi] Bug title");
+        expect(logged.join("\n")).toContain("Failure after running the command");
         const reportPath = join(cwd, "magic-context-pi-issue-20260428-123456.md");
         expect(existsSync(reportPath)).toBe(true);
         const report = readFileSync(reportPath, "utf-8");
-        expect(report).toContain("[pi] <text omitted>");
+        expect(report).toContain("[pi] Bug title");
+        expect(report).toContain("Failure after running the command");
         expect(report).toContain("~/path-");
-        expect(report).not.toContain("Bug title");
         expect(report).not.toContain(root);
         expect(report).not.toContain("abc123");
         expect(report).not.toContain("sk-12345678901234567890");

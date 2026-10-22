@@ -371,6 +371,7 @@ it("review comparison: empty-tail stale intent eventually clears without a lost 
             historianChunkTokens: 20_000,
             compartmentDirectory: "/tmp",
             messages: [],
+            coveredInstructions: [],
             pendingCompartmentInjection: null,
             deferredHistoryRefreshSessions: new Set(),
             client: {} as PluginContext["client"],

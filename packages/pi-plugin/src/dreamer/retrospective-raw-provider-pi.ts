@@ -170,8 +170,23 @@ export class PiRetrospectiveRawProvider implements RetrospectiveRawProvider {
 				? await this.deps.loadEntriesFromFile(filePath)
 				: asyncSessionEntries(filePath);
 			let ordinal = 0;
+			let sawUserMessage = false;
+			let sawAssistantReply = false;
+			// Keep assistant text private while retaining whether a reply preceded a later user line.
 			for await (const entry of entries) {
-				const row = normalizePiUserEntry(entry, sessionId, ++ordinal);
+				ordinal++;
+				let row: RetrospectiveRawMessage | null = null;
+				if (isPiUserEntry(entry)) {
+					row = normalizePiUserEntry(
+						entry,
+						sessionId,
+						ordinal,
+						sawUserMessage && sawAssistantReply,
+					);
+					sawUserMessage = true;
+				} else if (sawUserMessage && isPiAssistantEntry(entry)) {
+					sawAssistantReply = true;
+				}
 				if (!row || !eligible(row.ts)) continue;
 				kept.push(row);
 				kept.sort((a, b) => a.ts - b.ts || a.ordinal - b.ordinal);
@@ -193,6 +208,7 @@ function normalizePiUserEntry(
 	entry: unknown,
 	sessionId: string,
 	ordinal: number,
+	followsAssistantReply: boolean,
 ): RetrospectiveRawMessage | null {
 	const e = entry as PiMessageEntryLike | null;
 	if (!e || typeof e !== "object" || e.type !== "message") return null;
@@ -208,7 +224,23 @@ function normalizePiUserEntry(
 		role: "user",
 		text,
 		ts: message.timestamp,
+		...(followsAssistantReply ? { followsAssistantReply: true } : {}),
 	};
+}
+
+function isPiUserEntry(entry: unknown): boolean {
+	return piMessageRole(entry) === "user";
+}
+
+function isPiAssistantEntry(entry: unknown): boolean {
+	return piMessageRole(entry) === "assistant";
+}
+
+function piMessageRole(entry: unknown): unknown {
+	const e = entry as PiMessageEntryLike | null;
+	if (!e || typeof e !== "object" || e.type !== "message") return null;
+	const message = e.message as PiUserMessageLike | null;
+	return message && typeof message === "object" ? message.role : null;
 }
 
 function extractPiTextContent(content: unknown): string {

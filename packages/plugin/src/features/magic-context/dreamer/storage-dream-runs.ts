@@ -43,6 +43,8 @@ export interface DreamRunTaskSummary {
     progress?: string;
     /** Child prompt-token budget, consumption, finalize turn and accepted units. */
     tokenBudget?: { budget: number; spent: number; finalizeFired: boolean; banked: number };
+    /** Observed child prompt usage, including cache reads/writes; absent on older runs. */
+    children?: Array<{ sessionId: string; promptTokens: number }>;
     backlog?: DreamTaskRunBacklog;
 }
 

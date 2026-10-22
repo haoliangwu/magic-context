@@ -20758,6 +20758,13 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn strip_leading_tag_imitations_preserves_decimal_section_references() {
+        for reference in ["§12.3", "§5.1", "§12.3 of the spec"] {
+            assert_eq!(strip_leading_tag_imitations(reference), reference);
+        }
+    }
+
+    #[test]
     fn assistant_tag_imitations_strip_on_later_lines_but_not_code() {
         let value = "preamble\n\u{a7}22\u{a7} Delta\n`\u{a7}23\u{a7} inline`\n```rust\n\u{a7}24\u{a7} fenced\n```\n\u{a7}25\u{a7} Echo";
         assert_eq!(
@@ -23885,9 +23892,9 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         bootstrap_covering_a(&s);
-        // Large enough that the force batch clears the emergency minimum achievable
-        // reclaim; this test is about when the producer gate runs.
-        let huge = "x".repeat(100_000);
+        // Token-rich results keep non-reclaimable overhead below the selection
+        // limit. This fixture checks when automatic reductions can run.
+        let huge = "payload information ".repeat(50_000);
         let force_messages = vec![
             item("a", 1, "raw"),
             assistant_tool_call("force_old", 2, "force_old_call"),
@@ -24994,7 +25001,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         bootstrap_covering_a(&s);
-        let context = smart_pctx();
+        // Non-reclaimable overhead must stay below the selection limit even at
+        // 96% usage. Only protection of tool messages should prevent drops below 95%.
+        let mut context = smart_pctx();
+        context.execute_threshold_percentage = 88.0;
         let mut messages = vec![item("a", 1, "raw")];
         for n in 0..5 {
             let mut call =
@@ -25783,9 +25793,9 @@ pub(crate) mod tests {
     fn subagent_emergency_sample_latch_prevents_repeat_selection() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        // Large enough that the first batch clears the emergency minimum achievable
-        // reclaim; this test is about the same-sample latch, not that minimum.
-        let huge = "x".repeat(100_000);
+        // These results account for enough of the reported usage to make deletion
+        // useful. A long run of "x" tokenizes too cheaply to model that situation.
+        let huge = "payload information ".repeat(50_000);
         let messages = vec![
             item("head", 1, "raw"),
             assistant_tool_call("old", 2, "old_call"),
@@ -25815,10 +25825,8 @@ pub(crate) mod tests {
         );
         let first_bytes = serde_json::to_vec(&first.ck_messages).unwrap();
 
-        // Reset only the age watermark so this test remains about the emergency selector's
-        // same-sample latch. The first force pass advances the age watermark; without this
-        // reset, the second pass could legitimately select the emergency-reserved newer arc
-        // through the separate two-pass selector.
+        // Reset the saved age cutoff so the separate two-pass age rule cannot
+        // legitimately select the surviving newer result on the second call.
         let loaded = s.load("subagent").unwrap();
         let mut meta = loaded.meta.clone();
         meta.last_execute_ordinal = 0;

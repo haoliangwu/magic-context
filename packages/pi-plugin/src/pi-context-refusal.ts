@@ -26,6 +26,15 @@ import {
 	PiContextSupersededError,
 } from "./pi-context-budget";
 import {
+	type PiChainState,
+	type PiPreparedHistory,
+	piChainCapableApi,
+	piChainedRequest,
+	piChainResponse,
+	piExpandChainedRequest,
+	piPreparedHistory,
+} from "./pi-dispatch-chain";
+import {
 	piConversationFields as conversationFields,
 	piHasManagedSignature,
 	piManagedSignature,
@@ -36,6 +45,7 @@ import {
 	preparePiDispatch,
 } from "./pi-dispatch-structure";
 import { resolvePiHarnessKind } from "./pi-harness-kind";
+import { PiDegradedPassError } from "./pi-raw-fallback";
 
 const ENTRY_TYPE = "magic-context-turn-refused";
 const RETRY_MESSAGE =
@@ -61,9 +71,16 @@ interface Operation {
 		entryIds: readonly string[];
 		messages: readonly LkgInputSnapshot[];
 	};
+	// Byte identity of the first admitted full request of the latest pass, and
+	// of its first admitted chained continuation. Provider retries must repeat
+	// one of them exactly; a WebSocket continuation may fall back to a full SSE
+	// request within the same pass.
 	dispatchFields?: readonly LkgContentField[];
+	chainDispatchFields?: readonly LkgContentField[];
 	managedSignature?: string;
 	preparedStructure?: PiPreparedStructure;
+	// Recorded only for serializers that can chain through previous_response_id.
+	preparedHistory?: PiPreparedHistory;
 	retainedAfterEnd: boolean;
 	// Whether the dispatch fence has already admitted a request for the latest pass.
 	dispatched: boolean;
@@ -117,8 +134,10 @@ function releasePiOperationPayloads(operation: Operation): void {
 	operation.inputMessages = undefined;
 	operation.inputBranch = undefined;
 	operation.dispatchFields = undefined;
+	operation.chainDispatchFields = undefined;
 	operation.managedSignature = undefined;
 	operation.preparedStructure = undefined;
+	operation.preparedHistory = undefined;
 }
 
 function operationKey(ctx: ExtensionContext): string | object {
@@ -379,6 +398,12 @@ export function registerPiGuardedContext(
 	receiptMaps.add(structureWarnings);
 	const imageTrimNotices = new Map<string | object, boolean>();
 	receiptMaps.add(imageTrimNotices);
+	// What the latest admitted managed request carried and the response the
+	// provider returned to it. It outlives operations: Oh My Pi's automatic
+	// continuations (todo reminders, follow-up prompts) start new runs that
+	// chain from the previous run's last response. A fresh process has none.
+	const chains = new Map<string | object, PiChainState>();
+	receiptMaps.add(chains);
 	const refuse = (
 		ctx: ExtensionContext,
 		budget: PiContextBudget,
@@ -400,7 +425,9 @@ export function registerPiGuardedContext(
 		const identityConflict = findPiTagIdentityConflict(reason);
 		const message = identityConflict
 			? `${identityConflict.message}. ${budget.diagnostic()}`
-			: `${RETRY_MESSAGE} ${budget.diagnostic()} (${reason instanceof Error ? reason.message : String(reason)})`;
+			: reason instanceof PiDegradedPassError
+				? `${reason.message} ${budget.diagnostic()}`
+				: `${RETRY_MESSAGE} ${budget.diagnostic()} (${reason instanceof Error ? reason.message : String(reason)})`;
 		log("[magic-context][pi] CONTEXT REFUSED", message);
 		try {
 			ctx.ui?.notify(message, "error");
@@ -477,6 +504,31 @@ export function registerPiGuardedContext(
 				releasePiOperationPayloads(operation);
 			}
 		});
+		// Oh My Pi awaits this event for each finalized main-agent assistant message,
+		// before the message joins context and before the next provider request. It
+		// is OMP-only and absent from stock Pi's typed event map. Bind the response
+		// ID to the managed request admitted just before it; any other outcome
+		// (no admitted request, an error, a length cut-off, no stored output items)
+		// leaves nothing to continue from.
+		(
+			pi.on as (
+				event: string,
+				handler: (event: unknown, ctx: ExtensionContext) => void,
+			) => void
+		)("assistant_message", (event, ctx) => {
+			const key = operationKey(ctx);
+			try {
+				const awaiting = chains.get(key)?.awaiting;
+				const response = piChainResponse(
+					(event as { message?: unknown } | undefined)?.message,
+				);
+				if (awaiting && response)
+					chains.set(key, { anchor: { ...awaiting, ...response } });
+				else chains.delete(key);
+			} catch {
+				chains.delete(key);
+			}
+		});
 		// OMP supplies session identity, but no provider-attempt ID. The latest
 		// context pass is the receipt for this operation, including payload retries.
 		// No awaits, DB access or payload hashing are allowed in this backstop.
@@ -488,7 +540,11 @@ export function registerPiGuardedContext(
 				if (cancelledOperation) cancelledOperation.ready = false;
 				return;
 			}
-			if (options.compactionOff?.(ctx)) return;
+			if (options.compactionOff?.(ctx)) {
+				// An unmanaged request now owns the provider's latest response.
+				chains.delete(operationKey(ctx));
+				return;
+			}
 			const payload = (event as { payload?: unknown }).payload;
 			const key = operationKey(ctx);
 			// OMP erases the ephemeral request's attribution before this hook. Its
@@ -575,7 +631,34 @@ export function registerPiGuardedContext(
 					budget.abandoned
 				)
 					throw new Error("context pass ran without a managed context receipt");
-				if (!piHasManagedSignature(payload, active.managedSignature))
+				// A chained continuation sends only the items appended after a stored
+				// response. Check it as the full request the provider will process:
+				// the previous admitted request's input, that request's response, then
+				// this frame's items. The checks below then run on that expansion
+				// exactly as they run on a full request; only the retry byte identity
+				// stays on the frame actually sent.
+				const chained = piChainedRequest(payload);
+				let checked: unknown = payload;
+				let chainInput: readonly unknown[] | undefined;
+				if (chained) {
+					const expanded = piExpandChainedRequest(
+						payload as Record<string, unknown>,
+						chained,
+						chains.get(key)?.anchor,
+						active.preparedHistory,
+						{
+							current: active.pass,
+							resend: active.chainDispatchFields !== undefined,
+						},
+					);
+					if ("refusal" in expanded)
+						throw new Error(
+							`provider request does not match this pass's managed dispatch (chained continuation: ${expanded.refusal})`,
+						);
+					checked = expanded.payload;
+					chainInput = expanded.input;
+				}
+				if (!piHasManagedSignature(checked, active.managedSignature))
 					throw new Error(
 						"provider request does not match this pass's managed dispatch (missing current receipt signature)",
 					);
@@ -591,7 +674,7 @@ export function registerPiGuardedContext(
 				// ownership checks, or byte-for-byte comparison of subsequent retries.
 				// The opener proves managed content, not freshness: stale prepared requests
 				// are not detected on this pass when no structural plan can be built.
-				const body = payload as { messages?: unknown; input?: unknown };
+				const body = checked as { messages?: unknown; input?: unknown };
 				const skipReason = active.preparedStructure
 					? (active.preparedStructure.structuralSkipReason ??
 						(active.preparedStructure.api &&
@@ -601,6 +684,10 @@ export function registerPiGuardedContext(
 							? "provider selected Responses items without a matching history plan"
 							: undefined))
 					: "prepared history representation is not modeled";
+				if (chained && skipReason)
+					throw new Error(
+						"provider request does not match this pass's managed dispatch (chained continuation requires a modeled prepared history)",
+					);
 				if (skipReason && !structureWarnings.has(key)) {
 					structureWarnings.set(key, true);
 					log(
@@ -610,7 +697,7 @@ export function registerPiGuardedContext(
 				const structureMismatch = skipReason
 					? undefined
 					: piPreparedStructureMismatch(
-							payload,
+							checked,
 							active.preparedStructure,
 							(counts) => {
 								if (imageTrimNotices.has(key)) return;
@@ -624,18 +711,19 @@ export function registerPiGuardedContext(
 					throw new Error(
 						`provider request does not match this pass's managed dispatch (prepared turn structure); ${structureMismatch}`,
 					);
-				if (active.dispatched) {
-					if (
-						!active.dispatchFields ||
-						exactReusablePrefix(
-							[{ id: "conversation", fields }],
-							[{ id: "conversation", fields: active.dispatchFields }],
-						) !== 1
-					)
-						throw new Error(
-							"provider request does not match this pass's managed dispatch",
-						);
-				}
+				const admittedFields = chained
+					? active.chainDispatchFields
+					: active.dispatchFields;
+				if (
+					admittedFields &&
+					exactReusablePrefix(
+						[{ id: "conversation", fields }],
+						[{ id: "conversation", fields: admittedFields }],
+					) !== 1
+				)
+					throw new Error(
+						"provider request does not match this pass's managed dispatch",
+					);
 				// Record the host's last message entry ID once that prompt is persisted,
 				// only if its history exactly matches the input captured before rewriting.
 				// This reads in-memory history, never SQLite or provider payload bytes.
@@ -655,8 +743,26 @@ export function registerPiGuardedContext(
 					)
 						active.inputBranch = persisted;
 				}
-				if (!active.dispatched) active.dispatchFields = fields;
+				if (chained) active.chainDispatchFields ??= fields;
+				else active.dispatchFields ??= fields;
 				active.dispatched = true;
+				// This request now owns the provider's next response. Record what it
+				// carried so a continuation of that response can be expanded and checked.
+				// Only this pass may keep using the previous response, for a retry.
+				const chain = chains.get(key);
+				if (chain?.anchor && active.pass)
+					chain.anchor.supersededBy ??= active.pass;
+				const sentInput =
+					chainInput ??
+					(Array.isArray(body?.input) && body.messages === undefined
+						? [...body.input]
+						: undefined);
+				if (sentInput && active.preparedHistory)
+					chains.set(key, {
+						anchor: chain?.anchor,
+						awaiting: { input: sentInput, prepared: active.preparedHistory },
+					});
+				else chains.delete(key);
 			} catch (error) {
 				if (signal ? signal.aborted : budget.isCancelled(error)) {
 					budget.cancel();
@@ -764,6 +870,15 @@ export function registerPiGuardedContext(
 					result.messages = prepared.messages;
 				active.managedSignature = piManagedSignature(result.messages);
 				active.preparedStructure = prepared.structure;
+				if (
+					fenceEnabled &&
+					!budget.sideTurn &&
+					piChainCapableApi(ctx.model?.api)
+				)
+					active.preparedHistory = piPreparedHistory(
+						result.messages,
+						ctx.model,
+					);
 				budget.completed = true;
 				active.ready = true;
 				// Oh My Pi persists the new prompt concurrently with preparation; its

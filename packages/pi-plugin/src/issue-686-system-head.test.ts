@@ -132,8 +132,11 @@ test("issue 686: leading developer and mixed instruction heads use the same rule
 	}
 });
 
-test("issue 686: a system row inside the conversation still refuses", () => {
-	expect(piPreparedStructure([prompt, heads[0], prompt])).toBeUndefined();
+test("issue 686: a prepared system row inside the conversation is counted, not skipped", () => {
+	const messages = [prompt, heads[0], prompt];
+	const prepared = piPreparedStructure(messages);
+	expect(prepared?.messages).toHaveLength(3);
+	expect(piMatchesPreparedStructure({ messages }, prepared)).toBe(true);
 	expect(
 		piMatchesPreparedStructure(
 			{ messages: [prompt, heads[0], prompt] },

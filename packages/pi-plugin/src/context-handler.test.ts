@@ -783,8 +783,10 @@ describe("Pi pressure guards", () => {
 			).replace(/\s+/g, " ");
 			expect(src).toContain("let pendingOpsDidMutate = false");
 			expect(src).toContain("let heuristicOrReasoningDidMutate = false");
+			// The permission is the shared predicate the historian's redundancy
+			// skip also uses.
 			expect(src).toContain(
-				"isCacheBustingPass = prefixMutationAllowed && hasReclaimRide(rideSignals)",
+				"isCacheBustingPass = reclaimRidePermitted(rideSignals, ridePermissionGate)",
 			);
 			expect(src).toContain("if (identityRebuild) {");
 			expect(src).toMatch(
@@ -4036,7 +4038,7 @@ describe("registerPiContextHandler", () => {
 	it("latches one emergency batch per force-pressure episode and rearms only on safe edges", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-forward-emergency-latch";
-		const largeToolOutput = "word ".repeat(2999);
+		const largeToolOutput = "word ".repeat(4999);
 		try {
 			updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
 			const fake = createFakePi();
@@ -4746,7 +4748,10 @@ describe("registerPiContextHandler", () => {
 					});
 					for (let tag = 1; tag <= 15; tag++)
 						queuePendingOp(db, sessionId, tag, "drop");
-					const rideDecision = (explicitFlush: boolean) =>
+					const rideDecision = (
+						explicitFlush: boolean,
+						eligible?: ReadonlySet<number>,
+					) =>
 						checkCompartmentTrigger(
 							db,
 							sessionId,
@@ -4768,12 +4773,27 @@ describe("registerPiContextHandler", () => {
 								explicitFlush,
 								publishedHistory: false,
 							},
+							eligible,
 						);
 					expect(rideDecision(false)).toMatchObject({
 						shouldFire: true,
 						reason: "projected_headroom",
 					});
-					expect(rideDecision(true)).toEqual({ shouldFire: false });
+					// A ride permits an attempt, not a claim that the queued targets can change.
+					expect(rideDecision(true)).toMatchObject({
+						shouldFire: true,
+						reason: "projected_headroom",
+					});
+					expect(rideDecision(true, new Set())).toMatchObject({
+						shouldFire: true,
+						reason: "projected_headroom",
+					});
+					expect(
+						rideDecision(
+							true,
+							new Set(Array.from({ length: 15 }, (_, index) => index + 1)),
+						),
+					).toEqual({ shouldFire: false });
 				},
 			);
 		} finally {
@@ -4801,7 +4821,7 @@ describe("registerPiContextHandler", () => {
 
 			await expect(
 				handler(throwingEvent, fakeContext("ses-context") as never),
-			).rejects.toMatchObject({ name: "PiStorageBusyError" });
+			).rejects.toMatchObject({ name: "PiDegradedPassError" });
 			// Refusal is immediate; storage diagnostics are deliberately deferred.
 			await new Promise<void>((resolve) => setImmediate(resolve));
 			expect(getOrCreateSessionMeta(db, "ses-context").lastTransformError).toBe(
@@ -5179,7 +5199,7 @@ describe("registerPiContextHandler", () => {
 			};
 
 			await expect(runPass()).rejects.toMatchObject({
-				name: "PiStorageBusyError",
+				name: "PiDegradedPassError",
 			});
 			expect(getOrCreateSessionMeta(db, sessionId).piStableIdScheme ?? 0).toBe(
 				0,
@@ -6285,6 +6305,59 @@ describe("registerPiContextHandler", () => {
 	});
 
 	describe("Pi deferred compaction marker drain", () => {
+		it("strips an OMP extension summary only with matching Magic Context ownership", () => {
+			const strip = contextHandlerInternals.stripMcOwnedPiCompactionSummary;
+			for (const owner of ["fromHook", "fromExtension"]) {
+				const messages = [
+					{ role: "compactionSummary", summary: "marker", tokensBefore: 400 },
+					userMessage("tail", 1),
+				];
+				const ids: (string | undefined)[] = [undefined, "kept"];
+				expect(
+					strip(messages as never[], ids, [
+						{
+							type: "compaction",
+							summary: "marker",
+							tokensBefore: 400,
+							[owner]: true,
+							details: { source: "magic-context" },
+						},
+					]),
+				).toBe(true);
+				expect(messages).toEqual([userMessage("tail", 1)]);
+				expect(ids).toEqual(["kept"]);
+			}
+			for (const fields of [
+				{ fromExtension: true, details: { source: "another-extension" } },
+				{ fromExtension: true },
+				{ details: { source: "magic-context" } },
+				{
+					fromExtension: true,
+					details: { source: "magic-context" },
+					summary: "different",
+				},
+			]) {
+				const messages = [
+					{ role: "compactionSummary", summary: "marker", tokensBefore: 400 },
+				];
+				expect(
+					strip(
+						messages as never[],
+						[undefined],
+						[
+							{
+								type: "compaction",
+								summary: "marker",
+								tokensBefore: 400,
+								...fields,
+							},
+						],
+					),
+				).toBe(false);
+				expect(messages).toHaveLength(1);
+			}
+		});
+
 		function seedCompartment(
 			db: ReturnType<typeof createTestDb>,
 			sessionId: string,
@@ -6335,6 +6408,7 @@ describe("registerPiContextHandler", () => {
 			) as never as {
 				sessionManager: {
 					getBranch: () => unknown[];
+					getEntry?: (id: string) => unknown;
 					appendCompaction?: (...args: unknown[]) => string | undefined;
 				};
 			};
@@ -6347,8 +6421,23 @@ describe("registerPiContextHandler", () => {
 				ctx.sessionManager.getBranch = () => branchEntries;
 			}
 			if (args.appendCompaction) {
-				ctx.sessionManager.appendCompaction = (...appendArgs) => {
-					const compactionId = args.appendCompaction?.(...appendArgs);
+				ctx.sessionManager.getEntry = (id) =>
+					branchEntries.find((entry) => (entry as { id?: string }).id === id);
+				ctx.sessionManager.appendCompaction = (
+					summary,
+					firstKeptEntryId,
+					tokensBefore,
+					details,
+					fromHook,
+					_usage,
+				) => {
+					const compactionId = args.appendCompaction?.(
+						summary,
+						firstKeptEntryId,
+						tokensBefore,
+						details,
+						fromHook,
+					);
 					if (
 						typeof compactionId === "string" &&
 						!args.omitAppendedCompactionEntry
@@ -6356,7 +6445,8 @@ describe("registerPiContextHandler", () => {
 						branchEntries.push({
 							type: "compaction",
 							id: compactionId,
-							firstKeptEntryId: appendArgs[1],
+							firstKeptEntryId,
+							details,
 							...args.appendedEntryFields,
 						});
 					}
@@ -6677,12 +6767,30 @@ describe("registerPiContextHandler", () => {
 						sessionManager: {
 							...ctx.sessionManager,
 							getBranch: () => branchEntries,
-							appendCompaction: (...args: unknown[]) => {
-								const id = appendCompaction(...args);
+							getEntry: (id: string) =>
+								branchEntries.find(
+									(entry) => (entry as { id?: string }).id === id,
+								),
+							appendCompaction: (
+								summary: unknown,
+								firstKeptEntryId: unknown,
+								tokensBefore: unknown,
+								details: unknown,
+								fromHook: unknown,
+								_usage: unknown,
+							) => {
+								const id = appendCompaction(
+									summary,
+									firstKeptEntryId,
+									tokensBefore,
+									details,
+									fromHook,
+								);
 								branchEntries.push({
 									type: "compaction",
 									id,
-									firstKeptEntryId: args[1],
+									firstKeptEntryId,
+									details,
 								});
 								return id;
 							},
@@ -7298,7 +7406,7 @@ describe("registerPiContextHandler", () => {
 			}
 		});
 
-		it("logs unavailable equivalence once when the appended entry cannot be read", async () => {
+		it("logs a failed read-back once and retains the pending marker when the appended entry cannot be read", async () => {
 			const db = createTestDb();
 			const sessionId = "ses-pi-marker-equivalence-unavailable-log-once";
 			const logger = await import("@magic-context/core/shared/logger");
@@ -7329,11 +7437,11 @@ describe("registerPiContextHandler", () => {
 				}
 				const gateLines = logCalls.mock.calls.filter(
 					([id, message]) =>
-						id === sessionId &&
-						String(message).includes("gate=equivalence-unavailable"),
+						id === sessionId && String(message).includes("gate=manager-threw"),
 				);
 				expect(gateLines).toHaveLength(1);
 				expect(String(gateLines[0]?.[1])).not.toContain("private summary text");
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).not.toBeNull();
 			} finally {
 				clearContextHandlerSession(sessionId);
 				logCalls.mockRestore();
@@ -7818,7 +7926,7 @@ it("contract Pi consumed episode reaches 95", async () => {
 					{
 						...toolResultMessage(
 							`audit-call-${i}`,
-							"x".repeat(12000),
+							"word ".repeat(2999),
 							3 + i * 2,
 						),
 						toolName: "bash",
@@ -8079,7 +8187,7 @@ for (const withTools of [false, true]) {
 							{
 								...toolResultMessage(
 									`cross-${i}`,
-									"x".repeat(12000),
+									"word ".repeat(2999),
 									103 + i * 2,
 								),
 								toolName: "bash",
@@ -9228,7 +9336,7 @@ describe("Pi proactive strip of invalidated thinking", () => {
 
 	// Strict binding does not permit removing an older block while a newer
 	// signature is kept. Only a real prefix rewrite can remove them together.
-	it("a pressure pass alone keeps every signed block; an actual prefix rewrite strips all of them", async () => {
+	it("an unheld pressure pass of an open signed turn strips every signed block, and a prefix rewrite after the turn strips them all", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-trim-only";
 		const fake = createFakePi();
@@ -9296,31 +9404,16 @@ describe("Pi proactive strip of invalidated thinking", () => {
 			);
 			const strippedBefore = getMergedReasoningStrippedIds(db, sessionId);
 
-			// Pressure without a preceding-byte rewrite keeps all signed blocks.
+			// The open turn is above the hold cap (65% + 10), so it is not held,
+			// and its first bust (this 96% emergency pass) strips every signed
+			// block whatever it edits. Earlier revisions held the turn and kept
+			// every block on a pressure-only pass; an unheld bust of a prefix-bound
+			// signed turn is now always treated as a prefix rewrite.
 			const trim = await pass(10, 96);
-			const cleared = trim.filter(
-				(message, index) =>
-					index % 2 === 1 && index >= 4 && liveThinking(message) === 0,
-			);
-			expect(cleared.length).toBe(0);
-			// Cleared thinking is a contiguous oldest prefix of the kept turns...
-			const kept = trim
-				.map((message, index) => ({ index, thinking: liveThinking(message) }))
-				.filter(({ index }) => index % 2 === 1 && index >= 4)
-				.map(({ thinking }) => thinking);
-			expect(kept).toEqual([...kept].sort((a, b) => a - b));
-			expect(kept.at(-1)).toBe(1);
-			// ...and nothing newer was stripped: the newer turns are byte-identical.
-			expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(
-				strippedBefore,
-			);
-			const firstKept = trim.findIndex(
-				(message, index) =>
-					index >= 4 && index % 2 === 1 && liveThinking(message) === 1,
-			);
-			expect(sha256(trim.slice(firstKept))).toBe(
-				sha256(served.slice(firstKept)),
-			);
+			expect(trim.map(liveThinking).every((count) => count === 0)).toBe(true);
+			expect(
+				[...getMergedReasoningStrippedIds(db, sessionId)].length,
+			).toBeGreaterThan([...strippedBefore].length);
 
 			const defer = await pass(10, 10);
 			expect(sha256(defer)).toBe(sha256(trim));

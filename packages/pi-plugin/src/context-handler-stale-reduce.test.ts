@@ -59,7 +59,7 @@ function fixture() {
 		if (bash)
 			for (let i = 0; i < 40; i++)
 				messages.push(assistantToolCall(`bash-${i}`, "bash", {}, i * 2 + 2), {
-					...toolResultMessage(`bash-${i}`, "x".repeat(12000), i * 2 + 3),
+					...toolResultMessage(`bash-${i}`, "word ".repeat(2999), i * 2 + 3),
 					toolName: "bash",
 				});
 		messages.push(

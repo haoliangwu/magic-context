@@ -12,6 +12,7 @@ import { escalationBands } from "../../shared/escalation-bands";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { deriveTriggerBudget } from "./derive-budgets";
+import { omitIncompleteFileTokenTotals } from "./file-token-coverage";
 import { retreatPastHostUnservedRows } from "./host-served-rows";
 import {
     getCachedAbsoluteMessageCount,
@@ -22,6 +23,7 @@ import {
     readRawSessionMessages,
 } from "./read-session-chunk";
 import { hasMeaningfulUserText } from "./read-session-formatting";
+import type { RawMessage } from "./read-session-raw";
 import {
     buildToolArcs,
     buildTrueRawTokenIndex,
@@ -73,7 +75,10 @@ export interface ResolvedBoundaryContext {
      * their own token source; store-backed callers load only the requested owners.
      */
     storedTokenTotals?: Map<string, number>;
-    storedTokenTotalsForMessages?: (messageIds: string[]) => Map<string, number> | undefined;
+    storedTokenTotalsForMessages?: (
+        messageIds: string[],
+        messages?: readonly RawMessage[],
+    ) => Map<string, number> | undefined;
     calibration?: ReturnType<typeof sessionDecisionCalibration>;
 }
 
@@ -530,7 +535,10 @@ export function resolveProtectedTailBoundary(
         absoluteMessageCount,
     );
     const storedTotals =
-        ctx.storedTokenTotalsForMessages?.(messages.map((m) => m.id)) ?? ctx.storedTokenTotals;
+        ctx.storedTokenTotalsForMessages?.(
+            messages.map((m) => m.id),
+            messages,
+        ) ?? ctx.storedTokenTotals;
     const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
         providerShapeVersion: ctx.providerShapeVersion,
         cacheNamespace: ctx.cacheNamespace,
@@ -895,15 +903,19 @@ export function resolveBoundaryContext(args: {
     const calibration = sessionDecisionCalibration(args.db, args.sessionId);
     // Only messages above the compartment boundary enter the token index. Load
     // their owners by index, rather than materializing compacted tag history.
-    const storedTokenTotalsForMessages = (messageIds: string[]) => {
+    const storedTokenTotalsForMessages = (
+        messageIds: string[],
+        messages: readonly RawMessage[] = [],
+    ) => {
         try {
-            return getAllStatusTagTokenTotalsFlat(
+            const totals = getAllStatusTagTokenTotalsFlat(
                 args.db,
                 args.sessionId,
                 args.taggerFloor ?? 0,
                 calibration,
                 messageIds,
             ).totals;
+            return omitIncompleteFileTokenTotals(args.db, args.sessionId, messages, totals);
         } catch (error) {
             sessionLog(
                 args.sessionId,
@@ -958,7 +970,10 @@ export function resolveWrapupProtectedTailBoundary(
         absoluteMessageCount,
     );
     const storedTotals =
-        ctx.storedTokenTotalsForMessages?.(messages.map((m) => m.id)) ?? ctx.storedTokenTotals;
+        ctx.storedTokenTotalsForMessages?.(
+            messages.map((m) => m.id),
+            messages,
+        ) ?? ctx.storedTokenTotals;
     const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
         providerShapeVersion: ctx.providerShapeVersion,
         cacheNamespace: ctx.cacheNamespace,

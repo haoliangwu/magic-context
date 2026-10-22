@@ -152,8 +152,19 @@ for (const failure of [
 					(tag) => tag.type === "tool",
 				);
 				expect(tools).toHaveLength(4);
-				for (const tag of tools)
+				for (const [index, tag] of tools.entries()) {
 					queuePendingOp(db, sessionId, tag.tagNumber, "drop");
+					if (index !== 0) continue;
+					// Stale entries fill the first 64-operation chunk, so the
+					// second real drop fails after the first drop has committed.
+					for (let offset = 0; offset < 63; offset++) {
+						const number = 100_000 + offset;
+						db.prepare(
+							"INSERT INTO tags(session_id,tag_number,message_id,type,status,byte_size) VALUES(?,?,?,'message','compacted',1)",
+						).run(sessionId, number, `stale-${number}`);
+						queuePendingOp(db, sessionId, number, "drop");
+					}
+				}
 				db.exec(
 					`CREATE TEMP TRIGGER busy_drop BEFORE UPDATE OF status ON tags WHEN NEW.tag_number=${tools[1].tagNumber} AND NEW.status='dropped' BEGIN SELECT RAISE(ABORT, 'database is locked'); END`,
 				);

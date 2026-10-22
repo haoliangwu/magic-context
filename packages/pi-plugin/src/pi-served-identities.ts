@@ -55,9 +55,15 @@ function parseNumbers(value: unknown): number[] {
 export function readPiCommittedServedNumbers(
 	db: Database,
 	sessionId: string,
+	requireEnvelope = false,
 ): readonly number[] {
 	try {
-		return parseNumbers(readReplayEnvelope(db, sessionId).piServedTagNumbers);
+		const numbers = readReplayEnvelope(db, sessionId).piServedTagNumbers;
+		if (requireEnvelope && numbers === undefined)
+			throw new PiServedEnvelopeUnavailable(
+				"No committed Pi served-number envelope for torn legacy tail",
+			);
+		return parseNumbers(numbers);
 	} catch (error) {
 		if (error instanceof ReplayDocumentError) {
 			throw new PiServedEnvelopeUnavailable(

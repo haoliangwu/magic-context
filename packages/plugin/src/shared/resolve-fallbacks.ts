@@ -9,9 +9,9 @@ import type { ModelInput, ResolvedModelEntry } from "./model-resolution";
  * inevitably names providers the user doesn't have (e.g. a metapi-only user got
  * a chain of google/github-copilot/opencode entries, every one a
  * `Model not found` retry), which produced confusing errors and wasted
- * attempts. If the user configured nothing, this returns an empty list and the
- * runner's session-model last resort (the model the user is actually using) is
- * the only fallback.
+ * attempts. If the user configured no alternates, this returns an empty list.
+ * A configured historian never adds the session model to this list; only an
+ * unconfigured OpenCode historian inherits the session model.
  *
  * The returned list does NOT include the primary model — it's the ordered list
  * of *alternates* to try after the primary fails. Each entry is

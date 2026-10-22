@@ -26,6 +26,8 @@ export function latestRealUserIndex(messages: Message[]): number {
  * Provider-side oracle, opt-in for fixtures. Expected bytes come only from
  * responses emitted by the mock, never from the client's replayed history.
  * Scope separates concurrently running parent, child and title-generator calls.
+ * The latest turn's thinking must be sent exactly as returned, or not at all:
+ * an edited, reordered or partly removed set (a gap) is rejected.
  */
 export class LatestTurnThinkingValidator {
     /** A fixture may resume a provider-accepted legacy cache from known responses,
@@ -56,6 +58,13 @@ export class LatestTurnThinkingValidator {
 			.flatMap(blocks)
 			.filter((b) => b.type === "thinking" || b.type === "redacted_thinking");
 		if (bytes(actual) === bytes(previous.thinking)) return null;
+		// Removing every block of the turn is accepted: Opus 5.5 accepted a
+		// request with all signed thinking removed when probed live. Only the
+		// blocks returned after that request are expected from then on.
+		if (actual.length === 0) {
+			previous.thinking = [];
+			return null;
+		}
 		return "messages.1.content.0: thinking or redacted_thinking blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.";
 	}
 

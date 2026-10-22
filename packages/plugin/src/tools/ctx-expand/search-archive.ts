@@ -1,13 +1,26 @@
 import { withMessageFtsSessionFilter } from "../../features/magic-context/message-fts-session-filter";
 import type { ContextDatabase } from "../../features/magic-context/storage";
-import { readRawSessionMessageIdOrdinalsForRange } from "../../hooks/magic-context/read-session-chunk";
+import { runSessionWarmupWorker } from "../../hooks/magic-context/raw-ordinal-warmup";
+import {
+    hasRawMessageProvider,
+    readRawSessionMessageIdOrdinalsForRange,
+} from "../../hooks/magic-context/read-session-chunk";
+import { openCodeDbExists, withReadOnlySessionDb } from "../../hooks/magic-context/read-session-db";
 import { estimateTokens } from "../../hooks/magic-context/read-session-formatting";
+import { getSqliteDatabasePath } from "../../shared/sqlite";
 
 interface ArchiveRow {
     ordinal: number;
     id: string;
     role: string;
     content: string;
+}
+
+let archiveReadsOnThisThread = 0;
+
+/** @internal Counts every archive render so tests can detect accidental serving-thread reads. */
+export function getArchiveReadsOnThisThreadForTest(): number {
+    return archiveReadsOnThisThread;
 }
 
 /** Recover indexed text when the host no longer holds the cited messages. */
@@ -18,7 +31,9 @@ export function renderSearchArchive(
     end: number,
     tokenBudget: number,
     archiveOnly = false,
+    readRawIds = () => readRawSessionMessageIdOrdinalsForRange(sessionId, start, end),
 ): string | null {
+    archiveReadsOnThisThread += 1;
     return withMessageFtsSessionFilter(db, sessionId, (sessionFirst) => {
         let rawIds: Map<string, number> | undefined;
         // The sidecar bounds modern stores to this session and ordinal range. A
@@ -43,7 +58,7 @@ export function renderSearchArchive(
         for (const row of rows.iterate(sessionId, start, end) as Iterable<ArchiveRow>) {
             if (!row.content) continue;
             if (!archiveOnly) {
-                rawIds ??= readRawSessionMessageIdOrdinalsForRange(sessionId, start, end);
+                rawIds ??= readRawIds();
                 if (rawIds.get(row.id) === row.ordinal) continue;
             }
             const block = `[${row.ordinal}] ${row.role === "user" ? "U" : "A"}: ${row.content}`;
@@ -70,4 +85,47 @@ export function renderSearchArchive(
         }
         return text.join("\n");
     });
+}
+
+/** File-backed archive and exact raw-ordinal scans must not run on the serving thread. */
+export async function renderSearchArchiveOffThread(
+    db: ContextDatabase,
+    sessionId: string,
+    start: number,
+    end: number,
+    tokenBudget: number,
+    archiveOnly = false,
+): Promise<string | null> {
+    const path = getSqliteDatabasePath(db);
+    // Private in-memory stores cannot be reopened by a worker. A registered
+    // provider supplies raw IDs; otherwise the worker uses the explicit OpenCode path.
+    if (!path) return renderSearchArchive(db, sessionId, start, end, tokenBudget, archiveOnly);
+    const provider = hasRawMessageProvider(sessionId);
+    const rawPath =
+        !archiveOnly && !provider && openCodeDbExists()
+            ? withReadOnlySessionDb(getSqliteDatabasePath)
+            : null;
+    const result = await runSessionWarmupWorker(
+        {
+            path,
+            sessionId,
+            searchArchive: {
+                start,
+                end,
+                tokenBudget,
+                archiveOnly,
+                rawPath,
+                rawIds:
+                    !archiveOnly && provider
+                        ? [...readRawSessionMessageIdOrdinalsForRange(sessionId, start, end)]
+                        : undefined,
+            },
+        },
+        {},
+    );
+    if ("searchArchive" in result) return result.searchArchive;
+    // Falling back to a synchronous scan on worker failure recreates the stall.
+    throw new Error(
+        `Search archive worker unavailable: ${"failure" in result ? `${result.failure}: ${result.detail}` : "unexpected reply"}`,
+    );
 }

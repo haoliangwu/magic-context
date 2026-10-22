@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstatSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, rmdirSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { getMagicContextStorageDir } from "../../shared/data-path";
@@ -439,14 +439,35 @@ export function clearLkgRecoveryFence<T = void>(
     shouldClear?: (value: T | undefined) => boolean,
 ): T | undefined {
     if (!durableFencesSupported()) return remove?.();
-    return locked(sessionId, () => {
-        const result = remove?.();
-        if (shouldClear && !shouldClear(result)) return result;
-        rmSync(lkgRecoveryFencePath(sessionId), { force: true });
-        syncStorageDirectorySync(dirname(lkgRecoveryFencePath(sessionId)));
+    const path = lkgRecoveryFencePath(sessionId);
+    const missing = (file: string): boolean => {
+        try {
+            lstatSync(file);
+            return false;
+        } catch (error) {
+            return (error as NodeJS.ErrnoException).code === "ENOENT";
+        }
+    };
+    if (!remove && !shouldClear && missing(path) && missing(`${path}.locks`)) {
         clearLkgFenceProcessState(sessionId);
-        return result;
-    });
+        return undefined;
+    }
+    try {
+        return locked(sessionId, () => {
+            const result = remove?.();
+            if (shouldClear && !shouldClear(result)) return result;
+            rmSync(lkgRecoveryFencePath(sessionId), { force: true });
+            syncStorageDirectorySync(dirname(lkgRecoveryFencePath(sessionId)));
+            clearLkgFenceProcessState(sessionId);
+            return result;
+        });
+    } finally {
+        try {
+            rmdirSync(`${path}.locks`);
+        } catch {
+            /* A live contender's ticket must never be removed. */
+        }
+    }
 }
 export const __test = {
     setPlatform(value: NodeJS.Platform) {

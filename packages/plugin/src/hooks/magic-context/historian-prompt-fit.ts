@@ -108,7 +108,8 @@ export interface HistorianPromptFitArgs {
     window: HistorianProducerWindow;
     /**
      * The other models the same prompt may be sent to, in chain order (the
-     * configured fallbacks and the session-model last resort). Every attempt
+     * configured fallbacks, or the session model when no historian primary is
+     * configured). Every attempt
      * sends the bytes built once from this fit, so the chunk is sized to the
      * smallest window among `window` and each of these that can hold a minimal
      * prompt on its own. Models with an unknown window add no limit.

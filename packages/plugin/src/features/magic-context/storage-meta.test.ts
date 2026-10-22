@@ -15,6 +15,7 @@ function createMockDb() {
         get: mock((..._args: unknown[]) => undefined),
         run: mock((..._args: unknown[]) => {
             executions.push({ sql, inTransaction });
+            return { changes: 1 };
         }),
     }));
 

@@ -41,6 +41,8 @@ export type PromptBody = {
 export type PromptArgs = {
     path: { id: string };
     body: PromptBody;
+    /** Controls hidden historian message-block cache markers; never serialized in the prompt body. */
+    cacheTail?: import("./historian-cache").HistorianCacheTail;
     signal?: AbortSignal;
     [key: string]: unknown;
 };
@@ -72,6 +74,8 @@ export interface PromptAttemptInfo {
 export interface PromptRetryOptions {
     transport?: PromptTransport;
     timeoutMs?: number;
+    /** False for callers whose configured model chain must not accept provider suggestions. Defaults to true. */
+    allowModelSuggestions?: boolean;
     /** External abort signal — cancels the in-flight LLM prompt immediately when aborted */
     signal?: AbortSignal;
     /**
@@ -248,6 +252,23 @@ function externalAbortMessage(signal: AbortSignal): string {
     return `prompt aborted by external signal${reason instanceof Error && /^lease_(?:lost|expired):/.test(reason.message) ? `: ${reason.message}` : ""}`;
 }
 
+/** A carrier may ignore cancellation; stop waiting without trusting it to reject. */
+export function raceWithSignal<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+    // Match await's handling of synchronous completion as well as promises.
+    work = Promise.resolve(work);
+    if (!signal) return work;
+    return new Promise<T>((resolve, reject) => {
+        const abort = () => reject(new Error(externalAbortMessage(signal)));
+        if (signal.aborted) {
+            work.catch(() => {});
+            abort();
+            return;
+        }
+        signal.addEventListener("abort", abort, { once: true });
+        work.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    });
+}
+
 async function promptWithTimeout(
     client: Client,
     args: PromptArgs,
@@ -273,10 +294,13 @@ async function promptWithTimeout(
 
     try {
         const request = { ...args, signal: controller.signal };
-        if (transport) await transport(request);
+        if (transport) await raceWithSignal(transport(request), controller.signal);
         else {
             if (!client) throw new Error("Hidden completion transport is unavailable");
-            await client.session.prompt(request as Parameters<typeof client.session.prompt>[0]);
+            await raceWithSignal<unknown>(
+                client.session.prompt(request as Parameters<typeof client.session.prompt>[0]),
+                controller.signal,
+            );
         }
     } catch (error) {
         if (signal?.aborted) {
@@ -488,6 +512,7 @@ async function attemptOnce(
     callContext: string,
     label: string,
     transport?: PromptTransport,
+    allowModelSuggestions = true,
 ): Promise<void> {
     // Keep this snapshot separate from the object passed to the client. A
     // failed prompt facade may rewrite its request body before rejecting; the
@@ -498,9 +523,9 @@ async function attemptOnce(
         await promptWithTimeout(client, attemptArgs, timeoutMs, signal, transport);
         return;
     } catch (error) {
-        // If non-retryable (abort, overflow, timeout), bubble up immediately.
-        // Don't even try suggestion retry — caller needs the original error.
-        if (isNonRetryable(error, signal)) throw error;
+        // Non-retryable failures and callers with model suggestions disabled
+        // must surface the original error without accepting a provider suggestion.
+        if (isNonRetryable(error, signal) || !allowModelSuggestions) throw error;
 
         const suggestion = parseModelSuggestion(error);
         if (!suggestion || !originalBody.model) {
@@ -576,6 +601,7 @@ export async function promptSyncWithModelSuggestionRetry(
             callContext,
             explicitPrimaryLabel,
             options.transport,
+            options.allowModelSuggestions,
         );
         return;
     } catch (error) {
@@ -620,6 +646,7 @@ export async function promptSyncWithModelSuggestionRetry(
                 callContext,
                 label,
                 options.transport,
+                options.allowModelSuggestions,
             );
             log(
                 `[${callContext}] fallback succeeded with ${label} (attempt ${i + 2}/${fallbacks.length + 1})`,
@@ -665,6 +692,7 @@ async function attemptAndValidate<TOutput, TValidated>(
             callContext,
             attempt.label,
             options.transport,
+            options.allowModelSuggestions,
         );
     } catch (error) {
         throw {
@@ -676,7 +704,7 @@ async function attemptAndValidate<TOutput, TValidated>(
 
     let output: TOutput;
     try {
-        output = await options.fetchOutput(args, attempt);
+        output = await raceWithSignal(options.fetchOutput(args, attempt), options.signal);
     } catch (error) {
         throw {
             error,

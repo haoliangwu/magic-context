@@ -46,6 +46,53 @@ test("pooled readers reuse one handle but see WAL edits and reject a closed leas
     }
 });
 
+test("a close while the pool is held keeps serving readers and closes after the last release", () => {
+    const root = createTestTempDirFromPath(join(tmpdir(), "mc-reader-hold-"));
+    const path = join(root, "store.db");
+    fixture(path).close();
+    const pool = new V2StoreReaderPool();
+    try {
+        const first = pool.hold();
+        const second = pool.hold();
+        pool.close();
+        expect(pool.isClosed()).toBe(false);
+        // A held run's next poll still gets a reader while the pool is closing.
+        const reader = pool.open(path);
+        expect(reader.sequenceForId("s", "m1")).toBe(1);
+        reader.close();
+        // Nothing new may take a hold once closing has started.
+        expect(() => pool.hold()).toThrow("closed");
+        first();
+        first();
+        expect(pool.isClosed()).toBe(false);
+        second();
+        expect(pool.isClosed()).toBe(true);
+        expect(() => pool.open(path)).toThrow("Store reader pool is closed");
+    } finally {
+        pool.close();
+        rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test("closeWhenIdle closes an idle pool at once and bounds its wait on a held one", async () => {
+    const idle = new V2StoreReaderPool();
+    expect(await idle.closeWhenIdle(10_000)).toBe(true);
+
+    const held = new V2StoreReaderPool();
+    const release = held.hold();
+    const started = Date.now();
+    expect(await held.closeWhenIdle(30)).toBe(false);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(held.isClosed()).toBe(false);
+    release();
+    expect(held.isClosed()).toBe(true);
+
+    const released = new V2StoreReaderPool();
+    const later = released.hold();
+    setTimeout(later, 5);
+    expect(await released.closeWhenIdle(10_000)).toBe(true);
+});
+
 test("pool bounds retained handles and rechecks generation after file replacement", () => {
     const root = createTestTempDirFromPath(join(tmpdir(), "mc-reader-inode-"));
     const path = join(root, "store.db");

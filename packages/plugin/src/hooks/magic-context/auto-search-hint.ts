@@ -20,6 +20,7 @@
  */
 
 import type { UnifiedSearchResult } from "../../features/magic-context/search";
+import { cleanSearchText, matchedSearchSnippet } from "../../shared/search-text";
 import { type CavemanWordRules, CURRENT_CAVEMAN_RULES, cavemanCompress } from "./caveman";
 
 const MAX_FRAGMENTS = 3;
@@ -28,6 +29,7 @@ const MAX_HINT_CHARS = 800; // ~200 tokens hard ceiling
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 export interface AutoSearchHintOptions {
+    query?: string;
     maxFragments?: number;
     fragmentCharCap?: number;
     /** English word rules unless the user-level `language` is another language. */
@@ -58,11 +60,12 @@ function renderFragment(
     result: UnifiedSearchResult,
     charCap: number,
     wordRules: CavemanWordRules,
+    query: string,
 ): string {
     switch (result.source) {
         case "memory": {
             const compressed = cavemanCompress(
-                result.content,
+                cleanSearchText(result.content),
                 "ultra",
                 CURRENT_CAVEMAN_RULES,
                 wordRules,
@@ -73,13 +76,15 @@ function renderFragment(
             // Use only the subject line (first line) — bodies add noise without
             // changing the recall trigger. Preserve the short SHA + relative age
             // so the agent can decide if the age is even relevant.
-            const subject = result.content.split(/\r?\n/)[0] ?? result.content;
+            const subject = cleanSearchText(result.content.split(/\r?\n/)[0] ?? result.content);
             const body = truncate(subject, Math.max(10, charCap - 20));
             return `commit ${result.shortSha} ${formatAge(result.committedAtMs)}: ${body}`;
         }
         case "message": {
             const compressed = cavemanCompress(
-                result.content,
+                query
+                    ? matchedSearchSnippet(result.content, query, charCap)
+                    : cleanSearchText(result.content),
                 "ultra",
                 CURRENT_CAVEMAN_RULES,
                 wordRules,
@@ -87,13 +92,13 @@ function renderFragment(
             return truncate(compressed, charCap);
         }
         case "compartment": {
-            const source = result.snippet ?? result.title;
+            const source = cleanSearchText(result.title);
             const compressed = cavemanCompress(source, "ultra", CURRENT_CAVEMAN_RULES, wordRules);
             return truncate(compressed, charCap);
         }
         case "primer": {
             const compressed = cavemanCompress(
-                result.content,
+                cleanSearchText(result.content),
                 "ultra",
                 CURRENT_CAVEMAN_RULES,
                 wordRules,
@@ -102,7 +107,7 @@ function renderFragment(
         }
         case "note": {
             const compressed = cavemanCompress(
-                result.content,
+                cleanSearchText(result.content),
                 "ultra",
                 CURRENT_CAVEMAN_RULES,
                 wordRules,
@@ -130,7 +135,12 @@ export function buildAutoSearchHint(
     const lines: string[] = [];
 
     for (const result of picks) {
-        const fragment = renderFragment(result, fragmentCharCap, options.wordRules ?? "english");
+        const fragment = renderFragment(
+            result,
+            fragmentCharCap,
+            options.wordRules ?? "english",
+            options.query ?? "",
+        );
         if (fragment.length === 0) continue;
         lines.push(`- ${fragment}`);
     }
@@ -154,4 +164,12 @@ export function buildAutoSearchHint(
     }
 
     return wrapped;
+}
+
+/** Filter every fragment, not just the first hit in a fused ranking. */
+export function selectAutoSearchResults(
+    results: UnifiedSearchResult[],
+    threshold: number,
+): UnifiedSearchResult[] {
+    return results.filter((result) => (result.relevanceScore ?? result.score) >= threshold);
 }

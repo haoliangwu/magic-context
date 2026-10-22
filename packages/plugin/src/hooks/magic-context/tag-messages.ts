@@ -1,5 +1,9 @@
 import type { ContextDatabase } from "../../features/magic-context/storage";
-import { getSourceContents, saveSourceContent } from "../../features/magic-context/storage";
+import {
+    getSourceContents,
+    replaceSourceContent,
+    saveSourceContent,
+} from "../../features/magic-context/storage";
 import {
     adoptNullOwnerToolTag,
     getCandidateToolOwners,
@@ -10,6 +14,8 @@ import {
     getToolTagNumberByOwner,
     markWhitespaceAssistantTagInert,
     pickNearestPriorOwner,
+    updateTagByteSize,
+    updateTagTokenCount,
 } from "../../features/magic-context/storage-tags";
 import { makeToolCompositeKey, type Tagger } from "../../features/magic-context/tagger";
 import { textMentionsRecentCommit } from "../../shared/commit-detection";
@@ -24,13 +30,7 @@ import { estimateTokens } from "./read-session-formatting";
 import { neutralizeDroppedReasoningPart } from "./sentinel";
 import { byteSize, isThinkingPart, prependTag } from "./tag-content-primitives";
 import { createExistingTagResolver } from "./tag-id-fallback";
-import {
-    buildFileSourceContent,
-    isFilePart,
-    isTextPart,
-    isToolPartWithOutput,
-    stripTagPrefix,
-} from "./tag-part-guards";
+import { isFilePart, isTextPart, isToolPartWithOutput, stripTagPrefix } from "./tag-part-guards";
 import {
     createToolDropTarget,
     extractToolCallObservation,
@@ -330,7 +330,9 @@ export type TagTarget = {
     inputStringBytes?: () => number | null;
     /** Non-mutating: would removing this call leave the request ending on an
      * assistant turn (given what this pass already removed)? */
-    wouldStrandConversationEnd?: () => boolean;
+    wouldStrandConversationEnd?: (plannedRemovals?: ReadonlySet<unknown>) => boolean;
+    /** Project a full removal for later decisions without changing the transcript. */
+    notePlannedRemoval?: (plannedRemovals: Set<unknown>) => void;
     /** Non-mutating: the host adapter cannot remove this call structurally, so
      * drop() would keep a paired shell instead. A new drop then keeps the real
      * arguments (skeletonReal) rather than any placeholder. */
@@ -477,6 +479,9 @@ function extractToolTagMetadata(part: unknown): {
 }
 
 export interface TagMessagesOptions {
+    /** Rebaseline saved text when the host proves stored rows changed under the
+     * same ids. Also expire the cached history head so the shared transform rebuilds it. */
+    refreshSourceContents?: boolean;
     /** Original part references in the provider's unfinished signed assistant turn. */
     protectedThinkingMessages?: ReadonlySet<MessageLike>;
     /**
@@ -937,16 +942,25 @@ export function tagMessages(
                 // when assignTag's recovery rebound a different tag number
                 // than what the resolver expected.
                 const persistedSource = sourceContents.get(tagId);
-                if (persistedSource !== undefined) {
+                if (persistedSource !== undefined && !options.refreshSourceContents) {
                     textPart.text =
                         options.normalizeRestoredAssistantText && message.info.role === "assistant"
                             ? options.normalizeRestoredAssistantText(persistedSource)
                             : persistedSource;
                 } else {
                     const sourceContent = stripTagPrefix(textPart.text);
-                    if (sourceContent.trim().length > 0) {
+                    if (sourceContent.trim().length > 0 || options.refreshSourceContents) {
                         const _tSaveText = performance.now();
-                        saveSourceContent(db, sessionId, tagId, sourceContent);
+                        if (options.refreshSourceContents) {
+                            replaceSourceContent(db, sessionId, tagId, sourceContent);
+                            updateTagByteSize(db, sessionId, tagId, byteSize(sourceContent));
+                            updateTagTokenCount(
+                                db,
+                                sessionId,
+                                tagId,
+                                estimateTextTagTokenCount(sourceContent),
+                            );
+                        } else saveSourceContent(db, sessionId, tagId, sourceContent);
                         accSaveSource += performance.now() - _tSaveText;
                     }
                 }
@@ -1070,35 +1084,17 @@ export function tagMessages(
                 const filePart = part;
                 const messageParts = message.parts;
                 const contentId = `${messageId}:file${partIndex}`;
-                const existingTagId = resolver.resolve(messageId, "file", contentId, fileOrdinal);
-                const _tAssignFile = performance.now();
-                const tagId =
-                    existingTagId ??
-                    tagger.assignTag(
-                        sessionId,
-                        contentId,
-                        "file",
-                        byteSize(filePart.url),
-                        db,
-                        0,
-                        null,
-                        0,
-                        null,
-                        () => ({
-                            tokenCount: estimateTextTagTokenCount(filePart.url),
-                            inputTokenCount: null,
-                            reasoningTokenCount: null,
-                        }),
-                    );
-                accAssignTag += performance.now() - _tAssignFile;
-                if (existingTagId === undefined) {
-                    const sourceContent = buildFileSourceContent(message.parts);
-                    if (sourceContent) {
-                        const _tSaveFile = performance.now();
-                        saveSourceContent(db, sessionId, tagId, sourceContent);
-                        accSaveSource += performance.now() - _tSaveFile;
-                    }
-                }
+                const existingTagId =
+                    resolver.resolve(messageId, "file", contentId, fileOrdinal) ??
+                    getTagNumberByMessageId(db, sessionId, contentId) ??
+                    undefined;
+                fileOrdinal += 1;
+                // A file has no visible prefix, so allocating a number here would
+                // make the model's next visible number skip. Historical rows still
+                // bind their original drop targets without changing served bytes.
+                if (existingTagId === undefined) continue;
+                const tagId = existingTagId;
+                tagger.bindTag(sessionId, contentId, tagId);
                 messageTagNumbers.set(
                     message,
                     Math.max(messageTagNumbers.get(message) ?? 0, tagId),
@@ -1126,7 +1122,6 @@ export function tagMessages(
                         return true;
                     },
                 });
-                fileOrdinal += 1;
             }
         }
 

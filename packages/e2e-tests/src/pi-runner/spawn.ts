@@ -40,7 +40,8 @@ export function resolvePiPackageJson(host: PiRunnerHost = "pi"): string {
     : process.env.MC_E2E_OMP_PACKAGE_JSON;
   if (explicitPackageJson) return explicitPackageJson;
   if (host === "pi") {
-    const pinnedVersion = process.env.MC_E2E_PI_VERSION;
+    // Host fixtures assert Pi 0.87.1; adding unit-test aliases must not silently move the lane.
+    const pinnedVersion = process.env.MC_E2E_PI_VERSION ?? "0.87.1";
     if (pinnedVersion) {
       const bunModules = join(REPO_ROOT, "node_modules/.bun");
       const prefix = `${packageName.replace("/", "+")}@${pinnedVersion}+`;

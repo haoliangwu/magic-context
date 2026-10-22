@@ -89,12 +89,18 @@ test("emergency historian exceeding remaining optional budget refuses before pro
 	try {
 		const fake = createFakePi();
 		const entries: unknown[] = [];
+		const admissions: unknown[] = [];
 		registerPiContextHandler(
 			{
 				...fake.pi,
 				appendEntry: (_type: string, data: unknown) => entries.push(data),
 			} as never,
-			{ db },
+			{
+				db,
+				maybeAutoEmbedSession: (id, directory, identity) => {
+					admissions.push([id, directory, identity, now]);
+				},
+			},
 		);
 		let aborted = false;
 		const raw = [userMessage("must not send without a summary", 1)];
@@ -115,6 +121,9 @@ test("emergency historian exceeding remaining optional budget refuses before pro
 		timer = setTimeout(finish, 200);
 		await handler({ messages: raw }, ctx);
 		expect(aborted).toBe(true);
+		expect(admissions).toEqual([
+			[sessionId, ctx.cwd, expect.any(String), 20_960],
+		]);
 		expect(JSON.stringify(entries)).toContain("elapsed=20960ms");
 		expect(getTagsBySession(db, sessionId)).toEqual([]);
 	} finally {

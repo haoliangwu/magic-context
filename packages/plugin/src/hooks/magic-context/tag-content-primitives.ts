@@ -42,20 +42,32 @@ const MALFORMED_TAG_PREFIX_REGEX = /^(?:§\d+">§(?:\d+§)?\s*)+/;
 // `§N">§` are already gone) and BEFORE the stray-`§` pass.
 //
 // Two precision guards so we don't mangle real content:
-//   - `(?!\.\d)` — a `§` + digits + DECIMAL (`§5.1` = a section citation) is NOT
-//     a dangling tag; leave it for the stray-`§` pass (`§5.1` → `5.1`).
+//   - `(?!\d)(?!\.\d)` — the first guard makes the digit run whole (without it,
+//     the regex can backtrack from `§12.3` to `§1`); the second means a `§` +
+//     digits + DECIMAL (`§5.1` = a section citation) is NOT a dangling tag.
 //   - closer excludes `\w` AND `.` — never eats a following letter
 //     (`§42important` → `important`) or a sentence period; whitespace is excluded
 //     so content after a space survives (`§42 files` → ` files`).
-const DANGLING_TAG_GLOBAL_REGEX = /\u00a7\d+(?!\.\d)[^\s\u00a7\w.]?/g;
-// Do not change the leading variant without a rebuild gate. OpenCode tool
+const DANGLING_TAG_GLOBAL_REGEX = /\u00a7\d+(?!\d)(?!\.\d)[^\s\u00a7\w.]?/g;
+// The leading variant runs on text the host re-sends unchanged: OpenCode tool
 // outputs and Pi text parts and tool results are re-prefixed from the host's own
-// text on every pass (nothing saved, no epoch), so any change to what it strips
-// changes the bytes served on the first ordinary pass after deploy and busts the
-// prompt cache from that block on. It does eat a leading section reference
-// (`§5 of the contract` → `of the contract`); fixing that is cosmetic and only
-// safe on a pass that is already rebuilding.
-const DANGLING_TAG_PREFIX_REGEX = /^(?:\u00a7\d+(?!\.\d)[^\s\u00a7\w.]?\s*)+/;
+// text on every pass (nothing saved, no epoch). Any change to what it strips
+// therefore changes the bytes served on the first ordinary pass after an upgrade
+// and rewrites the prompt cache from that block on, so weigh every change here
+// against that cost.
+//
+// A rebuild gate would keep each existing session on the old stripping (saved
+// per session) until a pass that rewrites the cache anyway. The `(?!\d)` guard
+// was added here without one, on purpose. Before it, a part starting with a
+// multi-digit decimal section reference lost its leading digit (`§12.3` →
+// `2.3`). A session holding such a part has its cache rewritten once, from that
+// part on, the first time a build with the guard serves it. That is rare and
+// happens once, so the per-session state a gate needs is not worth it.
+//
+// The variant still eats a leading whole-number section reference
+// (`§5 of the contract` → `of the contract`). Fixing that is cosmetic and would
+// cost the same one-time rewrite for every session holding such a part.
+const DANGLING_TAG_PREFIX_REGEX = /^(?:\u00a7\d+(?!\d)(?!\.\d)[^\s\u00a7\w.]?\s*)+/;
 
 /** Well-formed `§N§` pairs anywhere (persistence cargo-cult cleanup). */
 const COMPLETE_TAG_PAIR_GLOBAL_REGEX = /\u00a7\d+\u00a7/g;

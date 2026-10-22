@@ -271,10 +271,12 @@ test("issue 674: response-chain identifiers cannot change under a retained recei
 	h.emit("agent_start");
 	h.emit("agent_start");
 	await h.emit("context", { messages: structuredClone(input) });
+	// A previous_response_id is now admitted only when it names the response
+	// recorded for the last admitted managed request, so the admitted request
+	// here is the full one and the resend introduces the chain identifier.
 	const payload = {
 		input: h.payload().messages,
 		instructions: "managed",
-		previous_response_id: "prepared-chain",
 	};
 	h.dispatch(payload);
 	h.emit("agent_end", { messages: structuredClone([first, reply]) });

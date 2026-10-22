@@ -181,12 +181,17 @@ describe("runToolOwnerBackfill", () => {
         const mc = createMcDb();
         insertTag(mc, "ses-1", "read:1", "tool", 100, 1);
 
+        const revision = mc.prepare(
+            "SELECT value FROM schema_migrations_meta WHERE key = 'tag_revision:ses-1'",
+        );
+        const before = revision.get();
         const result = runToolOwnerBackfill(mc);
         expect(result.sessionsCompleted).toBe(1);
         expect(result.rowsUpdated).toBe(1);
 
         const tags = getTagsBySession(mc, "ses-1");
         expect(tags[0].toolOwnerMessageId).toBe("msg-old");
+        expect(revision.get()).not.toEqual(before);
 
         closeQuietly(mc);
     });

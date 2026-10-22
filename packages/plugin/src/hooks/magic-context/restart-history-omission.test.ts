@@ -103,6 +103,7 @@ function runProductionFlow(opts: {
         SESSION_ID,
         opts.messages,
         opts.isCacheBustingPass,
+        [],
         PROJECT_PATH,
     );
     const state = getOrCreateSessionMeta(db, SESSION_ID) as unknown as M0M1State;
@@ -254,7 +255,7 @@ describe("restart history omission", () => {
         appendCompartments(db, SESSION_ID, [compartment(1, "B", "Bravo just-published")]);
 
         const failMsgs = makeMessages(6);
-        prepareCompartmentInjection(db, SESSION_ID, failMsgs, true, PROJECT_PATH);
+        prepareCompartmentInjection(db, SESSION_ID, failMsgs, true, [], PROJECT_PATH);
 
         const beforeClear = runProductionFlow({
             projectDirectory,

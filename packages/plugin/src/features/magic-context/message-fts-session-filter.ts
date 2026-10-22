@@ -19,6 +19,12 @@ interface CoverageCache {
 }
 
 const coverageCaches = new WeakMap<Database, CoverageCache>();
+let coverageScansOnThisThread = 0;
+
+/** @internal Worker modules have independent counters, unlike serving-thread reads. */
+export function getMessageFtsCoverageScansOnThisThreadForTest(): number {
+    return coverageScansOnThisThread;
+}
 
 function getCoverageCache(db: Database): CoverageCache {
     let cache = coverageCaches.get(db);
@@ -83,6 +89,7 @@ export function withMessageFtsSessionFilter<T>(
                     cache.version !== stamp.version ||
                     cache.changes !== stamp.changes
                 ) {
+                    coverageScansOnThisThread += 1;
                     const rows = cache.missing.all() as Array<{ sessionId: string }>;
                     incomplete = new Set(rows.map((row) => row.sessionId));
                     if (cacheable) {

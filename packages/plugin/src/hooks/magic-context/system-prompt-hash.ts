@@ -27,6 +27,11 @@ import { requestPendingMaterialization } from "./pending-materialization";
 import { estimateTokens } from "./read-session-formatting";
 import { systemPromptDates } from "./system-prompt-dates";
 import { isHeldHeadForRequest, recordSystemPromptForRequest } from "./system-prompt-delivery";
+import {
+    describeSystemPromptChange,
+    type SystemPromptSnapshot,
+    snapshotSystemPrompt,
+} from "./system-prompt-diagnostics";
 
 const MAGIC_CONTEXT_MARKER = "## Magic Context";
 const SYSTEM_PROMPT_GUIDANCE_SEPARATOR = "\n\n";
@@ -242,6 +247,9 @@ export function createSystemPromptHashHandler(deps: {
     // and only update it on cache-busting passes. This prevents a midnight date
     // flip from causing an unnecessary flush + cache rebuild.
     const stickyDateBySession = new Map<string, string>();
+    // Only the previous in-process prompt is retained for byte offsets. It is
+    // never persisted; a cold handler explicitly reports an unknown baseline.
+    const diagnosticPrompts = new Map<string, SystemPromptSnapshot>();
 
     const processSystemPrompt = async (
         input: {
@@ -609,10 +617,16 @@ export function createSystemPromptHashHandler(deps: {
             return;
         }
         const sessionMeta = sessionMetaEarly;
+        const previousPrompt = diagnosticPrompts.get(sessionId);
+        const currentPrompt =
+            previousPrompt && previousHash === currentHash
+                ? previousPrompt
+                : snapshotSystemPrompt(output.system, promptSurface.preset);
+        diagnosticPrompts.set(sessionId, currentPrompt);
         if (previousHash !== "" && previousHash !== "0" && previousHash !== currentHash) {
             sessionLog(
                 sessionId,
-                `system prompt hash changed: ${previousHash} → ${currentHash} (len=${systemContent.length}), ${idleCacheExpired ? "adopting on idle-expired request" : requestMessagesFinal ? "adopting on the request whose messages are already final" : "triggering flush"}`,
+                `system prompt hash changed: ${previousHash} → ${currentHash} (len=${systemContent.length}), ${idleCacheExpired ? "adopting on idle-expired request" : requestMessagesFinal ? "adopting on the request whose messages are already final" : "triggering flush"}; ${describeSystemPromptChange(previousPrompt, currentPrompt)}`,
             );
             // This request carries the new prompt, so the provider rewrites its
             // cache from the system block onward whatever the messages pass did.
@@ -733,6 +747,7 @@ export function createSystemPromptHashHandler(deps: {
     return {
         handler,
         clearSession: (sessionId: string) => {
+            diagnosticPrompts.delete(sessionId);
             clearSystemDateRefresh(deps.historyRefreshSessions, sessionId);
             guidanceEpochs.clear(sessionId);
             clearSystemPromptHashSession(sessionId, {

@@ -1,6 +1,15 @@
 import { createHash } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import {
+	closeSync,
+	fstatSync,
+	ftruncateSync,
+	openSync,
+	readFileSync,
+	readSync,
+	statSync,
+} from "node:fs";
 import * as path from "node:path";
+import { BoundedSessionMap } from "@magic-context/core/shared/bounded-session-map";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { log } from "@magic-context/core/shared/logger";
 import {
@@ -21,6 +30,126 @@ const LEDGER_DIRECTORY = "pi-served-array-digests";
 const BODY_DIRECTORY = "pi-served-array-bodies";
 const IDENTITY_DIRECTORY = "pi-served-tag-numbers";
 const FLUSH_DELAY_MS = 25;
+const zeroTailWarnings = new BoundedSessionMap<Set<string>>(1000);
+
+function noteZeroTail(
+	sessionId: string,
+	filePath: string,
+	total: number,
+	zeros: number,
+): void {
+	const warnings = zeroTailWarnings.get(sessionId) ?? new Set<string>();
+	const key = `${filePath}:${total}:${zeros}`;
+	if (warnings.has(key)) return;
+	warnings.add(key);
+	zeroTailWarnings.set(sessionId, warnings);
+	log(
+		`[magic-context][pi] WARNING unwritten served-ledger tail session=${sessionId} file=${filePath} ignored_zero_bytes=${zeros} retained_bytes=${total - zeros} total_bytes=${total}`,
+	);
+}
+
+class PiServedTailUnavailable extends PiServedEnvelopeUnavailable {
+	constructor(readonly completeNumbers: ReadonlySet<number>) {
+		super(
+			"Torn Pi served-number tail; committed served-number envelope required to prevent identity reuse",
+		);
+	}
+}
+
+function readLedgerLines(
+	filePath: string,
+	sessionId: string,
+): { lines: string[]; torn: boolean } {
+	let bytes: Buffer;
+	try {
+		bytes = readFileSync(filePath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT")
+			return { lines: [], torn: false };
+		throw new PiServedEnvelopeUnavailable(
+			`Pi served ledger unreadable: ${filePath}`,
+			{ cause: error },
+		);
+	}
+	let end = bytes.length;
+	while (end > 0 && bytes[end - 1] === 0) end--;
+	// Only a zero-only suffix on a record boundary is unwritten space. Embedded
+	// NULs, including those inside a newline-terminated row, are corruption.
+	if (end < bytes.length && (end === 0 || bytes[end - 1] === 10)) {
+		noteZeroTail(sessionId, filePath, bytes.length, bytes.length - end);
+		bytes = bytes.subarray(0, end);
+	}
+	const boundary = bytes.lastIndexOf(10) + 1;
+	return {
+		lines: bytes.subarray(0, boundary).toString("utf8").split("\n"),
+		torn: boundary !== bytes.length,
+	};
+}
+
+function parseLedgerRow(
+	line: string,
+	filePath: string,
+): Record<string, unknown> {
+	try {
+		const row = JSON.parse(line);
+		if (row && typeof row === "object" && !Array.isArray(row)) return row;
+	} catch (error) {
+		throw new PiServedEnvelopeUnavailable(
+			`Corrupt Pi served ledger JSON record: ${filePath}`,
+			{ cause: error },
+		);
+	}
+	throw new PiServedEnvelopeUnavailable(
+		`Invalid Pi served ledger record: ${filePath}`,
+	);
+}
+
+/** Inspect only the suffix on ordinary appends, not the growing ledger body. */
+function repairZeroTail(filePath: string, allowTornIdentity = false): void {
+	let fd: number;
+	try {
+		fd = openSync(filePath, "r+");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	try {
+		const size = fstatSync(fd).size;
+		let end = size;
+		const chunk = Buffer.alloc(Math.min(size, 4096));
+		while (end > 0) {
+			const start = Math.max(0, end - chunk.length);
+			const count = readSync(fd, chunk, 0, end - start, start);
+			if (count !== end - start)
+				throw new Error("Pi served ledger changed during tail repair");
+			let index = count - 1;
+			while (index >= 0 && chunk[index] === 0) index--;
+			if (index >= 0) {
+				end = start + index + 1;
+				if (chunk[index] === 10) break;
+				if (!allowTornIdentity)
+					throw new PiServedEnvelopeUnavailable(
+						`Torn Pi served ledger tail; refusing append: ${filePath}`,
+					);
+				// The committed envelope was checked by the identity reader. Discard
+				// only its incomplete mirror row, never a complete historical record.
+				const newline = chunk.lastIndexOf(10, index);
+				if (newline >= 0) {
+					end = start + newline + 1;
+					break;
+				}
+				end = start;
+			} else end = start;
+		}
+		if (end !== size) {
+			if (fstatSync(fd).size !== size)
+				throw new Error("Pi served ledger changed during tail repair");
+			ftruncateSync(fd, end);
+		}
+	} finally {
+		closeSync(fd);
+	}
+}
 
 type JsonMessage = Record<string, unknown>;
 
@@ -126,7 +255,18 @@ export function getPiServedTagNumbers(
 	db?: import("@magic-context/core/shared/sqlite").Database,
 ): ReadonlySet<number> {
 	if (db) {
-		const legacy = getPiServedTagNumbers(sessionId, storageDir);
+		let legacy: ReadonlySet<number>;
+		try {
+			legacy = getPiServedTagNumbers(sessionId, storageDir);
+		} catch (error) {
+			if (!(error instanceof PiServedTailUnavailable)) throw error;
+			// Mirror failures do not block dispatch, so even a pre-dispatch torn
+			// append may describe served identities. Never infer absence from it.
+			return new Set([
+				...error.completeNumbers,
+				...readPiCommittedServedNumbers(db, sessionId, true),
+			]);
+		}
 		try {
 			return new Set([
 				...legacy,
@@ -143,21 +283,11 @@ export function getPiServedTagNumbers(
 	const cached = servedTagNumbersBySession.get(sessionId);
 	if (cached?.path === filePath && sameIdentityFile(cached.stamp, stamp))
 		return cached.numbers;
-	let text: string;
-	try {
-		text = readFileSync(filePath, "utf8");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		text = "";
-	}
+	const { lines, torn } = readLedgerLines(filePath, sessionId);
 	const numbers = new Set<number>();
-	for (const line of text.split("\n")) {
+	for (const line of lines) {
 		if (!line.trim()) continue;
-		const row = JSON.parse(line) as {
-			version?: unknown;
-			session_id?: unknown;
-			tag_numbers?: unknown;
-		};
+		const row = parseLedgerRow(line, filePath);
 		if (
 			row.version !== 1 ||
 			row.session_id !== sessionId ||
@@ -166,12 +296,13 @@ export function getPiServedTagNumbers(
 				(number) => Number.isSafeInteger(number) && number > 0,
 			)
 		) {
-			throw new Error(
+			throw new PiServedEnvelopeUnavailable(
 				"Invalid durable Pi served-number record; refusing identity adoption",
 			);
 		}
 		for (const number of row.tag_numbers) numbers.add(number);
 	}
+	if (torn) throw new PiServedTailUnavailable(numbers);
 	// Retain the pre-read stamp: a peer append during the read must invalidate the
 	// next lookup rather than certify that the newly appended bytes were parsed.
 	servedTagNumbersBySession.set(sessionId, { path: filePath, numbers, stamp });
@@ -184,24 +315,34 @@ export function getPiLastServedDigest(
 ): string | undefined {
 	const previous = previousBySession.get(sessionId);
 	if (previous) return previous.digest;
-	try {
-		const lines = readFileSync(
-			getPiServedArrayLedgerPath(sessionId, storageDir),
-			"utf8",
-		)
-			.trim()
-			.split("\n");
-		const last = JSON.parse(lines.at(-1) ?? "") as PiServedArrayDigestRecord;
+	const filePath = getPiServedArrayLedgerPath(sessionId, storageDir);
+	const { lines, torn } = readLedgerLines(filePath, sessionId);
+	let digest: string | undefined;
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		const last = parseLedgerRow(line, filePath);
 		if (
-			last.version === 1 &&
-			last.session_id === sessionId &&
-			/^[a-f0-9]{64}$/.test(last.sha256)
+			last.version !== 1 ||
+			last.session_id !== sessionId ||
+			typeof last.sha256 !== "string" ||
+			!/^[a-f0-9]{64}$/.test(last.sha256) ||
+			!Number.isSafeInteger(last.sequence) ||
+			Number(last.sequence) < 1 ||
+			!Number.isSafeInteger(last.message_count) ||
+			Number(last.message_count) < 0
 		)
-			return last.sha256;
-	} catch {
-		// A missing or damaged returned-array digest cannot authorize deleting a
-		// duplicate tag: it does not prove which numbered bytes Pi received.
+			throw new PiServedEnvelopeUnavailable(
+				`Invalid Pi served digest record: ${filePath}`,
+			);
+		digest = last.sha256;
 	}
+	// Digests flush after dispatch. An older complete digest cannot prove the
+	// bytes of a possibly served, partially written newer request.
+	if (torn)
+		throw new PiServedEnvelopeUnavailable(
+			"Torn Pi served digest tail; exact-byte replay evidence unavailable",
+		);
+	return digest;
 }
 
 /** Keep returned bytes as identity evidence even when a changed input shape prevents replay. */
@@ -313,6 +454,7 @@ function recordWriteFailure(error: unknown): void {
 function appendPendingLines(filePath: string, lines: string[]): void {
 	try {
 		ensureStorageDirectorySync(path.dirname(filePath));
+		repairZeroTail(filePath);
 		writeStorageFileSync(filePath, lines.join(""), {
 			encoding: "utf8",
 			flag: "a",
@@ -393,9 +535,17 @@ export function capturePiServedArray(
 		const digest = sha256(serializedArray);
 		const storageDir = options.storageDir ?? getMagicContextStorageDir();
 		identityPersistenceFailed = true;
-		const previousNumbers = options.recoveryWithoutTagState
-			? new Set<number>()
-			: getPiServedTagNumbers(sessionId, storageDir);
+		let previousNumbers: ReadonlySet<number> = new Set();
+		if (!options.recoveryWithoutTagState) {
+			try {
+				previousNumbers = getPiServedTagNumbers(sessionId, storageDir);
+			} catch (error) {
+				if (!(error instanceof PiServedTailUnavailable) || !options.db)
+					throw error;
+				readPiCommittedServedNumbers(options.db, sessionId, true);
+				previousNumbers = error.completeNumbers;
+			}
+		}
 		const managedNumbers = options.recoveryWithoutTagState
 			? []
 			: (options.servedTagNumbers ?? []);
@@ -448,6 +598,7 @@ export function capturePiServedArray(
 			identityPersistenceFailed = true;
 			ensureStorageDirectorySync(path.dirname(identityPath));
 			options.assertCurrentPass?.();
+			repairZeroTail(identityPath, !!options.db);
 			writeStorageFileSync(
 				identityPath,
 				`${JSON.stringify({ version: 1, session_id: sessionId, tag_numbers: newNumbers })}\n`,
@@ -505,6 +656,7 @@ export const __test = {
 		pendingLinesByPath.clear();
 		swallowedWriteCount = 0;
 		lastWriteError = null;
+		zeroTailWarnings.clear();
 	},
 };
 

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Database, withSqliteTransformPass } from "../../shared/sqlite";
+import { Database, isTransientSqliteError, withSqliteTransformPass } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { startMessageFtsRowidMapBackfill } from "./message-fts-rowid-map";
 import { startMessageTimeBackfill } from "./message-time-backfill";
@@ -22,7 +22,12 @@ test("startup FTS map backfill must not synchronously wait for the production fi
     blocker.exec("BEGIN IMMEDIATE");
     try {
         const started = performance.now();
-        await expect(startMessageFtsRowidMapBackfill(db)).rejects.toThrow();
+        await startMessageFtsRowidMapBackfill(db).then(
+            () => {
+                throw new Error("expected writer contention");
+            },
+            (error) => expect(isTransientSqliteError(error)).toBe(true),
+        );
         expect(performance.now() - started).toBeLessThan(650);
     } finally {
         blocker.exec("ROLLBACK");

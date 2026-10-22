@@ -7,7 +7,7 @@ import type { ToolExpansionMap } from "../../shared/historian-tool-template";
 import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
-import { isSystemDirective } from "../../shared/system-directive";
+import { isSystemDirective, removeSystemReminders } from "../../shared/system-directive";
 import { isHostUnservedRow, markHostUnservedRow } from "./host-served-rows";
 import { prewarmRawSessionOrdinalsForDb } from "./raw-ordinal-warmup";
 import {
@@ -299,8 +299,6 @@ export function withRawMessageProvider<T>(
     return result;
 }
 
-const SYSTEM_REMINDER_BLOCK_REGEX = /<system-reminder>[\s\S]*?<\/system-reminder>/gi;
-
 /**
  * Strip system-reminder blocks and OMO markers from user text for chunk
  * compaction. OpenCode 1.17.8 and older wrapped a user message sent mid-run in a
@@ -309,7 +307,7 @@ const SYSTEM_REMINDER_BLOCK_REGEX = /<system-reminder>[\s\S]*?<\/system-reminder
  */
 export function cleanUserText(text: string): string {
     return stripOutsideSteeringWrappers(text, (segment) =>
-        segment.replace(SYSTEM_REMINDER_BLOCK_REGEX, "").replace(OMO_INTERNAL_INITIATOR_MARKER, ""),
+        removeSystemReminders(segment).replace(OMO_INTERNAL_INITIATOR_MARKER, ""),
     ).trim();
 }
 

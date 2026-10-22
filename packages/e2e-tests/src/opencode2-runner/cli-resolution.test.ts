@@ -3,8 +3,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import versions from "../../opencode2-versions.json";
 
 import {
+	expectedOpenCode2Version,
 	pinnedOpenCode2Version,
 	resolveOpenCode2CLI,
 	sharedOpenCode2Install,
@@ -154,6 +156,16 @@ describe("OpenCode 2 CLI resolution order", () => {
 });
 
 describe("OpenCode 2 CLI pin", () => {
+	test("compatibility primary stays aligned with the package pin", () => {
+		expect(expectedOpenCode2Version(versions.primary)).toBe(pinnedOpenCode2Version());
+	});
+
+	test("an explicit compatibility target preserves exact version checks", () => {
+		expect(expectedOpenCode2Version("2.1.0")).toBe("2.1.0");
+		expect(() => expectedOpenCode2Version("latest")).toThrow("not listed");
+		expect(() => expectedOpenCode2Version("2.1.1")).toThrow("not listed");
+	});
+
 	test("reads the exact @opencode/cli devDependency from packages/plugin", () => {
 		expect(pinnedOpenCode2Version()).toBe("2.0.22");
 	});

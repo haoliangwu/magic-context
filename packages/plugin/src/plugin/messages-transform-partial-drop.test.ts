@@ -18,7 +18,7 @@ import { createMessagesTransformHandler } from "./messages-transform";
 
 for (const lane of ["oc1", "oc2"] as const) {
     for (const position of [1, 2, 3]) {
-        test(`partial-drop LKG ${lane}: position ${position} serves committed drops before defer restart`, async () => {
+        test(`partial-drop LKG ${lane}: chunk ${position} serves committed drops before defer restart`, async () => {
             const sessionId = `partial-lkg-${lane}-${position}`;
             let db = openDatabase();
             if (!db) throw new Error("throwaway database unavailable");
@@ -125,8 +125,19 @@ for (const lane of ["oc1", "oc2"] as const) {
                 await pass(true);
                 const tags = getTagsBySession(db, sessionId).filter((tag) => tag.type === "tool");
                 expect(tags).toHaveLength(12);
-                for (const tag of tags.slice(0, 3))
+                for (const [index, tag] of tags.slice(0, 3).entries()) {
                     queuePendingOp(db, sessionId, tag.tagNumber, "drop");
+                    // Fill the rest of each 64-operation chunk with stale queue entries.
+                    // The next real drop then tests recovery after an earlier chunk committed.
+                    for (let offset = 0; offset < 63; offset++) {
+                        const number = 100_000 + index * 63 + offset;
+                        insertTag(db, sessionId, `stale-${number}`, "message", 1, number);
+                        db.prepare(
+                            "UPDATE tags SET status='compacted' WHERE session_id=? AND tag_number=?",
+                        ).run(sessionId, number);
+                        queuePendingOp(db, sessionId, number, "drop");
+                    }
+                }
                 db.exec(
                     `CREATE TEMP TRIGGER partial_drop_abort BEFORE UPDATE OF status ON tags WHEN NEW.tag_number=${tags[position - 1]!.tagNumber} AND NEW.session_id='${sessionId}' AND NEW.status='dropped' BEGIN SELECT RAISE(ABORT,'partial lkg fault'); END`,
                 );

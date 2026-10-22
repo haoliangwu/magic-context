@@ -66,6 +66,19 @@ In pi-web, several sessions share one process. Startup maintenance runs once per
 
 Pi catches exceptions from context handlers and continues with the original messages, which would send an unmanaged prompt. `registerPiGuardedContext` wraps both the main context handler and the fail-closed handler: when either throws, it logs the error, appends a display-only `magic-context-turn-refused` entry asking the user to resend, and calls `ctx.abort()`. The entry is never shown to the model.
 
+## The model's own tag prefix
+
+The Magic Context prompt asks the model to open each text reply with the next tag, such as `§12§ `. The user should never see it. On Pi, two hooks remove the tag prefix; the last paragraphs of this section describe how OMP differs:
+
+- **Saved message (Pi).** `message_end` runs `stripTagPrefixFromAssistantMessage` (`strip-tag-prefix.ts`). Pi emits `message_end` to extensions before it appends the message, so the saved reply is clean.
+- **Live stream.** `message_update` runs the rewrite in `stream-tag-prefix-strip.ts`. Pi JSON and RPC mode write each `text_delta` as it arrives. The rewrite holds the start of a text block only while it can still be the tag (whitespace, `§`, digits), then drops the prefix or releases the held text unchanged. The tag often arrives split across deltas. A later `§N§` in the reply is left alone. The same event's `text_end.content`, `message` and `partial` snapshots get copies showing the same text. The provider's own message is not edited, so the saved reply comes only from the `message_end` strip, as before.
+
+Pi's extension API offers no way to rewrite a `message_update` event. The live-stream rewrite edits the event object in place, and that reaches the JSON/RPC writer only because Pi's `AgentSession` awaits extension handlers before notifying public listeners and hands both the same objects. `stream-tag-prefix-strip-host-order.test.ts` runs a real session on Pi 0.87.1 and 1.3.0, so a Pi update that changes this order fails that test.
+
+OMP cannot use the live-stream rewrite (the `message_update` edit described above), and the plugin does not register it there. OMP 18.12.x `AgentSession.#emitSessionEvent` notifies its listeners (RPC, TUI) of `message_update` first and queues extension handlers on a microtask afterwards, and its own type docs say text already streamed is not retracted. So on OMP, clients that build replies from deltas still see the prefix; Magic Context cannot change streamed deltas there.
+
+The saved reply on OMP is cleaned through a different hook. OMP 18.12.x hands `message_end` handlers a detached copy of the message (`cloneMessageNotification` in `lifecycle-mirror.ts`), so the in-place `message_end` strip changes nothing there. On OMP only, the plugin registers `registerOmpAssistantMessageStrip` (`strip-tag-prefix.ts`) on OMP's `assistant_message` hook. That hook runs on the finished message before it reaches agent context, `message_end` listeners and persistence. It accepts replacement `content` whose text parts may differ only in `text`. The handler applies the same rule as the `message_end` strip (`stripPersistedAssistantText`), so OMP's session file, its `message_end` frame and its UI show the cleaned reply. Stock Pi 0.87.1 and 1.3.0 have no `assistant_message` event and keep the `message_end` strip unchanged. `strip-tag-prefix-omp-host-order.test.ts` runs a real OMP 18.12.3 session and fails if the saved reply keeps the prefix. It also fails if OMP stops detaching the `message_end` message.
+
 ## Other Pi-specific pieces
 
 - **Channel 2 nudges** are sent with `pi.sendMessage(..., { deliverAs: "steer", triggerTurn: true })` and `display: false`. During a busy run, `steer` waits for every scheduled tool to finish and injects the nudge before the next model call; when idle, `triggerTurn` starts a turn.

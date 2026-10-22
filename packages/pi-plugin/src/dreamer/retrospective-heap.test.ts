@@ -136,6 +136,9 @@ test("Pi retrospective input is byte-identical to whole-file reads under caps", 
 	);
 	const api = await loadDefaultPiSessionApi();
 	const entries = (await api.loadEntriesFromFile(file)) as typeof rows;
+	const firstUserIndex = entries.findIndex(
+		(entry) => entry?.type === "message" && entry.message?.role === "user",
+	);
 	const all = entries
 		.flatMap((e, i) => {
 			const m = e?.message;
@@ -153,6 +156,15 @@ test("Pi retrospective input is byte-identical to whole-file reads under caps", 
 							.map((p: { text: string }) => p.text)
 							.join("\n")
 			).trim();
+			// Derive reply history from file order before sorting by timestamp.
+			const followsAssistantReply =
+				firstUserIndex >= 0 &&
+				entries
+					.slice(firstUserIndex + 1, i)
+					.some(
+						(entry) =>
+							entry?.type === "message" && entry.message?.role === "assistant",
+					);
 			return text
 				? [
 						{
@@ -161,6 +173,7 @@ test("Pi retrospective input is byte-identical to whole-file reads under caps", 
 							role: "user" as const,
 							text,
 							ts: m.timestamp,
+							...(followsAssistantReply ? { followsAssistantReply: true } : {}),
 						},
 					]
 				: [];

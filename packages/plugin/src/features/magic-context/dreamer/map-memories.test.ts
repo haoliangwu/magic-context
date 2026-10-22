@@ -293,6 +293,8 @@ describe("mapMemories disposition", () => {
                 remaining: 61,
                 complete: false,
                 stopReason: "timeout-circuit-breaker",
+                failure: expect.any(Error),
+                failureStage: "prompt",
             });
         } finally {
             closeQuietly(db);
@@ -522,6 +524,8 @@ describe("mapMemories disposition", () => {
             // for backoff rather than immediately blocking the next scheduled run.
             expect(retryPrompt).toEqual([second.id]);
             expect(firstResult).toEqual({
+                failure: expect.any(Error),
+                failureStage: "prompt",
                 mapped: 0,
                 independent: 1,
                 batches: 1,
@@ -1453,7 +1457,7 @@ describe("map-memories whitespace-only output (regression: whitespace must not d
     };
     const ids = (parsed: { id: number }[]) => parsed.map((entry) => entry.id);
 
-    // Hidden completion path (parse: assistantText(completion.messages) || text).
+    // Hidden completion path: final documents stand alone; fragments use the transcript.
     test("falls back to completion.text when messages are whitespace-only (the fix)", () => {
         expect(ids(parseMapMemoriesCompletion(VALID, { messages: [wsMsg] }, IDS))).toEqual([1, 2]);
     });
@@ -1464,6 +1468,20 @@ describe("map-memories whitespace-only output (regression: whitespace must not d
         expect(ids(parseMapMemoriesCompletion(VALID, { messages: [toolMsg] }, IDS))).toEqual([
             1, 2,
         ]);
+    });
+    test("a complete final manifest wins over stale nonempty transcript text", () => {
+        const stale = {
+            info: { role: "assistant" },
+            parts: [
+                { type: "text", text: '<mappings><memory id="99" independent="true"/></mappings>' },
+            ],
+        };
+        expect(ids(parseMapMemoriesCompletion(VALID, { messages: [stale] }, IDS))).toEqual([1, 2]);
+    });
+    test("an incomplete replacement is not rescued by an earlier complete manifest", () => {
+        expect(() =>
+            parseMapMemoriesCompletion("<mappings>", { messages: [manifestMsg] }, IDS),
+        ).toThrow("missing closing root tag");
     });
     test("prefers a real manifest carried by messages over completion.text (priority preserved)", () => {
         const fromMessages = `<mappings><memory id="3" independent="true"/></mappings>`;

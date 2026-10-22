@@ -129,3 +129,14 @@ describe("buildVerifyPrompt", () => {
         expect(prompt).toContain("default verified");
     });
 });
+
+it("conditionally prefers registered navigation tools and reserves whole-file reads for whole-file claims", () => {
+    const prompt = buildVerifyPrompt("git:batch-fixture", []);
+    expect(prompt).toContain("When available in this session");
+    expect(prompt).toContain("aft_outline to outline the backing file");
+    expect(prompt).toContain("aft_zoom on the claimed symbol (or aft_search to locate it)");
+    expect(prompt).toContain("Read a whole file only when the claim is about the file as a whole");
+    expect(prompt).toContain("Otherwise use the available read-only tools");
+    expect(VERIFY_SYSTEM_PROMPT).toContain("plus any available AFT navigation tools");
+    expect(VERIFY_SYSTEM_PROMPT).toContain("unless the claim concerns the file as a whole");
+});

@@ -7,6 +7,7 @@ import { getDataDir, getMagicContextStorageDir } from "../src/shared/data-path";
 import { Database } from "../src/shared/sqlite";
 import { closeQuietly } from "../src/shared/sqlite-helpers";
 import { clearSession } from "../src/features/magic-context/storage-meta-session";
+import { installTagIdentityRevisionTrigger } from "../src/features/magic-context/storage-tag-identity-revision";
 import { SESSION_SCOPED_TABLES } from "../src/features/magic-context/storage-session-tables";
 import {
     copySessionStateForClone,
@@ -1372,6 +1373,7 @@ export function deleteClonedSession(options: DeleteClonedSessionOptions): Delete
     try {
         opencode = openDatabase(opencodeDbPath, false);
         context = openDatabase(contextDbPath, false);
+        installTagIdentityRevisionTrigger(context);
         const session = opencode
             .prepare("SELECT metadata FROM session WHERE id = ?")
             .get(options.sessionId) as { metadata?: unknown } | undefined;
@@ -1435,6 +1437,9 @@ export function cloneSession(options: CloneSessionOptions): CloneResult {
         }
         writeOpenCode = openDatabase(opencodeDbPath, false);
         writeContext = openDatabase(contextDbPath, false);
+        // The offline command does not initialize or migrate the store. It must
+        // still publish tag changes to caches on already-open host connections.
+        installTagIdentityRevisionTrigger(writeContext);
         const openCodeSnapshotBefore = sourceSnapshot(writeOpenCode, sessionScopedTables(writeOpenCode), options.sessionId);
         const copiedOpenCode = runImmediate(writeOpenCode, () =>
             copyOpenCodeRows(

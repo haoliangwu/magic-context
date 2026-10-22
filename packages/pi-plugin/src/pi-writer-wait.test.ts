@@ -105,9 +105,26 @@ test("Pi session metadata is read inside the acquired transaction, not after an 
 	const prepare = db.prepare.bind(db);
 	let firstReadHeld: boolean | undefined;
 	const spy = spyOn(db, "prepare").mockImplementation((sql) => {
-		if (sql.includes("FROM session_meta") && firstReadHeld === undefined)
-			firstReadHeld = db.inTransaction;
-		return prepare(sql);
+		const statement = prepare(sql);
+		// Tag-version readiness stamps are not the session state consumed by a
+		// transform. Observe execution of the full metadata projection, not when
+		// a statement was merely prepared before writer admission.
+		if (
+			!sql.includes("FROM session_meta") ||
+			!sql.includes("last_response_time")
+		)
+			return statement;
+		return new Proxy(statement, {
+			get(target, key) {
+				const value = Reflect.get(target, key);
+				if (key === "get")
+					return (...args: unknown[]) => {
+						firstReadHeld ??= db.inTransaction;
+						return Reflect.apply(value, target, args);
+					};
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
 	});
 	try {
 		const raw = [userMessage("unsent request", 1)];

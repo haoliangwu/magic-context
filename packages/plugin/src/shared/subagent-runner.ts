@@ -64,6 +64,8 @@ export interface SubagentRunOptions {
     agent: string;
     systemPrompt: string;
     userMessage: string;
+    /** Hidden historian only: use `write` to retain cache markers for retries or later turns. */
+    cacheTail?: import("./historian-cache").HistorianCacheTail;
     model?: string | undefined;
     fallbackModels?: readonly ModelInput[];
     timeoutMs?: number | undefined;

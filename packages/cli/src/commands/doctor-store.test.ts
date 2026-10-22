@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LATEST_SUPPORTED_VERSION } from "@magic-context/core/features/magic-context/storage-db";
@@ -59,6 +60,32 @@ test("store init honours the explicit storage directory and leaves existing stor
     expect(runDoctorStoreInit((line) => lines.push(line))).toBe(0);
     expect(lines.join("\n")).toContain("Store already exists:");
     expect(readFileSync(path)).toEqual(before);
+});
+
+test("store init inspects a stopped WAL database without creating sidecars or changing bytes", () => {
+    const path = join(data, "context.db");
+    expect(runDoctorStoreInit(() => {})).toBe(0);
+    const writer = new Database(path);
+    writer.exec("PRAGMA journal_mode=WAL");
+    writer.prepare("INSERT INTO project_state(project_path) VALUES (?)").run("dir:stopped");
+    writer.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    writer.close();
+    expect(existsSync(`${path}-wal`)).toBe(false);
+    expect(existsSync(`${path}-shm`)).toBe(false);
+
+    const before = createHash("sha256").update(readFileSync(path)).digest("hex");
+    const originalMode = statSync(data).mode & 0o777;
+    chmodSync(data, originalMode & ~0o222);
+    try {
+        const lines: string[] = [];
+        expect(runDoctorStoreInit((line) => lines.push(line))).toBe(0);
+        expect(lines.join("\n")).toContain(`schema v${LATEST_SUPPORTED_VERSION}`);
+        expect(createHash("sha256").update(readFileSync(path)).digest("hex")).toBe(before);
+        expect(existsSync(`${path}-wal`)).toBe(false);
+        expect(existsSync(`${path}-shm`)).toBe(false);
+    } finally {
+        chmodSync(data, originalMode);
+    }
 });
 
 test("store init refuses a newer schema without changing it", () => {

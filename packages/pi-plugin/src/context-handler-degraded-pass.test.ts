@@ -101,14 +101,19 @@ describe("Pi context handler never serves a degraded pass", () => {
 				expect(spy).toHaveBeenCalled();
 				expect(result.ok).toBe(false);
 				if (!result.ok) {
-					expect(result.error).toMatchObject({ name: "PiStorageBusyError" });
-					expect((result.error as { cause?: unknown }).cause).toMatchObject({
+					expect(result.error).toMatchObject({
 						name: "PiDegradedPassError",
 						site:
 							stage === "tagging"
 								? "tagging-persistence-failure"
 								: "flushed-status-failure",
 					});
+					expect((result.error as Error).message).not.toContain(
+						"storage is busy",
+					);
+					expect((result.error as Error).message).not.toContain(
+						"send your message again",
+					);
 				}
 				expect(logLines.join("\n")).toContain("DEGRADED PASS");
 			} finally {
@@ -131,8 +136,8 @@ describe("Pi context handler never serves a degraded pass", () => {
 		expect(result.ok).toBe(false);
 		if (!result.ok) {
 			expect(result.error).toMatchObject({
-				name: "PiStorageBusyError",
-				cause: { name: "PiDegradedPassError", site: "context-handler-failed" },
+				name: "PiDegradedPassError",
+				site: "context-handler-failed",
 			});
 		}
 	});
@@ -148,11 +153,19 @@ describe("Pi context handler never serves a degraded pass", () => {
 			[userMessage("hello", 1)],
 		);
 		expect(result.ok).toBe(false);
-		if (!result.ok)
+		if (!result.ok) {
 			expect(result.error).toMatchObject({
-				name: "PiStorageBusyError",
-				cause: { name: "PiDegradedPassError", site: "context-handler-failed" },
+				name: "PiDegradedPassError",
+				site: "context-handler-failed",
 			});
+			expect((result.error as Error).message).toContain(
+				"ordinary transform defect",
+			);
+			expect((result.error as Error).message).not.toContain("storage is busy");
+			expect((result.error as Error).message).not.toContain(
+				"send your message again",
+			);
+		}
 	});
 
 	it("passes through an ordinary failure when compaction is off", async () => {

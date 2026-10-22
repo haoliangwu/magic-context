@@ -44,6 +44,11 @@ import {
 	MAGIC_CONTEXT_PI_SUBAGENT_ENV,
 	PiSubagentRunner,
 } from "./subagent-runner";
+import { __setPiTagSnapshotWorkerForTests } from "./tag-snapshot-pi";
+import {
+	PiTagHydrationError,
+	startPiTagSnapshotWorker,
+} from "./tag-snapshot-worker-client-pi";
 
 const originalEnv = {
 	MAGIC_CONTEXT_PI_SUBAGENT: process.env.MAGIC_CONTEXT_PI_SUBAGENT,
@@ -233,6 +238,62 @@ describe("Pi in-process child guard (#247)", () => {
 		expect(scheduled).not.toHaveBeenCalled();
 		await runtime.emitPiEvent("session_shutdown", {}, ctx);
 	}, 20_000);
+
+	it("shutdown owns cancelled hydration until its worker is released", async () => {
+		isolateXdgEnv();
+		delete process.env[MAGIC_CONTEXT_PI_SUBAGENT_ENV];
+		const runtime = createCountingPi();
+		await magicContextPiExtension(runtime.pi);
+		const db = openDatabase();
+		let release!: () => void;
+		let reject!: (error: Error) => void;
+		let cancelled = false;
+		let started = false;
+		const released = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const result = new Promise<never>((_resolve, rejectResult) => {
+			reject = rejectResult;
+		});
+		__setPiTagSnapshotWorkerForTests(db, () => {
+			started = true;
+			return {
+				result,
+				released,
+				cancel: () => {
+					cancelled = true;
+					reject(new PiTagHydrationError("cancelled"));
+				},
+			};
+		});
+		const ctx = {
+			cwd: process.cwd(),
+			hasUI: false,
+			sessionManager: { getSessionId: () => "ses-hydration-drain" },
+			ui: { setStatus() {} },
+		};
+		let shutdown: Promise<unknown> | undefined;
+		try {
+			await runtime.emitPiEvent("session_start", {}, ctx);
+			expect(started).toBe(true);
+			let finished = false;
+			shutdown = runtime.emitPiEvent("session_shutdown", {}, ctx).then(() => {
+				finished = true;
+			});
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(cancelled).toBe(true);
+			expect(finished).toBe(false);
+			release();
+			await shutdown;
+			expect(finished).toBe(true);
+		} finally {
+			release();
+			await shutdown;
+			__setPiTagSnapshotWorkerForTests(db, (request, cached) =>
+				startPiTagSnapshotWorker(request, { cached }),
+			);
+		}
+	});
 
 	it("keeps session B historian and Dreamer live when session A shuts down", async () => {
 		const configHome = isolateXdgEnv();

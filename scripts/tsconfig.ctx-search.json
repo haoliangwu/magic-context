@@ -9,10 +9,21 @@
 		"typeRoots": [
 			"../packages/plugin/node_modules/@types",
 			"../packages/plugin/node_modules"
-		]
+		],
+		"paths": {
+			"@magic-context/core/*": ["src/*"],
+			"@cortexkit/retina-local-fs/*": [
+				"../retina-local-fs/dist/types/*",
+				"../retina-local-fs/src/*"
+			]
+		}
 	},
 	"include": [
 		"search-pool-benchmark.ts",
+		"auto-search-benchmark.ts",
+		"../packages/plugin/src/hooks/magic-context/auto-search-frozen-replay.test.ts",
+		"../packages/plugin/src/hooks/magic-context/auto-search-quality.test.ts",
+		"../packages/pi-plugin/src/auto-search-quality.test.ts",
 		"../packages/plugin/src/features/magic-context/search-pool.test.ts",
 		"../packages/plugin/src/shared/chunk-vector-writer-guard.test.ts",
 		"ctx-search-benchmark.ts",

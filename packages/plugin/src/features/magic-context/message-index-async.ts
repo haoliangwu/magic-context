@@ -4,14 +4,16 @@ import type {
     RawMessageOrdinalAnchor,
 } from "../../hooks/magic-context/read-session-raw";
 import { scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
+import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import { log, sessionLog } from "../../shared/logger";
 import {
-    type Database,
+    Database,
     getSqliteDatabasePath,
     indexCoordinationInput,
     withSqliteBackgroundWriter,
 } from "../../shared/sqlite";
+import { gaDatabasePath } from "../../v2/store-reader";
 import {
     clearIndexedMessages,
     getLastIndexedOrdinal,
@@ -23,7 +25,7 @@ import {
     isMessageIndexSourceCurrent,
     type MessageHistoryOrphanSweepOptions,
     type MessageHistoryOrphanSweepResult,
-    sweepOrphanedOpenCodeMessageIndexes,
+    sweepOrphanedOpenCodeMessageIndexesCooperatively,
 } from "./message-index";
 import type { IndexWorkerMeasurements } from "./message-index-bounded";
 
@@ -469,9 +471,18 @@ export async function sweepOrphanedOpenCodeMessageIndexesOffThread(
     openSource: () => Database | null,
     options: MessageHistoryOrphanSweepOptions = {},
 ): Promise<MessageHistoryOrphanSweepResult> {
+    // The legacy opener validates v1 tables and rejects a native OC2 store.
+    // Its path must be resolved independently; the sweep validates session_v2
+    // through V2StoreReader before treating any context row as orphaned.
+    if (getHarness() === "opencode2")
+        openSource = () =>
+            new Database(gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"), {
+                readonly: true,
+                fileMustExist: true,
+            });
     const path = getSqliteDatabasePath(db);
-    if (!path || getHarness() !== "opencode")
-        return sweepOrphanedOpenCodeMessageIndexes(db, openSource, options);
+    if (!path || (getHarness() !== "opencode" && getHarness() !== "opencode2"))
+        return sweepOrphanedOpenCodeMessageIndexesCooperatively(db, openSource, options);
     let source: Database | null = null;
     let sourcePath: string | null = null;
     try {
@@ -483,7 +494,8 @@ export async function sweepOrphanedOpenCodeMessageIndexesOffThread(
     } finally {
         if (sourcePath) source?.close();
     }
-    if (!sourcePath) return sweepOrphanedOpenCodeMessageIndexes(db, () => source, options);
+    if (!sourcePath)
+        return sweepOrphanedOpenCodeMessageIndexesCooperatively(db, () => source, options);
     const reply = await runSessionWarmupWorker(
         {
             path,

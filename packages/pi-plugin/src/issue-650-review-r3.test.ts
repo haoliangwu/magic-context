@@ -50,6 +50,7 @@ import {
 	createFakePi,
 	createTestDb,
 	fakeContext,
+	heavyReasoningUsage,
 	type PiMessage,
 	toolResultMessage,
 	userMessage,
@@ -632,6 +633,8 @@ for (const proof of [
 			provider: "anthropic",
 			model: "claude-opus-5-5",
 			api: "anthropic-messages",
+			// A heavy step, so the bounded hold keeps this turn's prefix.
+			usage: heavyReasoningUsage(),
 		});
 		(call.content as unknown[]).unshift({
 			type: "thinking",

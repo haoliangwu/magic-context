@@ -1,4 +1,5 @@
 import { createMemo, createSignal, For, Show } from "solid-js";
+import { pickerAccessibleName } from "./a11y-state";
 import FloatingLayer from "./FloatingLayer";
 import { commitTypedModelValue, getTypedModelSelection } from "./model-selection";
 
@@ -88,7 +89,11 @@ export default function ModelSelect(props: ModelSelectProps) {
         class="model-select-trigger"
         onClick={openDropdown}
         type="button"
-        aria-label={props.label}
+        aria-label={
+          props.label === undefined
+            ? undefined
+            : pickerAccessibleName(props.label, valueStr(), displayValue())
+        }
         aria-expanded={open()}
         aria-haspopup="dialog"
         title={displayValue()}

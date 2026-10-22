@@ -9,7 +9,7 @@ import {
     openDatabase,
     resolveDatabasePath,
 } from "@magic-context/core/features/magic-context/storage-db";
-import { Database } from "@magic-context/core/shared/sqlite";
+import { openExistingDatabase } from "../lib/database-access";
 import { availableDiskBytes, checkDiskSpace, existingDirectoryAncestor } from "../lib/disk-space";
 import { probeHostProcessesUsing } from "./doctor-opencode2-cache";
 import { defaultInspectHolders } from "./doctor-repair-db";
@@ -156,13 +156,18 @@ export function runDoctorSingleStore(
                 `CLI ${context}; engine ${engineContextPath()}`,
             );
         const backupRoot = resolve(options.backupRoot ?? join(data, "backups"));
-        const contextDb = new Database(context, { readonly: true });
-        const storeDb = new Database(store, { readonly: true });
+        const contextDb = openExistingDatabase(context, { readonly: true });
+        if (!contextDb)
+            return refuse("single_store_missing_database", `Database disappeared: ${context}`);
+        let storeDb: ReturnType<typeof openExistingDatabase> = null;
         let contextVersion: number;
         let storeVersion: number;
         let state: MigrationState | null = null;
         let marker: { single_store: number; single_store_set_at_ms: number | null } | null;
         try {
+            storeDb = openExistingDatabase(store, { readonly: true });
+            if (!storeDb)
+                return refuse("single_store_missing_database", `Database disappeared: ${store}`);
             contextVersion = getPersistedSchemaVersion(contextDb);
             storeVersion =
                 (
@@ -190,7 +195,7 @@ export function runDoctorSingleStore(
                     : null;
         } finally {
             contextDb.close();
-            storeDb.close();
+            storeDb?.close();
         }
         if (state?.state === "migrated" || marker?.single_store) {
             if (

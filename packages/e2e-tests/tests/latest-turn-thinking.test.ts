@@ -15,13 +15,17 @@ const thinking = (n: number) => ({
 	signature: `signed-${n}`,
 });
 
-test("mock rejects edited, missing and reordered latest-turn thinking across tool results", async () => {
+test("mock rejects edited, missing and reordered latest-turn thinking across tool results, and accepts removing all of it", async () => {
 	const mock = new MockProvider();
 	const { baseURL } = await mock.start({
 		thinkingScope: () => "negative-control",
 	});
 	mock.setDefault({
-		content: [thinking(1), { type: "redacted_thinking", data: "opaque-1" }],
+		content: [
+			thinking(1),
+			{ type: "redacted_thinking", data: "opaque-1" },
+			thinking(2),
+		],
 		usage: { input_tokens: 10, output_tokens: 10 },
 	});
 	const send = (messages: unknown[]) =>
@@ -33,6 +37,7 @@ test("mock rejects edited, missing and reordered latest-turn thinking across too
 	const returned = [
 		thinking(1),
 		{ type: "redacted_thinking", data: "opaque-1" },
+		thinking(2),
 	];
 	const result = {
 		role: "user",
@@ -41,10 +46,12 @@ test("mock rejects edited, missing and reordered latest-turn thinking across too
 	try {
 		expect((await send([user])).status).toBe(200);
 		for (const content of [
-			[{ ...thinking(1), thinking: "edited" }, returned[1]],
-			[returned[0]],
+			[{ ...thinking(1), thinking: "edited" }, returned[1], returned[2]],
+			// A middle gap.
+			[returned[0], returned[2]],
+			[returned[0], returned[1]],
+			[returned[1], returned[2]],
 			[...returned].reverse(),
-			[],
 		]) {
 			const rejected = await send([
 				user,
@@ -56,11 +63,13 @@ test("mock rejects edited, missing and reordered latest-turn thinking across too
 				"latest assistant message cannot be modified",
 			);
 		}
+		// Rewording the prompt does not start a new turn, so a partial set is
+		// still rejected.
 		expect(
 			(
 				await send([
 					{ ...user, content: "edited prompt" },
-					{ role: "assistant", content: [] },
+					{ role: "assistant", content: [returned[0]] },
 					result,
 				])
 			).status,
@@ -69,6 +78,11 @@ test("mock rejects edited, missing and reordered latest-turn thinking across too
 		expect(
 			(await send([user, { role: "assistant", content: returned }, result]))
 				.status,
+		).toBe(200);
+		// Removing every block of the turn is accepted (Opus 5.5 accepted it
+		// live); a middle gap is not.
+		expect(
+			(await send([user, { role: "assistant", content: [] }, result])).status,
 		).toBe(200);
 		expect(
 			(
@@ -84,8 +98,21 @@ test("mock rejects edited, missing and reordered latest-turn thinking across too
 	}
 });
 
-for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "drops" }, { band: 76, mode: "primary" }, { band: 85, mode: "primary" }, { band: 76, mode: "legacy-accepted" }, { band: 76, mode: "legacy-rejected" }]) {
-	test(mode === "primary" ? band === 76 ? "Anthropic primary long tool loop holds queued drops on a plain real-user pass until ctx-flush at 76%" : `Anthropic primary long tool loop defers thinking-changing queued drops at ${band}%` : mode === "drops" ? `Anthropic task preserves latest-turn thinking and queues ctx_reduce at ${band}%` : `Anthropic task ${mode} thinking replay`, async () => {
+// The execute threshold here is 5,000 tokens of the 91,808-token window (about
+// 5.4%), so the bounded signed-thinking hold ends at about 15.4%. At 76% and 85%
+// a signed turn is never held: the task's subagent execute and the primary's
+// force band bust mid-turn, apply the queued ctx_reduce and strip the turn's
+// signed thinking. Earlier revisions held both until the next real user
+// message. The held behaviour is still covered at 10% (execute, below the cap)
+// with a heavy step: thinking text long enough to estimate above 1,500 tokens.
+const heavyThinking = (n: number) => ({
+	...thinking(n),
+	thinking: `Reason ${n} ${"weighing the next step carefully ".repeat(400)}`,
+});
+for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "drops" }, { band: 10, mode: "drops" }, { band: 76, mode: "primary" }, { band: 85, mode: "primary" }, { band: 76, mode: "legacy-accepted" }, { band: 76, mode: "legacy-rejected" }]) {
+	const heldBand = band === 10;
+	const busts = !heldBand && (mode === "drops" || (mode === "primary" && band === 85));
+	test(mode === "primary" ? band === 76 ? "Anthropic primary long tool loop holds queued drops on a plain real-user pass until ctx-flush at 76%" : `Anthropic primary long tool loop applies a thinking-changing queued drop mid-turn above the hold cap at ${band}%` : mode === "drops" ? heldBand ? `Anthropic task held for heavy reasoning preserves latest-turn thinking and queues ctx_reduce at ${band}%` : `Anthropic task applies ctx_reduce mid-turn above the hold cap and strips the turn's thinking at ${band}%` : `Anthropic task ${mode} thinking replay`, async () => {
         let enforceLegacy = mode !== "legacy-accepted";
         const modelID = mode.startsWith("legacy-") ? "mock-sonnet" : "claude-sonnet-5-5";
 		const oldTmp = process.env.TMPDIR;
@@ -183,7 +210,7 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 				};
 				const tool = (name: string, input: unknown) => ({
 					content: [
-						thinking(pass),
+						heldBand ? heavyThinking(pass) : thinking(pass),
 						{ type: "tool_use", id: `call-${pass}`, name, input },
 					],
 					stop_reason: "tool_use" as const,
@@ -317,18 +344,51 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
             }
 			expect(pass).toBe(lastPass);
 			expect(h.mock.requests().some((r) => r.thinkingViolation)).toBe(false);
-			// The request after ctx_reduce still carries the output and extends the
-			// previous request byte for byte: no thinking was edited or removed.
-			expect(bytes(wire[reducePass])).toContain("SPENT-b");
-			expect(bytes(wire[reducePass]!.slice(0, wire[reducePass - 1]!.length))).toBe(
-				bytes(wire[reducePass - 1]),
-			);
-			expect(
-				h
-					.contextDb()
-					.query("SELECT tag_id FROM pending_ops WHERE session_id = ?")
-					.all(childId),
-			).toContainEqual({ tag_id: tag });
+			if (busts) {
+				// Above the cap a bust inside the loop removes the spent output (the
+				// queued ctx_reduce, or at 85% the force band's own reclaim), and the
+				// request that first lacks it carries no signed thinking: that bust
+				// stripped every block of the turn. The provider oracle accepted
+				// every request.
+				const thinkingIn = (messages: unknown[]) =>
+					messages
+						.flatMap((message) => (message as { content: unknown }).content)
+						.filter((part) => (part as { type?: string } | null)?.type === "thinking");
+				// The third request is the first to carry b.txt's output.
+				expect(bytes(wire[2])).toContain("SPENT-b");
+				const landed = wire.findIndex(
+					(messages, index) => index > 2 && !bytes(messages).includes("SPENT-b"),
+				);
+				expect(landed).toBeGreaterThan(2);
+				expect(landed).toBeLessThan(lastPass);
+				expect(thinkingIn(wire[landed]!)).toEqual([]);
+				if (mode === "drops") {
+					// The task's every execute pass is its own ride, so the queued
+					// ctx_reduce is applied inside the loop.
+					expect(
+						h
+							.contextDb()
+							.query("SELECT tag_id FROM pending_ops WHERE session_id = ?")
+							.all(childId),
+					).toHaveLength(0);
+					contain();
+					return;
+				}
+			}
+			if (!busts) {
+				// The request after ctx_reduce still carries the output and extends the
+				// previous request byte for byte: no thinking was edited or removed.
+				expect(bytes(wire[reducePass])).toContain("SPENT-b");
+				expect(bytes(wire[reducePass]!.slice(0, wire[reducePass - 1]!.length))).toBe(
+					bytes(wire[reducePass - 1]),
+				);
+				expect(
+					h
+						.contextDb()
+						.query("SELECT tag_id FROM pending_ops WHERE session_id = ?")
+						.all(childId),
+				).toContainEqual({ tag_id: tag });
+			}
 			const previousRequest = wire.at(-1)!;
 			const workerRequest = () => h.mock.requests().filter(request =>
 				bytes(request.body.system).includes("ISSUE-630-WORKER"),
@@ -356,6 +416,22 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 					"pending ops held — reason=no originating cache-bust opportunity; scheduler=execute, historianRunning=false",
 				);
 				// An explicit flush supplies the shared rebuild permission and releases the queue.
+				const response = await fetch(`${h.serverUrl}/session/${childId}/command?directory=${encodeURIComponent(h.workdir)}`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ command: "ctx-flush", arguments: "" }),
+				});
+				expect(response.ok).toBe(true);
+				await h.sendPrompt(childId, "Apply the explicitly requested rebuild; finish.", {
+					timeoutMs: 30_000,
+					agent: "thinking-worker",
+				});
+			}
+			if (mode === "primary" && band === 85) {
+				// The force band's one reclaim already removed the output; the drop the
+				// agent queued after it waits for the next bust, as on any model (the
+				// held turn of earlier revisions requested a rebuild for it instead).
+				expect(h.contextDb().query("SELECT tag_id FROM pending_ops WHERE session_id = ?").all(childId)).toContainEqual({ tag_id: tag });
 				const response = await fetch(`${h.serverUrl}/session/${childId}/command?directory=${encodeURIComponent(h.workdir)}`, {
 					method: "POST",
 					headers: { "content-type": "application/json" },

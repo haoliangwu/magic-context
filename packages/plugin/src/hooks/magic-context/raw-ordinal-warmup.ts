@@ -50,11 +50,23 @@ export interface RawOrdinalWarmupInput {
     previous?: RawSessionSummaryScan;
     harness?: HarnessId;
     indexCancellation?: SharedArrayBuffer;
+    /** Shared cancellation checked after imports, before the worker opens its SQLite connection. */
+    openCancellation?: SharedArrayBuffer;
     indexCoordination?: SharedArrayBuffer;
     indexOwner?: number;
     orphanSweep?: { sourcePath: string | null; options: MessageHistoryOrphanSweepOptions };
     /** Ordinals whose message ids the worker reads exactly (see raw-exact-ordinal-read.ts). */
     exactOrdinalIds?: number[];
+    ftsRowidBackfill?: boolean;
+    /** Archive rendering uses explicit store paths; workers never discover a host store. */
+    searchArchive?: {
+        start: number;
+        end: number;
+        tokenBudget: number;
+        archiveOnly: boolean;
+        rawPath: string | null;
+        rawIds?: Array<[string, number]>;
+    };
 }
 
 export type RawOrdinalWarmupReply =
@@ -65,7 +77,9 @@ export type RawOrdinalWarmupReply =
     | { kind: "indexed"; inserted: boolean; measurements?: IndexWorkerMeasurements }
     | { kind: "orphan-sweep"; result: MessageHistoryOrphanSweepResult }
     | { kind: "exact-ordinal-ids"; ids: Array<[number, string | null]> }
-    | { kind: "error"; error: string };
+    | { kind: "search-archive"; text: string | null }
+    | { kind: "fts-rowid-backfill" }
+    | { kind: "error"; error: string; code?: string; errcode?: number };
 
 /**
  * "warm": this connection has valid rank checkpoints. "failed": the
@@ -84,6 +98,7 @@ export type RawOrdinalWarmupFailureReason =
 
 export interface RawOrdinalWarmupOptions {
     entry?: URL;
+    signal?: AbortSignal;
     /** @deprecated File stores always scan off-thread; retained for old callers. */
     inThreadMaxRows?: number;
     acceptMs?: number;
@@ -145,6 +160,9 @@ export function runSessionWarmupWorker(
 ): Promise<WorkerResult> {
     ensureExitHook();
     return new Promise((resolve) => {
+        const openCancellation = new Int32Array(
+            new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
+        );
         let worker: Worker | undefined;
         let deadline: ReturnType<typeof setTimeout> | undefined;
         let settled = false;
@@ -156,11 +174,21 @@ export function runSessionWarmupWorker(
                 | { inserted: boolean; measurements?: IndexWorkerMeasurements }
                 | { orphanSweep: MessageHistoryOrphanSweepResult }
                 | { exactOrdinalIds: Array<[number, string | null]> }
-                | { failure: RawOrdinalWarmupFailureReason; detail: string },
+                | { searchArchive: string | null }
+                | { ftsRowidBackfill: true }
+                | {
+                      failure: RawOrdinalWarmupFailureReason;
+                      detail: string;
+                      code?: string;
+                      errcode?: number;
+                  },
         ) => {
             if (settled) return;
             settled = true;
+            // Worker termination is asynchronous; publish cancellation before requesting it.
+            Atomics.store(openCancellation, 0, 1);
             clearTimeout(deadline);
+            options.signal?.removeEventListener("abort", abort);
             if (worker) {
                 activeWorkers.delete(worker);
                 const stopped = worker.terminate();
@@ -182,9 +210,18 @@ export function runSessionWarmupWorker(
             );
             deadline.unref?.();
         };
+        const abort = () => finish({ failure: "stopped", detail: "stopped" });
+        if (options.signal?.aborted) {
+            abort();
+            return;
+        }
+        options.signal?.addEventListener("abort", abort, { once: true });
         try {
             worker = inRootAsyncContext(
-                () => new Worker(options.entry ?? defaultEntry(), { workerData: input }),
+                () =>
+                    new Worker(options.entry ?? defaultEntry(), {
+                        workerData: { ...input, openCancellation: openCancellation.buffer },
+                    }),
             );
         } catch (error) {
             finish({ failure: "start-failed", detail: String(error) });
@@ -203,7 +240,15 @@ export function runSessionWarmupWorker(
                 finish({ inserted: reply.inserted, measurements: reply.measurements });
             else if (reply.kind === "orphan-sweep") finish({ orphanSweep: reply.result });
             else if (reply.kind === "exact-ordinal-ids") finish({ exactOrdinalIds: reply.ids });
-            else finish({ failure: "worker-error", detail: reply.error });
+            else if (reply.kind === "search-archive") finish({ searchArchive: reply.text });
+            else if (reply.kind === "fts-rowid-backfill") finish({ ftsRowidBackfill: true });
+            else
+                finish({
+                    failure: "worker-error",
+                    detail: reply.error,
+                    code: reply.code,
+                    errcode: reply.errcode,
+                });
         });
         worker.on("error", (error) => finish({ failure: "worker-error", detail: String(error) }));
         worker.on("exit", (code) => finish({ failure: "exited", detail: `exit code ${code}` }));
@@ -305,7 +350,9 @@ type WorkerResult =
     | { inserted: boolean; measurements?: IndexWorkerMeasurements }
     | { orphanSweep: MessageHistoryOrphanSweepResult }
     | { exactOrdinalIds: Array<[number, string | null]> }
-    | { failure: RawOrdinalWarmupFailureReason; detail: string };
+    | { searchArchive: string | null }
+    | { ftsRowidBackfill: true }
+    | { failure: RawOrdinalWarmupFailureReason; detail: string; code?: string; errcode?: number };
 
 /** One worker scan of a store and session, shared by every connection that asks meanwhile. */
 interface SharedScan {

@@ -202,7 +202,7 @@ describe("dreamer budget on an async child", () => {
             },
             readChildTokenBudget: (id: string) => {
                 expect(id).toBe("ses-child");
-                expect(ready).toBe(true);
+                if (!ready) return undefined;
                 return { spent: 58, finalizeFired: true };
             },
         };

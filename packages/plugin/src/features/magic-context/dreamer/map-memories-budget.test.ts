@@ -196,8 +196,12 @@ test("two failed attempts defer unmapped memories across runs", async () => {
             delete: async () => ({}),
         },
     } as never;
+    const failed = await mapMemories(args);
+    expect(failed.failure).toBeInstanceOf(Error);
+    expect((failed.failure as Error).message).toContain("MessageAbortedError");
+    expect(failed.failureStage).toBe("prompt");
     await mapMemories(args);
-    await mapMemories(args);
+    expect((await mapMemories(args)).deferred).toBe(true);
     expect(
         selectMapMemoryInputs(args.db, args.projectIdentity, args.sessionDirectory),
     ).toHaveLength(0);

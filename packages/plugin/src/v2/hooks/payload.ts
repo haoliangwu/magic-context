@@ -1,4 +1,8 @@
 import { isDroppedToolOutput } from "../../hooks/magic-context/ctx-reduce-nudge";
+import {
+    isCoveredInstructionRow,
+    markCoveredInstructionRow,
+} from "../../hooks/magic-context/host-served-rows";
 import { modelAcceptsEmptyContent } from "../../hooks/magic-context/sentinel";
 import { getEmptyImageParts } from "../../hooks/magic-context/strip-content";
 import type { MessageLike } from "../../hooks/magic-context/tag-messages";
@@ -388,6 +392,8 @@ export function adaptPayload(
             parts,
         };
         originals.set(mapped, message);
+        // The transform decides whether a restored covered instruction is served.
+        if (isCoveredInstructionRow(message)) markCoveredInstructionRow(mapped.info);
         if (typeof message.id !== "string") bridgesByCarrier.set(mapped, byCallID);
         messages.push(mapped);
     }

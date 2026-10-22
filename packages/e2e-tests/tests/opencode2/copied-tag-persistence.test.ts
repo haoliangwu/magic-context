@@ -110,11 +110,22 @@ test("OpenCode 2 requests carry assistant replies without copied §N§ tag notat
 		}
 		// Those later passes are defer passes: the ones allowed to change nothing
 		// already sent. Only the session's first pass (its first m[0] render) is not.
-		const deferPasses = readPluginLog(host.env)
-			.split("\n")
-			.filter(
-				(line) => line.includes(session.id) && line.includes("pending ops WILL NOT APPLY — reason=scheduler_defer"),
-			);
+		// The plugin buffers log writes for up to half a second, so the last
+		// turns' lines may not be on disk when the last turn returns. Wait for
+		// every turn after the first to log its pass before counting.
+		const readDeferPasses = () =>
+			readPluginLog(host.env)
+				.split("\n")
+				.filter(
+					(line) =>
+						line.includes(session.id) && line.includes("pending ops WILL NOT APPLY — reason=scheduler_defer"),
+				);
+		const logDeadline = Date.now() + 5_000;
+		let deferPasses = readDeferPasses();
+		while (deferPasses.length < PROMPTS.length - 1 && Date.now() < logDeadline) {
+			await Bun.sleep(100);
+			deferPasses = readDeferPasses();
+		}
 		console.log(`defer passes: ${deferPasses.length}`);
 		expect(deferPasses.length).toBeGreaterThanOrEqual(3);
 	} catch (error) {

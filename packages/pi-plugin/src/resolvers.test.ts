@@ -12,6 +12,24 @@ import {
 } from "./index";
 
 describe("Pi config resolvers", () => {
+	for (const harness of ["pi", "omp"] as const) {
+		it(`${harness} does not configure a historian from loader defaults or metadata alone`, () => {
+			for (const input of [
+				{},
+				{ historian: {} },
+				{
+					historian: {
+						temperature: 0.1,
+						[harness]: { thinking_level: "high" },
+					},
+				},
+			]) {
+				const config = MagicContextConfigSchema.parse(input);
+				expect(config.historian?.[harness]?.model).toBeUndefined();
+				expect(resolveHistorianFromConfig(config, harness)).toBeUndefined();
+			}
+		});
+	}
 	it("selects the same muse percentage and token thresholds as OpenCode", () => {
 		const modelKey = canonicalPiModelKey(
 			"opencode",

@@ -17,6 +17,7 @@ import {
     contextUsagePassSnapshot,
     loadContextUsage,
     resolveUnknownUsageFromWireEstimate,
+    savedProviderReadingForPass,
 } from "./transform-context-state";
 
 const tempDirs: string[] = [];
@@ -90,6 +91,64 @@ describe("resolveUnknownUsageFromWireEstimate", () => {
                 usableHardLimit: 1_048_576,
             }),
         ).toEqual({ percentage: 0, inputTokens: 0 });
+    });
+});
+
+describe("savedProviderReadingForPass", () => {
+    const persisted = {
+        usage: { percentage: 59.9, inputTokens: 55_000 },
+        updatedAt: 1_000,
+        lastObservedModelKey: "mock/model-a",
+        lastUsageContextLimit: 91_808,
+    };
+    const qualifying = {
+        persisted,
+        currentModelKey: "mock/model-a",
+        contextLimit: 91_808,
+        lastResponseTime: 1_000,
+        cacheExpired: false,
+    };
+
+    it("returns the saved reading for the same model and limit inside the cache window", () => {
+        expect(savedProviderReadingForPass(qualifying)).toEqual({
+            percentage: 59.9,
+            inputTokens: 55_000,
+        });
+    });
+
+    it("refuses a reading for another model, another or unknown limit, or an expired cache", () => {
+        expect(
+            savedProviderReadingForPass({ ...qualifying, currentModelKey: "mock/model-b" }),
+        ).toBeNull();
+        expect(
+            savedProviderReadingForPass({ ...qualifying, currentModelKey: undefined }),
+        ).toBeNull();
+        expect(
+            savedProviderReadingForPass({
+                ...qualifying,
+                persisted: { ...persisted, lastObservedModelKey: null },
+            }),
+        ).toBeNull();
+        expect(savedProviderReadingForPass({ ...qualifying, contextLimit: 200_000 })).toBeNull();
+        expect(savedProviderReadingForPass({ ...qualifying, contextLimit: undefined })).toBeNull();
+        expect(
+            savedProviderReadingForPass({
+                ...qualifying,
+                persisted: { ...persisted, lastUsageContextLimit: 0 },
+            }),
+        ).toBeNull();
+        expect(savedProviderReadingForPass({ ...qualifying, cacheExpired: true })).toBeNull();
+        expect(savedProviderReadingForPass({ ...qualifying, lastResponseTime: 0 })).toBeNull();
+    });
+
+    it("refuses an empty reading", () => {
+        expect(savedProviderReadingForPass({ ...qualifying, persisted: null })).toBeNull();
+        expect(
+            savedProviderReadingForPass({
+                ...qualifying,
+                persisted: { ...persisted, usage: { percentage: 59.9, inputTokens: 0 } },
+            }),
+        ).toBeNull();
     });
 });
 

@@ -123,6 +123,10 @@ test("OpenCode 2 shapes all six dream routes and keeps timer work in its owning 
         for (let index = 0; index < 5; index++) {
             const session = await client.session.create({ title: `real-user-${index}`, location: { directory: host.cwd }, model: { providerID: "openai", id: "mock-model" } });
             sessions.push(session.id);
+            await client.session.prompt({ sessionID: session.id, text: `OPENING_${index}: explain the Fixture project rule.` });
+            await client.session.wait({ sessionID: session.id }, { signal: AbortSignal.timeout(20_000) });
+            // The friction gate only reviews a user line that answers an assistant
+            // reply, so each session needs a correction after its opening message.
             await client.session.prompt({ sessionID: session.id, text: `REAL_USER_${index}: repeated correction about the Fixture project rule.` });
             await client.session.wait({ sessionID: session.id }, { signal: AbortSignal.timeout(20_000) });
         }

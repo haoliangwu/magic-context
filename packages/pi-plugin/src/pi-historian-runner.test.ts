@@ -227,6 +227,16 @@ function attemptedModels(runner: SubagentRunner): Array<string | undefined> {
 	).mock.calls.map(([options]) => options.model);
 }
 
+function attemptedUserMessages(
+	runner: SubagentRunner,
+): Array<string | undefined> {
+	return (
+		runner.run as unknown as {
+			mock: { calls: Array<[Parameters<SubagentRunner["run"]>[0]]> };
+		}
+	).mock.calls.map(([options]) => options.userMessage);
+}
+
 async function runHistorianWith(args: {
 	outputs?: string[];
 	runner?: SubagentRunner;
@@ -780,6 +790,32 @@ describe("runPiHistorian", () => {
 		}
 	});
 
+	it("passes repair feedback to fallback models after repair validation fails", async () => {
+		const { db, runner } = await runHistorianWith({
+			outputs: [
+				"not xml",
+				"still not xml",
+				successXml("Pi fallback recovered the history."),
+			],
+			fallbackModels: ["fallback/model"],
+		});
+		try {
+			expect(attemptedModels(runner)).toEqual([
+				"test/model",
+				"test/model",
+				"fallback/model",
+			]);
+			const userMessages = attemptedUserMessages(runner);
+			expect(userMessages).toHaveLength(3);
+			expect(userMessages[1]).toContain("Validation error:");
+			expect(userMessages[1]).toContain("Previous invalid XML:\nnot xml");
+			expect(userMessages[2]).toBe(userMessages[1]);
+			expect(getCompartments(db, "ses-historian")).toHaveLength(1);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("records the classified Zen refusal instead of generic empty output", async () => {
 		const { db } = await runHistorianWith({
 			historianModel: "opencode/free",
@@ -967,35 +1003,70 @@ describe("runPiHistorian", () => {
 		});
 	}
 
-	it("tries configured fallbacks before the live session model last resort", async () => {
-		const { db, runner } = await runHistorianWith({
-			outputs: ["", "", successXml("Session model recovered Pi history.")],
-			fallbackModels: ["fallback/model"],
-			fallbackModelId: "session/model",
+	for (const host of ["Pi", "OMP"]) {
+		it(`${host} reports an exhausted configured historian chain without calling the session model`, async () => {
+			clearPiHistorianAlertState("ses-historian");
+			const notices: string[] = [];
+			const { db, runner } = await runHistorianWith({
+				historianModel: `${host.toLowerCase()}/historian`,
+				outputs: [
+					"",
+					"",
+					successXml("Session model must not recover history."),
+				],
+				fallbackModels: ["fallback/model"],
+				fallbackModelId: "session/model",
+				notifyIssue: (message) => {
+					notices.push(message);
+				},
+			});
+			try {
+				expect(attemptedModels(runner)).toEqual([
+					`${host.toLowerCase()}/historian`,
+					"fallback/model",
+				]);
+				const options = (
+					runner.run as unknown as {
+						mock: { calls: Array<[Parameters<SubagentRunner["run"]>[0]]> };
+					}
+				).mock.calls.map(([invocation]) => invocation);
+				expect(options.map((invocation) => invocation.accountingTask)).toEqual([
+					undefined,
+					"fallback",
+				]);
+				expect(getCompartments(db, "ses-historian")).toEqual([]);
+				expect(getHistorianFailureState(db, "ses-historian").failureCount).toBe(
+					1,
+				);
+				expect(notices.join("\n")).toContain(
+					"History compression could not finish",
+				);
+			} finally {
+				closeQuietly(db);
+			}
 		});
-		try {
-			expect(attemptedModels(runner)).toEqual([
-				"test/model",
-				"fallback/model",
-				"session/model",
-			]);
-			const options = (
-				runner.run as unknown as {
-					mock: { calls: Array<[Parameters<SubagentRunner["run"]>[0]]> };
-				}
-			).mock.calls.map(([invocation]) => invocation);
-			expect(options.map((invocation) => invocation.accountingTask)).toEqual([
-				undefined,
-				"fallback",
-				"fallback-session",
-			]);
-			expect(getCompartments(db, "ses-historian")).toEqual([
-				expect.objectContaining({ title: "Initial Pi slice" }),
-			]);
-		} finally {
-			closeQuietly(db);
-		}
-	});
+
+		it(`${host} keeps a successful configured historian on its configured chain`, async () => {
+			const { db, runner } = await runHistorianWith({
+				historianModel: `${host.toLowerCase()}/historian`,
+				outputs: ["", successXml("Configured fallback recovered history.")],
+				fallbackModels: ["fallback/model"],
+				fallbackModelId: "session/model",
+			});
+			try {
+				expect(attemptedModels(runner)).toEqual([
+					`${host.toLowerCase()}/historian`,
+					"fallback/model",
+				]);
+				expect(getHistorianFailureState(db, "ses-historian").failureCount).toBe(
+					0,
+				);
+				expect(getCompartments(db, "ses-historian")).toHaveLength(1);
+			} finally {
+				closeQuietly(db);
+			}
+		});
+	}
 
 	it("uses only each Pi fallback's own thinking level", async () => {
 		const { db, runner } = await runHistorianWith({
@@ -1064,6 +1135,13 @@ describe("runPiHistorian", () => {
 		});
 		try {
 			expect(attemptedModels(runner)).toEqual(["test/model", "test/model"]);
+			expect(
+				(
+					runner.run as unknown as {
+						mock: { calls: Array<[{ cacheTail?: string }]> };
+					}
+				).mock.calls.map(([options]) => options.cacheTail),
+			).toEqual(["skip", "write"]);
 			expect(getCompartments(db, "ses-historian")).toHaveLength(1);
 		} finally {
 			closeQuietly(db);
@@ -1082,6 +1160,13 @@ describe("runPiHistorian", () => {
 		});
 		try {
 			expect(attemptedModels(runner)).toEqual(["test/model", "fallback/model"]);
+			expect(
+				(
+					runner.run as unknown as {
+						mock: { calls: Array<[{ cacheTail?: string }]> };
+					}
+				).mock.calls.map(([options]) => options.cacheTail),
+			).toEqual(["skip", "skip"]);
 			expect(getCompartments(db, "ses-historian")).toHaveLength(1);
 		} finally {
 			closeQuietly(db);

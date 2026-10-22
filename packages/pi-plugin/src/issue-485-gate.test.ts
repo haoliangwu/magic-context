@@ -658,7 +658,14 @@ it("J populated stale-view snapshot is refused by the equivalence fence", async 
 		const runtime = new Proxy(manager, {
 			get(target, key) {
 				if (key === "appendCompaction")
-					return (...args: Parameters<SessionManager["appendCompaction"]>) => {
+					return (
+						summary: string,
+						firstKeptEntryId: string,
+						tokensBefore: number,
+						details: unknown,
+						fromHook: boolean | undefined,
+						usage: Parameters<SessionManager["appendCompaction"]>[5],
+					) => {
 						// Append to the host session after Magic Context has read the messages it will fold.
 						target.appendMessage({
 							role: "system",
@@ -666,7 +673,14 @@ it("J populated stale-view snapshot is refused by the equivalence fence", async 
 							toolsRemoved: [{ name: "read" }],
 							timestamp: 10,
 						});
-						return target.appendCompaction(...args);
+						return target.appendCompaction(
+							summary,
+							firstKeptEntryId,
+							tokensBefore,
+							details,
+							fromHook,
+							usage,
+						);
 					};
 				const value = Reflect.get(target, key);
 				return typeof value === "function" ? value.bind(target) : value;

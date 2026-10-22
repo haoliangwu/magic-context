@@ -119,6 +119,8 @@ interface ChunkOutcome {
      *  measured elapsed time so the run loop can log how long the doomed chunk
      *  actually ran (helps an operator size chunk vs model). */
     failure?: {
+        error?: unknown;
+        stage?: "child-start" | "prompt" | "apply";
         class: ChunkFailureClass;
         brief: string;
         elapsedMs: number;
@@ -126,6 +128,9 @@ interface ChunkOutcome {
 }
 
 export interface CompressCuesResult {
+    failure?: unknown;
+    failureStage?: "child-start" | "prompt" | "apply";
+    stopReason?: "deadline" | "timeout-circuit-breaker";
     /** Cues written this run (memories whose cue moved from missing/stale to set). */
     compressed: number;
     /** Cues the model returned that failed per-cue validation and were skipped. */
@@ -277,12 +282,16 @@ export async function runCompressCues(args: CompressCuesArgs): Promise<CompressC
         let timeoutStreakElapsedMs: number[] = [];
         for (let i = 0; i < chunks.length; i += 1) {
             const remainingMs = Math.max(0, args.deadline - Date.now());
-            if (remainingMs <= 0) break;
+            if (remainingMs <= 0) {
+                result.stopReason = "deadline";
+                break;
+            }
             // Not enough budget left to give this chunk a fair (>= floor) slice.
             // Starting it would just produce another timeout, so stop here and
             // bank progress: cues already written are durable per memory, and the
             // incomplete result keeps this task transient so cron retries it.
             if (remainingMs < CHUNK_TIMEOUT_FLOOR_MS) {
+                result.stopReason = "deadline";
                 log(
                     `[dreamer] compress-cues: stopping before chunk ${i + 1}/${chunks.length} — remaining budget ${remainingMs}ms is below the ${CHUNK_TIMEOUT_FLOOR_MS}ms chunk floor; banking ${result.compressed} compressed cue(s)`,
                 );
@@ -295,6 +304,10 @@ export async function runCompressCues(args: CompressCuesArgs): Promise<CompressC
             const chunk = chunks[i];
             if (!chunk) break;
             const outcome = await compressOneChunk(args, chunk, sliceMs, abortController.signal);
+            if (outcome.failure) {
+                result.failure = outcome.failure.error;
+                result.failureStage = outcome.failure.stage;
+            }
             result.compressed += outcome.compressed;
             result.skipped += outcome.skipped;
             result.remaining -= outcome.compressed;
@@ -305,6 +318,7 @@ export async function runCompressCues(args: CompressCuesArgs): Promise<CompressC
                 consecutiveTimeouts += 1;
                 timeoutStreakElapsedMs.push(outcome.failure.elapsedMs);
                 if (consecutiveTimeouts >= CONSECUTIVE_TIMEOUT_LIMIT) {
+                    result.stopReason = "timeout-circuit-breaker";
                     // Circuit breaker: the model is consistently slower than its
                     // time slice. Stop now instead of burning the remaining chunks
                     // (and model quota) on attempts that will also time out.
@@ -338,7 +352,10 @@ export async function runCompressCues(args: CompressCuesArgs): Promise<CompressC
  *  those keep the existing per-chunk retry-next-run behavior and must not trip
  *  the consecutive-timeout circuit breaker. */
 function isTimeoutClassError(error: unknown): boolean {
-    return error instanceof Error && /^prompt timed out after \d+ms$/.test(error.message);
+    return (
+        shared.isPromptTimeoutError(error) ||
+        shared.getPromptFailureDetail(error)?.failureClass === "provider_timeout"
+    );
 }
 
 async function compressOneChunk(
@@ -358,6 +375,7 @@ async function compressOneChunk(
     );
     let promptSettled = false;
     const startedAt = Date.now();
+    let stage: "child-start" | "prompt" | "apply" = "child-start";
     try {
         const prompt = buildCompressCuesPrompt({
             projectPath: args.projectIdentity,
@@ -378,6 +396,7 @@ async function compressOneChunk(
         });
         agentSessionId = handle.id || null;
         if (!agentSessionId) throw new Error("Could not create compress-cues session.");
+        stage = "prompt";
         // The retry callbacks close over the opened run; bind it once so the closures
         // see the resolved handle rather than the nullable slot it was assigned to.
         const opened = handle;
@@ -444,6 +463,7 @@ async function compressOneChunk(
             });
         }
 
+        stage = "apply";
         return args.moduleRoute
             ? await applyCuesThroughModule(args, chunk, run.validated, signal)
             : applyCues(args, chunk, run.validated);
@@ -458,6 +478,7 @@ async function compressOneChunk(
         // only on abort (lease lost / deadline) so the scheduler records it.
         if (
             signal.aborted ||
+            error instanceof DreamerModuleFailureError ||
             error instanceof HiddenCompletionRefusal ||
             error instanceof DreamerProviderOutputFailureError
         )
@@ -469,6 +490,8 @@ async function compressOneChunk(
             compressed: 0,
             skipped: 0,
             failure: {
+                error,
+                stage,
                 class: isTimeoutClassError(error) ? "timeout" : "other",
                 brief: desc.brief,
                 elapsedMs: Date.now() - startedAt,
