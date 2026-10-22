@@ -59,7 +59,7 @@
     },
     "packages/dsh-plugin": {
       "name": "@cortexkit/dsh-magic-context",
-      "version": "0.49.12",
+      "version": "0.49.18",
       "bin": {
         "dsh-magic-context": "dist/cli.js",
       },
