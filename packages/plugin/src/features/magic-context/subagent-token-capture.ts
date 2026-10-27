@@ -236,6 +236,8 @@ function hostLabel(harness: HarnessId): string {
             return "Pi";
         case "omp":
             return "Oh My Pi";
+        case "dsh":
+            return "DeepSeek Harness";
     }
 }
 
