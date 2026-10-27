@@ -104,7 +104,9 @@ export function stripTagSectionCharacters(value: string): string {
  * (`experimental.text.complete`, Pi `message_end`). Removes whole `§N§` pairs
  * (never bare leading digits), then malformed hybrids and stray `§`.
  */
-export function stripPersistedAssistantText(value: string): string {
+export function stripPersistedAssistantText(value: string, acceptsEmpty = true): string {
+    // Model-authored blank framing is not copied notation and must keep its bytes.
+    if (!acceptsEmpty && !value.includes("§") && !value.trim()) return value;
     let text = stripWellFormedLeadingTagPrefix(value);
     text = stripCompleteTagPairsGlobally(text);
     text = stripMalformedTagNotationGlobally(text);
@@ -112,7 +114,10 @@ export function stripPersistedAssistantText(value: string): string {
     // so the digits + closer are removed as a unit instead of orphaned.
     text = stripDanglingTagNotationGlobally(text);
     text = stripTagSectionCharacters(text);
-    return text.trim();
+    const stripped = text.trim();
+    // Keeping the original is safe even for a text-only message, and preserves
+    // part positions required by Oh My Pi's finished-message replacement hook.
+    return !acceptsEmpty && value.trim().length > 0 && stripped.length === 0 ? value : stripped;
 }
 
 export function byteSize(value: string): number {

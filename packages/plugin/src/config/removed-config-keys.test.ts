@@ -37,12 +37,7 @@ const FORBIDDEN = [
 const ALLOWED_BASENAMES = new Set<string>([]);
 
 function walkSourceFiles(dir: string, out: string[] = []): string[] {
-    let entries: string[];
-    try {
-        entries = readdirSync(dir);
-    } catch {
-        return out; // package not present in this checkout
-    }
+    const entries = readdirSync(dir);
     for (const entry of entries) {
         if (entry === "node_modules" || entry === "dist") continue;
         const full = join(dir, entry);
@@ -65,12 +60,7 @@ function walkSourceFiles(dir: string, out: string[] = []): string[] {
 function scanForForbidden(files: string[]): string[] {
     const offenders: string[] = [];
     for (const file of files) {
-        let text: string;
-        try {
-            text = readFileSync(file, "utf-8");
-        } catch {
-            continue; // file absent in this checkout
-        }
+        const text = readFileSync(file, "utf-8");
         for (const key of FORBIDDEN) {
             if (text.includes(key)) offenders.push(`${file}: ${key}`);
         }
@@ -82,7 +72,11 @@ const REPO_ROOT = join(__dirname, "..", "..", "..", "..");
 
 describe("removed Phase 2 config keys", () => {
     it("no production source references auto_drop_tool_age / drop_tool_structure", () => {
-        const files = [...walkSourceFiles(PLUGIN_SRC), ...walkSourceFiles(PI_SRC)];
+        const files = [PLUGIN_SRC, PI_SRC].flatMap((root) => {
+            const found = walkSourceFiles(root);
+            expect(found).toContain(join(root, "index.ts"));
+            return found;
+        });
         expect(scanForForbidden(files)).toEqual([]);
     });
 
@@ -96,21 +90,13 @@ describe("removed Phase 2 config keys", () => {
             join(REPO_ROOT, "README.md"),
             join(REPO_ROOT, "assets", "magic-context.schema.json"),
         ];
-        const e2eFiles = walkSourceFiles(join(REPO_ROOT, "packages", "e2e-tests", "tests")).filter(
-            // e2e tests are the consumer surface here, not unit tests of the
-            // keys — scan them despite the .test.ts skip in walkSourceFiles.
-            () => true,
-        );
+        const e2eFiles = walkSourceFiles(join(REPO_ROOT, "packages", "e2e-tests", "tests"));
         // walkSourceFiles skips .test.ts, so collect e2e .test.ts explicitly.
         const e2eDir = join(REPO_ROOT, "packages", "e2e-tests", "tests");
-        let e2eEntries: string[] = [];
-        try {
-            e2eEntries = readdirSync(e2eDir)
-                .filter((f) => f.endsWith(".ts"))
-                .map((f) => join(e2eDir, f));
-        } catch {
-            e2eEntries = [];
-        }
+        const e2eEntries = readdirSync(e2eDir)
+            .filter((f) => f.endsWith(".ts"))
+            .map((f) => join(e2eDir, f));
+        expect(e2eEntries.length).toBeGreaterThan(0);
         expect(scanForForbidden([...docFiles, ...e2eFiles, ...e2eEntries])).toEqual([]);
     });
 });

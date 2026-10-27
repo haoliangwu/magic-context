@@ -30,6 +30,7 @@ export interface CtxSearchToolDeps {
     /** When true, ctx_search surfaces indexed git commits as a 3rd source. */
     gitCommitsEnabled?: boolean;
     rerankConnectionFile?: string;
+    rerankConfig?: import("../../config/schema/magic-context").RerankConfig;
     /** Override message reader for testing (avoids opening OpenCode DB in CI). */
     readMessages?: (sessionId: string) => Array<{
         ordinal: number;

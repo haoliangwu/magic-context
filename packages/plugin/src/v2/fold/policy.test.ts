@@ -123,7 +123,6 @@ test("a failed host fold retains its in-process attempt and retries with a new i
 // and each new cache derives ids from its own random source id, so a restarted
 // host has no earlier id to reuse. Merging a request still queued from before the
 // restart is left to OpenCode's own compaction queue.
-test.skip("a pending fold reuses its durable id across a host restart", () => {});
 
 test("automatic admission reports cache callback failures without an unhandled rejection", async () => {
     const f = fixture();

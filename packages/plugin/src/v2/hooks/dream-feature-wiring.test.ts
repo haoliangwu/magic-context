@@ -55,8 +55,9 @@ afterAll(async () => {
     due.mockRestore();
     closeDatabase();
 });
-test("v2 dream trigger wires memoryInjectionBudgetTokens", () =>
-    expect(captured.memoryInjectionBudgetTokens).toBe(1234));
-test("v2 dream trigger wires retinaHandoff", () => expect(captured.retinaHandoff).toBe(true));
-test("v2 dream trigger wires transformMode", () => expect(captured.transformMode).toBe("rust"));
-test("v2 dream trigger wires moduleClient", () => expect(captured.moduleClient).toBe(moduleClient));
+test("v2 dream trigger forwards executor options", () => {
+    expect(captured.memoryInjectionBudgetTokens).toBe(1234);
+    expect(captured.retinaHandoff).toBe(true);
+    expect(captured.transformMode).toBe("rust");
+    expect(captured.moduleClient).toBe(moduleClient);
+});

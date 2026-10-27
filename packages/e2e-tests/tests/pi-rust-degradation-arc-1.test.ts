@@ -9,12 +9,9 @@ import { readPiSessionMessages } from "../../pi-plugin/src/read-session-pi";
 import { PiTestHarness } from "../src/pi-harness";
 import {
 	assertExternalProviderIsNotSupervised,
-	assertMutationDiscipline,
 	assertTraceBranch,
 	createFakePi,
 	messagesOnly,
-	readArtifact,
-	readRepositorySource,
 	textInMessages,
 } from "./pi-rust-degradation-support";
 
@@ -23,7 +20,6 @@ const trace = JSON.parse(
 		join(import.meta.dir, "..", "pi-rust-degradation-trace.json"),
 	).text(),
 ) as { branches: Array<Record<string, unknown>>; trace_conclusion: string };
-const artifact = readArtifact("mutations/fm-pi-1.json");
 
 let h: PiTestHarness;
 
@@ -166,15 +162,4 @@ describe("FM-PI-1: external module loss at the Pi JSONL seam", () => {
 		).toBe(true);
 	});
 
-	it("FM-PI-1 mutation records keep both halves and both rung mutations", () => {
-		assertMutationDiscipline(artifact, [
-			"FM-PI-1-CONTINUE-JSONL",
-			"FM-PI-1-REFUSE-JSONL",
-		]);
-		const source = readRepositorySource(
-			"packages/pi-plugin/src/fail-closed-pi.ts",
-		);
-		expect(source).toContain("controller.enforce");
-		expect(source).toContain("throw createFailClosedBlockingError");
-	});
 });

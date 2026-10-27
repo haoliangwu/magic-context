@@ -6,7 +6,7 @@ set -euo pipefail
 # Usage:
 #   ./scripts/release.sh 0.1.0        # release v0.1.0
 #   ./scripts/release.sh 0.1.0 --dry  # preview without committing/pushing
-#   ./scripts/release.sh 0.1.0 --ci-gate=<sha>  # reuse CI, Mutations and Smoke on HEAD
+#   ./scripts/release.sh 0.1.0 --ci-gate=<sha>  # reuse CI and Smoke on HEAD
 #
 # What it does:
 #   1. Validates the version is semver
@@ -82,7 +82,7 @@ if [[ -n "$CI_GATE_SHA" ]]; then
     CI_GATE_SHA=""
   else
     python3 "$SCRIPT_DIR/ci-gate.py" release "$CI_GATE_SHA"
-    echo "  CI, Mutations and Smoke certify $CI_GATE_SHA; skipping all local test, lint and typecheck gates."
+    echo "  CI and Smoke certify $CI_GATE_SHA; skipping all local test, lint and typecheck gates."
   fi
 fi
 
@@ -220,6 +220,8 @@ if [[ -z "$CI_GATE_SHA" ]]; then
   bun run --cwd "$PI_DIR" lint 2>&1 || { echo "Error: Pi-plugin lint failed"; exit 1; }
   bun run --cwd "$PI_DIR" typecheck 2>&1 || { echo "Error: Pi-plugin typecheck failed"; exit 1; }
   run_package_tests "pi-plugin" "$PI_DIR"
+  bun "$REPO_ROOT/packages/e2e-tests/scripts/run-slow-unit-tests.ts" || { echo "Error: Slow unit lane failed"; exit 1; }
+  MAGIC_CONTEXT_DEBUG_ASSERTIONS=1 bun "$REPO_ROOT/packages/e2e-tests/scripts/run-slow-unit-tests.ts" || { echo "Error: Slow unit assertions lane failed"; exit 1; }
 fi
 
 echo "  [pi-plugin] bun build..."

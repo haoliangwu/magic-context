@@ -10,7 +10,6 @@ describe("plugin model-limit cache warmup", () => {
 
         expect(refreshCalls).toHaveLength(1); // one startup call, no timer callback
         expect(source).not.toContain("setInterval(");
-        expect(source).toContain("Do NOT refresh periodically");
     });
 });
 

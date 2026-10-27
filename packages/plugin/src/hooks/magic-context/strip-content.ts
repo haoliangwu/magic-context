@@ -12,6 +12,7 @@ import {
     modelAcceptsEmptyContent,
     neutralizeWholeMessage,
 } from "./sentinel";
+import { markServedShapeRepair } from "./served-shape-repair";
 import { stripWellFormedLeadingTagPrefix } from "./tag-content-primitives";
 import type { MessageLike, ThinkingLikePart } from "./tag-messages";
 
@@ -296,8 +297,11 @@ export function replayStrippedInlineThinking(
     messages: MessageLike[],
     messageTagNumbers: Map<MessageLike, number>,
     persistedWatermark: number,
+    captureRepair = false,
 ): number {
     if (persistedWatermark <= 0) return 0;
+    if (captureRepair)
+        captureInlineThinkingRepairs(messages, messageTagNumbers, persistedWatermark);
 
     let stripped = 0;
     for (const message of messages) {
@@ -399,12 +403,32 @@ export function stripClearedReasoning(messages: MessageLike[]): number {
 
 const INLINE_THINKING_PATTERN = /<(?:thinking|think)>[\s\S]*?<\/(?:thinking|think)>\s*/g;
 
+/** Capture replay candidates before the shared postprocess decides its bust permission. */
+export function captureInlineThinkingRepairs(
+    messages: MessageLike[],
+    messageTagNumbers: Map<MessageLike, number>,
+    watermark: number,
+): void {
+    for (const message of messages) {
+        const tag = messageTagNumbers.get(message) ?? 0;
+        if (message.info.role !== "assistant" || tag <= 0 || tag > watermark) continue;
+        for (const [index, part] of message.parts.entries()) {
+            if (!isRecord(part) || part.type !== "text" || typeof part.text !== "string") continue;
+            const cleaned = part.text.replace(INLINE_THINKING_PATTERN, "");
+            if (cleaned !== part.text && !cleaned.trim())
+                markServedShapeRepair(message.info, [{ index, text: "[cleared]" }], true);
+        }
+    }
+}
+
 export function stripInlineThinking(
     messages: MessageLike[],
     messageTagNumbers: Map<MessageLike, number>,
     cutoff: number,
+    captureRepair = false,
 ): number {
     const ageCutoff = cutoff;
+    if (captureRepair) captureInlineThinkingRepairs(messages, messageTagNumbers, cutoff);
     let stripped = 0;
 
     for (const message of messages) {

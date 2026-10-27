@@ -218,7 +218,6 @@ test("a failed second host cut preserves the previous snapshot even before its f
 });
 
 // Inapplicable: there is no disk copy of captured messages to corrupt with this SQL update. A new process reloads the original host rows.
-test.skip("persisted native snapshot corruption is refused before replay", () => {});
 
 test("restart restores byte-identical native history once and hot passes perform no restore reads", async () => {
     const f = fixture();

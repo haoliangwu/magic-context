@@ -22,6 +22,7 @@ import {
     beginOffThreadMigration,
 } from "../../shared/off-thread-migration-clock";
 import { __resetRpcIdentityTestHooks, __setRpcIdentityTestHooks } from "../../shared/rpc-utils";
+import { scaleTest } from "../../shared/slow-test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
@@ -267,15 +268,16 @@ test("storage gate defers its opener until the caller returns and never piles up
     await next;
 });
 
-test("boot wait retains a healthy database that opens after two seconds", async () => {
+test("boot wait retains a healthy database when the pending open becomes ready", async () => {
     const database = openDatabase();
+    const ready = Promise.withResolvers<typeof database>();
     const gate = createV2StorageGate({
-        open: async () => {
-            await Bun.sleep(2000);
-            return database;
-        },
+        open: () => ready.promise,
     });
-    expect(await probeV2StorageAtBoot(gate)).toBe(database);
+    const pending = probeV2StorageAtBoot(gate, 1000);
+    expect(gate.current()).toBeUndefined();
+    ready.resolve(database);
+    expect(await pending).toBe(database);
     expect(gate.require()).toBe(database);
 });
 
@@ -297,10 +299,15 @@ test("boot wait does not count time an off-thread schema migration spends", asyn
     }
 });
 
-test("boot wait gives up on an unresolved open after fifteen seconds", async () => {
-    const gate = createV2StorageGate({ open: () => new Promise<null>(() => {}) });
-    const started = performance.now();
-    expect(await probeV2StorageAtBoot(gate)).toBeUndefined();
-    expect(performance.now() - started).toBeGreaterThanOrEqual(15_000);
-    expect(gate.current()).toBeUndefined();
-}, 30_000);
+scaleTest(
+    "boot wait gives up on an unresolved open after its deadline",
+    async (slow) => {
+        const gate = createV2StorageGate({ open: () => new Promise<null>(() => {}) });
+        const started = performance.now();
+        const timeout = slow ? 15_000 : 30;
+        expect(await probeV2StorageAtBoot(gate, slow ? undefined : timeout)).toBeUndefined();
+        expect(performance.now() - started).toBeGreaterThanOrEqual(timeout);
+        expect(gate.current()).toBeUndefined();
+    },
+    30_000,
+);

@@ -1,6 +1,6 @@
 {
 	"name": "@cortexkit/pi-magic-context",
-	"version": "0.49.18",
+	"version": "0.49.23",
 	"type": "module",
 	"description": "Pi and OMP coding agent extension for Magic Context — cross-session memory and context management",
 	"main": "dist/index.js",
@@ -32,8 +32,8 @@
 		"build": "bun ../../scripts/check-bun.mjs && tsc -p ../retina-local-fs/tsconfig.build.json && bun ../../scripts/clean-dist-chunks.mjs dist index.js subagent-entry.js historian-calibration-extension.js embedding-worker-process.js raw-ordinal-warmup-worker.js tag-snapshot-worker-pi.js transformers-web.js transformers-node-wasm.js && bun build ../plugin/src/features/magic-context/memory/transformers-web-entry.ts --outfile dist/transformers-web.js --target browser --format esm --external onnxruntime-web && bun ../plugin/scripts/build-transformers-node-wasm.ts dist && bun build src/index.ts src/tag-snapshot-worker-pi.ts src/subagent-entry.ts src/historian-calibration-extension.ts ../plugin/src/features/magic-context/memory/embedding-worker.ts ../plugin/src/features/magic-context/memory/embedding-worker-process.ts ../plugin/src/features/magic-context/migration-worker.ts ../plugin/src/hooks/magic-context/auto-search-worker.ts ../plugin/src/hooks/magic-context/raw-ordinal-warmup-worker.ts ../plugin/src/features/magic-context/compaction-marker-candidates-worker.ts ../plugin/src/features/magic-context/chunk-embedding-write-worker.ts --outdir dist --entry-naming '[name].[ext]' --target node --format esm --splitting --external @earendil-works/pi-coding-agent --external @oh-my-pi/pi-coding-agent --external @earendil-works/pi-tui --external onnxruntime-node --external onnxruntime-web --external sharp --external bun:ffi --external node:sqlite",
 		"build:e2e-argv": "bun ../../scripts/clean-dist-chunks.mjs ../../tests/docker/.generated subagent-runner-e2e.mjs && bun build src/subagent-runner.ts --outdir ../../tests/docker/.generated --entry-naming 'subagent-runner-e2e.mjs' --splitting --target node --format esm --external node:sqlite && node --input-type=module -e 'const { __test } = await import(\"../../tests/docker/.generated/subagent-runner-e2e.mjs\"); if (typeof __test.buildArgs !== \"function\" || typeof __test.resolvePiInvocation !== \"function\") throw new Error(\"argv renderer exports missing\"); console.log(\"Node argv renderer: 2 exports loaded\")'",
 		"typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit",
-		"test": "bun ../../scripts/check-bun.mjs && bun install --frozen-lockfile && BUN_JSC_useOMGJIT=0 bun test --parallel=4 --timeout 30000",
-		"test:serial": "bun ../../scripts/check-bun.mjs && bun install --frozen-lockfile && BUN_JSC_useOMGJIT=0 bun test --parallel=1 --timeout 30000",
+		"test": "bun ../../scripts/check-bun.mjs && bun install --frozen-lockfile && MC_SLOW_TESTS=0 BUN_JSC_useOMGJIT=0 bun test --parallel=4 --timeout 30000",
+		"test:serial": "bun ../../scripts/check-bun.mjs && bun install --frozen-lockfile && MC_SLOW_TESTS=0 BUN_JSC_useOMGJIT=0 bun test --parallel=1 --timeout 30000",
 		"lint": "bun ../../scripts/check-bun.mjs && biome check src",
 		"lint:fix": "biome check --write src",
 		"format": "biome format --write src",
@@ -49,7 +49,7 @@
 		"comment-json": "^5.0.0",
 		"onnxruntime-web": "1.26.0-dev.20260416-b7804b056c",
 		"quickjs-emscripten": "^0.32.0",
-		"zod": "^4.1.8"
+		"zod": "^4.6.6"
 	},
 	"optionalDependencies": {
 		"onnxruntime-node": "1.30.0",
@@ -65,9 +65,12 @@
 		"@types/bun": "^1.3.10",
 		"@types/node": "^22.20.0",
 		"omp-coding-agent-1812": "npm:@oh-my-pi/pi-coding-agent@18.12.3",
+		"omp-coding-agent-18126": "npm:@oh-my-pi/pi-coding-agent@18.12.6",
+		"omp-pi-ai-171": "npm:@oh-my-pi/pi-ai@17.1.7",
 		"omp-pi-ai-1889": "npm:@oh-my-pi/pi-ai@18.8.9",
 		"omp-pi-ai-1811": "npm:@oh-my-pi/pi-ai@18.11.3",
 		"omp-pi-ai-1812": "npm:@oh-my-pi/pi-ai@18.12.3",
+		"omp-pi-ai-18126": "npm:@oh-my-pi/pi-ai@18.12.6",
 		"pi-agent-core-087": "npm:@earendil-works/pi-agent-core@0.87.1",
 		"pi-ai-086": "npm:@earendil-works/pi-ai@0.86.0",
 		"pi-ai-087": "npm:@earendil-works/pi-ai@0.87.1",

@@ -25,7 +25,6 @@ interface ModuleStatus {
     compartment_count?: number;
 }
 
-const expectInvalidOutput = process.env.MC_RUST_E2E_BROCA_EXPECT_BAD === "1";
 
 describe.skipIf(!rustPrereqs.ok)("rust historian: hermetic Broca producer", () => {
     let h: RustTestHarness;
@@ -103,20 +102,6 @@ describe.skipIf(!rustPrereqs.ok)("rust historian: hermetic Broca producer", () =
             const sessionId = await h.createSession();
             await driveHistorian(sessionId);
             await waitForProducerRun(1);
-
-            if (expectInvalidOutput) {
-                const failed: HistorianStatus = {};
-                const deadline = Date.now() + 120_000;
-                while (Date.now() < deadline) {
-                    Object.assign(failed, await status(sessionId));
-                    if (failed.last_failure) break;
-                    await Bun.sleep(100);
-                }
-                expect(failed.last_failure).toMatch(/tier|validat|compartment/i);
-                expect(failed.failure_backoff_at_ms ?? 0).toBeGreaterThan(Date.now() - 120_000);
-                expect(failed.failure_backoff_at_ms ?? 0).toBeGreaterThan(0);
-                return;
-            }
 
             const publishDeadline = Date.now() + 120_000;
             let published: ModuleStatus = {};

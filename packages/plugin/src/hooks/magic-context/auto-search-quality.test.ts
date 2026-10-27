@@ -69,6 +69,55 @@ const options = {
     isEmbeddingRuntimeEnabled: () => true,
 };
 
+for (const harness of ["opencode", "pi"] as const)
+    test(`automatic hint worker excludes hosted reranking for ${harness} even with explicit options`, async () => {
+        _resetHarnessForTesting();
+        setHarness(harness);
+        const f = fixture();
+        f.message(1, "archived", "historian cache wiring budget explanation");
+        f.message(2, "archived-two", "historian cache wiring budget reasoning");
+        const query = "historian cache wiring budget";
+        let calls = 0;
+        const server = Bun.serve({
+            port: 0,
+            hostname: "127.0.0.1",
+            async fetch(req) {
+                calls++;
+                const { documents } = (await req.json()) as { documents: string[] };
+                return Response.json({
+                    results: documents.map((_, index) => ({ index, relevance_score: index })),
+                });
+            },
+        });
+        const explicit = {
+            sources: ["message" as const],
+            embeddingEnabled: false,
+            explicitSearch: true,
+            countRetrievals: false,
+            measurementDisabled: true,
+            rerankConfig: {
+                provider: "remote" as const,
+                endpoint: String(server.url),
+                model: "reranker",
+                api_key: "FAKE_HINT_KEY_765",
+                timeout_ms: 1500,
+                top_n: 20,
+            },
+        };
+        try {
+            const direct = await unifiedSearch(f.db, "session", "/synthetic", query, explicit);
+            expect(direct.length).toBeGreaterThan(0);
+            expect(calls).toBe(1);
+            calls = 0;
+            const hinted = await searchAutoHint(f.db, "session", "/synthetic", query, explicit);
+            expect(hinted.length).toBeGreaterThan(0);
+            expect(calls).toBe(0);
+        } finally {
+            server.stop(true);
+            workers.disposeIdleAutoSearchWorkers();
+        }
+    });
+
 test("mixed-lane hint scores preserve weak cosine instead of promoting rank one", async () => {
     const f = fixture();
     f.message(4, "archived", "historian cache wiring is archived separately");

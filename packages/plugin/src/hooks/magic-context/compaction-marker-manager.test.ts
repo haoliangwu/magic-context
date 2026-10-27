@@ -53,10 +53,7 @@ import {
     selectHiddenMessagesAtCompactionSeam,
 } from "./inject-compartments";
 import type { MessageLike } from "./tag-messages";
-import {
-    RUST_MARKER_LOCK_SKIP_LOG,
-    reconcileMarkerRepresentation,
-} from "./transform-postprocess-phase";
+import { reconcileMarkerRepresentation } from "./transform-postprocess-phase";
 
 const tempDirs: string[] = [];
 // Production prepares summary IDs on a worker when rebuilding context history,
@@ -285,10 +282,6 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         "r2 proof: a retained partial at the prior target ordinal still vetoes the next cut",
         checkRetainedPartial,
     );
-    it("lock-contention diagnostics promise the next cache-busting pass, not the next ordinary pass", async () => {
-        expect(RUST_MARKER_LOCK_SKIP_LOG).toContain("next cache-busting pass retries");
-        expect(RUST_MARKER_LOCK_SKIP_LOG).not.toContain("next pass retries");
-    });
     it("does not let already-cut indexed ends behind the current marker veto an advance", async () => {
         const dataHome = useTempDataHome("marker-old-gap-");
         const oc = createOpenCodeDb(dataHome);

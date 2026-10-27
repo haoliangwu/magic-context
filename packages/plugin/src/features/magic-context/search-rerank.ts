@@ -1,4 +1,5 @@
 import { SubcClient } from "@cortexkit/subc-client";
+import type { RerankConfig } from "../../config/schema/magic-context";
 import { getDefaultSubcConnectionFile } from "../../hooks/magic-context/module-transport";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
@@ -9,6 +10,9 @@ import type { UnifiedSearchResult } from "./search";
 export const RERANK_MODEL = "gte-reranker-modernbert-base-f32";
 export const RERANK_LANE_LIMIT = 25;
 const DEADLINE_MS = 1500;
+// Keep the existing location/title/body recipe's 1 KiB budget: twenty documents
+// send at most 20 KiB of source text rather than unbounded stored conversations.
+const DOCUMENT_BYTES = 1024;
 
 /** Rerank questions and multi-word descriptions; prefer the existing ranking for short symbol-heavy lookups. */
 export function isProseQuery(query: string): boolean {
@@ -109,7 +113,7 @@ export function truncateUtf8(text: string, bytes: number): string {
 }
 export function candidateText(location: string, title: string, body: string): string {
     const header = `${truncateUtf8(location.replaceAll("\n", " "), 200)}\n${truncateUtf8(title.replaceAll("\n", " "), 120)}\n`;
-    return header + truncateUtf8(body, 1024 - Buffer.byteLength(header));
+    return header + truncateUtf8(body, DOCUMENT_BYTES - Buffer.byteLength(header));
 }
 
 export interface PinnedReranker {
@@ -198,13 +202,125 @@ export interface RerankSession {
     lane: PinnedReranker;
     identity: { project_root: string; harness: string; session: string };
 }
+export type PreparedReranker = RerankSession | { remote: RerankConfig };
+
+async function remoteScores(
+    config: RerankConfig,
+    query: string,
+    documents: string[],
+    signal?: AbortSignal,
+): Promise<number[]> {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    try {
+        const cancelled = new Promise<never>((_, reject) => {
+            const cancel = (reason: string) => {
+                reject(new RerankFailure(reason));
+                controller.abort();
+            };
+            onAbort = () => cancel("aborted");
+            if (signal?.aborted) onAbort();
+            else signal?.addEventListener("abort", onAbort, { once: true });
+            timer = setTimeout(
+                () => cancel("timeout"),
+                Math.max(50, Math.min(15000, config.timeout_ms ?? DEADLINE_MS)),
+            );
+        });
+        const request = async () => {
+            const tei = config.endpoint?.startsWith("tei+");
+            const endpoint = (tei ? config.endpoint?.slice(4) : config.endpoint)?.replace(
+                /\/+$/,
+                "",
+            );
+            if (!endpoint || !/^https?:\/\//.test(endpoint))
+                throw new RerankFailure("invalid_endpoint");
+            const response = await fetch(`${endpoint}/rerank`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    ...(config.api_key ? { Authorization: `Bearer ${config.api_key}` } : {}),
+                },
+                body: JSON.stringify(
+                    tei
+                        ? { query, texts: documents }
+                        : {
+                              model: config.model,
+                              query,
+                              documents,
+                              top_n: documents.length,
+                          },
+                ),
+                signal: controller.signal,
+                redirect: "error",
+            });
+            if (!response.ok) throw new RerankFailure(`http_${response.status}`);
+            const body = await response.json();
+            const rows = tei ? body : (body as { results?: unknown } | null)?.results;
+            if (!Array.isArray(rows) || rows.length !== documents.length)
+                throw new RerankFailure("invalid_reply");
+            const scores = new Array<number>(documents.length);
+            const seen = new Set<number>();
+            for (const row of rows) {
+                const index = row?.index;
+                const score = tei ? row?.score : row?.relevance_score;
+                if (
+                    !Number.isInteger(index) ||
+                    index < 0 ||
+                    index >= documents.length ||
+                    seen.has(index) ||
+                    typeof score !== "number" ||
+                    !Number.isFinite(score)
+                )
+                    throw new RerankFailure("invalid_reply");
+                seen.add(index);
+                scores[index] = score;
+            }
+            return scores;
+        };
+        return await Promise.race([cancelled, request()]);
+    } finally {
+        clearTimeout(timer);
+        if (onAbort) signal?.removeEventListener("abort", onAbort);
+    }
+}
+
+/** Only fixed, locally generated reasons may reach tool output or logs. */
+export function remoteRerankSkipped(reason: string, onSkipped?: (line: string) => void): void {
+    const safe =
+        /^(?:invalid_reply|invalid_endpoint|validation|timeout|aborted|candidate_validation|http_\d{3})$/.test(
+            reason,
+        )
+            ? reason
+            : "remote_error";
+    const line = `Reranking skipped: ${safe}`;
+    logRerankFallback(safe);
+    onSkipped?.(line);
+}
 /** Discover the certified Synapse model before collecting larger candidate pools, avoiding extra retrieval when the service is absent. */
+export function prepareReranker(
+    projectRoot: string,
+    sessionId: string,
+    connectionFile?: string,
+    injectedClient?: SynapseClientLike | null,
+    config?: undefined,
+): Promise<RerankSession | null>;
+export function prepareReranker(
+    projectRoot: string,
+    sessionId: string,
+    connectionFile?: string,
+    injectedClient?: SynapseClientLike | null,
+    config?: RerankConfig,
+): Promise<PreparedReranker | null>;
 export async function prepareReranker(
     projectRoot: string,
     sessionId: string,
     connectionFile?: string,
     injectedClient?: SynapseClientLike | null,
-): Promise<RerankSession | null> {
+    config?: RerankConfig,
+): Promise<PreparedReranker | null> {
+    if (config?.provider === "off") return null;
+    if (config?.provider === "remote") return { remote: config };
     try {
         if (injectedClient === null) throw new RerankFailure("missing_synapse");
         const client =
@@ -233,61 +349,73 @@ export async function prepareReranker(
 
 /** A failure returns the original array, never the poorer fused ranking. */
 export async function rerankSearchResults(
-    session: RerankSession,
+    session: PreparedReranker,
     query: string,
     baseline: UnifiedSearchResult[],
     pool: UnifiedSearchResult[],
     texts: string[],
     limit: number,
+    signal?: AbortSignal,
+    onSkipped?: (line: string) => void,
 ): Promise<UnifiedSearchResult[]> {
     if (!pool.length) return baseline;
     try {
         if (
             pool.length > 20 ||
             texts.length !== pool.length ||
-            texts.some((text) => Buffer.byteLength(text) > 1024)
+            texts.some((text) => Buffer.byteLength(text) > DOCUMENT_BYTES)
         )
             throw new RerankFailure("validation");
-        const body = unwrap(
-            await bounded(
-                session.client.call(
-                    "synapse",
-                    "rerank.score",
-                    {
-                        model: RERANK_MODEL,
-                        query,
-                        candidates: texts,
-                        required_fingerprint: session.lane.fingerprint,
-                        allow_equivalent: false,
-                        accept_declared: false,
-                        max_queue_ms: 100,
-                        deadline_ms: DEADLINE_MS,
-                    },
-                    {
-                        timeoutMs: DEADLINE_MS,
-                        targetKind: "management_surface",
-                        identity: session.identity,
-                    },
+        let scores: number[];
+        if ("remote" in session) {
+            scores = await remoteScores(session.remote, query, texts, signal);
+        } else {
+            const body = unwrap(
+                await bounded(
+                    session.client.call(
+                        "synapse",
+                        "rerank.score",
+                        {
+                            model: RERANK_MODEL,
+                            query,
+                            candidates: texts,
+                            required_fingerprint: session.lane.fingerprint,
+                            allow_equivalent: false,
+                            max_queue_ms: 100,
+                            deadline_ms: DEADLINE_MS,
+                        },
+                        {
+                            timeoutMs: DEADLINE_MS,
+                            targetKind: "management_surface",
+                            identity: session.identity,
+                        },
+                    ),
                 ),
-            ),
-        );
-        if (body.fingerprint !== session.lane.fingerprint)
-            throw new RerankFailure("fingerprint_mismatch");
-        if (body.table_epoch !== session.lane.tableEpoch) throw new RerankFailure("epoch_mismatch");
-        if (
-            !Array.isArray(body.scores) ||
-            body.scores.length !== pool.length ||
-            body.scores.some((score) => typeof score !== "number" || !Number.isFinite(score))
-        )
-            throw new RerankFailure("validation");
-        const scores = body.scores as number[];
+            );
+            if (body.fingerprint !== session.lane.fingerprint)
+                throw new RerankFailure("fingerprint_mismatch");
+            if (body.table_epoch !== session.lane.tableEpoch)
+                throw new RerankFailure("epoch_mismatch");
+            if (
+                !Array.isArray(body.scores) ||
+                body.scores.length !== pool.length ||
+                body.scores.some((score) => typeof score !== "number" || !Number.isFinite(score))
+            )
+                throw new RerankFailure("validation");
+            scores = body.scores as number[];
+        }
         return pool
             .map((hit, index) => ({ hit, index, score: scores[index] }))
             .sort((a, b) => b.score - a.score || a.index - b.index)
             .slice(0, limit)
             .map((row) => row.hit);
     } catch (error) {
-        logRerankFallback(reasonOf(error));
+        if ("remote" in session)
+            remoteRerankSkipped(
+                error instanceof RerankFailure ? error.reason : "remote_error",
+                onSkipped,
+            );
+        else logRerankFallback(reasonOf(error));
         return baseline;
     }
 }

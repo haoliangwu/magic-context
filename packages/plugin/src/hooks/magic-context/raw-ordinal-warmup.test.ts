@@ -9,6 +9,7 @@ import { OPENCODE1_MESSAGE_PART_SCHEMA } from "../../features/magic-context/__te
 import { scheduleIncrementalIndex } from "../../features/magic-context/message-index-async";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDir } from "../../shared/test-temp-dir";
+import { getWorkerShutdownStats } from "../../shared/worker-shutdown";
 import {
     getRawOrdinalWarmupFailures,
     prewarmRawSessionOrdinalsForDb,
@@ -151,6 +152,27 @@ describe("canonical ordinal warm-up", () => {
             );
             controller.abort();
             expect(await running).toEqual({ failure: "stopped", detail: "stopped" });
+        }),
+    );
+
+    it(
+        "a stopped warm-up closes its connections and exits instead of being terminated",
+        withStore(600, async (path) => {
+            const before = getWorkerShutdownStats().get("raw-ordinal-warmup") ?? {
+                graceful: 0,
+                forced: 0,
+            };
+            const controller = new AbortController();
+            const running = runSessionWarmupWorker(
+                { path, sessionId: SESSION },
+                { signal: controller.signal },
+            );
+            controller.abort();
+            expect(await running).toEqual({ failure: "stopped", detail: "stopped" });
+            expect(getWorkerShutdownStats().get("raw-ordinal-warmup")).toEqual({
+                graceful: before.graceful + 1,
+                forced: before.forced,
+            });
         }),
     );
 

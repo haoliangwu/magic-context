@@ -645,3 +645,110 @@ test("session errors belonging to another child do not fail the run", async () =
     await promptAsyncAndWaitForIdle(host.client, request(), { pollIntervalMs: 1 });
     expect(host.polls()).toBe(1);
 });
+
+describe("prompt_async transport and the first-output deadline", () => {
+    /**
+     * A child session where each model answers its own way. "dead" leaves the
+     * empty assistant row the host writes before the provider responds and stays
+     * busy forever; "partial" streams a text part and then stays busy; "answer"
+     * settles with a final assistant message on the next poll.
+     */
+    function modelHost(behaviours: Record<string, "dead" | "partial" | "answer">) {
+        const messages: Message[] = [];
+        let current: "dead" | "partial" | "answer" | null = null;
+        const sent: string[] = [];
+        const promptAsync = mock(
+            async (request: { body: { model?: { providerID: string; modelID: string } } }) => {
+                const model = request.body.model
+                    ? `${request.body.model.providerID}/${request.body.model.modelID}`
+                    : "primary";
+                sent.push(model);
+                current = behaviours[model] ?? "answer";
+                messages.push({
+                    info: { id: `msg_user_${messages.length}`, role: "user", time: { created: 1 } },
+                    parts: [{ type: "text", text: "go" }],
+                });
+                messages.push({
+                    info: {
+                        id: `msg_assistant_${messages.length}`,
+                        role: "assistant",
+                        time: { created: 2 },
+                    },
+                    parts: current === "partial" ? [{ type: "text", text: "<classify>" }] : [],
+                });
+                return { data: undefined };
+            },
+        );
+        const abort = mock(async () => {
+            current = null;
+            return { data: true };
+        });
+        const status = mock(async () => {
+            if (current === "dead" || current === "partial")
+                return { data: { "ses-child": { type: "busy" } } };
+            if (current === "answer") {
+                const last = messages.at(-1);
+                if (last && !last.info.time.completed) {
+                    last.info.time.completed = 3;
+                    last.info.finish = "stop";
+                    last.parts = [{ type: "text", text: "<classify></classify>" }];
+                }
+            }
+            return { data: {} };
+        });
+        const list = mock(async () => ({ data: messages.map((message) => ({ ...message })) }));
+        return {
+            client: { session: { promptAsync, abort, status, messages: list } } as never,
+            sent,
+            abort,
+        };
+    }
+
+    async function runChain(
+        host: ReturnType<typeof modelHost>,
+        timeoutMs: number,
+        firstOutputTimeoutMs: number,
+    ) {
+        const transport = createPromptAsyncTransport(host.client, "ses-child", {
+            pollIntervalMs: 5,
+        });
+        return promptSyncWithValidatedOutputRetry(
+            host.client,
+            {
+                ...request(),
+                body: {
+                    model: { providerID: "opencode", modelID: "free-model" },
+                    parts: [{ type: "text", text: "go" }],
+                },
+            },
+            {
+                transport,
+                timeoutMs,
+                firstOutputTimeoutMs,
+                fallbackModels: ["anthropic/claude-sonnet-5-5"],
+                fetchOutput: async () => "<classify></classify>",
+                validateOutput: (output: string) => output,
+            },
+        );
+    }
+
+    test("a model that never answers is cut at the deadline and the fallback completes", async () => {
+        const host = modelHost({ "opencode/free-model": "dead" });
+        const startedAt = Date.now();
+
+        const run = await runChain(host, 5_000, 60);
+
+        expect(run.attempt.label).toBe("anthropic/claude-sonnet-5-5");
+        expect(host.sent).toEqual(["opencode/free-model", "anthropic/claude-sonnet-5-5"]);
+        // The dead model's run is stopped on the host before the fallback is sent.
+        expect(host.abort).toHaveBeenCalledWith({ path: { id: "ses-child" } });
+        expect(Date.now() - startedAt).toBeLessThan(2_000);
+    });
+
+    test("a model that streamed part of an answer keeps its timeout and does not fall back", async () => {
+        const host = modelHost({ "opencode/free-model": "partial" });
+
+        await expect(runChain(host, 200, 40)).rejects.toThrow("prompt timed out after 200ms");
+        expect(host.sent).toEqual(["opencode/free-model"]);
+    });
+});

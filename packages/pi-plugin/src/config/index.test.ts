@@ -244,6 +244,7 @@ describe("loadPiConfig", () => {
 		).find((task) => task.task === "compress-cues");
 		expect(compressCues?.model).toEqual({
 			model: "google-antigravity/antigravity-gemini-3.8-flash",
+			sourceConfigKey: "dreamer.pi.model",
 		});
 	});
 

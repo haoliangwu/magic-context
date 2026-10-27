@@ -1,5 +1,5 @@
 import { sessionLog } from "../../shared/logger";
-import { clonePreservingInstances } from "./payload";
+import { clonePreservingInstances, clonePreservingInstancesMeasured } from "./payload";
 import type { SessionContext, V2Message } from "./types";
 
 interface GenerateReplayAnchor {
@@ -24,31 +24,124 @@ interface ServedPrefix {
     system: SessionContext["system"];
     messages: V2Message[];
     tools: SessionContext["tools"];
+    /** Estimated heap this copy keeps alive; see {@link clonePreservingInstancesMeasured}. */
+    bytes: number;
 }
 
+export interface GenerateReplayLimits {
+    /** Most sessions kept; the least recently captured or replayed one goes first. */
+    maxSessions: number;
+    /** A session whose served request is estimated above this is not kept at all. */
+    sessionMaxBytes: number;
+    /** Ceiling on the estimate summed over every kept session. */
+    totalMaxBytes: number;
+}
+
+/**
+ * Each kept session holds a copy of its whole served request. Measured on a synthetic
+ * 6,000-message session with about 10 MB of text, the estimate is about 21 MiB and the
+ * heap actually kept about 12 MiB (the runtime stores most text one byte per character).
+ * The per-session cap fits sessions several times that size, and the total fits two
+ * sessions at the cap or around ten sessions of that measured size, so a few long
+ * sessions in use together do not evict each other on every turn. The figures match the
+ * shared last-good-request entry cache (`LKG_ENTRY_CACHE_*`).
+ */
+export const DEFAULT_GENERATE_REPLAY_LIMITS: Readonly<GenerateReplayLimits> = Object.freeze({
+    maxSessions: 16,
+    sessionMaxBytes: 128 * 1024 * 1024,
+    totalMaxBytes: 256 * 1024 * 1024,
+});
+
 /** OpenCode's /btw requests reuse the last main request's system and history.
- * They never run the turn transform, which executes drops and advances counters. */
+ * They never run the turn transform, which executes drops and advances counters.
+ *
+ * Kept requests are bounded by {@link GenerateReplayLimits}. A session without a kept
+ * request (evicted, over the per-session cap, or never captured since the process
+ * started) gets no replay: `apply` leaves the host's request exactly as the host built
+ * it, the same as on a cold start, rather than reusing an older served request. */
 export class V2GenerateReplay {
+    /** In least-recently-used order: the first entry is evicted first. */
     private readonly prefixes = new Map<string, ServedPrefix>();
+    private totalBytes = 0;
+    private readonly limits: Readonly<GenerateReplayLimits>;
+
+    constructor(limits: GenerateReplayLimits = DEFAULT_GENERATE_REPLAY_LIMITS) {
+        if (
+            !Number.isSafeInteger(limits.maxSessions) ||
+            limits.maxSessions < 1 ||
+            !Number.isSafeInteger(limits.sessionMaxBytes) ||
+            limits.sessionMaxBytes < 1 ||
+            !Number.isSafeInteger(limits.totalMaxBytes) ||
+            limits.totalMaxBytes < 1
+        )
+            throw new Error("Generate replay limits must be positive integers");
+        this.limits = { ...limits };
+    }
 
     capture(draft: SessionContext, anchor: GenerateReplayAnchor | undefined): void {
+        // Drop the previous request first: if this one is not kept, a later replay
+        // must find nothing rather than the older request.
+        this.forget(draft.sessionID);
         if (!anchor) {
-            this.prefixes.delete(draft.sessionID);
             sessionLog(draft.sessionID, "generate replay capture skipped: no-anchor");
             return;
         }
+        const parts = {
+            anchor: clonePreservingInstancesMeasured(anchor),
+            system: clonePreservingInstancesMeasured(draft.system),
+            messages: clonePreservingInstancesMeasured(draft.messages),
+            tools: clonePreservingInstancesMeasured(draft.tools),
+        };
+        const bytes =
+            256 +
+            parts.anchor.bytes +
+            parts.system.bytes +
+            parts.messages.bytes +
+            parts.tools.bytes;
+        if (bytes > this.limits.sessionMaxBytes || bytes > this.limits.totalMaxBytes) {
+            sessionLog(
+                draft.sessionID,
+                `generate replay capture skipped: over-session-cap (${bytes} > ${Math.min(this.limits.sessionMaxBytes, this.limits.totalMaxBytes)} bytes)`,
+            );
+            return;
+        }
+        while (
+            this.prefixes.size > 0 &&
+            (this.prefixes.size >= this.limits.maxSessions ||
+                this.totalBytes + bytes > this.limits.totalMaxBytes)
+        ) {
+            const oldest = this.prefixes.keys().next().value;
+            if (oldest === undefined) break;
+            this.forget(oldest);
+        }
         this.prefixes.set(draft.sessionID, {
-            anchor: clonePreservingInstances(anchor),
+            anchor: parts.anchor.copy,
             model: `${draft.model.providerID}/${draft.model.id}`,
             agent: draft.agent,
-            system: clonePreservingInstances(draft.system),
-            messages: clonePreservingInstances(draft.messages),
-            tools: clonePreservingInstances(draft.tools),
+            system: parts.system.copy,
+            messages: parts.messages.copy,
+            tools: parts.tools.copy,
+            bytes,
         });
+        this.totalBytes += bytes;
     }
 
     forget(sessionID: string): void {
+        const prefix = this.prefixes.get(sessionID);
+        if (!prefix) return;
         this.prefixes.delete(sessionID);
+        this.totalBytes -= prefix.bytes;
+    }
+
+    /** Kept sessions and their estimated bytes, for debug memory diagnostics. */
+    stats(): { totalBytes: number; sessions: Array<{ sessionId: string; bytes: number }> } {
+        return {
+            totalBytes: this.totalBytes,
+            sessions: [...this.prefixes].map(([sessionId, prefix]) => ({
+                sessionId,
+                bytes: prefix.bytes,
+            })),
+        };
     }
 
     apply(draft: SessionContext): boolean {
@@ -58,6 +151,9 @@ export class V2GenerateReplay {
             return false;
         };
         if (!prefix) return skip("no-prefix");
+        // A replayed session is in use again; keep it over idle sessions.
+        this.prefixes.delete(draft.sessionID);
+        this.prefixes.set(draft.sessionID, prefix);
         if (prefix.model !== `${draft.model.providerID}/${draft.model.id}`)
             return skip("model-mismatch");
         if (prefix.agent !== draft.agent) return skip("agent-mismatch");

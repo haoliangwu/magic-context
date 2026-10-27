@@ -329,6 +329,7 @@ export interface OpenCode2SpawnOptions {
 export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 	const providerID = options.providerID ?? "openai";
 	const fixture = options.existingIsolation ?? isolation();
+	fixture.env.MAGIC_CONTEXT_LOG_SYNC = "1";
 	try {
 		assertIsolation(fixture.root, fixture.env);
 		const references = isolateStoreDirectories(fixture.root, join(fixture.env.XDG_DATA_HOME!, "opencode", fixture.env.OPENCODE_DB!), join(fixture.env.MAGIC_CONTEXT_STORAGE_DIR ?? join(fixture.env.XDG_DATA_HOME!, "cortexkit", "magic-context"), "context.db"));

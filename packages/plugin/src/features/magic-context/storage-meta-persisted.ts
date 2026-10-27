@@ -19,6 +19,7 @@ import { ensureSessionMetaRow } from "./storage-meta-shared";
 import {
     isPersistedTrailingBlankDecision,
     type PersistedTrailingBlankDecision,
+    parseReplayDocument,
     ReplayDocumentError,
     readAllTrailingBlankDecisions,
     readReplayDocument,
@@ -2684,6 +2685,32 @@ export function thinkingBindingRecoveryFrozenId(messageId: string): string {
     return `${THINKING_BINDING_RECOVERY_FROZEN_PREFIX}${messageId}`;
 }
 
+/**
+ * Ledger entry naming an OpenCode message whose signed thinking a
+ * compaction-off pass removed from the wire. OpenCode's compaction-off never
+ * applies the binding-mismatch entries above (managed mode wrote them, and
+ * compaction-off served those blocks unstripped), so it replays only these.
+ * The same id is also written as a binding-mismatch entry, so a session that
+ * returns to managed mode keeps the strip. (Pi replays its binding-mismatch
+ * entries in compaction-off too, so it needs no entry of this kind.)
+ */
+export const COMPACTION_OFF_THINKING_FROZEN_PREFIX = "compaction_off_thinking:";
+
+export function compactionOffThinkingFrozenId(messageId: string): string {
+    return `${COMPACTION_OFF_THINKING_FROZEN_PREFIX}${messageId}`;
+}
+
+/** The message ids named by compaction-off thinking strips in a ledger. */
+export function compactionOffFrozenThinkingIds(ledger: Iterable<string>): Set<string> {
+    const ids = new Set<string>();
+    for (const entry of ledger) {
+        if (!entry.startsWith(COMPACTION_OFF_THINKING_FROZEN_PREFIX)) continue;
+        const id = entry.slice(COMPACTION_OFF_THINKING_FROZEN_PREFIX.length);
+        if (id.length > 0) ids.add(id);
+    }
+    return ids;
+}
+
 export function getThinkingBindingRecoveryTarget(db: Database, sessionId: string): string | null {
     const row = db
         .prepare("SELECT thinking_binding_recovery_target FROM session_meta WHERE session_id = ?")
@@ -3143,6 +3170,8 @@ export function getCompactionMarkerHealth(
 
 /** Frozen rendering decisions consumed by one postprocess pass. */
 export interface PostprocessReplaySnapshot {
+    servedShapeRepair?: unknown;
+    executeReclaim?: unknown;
     staleReduceStrippedIds: Set<string>;
     processedImageStrippedIds: Set<string>;
     processedImageMarkers: Map<string, ProcessedImageMarker>;
@@ -3157,6 +3186,17 @@ export interface PostprocessReplaySnapshot {
     mergedReasoningStrippedIds: Set<string>;
     thinkingBindingRecoveryTarget: string | null;
     trailingBlankDecisions: Map<string, PersistedTrailingBlankDecision>;
+}
+
+function executeReclaimFromReplay(raw: string | null | undefined): unknown {
+    try {
+        return parseReplayDocument(raw).executeReclaim;
+    } catch {
+        // An unsupported replay document must remain untouched. Existing cleanup
+        // can still ride a fold; originating execute-reclaim requires persisting
+        // its consecutive held-execute counter first.
+        return undefined;
+    }
 }
 
 /**
@@ -3204,6 +3244,14 @@ export function loadPostprocessReplaySnapshot(
         row?.todo_permission_denied === 1 ? true : row?.todo_permission_denied === 0 ? false : null;
     const thinkingBindingRecoveryTarget = row?.thinking_binding_recovery_target;
     return {
+        servedShapeRepair: (() => {
+            try {
+                return parseReplayDocument(row?.trailing_blank_decisions).servedShapeRepair;
+            } catch {
+                return undefined;
+            }
+        })(),
+        executeReclaim: executeReclaimFromReplay(row?.trailing_blank_decisions),
         staleReduceStrippedIds: new Set(parseStrippedBlob(row?.stale_reduce_stripped_ids)),
         processedImageStrippedIds: new Set(
             parseProcessedImageMarkers(row?.processed_image_stripped_ids).keys(),

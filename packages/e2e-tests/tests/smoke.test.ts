@@ -14,7 +14,6 @@ import {
  */
 
 let h: ScenarioHarness;
-let serverUrl: string | null;
 
 const options = {
     mockDefault: {
@@ -31,20 +30,10 @@ const options = {
 forEachHost(import.meta.url, "opencode e2e smoke", (host) => {
     beforeAll(async () => {
         h = await createScenarioHarness(host, options);
-        serverUrl = h.serverUrl;
     });
 
     afterAll(async () => {
         await h?.dispose();
-    });
-
-    it("mock server and host are reachable", () => {
-        if (serverUrl === null) {
-            // Pi-family hosts are persistent RPC processes rather than HTTP servers.
-            expect(["pi", "omp"]).toContain(h.host);
-            return;
-        }
-        expect(serverUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
     });
 
     it("sends a prompt, mock captures it, plugin initializes its DB", async () => {

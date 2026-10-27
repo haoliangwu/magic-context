@@ -14,6 +14,7 @@ import type {
     SubagentKind,
 } from "../../features/magic-context/storage-subagent-invocations";
 import {
+    annotateSubagentInvocationError,
     failedInvocationStatus,
     recordChildInvocation,
     sumTokensFromChildMessages,
@@ -183,6 +184,8 @@ export function createV1HiddenCompletionExecutor(
     // the only timer, and it still aborts the child when it fires. Clients without
     // prompt_async (the Pi facades) keep the synchronous prompt.
     const historianChildren = new Set<string>();
+    const hostErrors = new Map<string, unknown>();
+    const runIdentities = new Map<string, import("./compartment-runner-types").HiddenRunIdentity>();
     return {
         capabilities: { tools: true, harness: "opencode" },
         async open(run) {
@@ -198,18 +201,51 @@ export function createV1HiddenCompletionExecutor(
                 preferResponseOnMissingData: true,
             });
             const id = typeof created?.id === "string" ? created.id : "";
-            if (id) rememberV1HiddenRun(id, run);
+            if (id) {
+                rememberV1HiddenRun(id, run);
+                runIdentities.set(id, run);
+            }
             if (id && run.kind !== "dreamer-task") {
                 historianChildren.add(id);
                 rememberHistorianOutputCap(id, run.maxOutputTokens);
             }
-            return { id, childSessionId: id || undefined };
+            const configured = toModelEntry(run.model);
+            return {
+                id,
+                childSessionId: id || undefined,
+                ...(configured ? { attemptedModel: configured.model } : {}),
+                ...(configured?.sourceConfigKey
+                    ? { modelConfigKey: configured.sourceConfigKey }
+                    : {}),
+            };
         },
         async attempt(handle, request) {
             if (!client) throw new Error("Hidden completion client is unavailable");
+            const identity = runIdentities.get(handle.id);
+            const requestedModel = request.body?.model;
+            const requestedRef =
+                requestedModel &&
+                typeof requestedModel.providerID === "string" &&
+                typeof requestedModel.modelID === "string"
+                    ? `${requestedModel.providerID}/${requestedModel.modelID}`
+                    : undefined;
+            const matchingConfigured = (identity?.configuredModels ?? [])
+                .map(toModelEntry)
+                .find((entry) => entry?.model === requestedRef);
+            const configured =
+                matchingConfigured ??
+                (requestedRef &&
+                identity?.model &&
+                toModelEntry(identity.model)?.model === requestedRef
+                    ? toModelEntry(identity.model)
+                    : toModelEntry(identity?.model));
+            handle.attemptedModel = requestedRef ?? configured?.model ?? handle.attemptedModel;
+            handle.modelConfigKey = configured?.sourceConfigKey ?? handle.modelConfigKey;
             if (shared.supportsPromptAsync(client)) {
                 try {
-                    await shared.promptAsyncAndWaitForIdle(client, request);
+                    await shared.promptAsyncAndWaitForIdle(client, request, {
+                        modelConfigKey: handle.modelConfigKey,
+                    });
                 } catch (error) {
                     // A provider error the host recorded ends the historian's run. The
                     // synchronous prompt returned normally in that case and collect()
@@ -217,8 +253,16 @@ export function createV1HiddenCompletionExecutor(
                     // its next model in a fresh child. Keep that: rethrowing here would
                     // make the historian's retry loop send the same prompt again into
                     // this child.
-                    if (historianChildren.has(handle.id) && shared.isHostSessionError(error))
-                        return;
+                    if (shared.isHostSessionError(error)) {
+                        const hostError = shared.hostSessionErrorOf(error);
+                        hostErrors.set(handle.id, hostError);
+                        annotateSubagentInvocationError(error, {
+                            attemptedModel: handle.attemptedModel,
+                            modelConfigKey: handle.modelConfigKey,
+                            hostError,
+                        });
+                        if (historianChildren.has(handle.id)) return;
+                    }
                     throw error;
                 }
                 return;
@@ -235,13 +279,21 @@ export function createV1HiddenCompletionExecutor(
                 preferResponseOnMissingData: true,
             });
             const assistantFailure = extractLatestAssistantFailure(messages);
+            const hostError = hostErrors.get(handle.id);
             if (assistantFailure) {
                 const finish = assistantFailure.finish
                     ? ` (finish=${assistantFailure.finish})`
                     : "";
-                throw new Error(
+                const error = new Error(
                     `Historian host recorded an assistant error${finish}: ${describeAssistantFailure(assistantFailure.error)}`,
+                    hostError === undefined ? undefined : { cause: hostError },
                 );
+                annotateSubagentInvocationError(error, {
+                    attemptedModel: handle.attemptedModel,
+                    modelConfigKey: handle.modelConfigKey,
+                    hostError,
+                });
+                throw error;
             }
             const text = extractLatestAssistantText(messages);
             const latest = Array.isArray(messages)
@@ -269,12 +321,17 @@ export function createV1HiddenCompletionExecutor(
                     undefined,
                     info.finish ?? info.finish_reason ?? info.finishReason,
                 ),
+                attemptedModel: handle.attemptedModel,
+                modelConfigKey: handle.modelConfigKey,
+                ...(hostError === undefined ? {} : { hostError }),
             };
         },
         async close(handle, settlement) {
             if (handle?.id) {
                 rememberV1HiddenRun(handle.id, undefined);
                 historianChildren.delete(handle.id);
+                hostErrors.delete(handle.id);
+                runIdentities.delete(handle.id);
                 forgetHistorianOutputCap(handle.id);
             }
             if (!client) return;
@@ -580,13 +637,15 @@ async function runHistorianPrompt(args: {
         status: SubagentInvocationStatus;
         messages?: unknown[];
         error?: unknown;
+        hostError?: unknown;
     }): number | null => {
         if (invocationRecorded) return null;
         invocationRecorded = true;
+        const configuredModel = toModelEntry(modelOverride);
         const actualModelRef =
             completion?.providerId && completion.modelId
                 ? `${completion.providerId}/${completion.modelId}`
-                : null;
+                : (handle?.attemptedModel ?? configuredModel?.model ?? null);
         const usedConfiguredFallback =
             actualModelRef !== null &&
             (fallbackModels ?? []).some(
@@ -611,6 +670,10 @@ async function runHistorianPrompt(args: {
                       modelId: completion.modelId,
                   }
                 : {}),
+            attemptedModel: handle?.attemptedModel ?? modelOverride,
+            configuredModels: fallbackModels,
+            modelConfigKey: handle?.modelConfigKey ?? configuredModel?.sourceConfigKey,
+            hostError: params.hostError ?? completion?.hostError,
             error: params.error,
             parentInvocationId:
                 agentId === HISTORIAN_EDITOR_AGENT ? (parentInvocationId ?? null) : null,
@@ -795,6 +858,7 @@ async function runHistorianPrompt(args: {
             status: emptyError ? "empty" : "completed",
             messages: completion.messages,
             error: emptyError,
+            hostError: completion.hostError,
         });
         if (emptyError && (!reasoningResult || lengthCapped)) {
             return {

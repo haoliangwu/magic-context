@@ -30,8 +30,8 @@ if name == "gh":
         if "--paginate" not in args or "--slurp" not in args or not any(f"head_sha={expected}" in arg for arg in args):
             sys.exit("Release query must paginate the full certified SHA")
         runs = [{"id": index + 10, "name": workflow, "head_sha": expected,
-                 "status": "completed", "conclusion": "success"}
-                for index, workflow in enumerate(("CI", "Mutations", "Smoke"))]
+                 "status": "completed", "conclusion": "success", "head_branch": "train/check-pr-123", "event": "push"}
+                for index, workflow in enumerate(("CI", "Smoke"))]
         for run in runs:
             run.update(scenario.get("workflows", {}).get(run["name"], {}))
         runs = [run for run in runs if run["name"] != scenario.get("missing")]
@@ -40,6 +40,10 @@ if name == "gh":
                 run["name"] = "Smoke (opencode bring-up on Linux)"
         runs.extend(scenario.get("extra_runs", []))
         print(json.dumps([{"workflow_runs": runs}]))
+    elif args[:1] == ["api"] and any("/jobs?" in arg for arg in args):
+        jobs = [{"name": f"Slow unit ({mode})", "status": "completed", "conclusion": "success"}
+                for mode in ("normal", "assertions")]
+        print(json.dumps([{"jobs": scenario.get("slow_jobs", jobs)}]))
     elif args[:2] == ["run", "list"] and "--workflow=release.yml" in args:
         print(777)
     elif args[:3] == ["run", "watch", "777"]:

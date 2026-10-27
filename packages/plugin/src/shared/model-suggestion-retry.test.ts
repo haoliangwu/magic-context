@@ -5,6 +5,8 @@ import { recordedGeminiQuotaMessages } from "../features/magic-context/dreamer/p
 import { HiddenAgentStepLimit } from "../v2/hooks/hidden-child";
 import {
     getPromptFailureDetail,
+    noteModelActivityMonitored,
+    noteModelOutputReceived,
     promptSyncWithModelSuggestionRetry,
     promptSyncWithValidatedOutputRetry,
 } from "./model-suggestion-retry";
@@ -832,4 +834,168 @@ test("timeout rejects an uncooperative carrier and aborts its child", async () =
     } finally {
         clearTimeout(timer);
     }
+});
+
+describe("first-output deadline", () => {
+    const primary = { providerID: "opencode", modelID: "free-model" };
+    type Behaviour = "silent" | "partial" | "answer" | "unmonitored";
+
+    /**
+     * A transport double that behaves per model. "silent" watches the child but the
+     * model never answers; "partial" streams something and then hangs; "unmonitored"
+     * hangs without ever reporting whether the model answered (the Pi and OpenCode 2
+     * carriers); "answer" completes at once.
+     */
+    function modelTransport(behaviours: Record<string, Behaviour>) {
+        const calls: Array<{ model: string; startedAt: number }> = [];
+        const transport = Object.assign(
+            async (request: PromptCall & { signal?: AbortSignal }) => {
+                const model = request.body.model
+                    ? `${request.body.model.providerID}/${request.body.model.modelID}`
+                    : "primary";
+                calls.push({ model, startedAt: Date.now() });
+                const behaviour = behaviours[model] ?? "answer";
+                if (behaviour === "answer") return;
+                if (behaviour === "silent") noteModelActivityMonitored(request.signal);
+                if (behaviour === "partial") noteModelOutputReceived(request.signal);
+                await new Promise<void>((_resolve, reject) =>
+                    request.signal?.addEventListener("abort", () => reject(new Error("aborted"))),
+                );
+            },
+            { childSessionId: "child-first-output" },
+        );
+        return { transport, calls };
+    }
+
+    async function run(
+        behaviours: Record<string, Behaviour>,
+        options: { timeoutMs: number; firstOutputTimeoutMs?: number; fallbackModels?: string[] },
+    ) {
+        const { transport, calls } = modelTransport(behaviours);
+        const startedAt = Date.now();
+        let caught: unknown;
+        let result: Awaited<ReturnType<typeof promptSyncWithValidatedOutputRetry>> | undefined;
+        try {
+            result = await promptSyncWithValidatedOutputRetry(
+                createClient(mock(async () => ({}))),
+                createArgs(primary),
+                {
+                    transport: transport as never,
+                    timeoutMs: options.timeoutMs,
+                    ...(options.firstOutputTimeoutMs !== undefined
+                        ? { firstOutputTimeoutMs: options.firstOutputTimeoutMs }
+                        : {}),
+                    fallbackModels: options.fallbackModels ?? ["anthropic/claude-sonnet-5-5"],
+                    fetchOutput: async () => "<classify></classify>",
+                    validateOutput: (output: string) => output,
+                },
+            );
+        } catch (error) {
+            caught = error;
+        }
+        return { result, caught, calls, elapsedMs: Date.now() - startedAt };
+    }
+
+    test("a primary that streams nothing by the deadline moves on to the fallback", async () => {
+        const outcome = await run(
+            { "opencode/free-model": "silent" },
+            { timeoutMs: 2_000, firstOutputTimeoutMs: 40 },
+        );
+        expect(outcome.caught).toBeUndefined();
+        expect(outcome.result?.attempt.label).toBe("anthropic/claude-sonnet-5-5");
+        expect(outcome.calls.map((call) => call.model)).toEqual([
+            "opencode/free-model",
+            "anthropic/claude-sonnet-5-5",
+        ]);
+        // The silent primary was cut at its first-output deadline, not its timeout.
+        expect(outcome.elapsedMs).toBeLessThan(1_000);
+    });
+
+    test("the unvalidated chain also moves on from a silent primary", async () => {
+        const { transport, calls } = modelTransport({ "opencode/free-model": "silent" });
+        await promptSyncWithModelSuggestionRetry(
+            createClient(mock(async () => ({}))),
+            createArgs(primary),
+            {
+                transport: transport as never,
+                timeoutMs: 2_000,
+                firstOutputTimeoutMs: 40,
+                fallbackModels: ["anthropic/claude-sonnet-5-5"],
+            },
+        );
+        expect(calls.map((call) => call.model)).toEqual([
+            "opencode/free-model",
+            "anthropic/claude-sonnet-5-5",
+        ]);
+    });
+
+    test("a primary that produced output before timing out does not fall back", async () => {
+        const outcome = await run(
+            { "opencode/free-model": "partial" },
+            { timeoutMs: 120, firstOutputTimeoutMs: 20 },
+        );
+        expect((outcome.caught as Error).message).toBe("prompt timed out after 120ms");
+        expect(outcome.calls).toHaveLength(1);
+        expect(getPromptFailureDetail(outcome.caught)?.failureClass).toBe("provider_timeout");
+    });
+
+    test("a silent primary's time comes out of the fallback's timeout", async () => {
+        // The fallback is the last model, so it gets no first-output cut of its own;
+        // its timeout is what the silent primary left of the overall 300 ms.
+        const outcome = await run(
+            { "opencode/free-model": "silent", "anthropic/claude-sonnet-5-5": "silent" },
+            { timeoutMs: 300, firstOutputTimeoutMs: 100 },
+        );
+        const message = (outcome.caught as Error).message;
+        const fallbackTimeoutMs = Number(/prompt timed out after (\d+)ms$/.exec(message)?.[1]);
+        expect(outcome.calls).toHaveLength(2);
+        expect(fallbackTimeoutMs).toBeLessThanOrEqual(200);
+        expect(fallbackTimeoutMs).toBeGreaterThan(100);
+        expect(outcome.elapsedMs).toBeLessThan(300 + 150);
+    });
+
+    test("the last model in the chain is never cut for silence", async () => {
+        const outcome = await run(
+            { "opencode/free-model": "silent" },
+            { timeoutMs: 120, firstOutputTimeoutMs: 20, fallbackModels: [] },
+        );
+        expect((outcome.caught as Error).message).toBe("prompt timed out after 120ms");
+        expect(outcome.calls).toHaveLength(1);
+    });
+
+    test("a transport that cannot see model output keeps the plain timeout", async () => {
+        const outcome = await run(
+            { "opencode/free-model": "unmonitored" },
+            { timeoutMs: 120, firstOutputTimeoutMs: 20 },
+        );
+        expect((outcome.caught as Error).message).toBe("prompt timed out after 120ms");
+        expect(outcome.calls).toHaveLength(1);
+    });
+
+    test("a caller without a first-output deadline keeps timeouts final", async () => {
+        // The historian passes no first-output deadline: a silent model still ends
+        // its chain at the timeout, exactly as before.
+        const outcome = await run({ "opencode/free-model": "silent" }, { timeoutMs: 120 });
+        expect((outcome.caught as Error).message).toBe("prompt timed out after 120ms");
+        expect(outcome.calls).toHaveLength(1);
+    });
+
+    test("a caller without a first-output deadline still falls back on a provider failure", async () => {
+        const prompt = mock(async (args: PromptCall) => {
+            if (args.body.model?.providerID === "opencode")
+                throw new Error("429 Too Many Requests: quota exceeded");
+            return {};
+        });
+        const result = await promptSyncWithValidatedOutputRetry(
+            createClient(prompt),
+            createArgs(primary),
+            {
+                fallbackModels: ["anthropic/claude-sonnet-5-5"],
+                fetchOutput: async () => "summary",
+                validateOutput: (output: string) => output,
+            },
+        );
+        expect(result.attempt.label).toBe("anthropic/claude-sonnet-5-5");
+        expect(prompt).toHaveBeenCalledTimes(2);
+    });
 });

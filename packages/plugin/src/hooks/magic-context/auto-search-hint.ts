@@ -166,10 +166,19 @@ export function buildAutoSearchHint(
     return wrapped;
 }
 
-/** Filter every fragment, not just the first hit in a fused ranking. */
+/**
+ * Filter every fragment, not just the first hit in a fused ranking, and order
+ * the survivors by the same relevance the threshold applies to, so the hint
+ * leads with its most relevant fragments rather than the best-ranked ones.
+ * The sort is stable: fragments of equal relevance keep the search's order.
+ * Only new hints are built from this; a saved hint is replayed as saved.
+ */
 export function selectAutoSearchResults(
     results: UnifiedSearchResult[],
     threshold: number,
 ): UnifiedSearchResult[] {
-    return results.filter((result) => (result.relevanceScore ?? result.score) >= threshold);
+    const relevance = (result: UnifiedSearchResult) => result.relevanceScore ?? result.score;
+    return results
+        .filter((result) => relevance(result) >= threshold)
+        .sort((left, right) => relevance(right) - relevance(left));
 }

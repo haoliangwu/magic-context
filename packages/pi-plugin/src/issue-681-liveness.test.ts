@@ -24,6 +24,37 @@ beforeAll(async () => {
 		new URL("context-handler.ts", import.meta.url),
 		"utf8",
 	);
+	const sqliteSource = await readFile(
+		new URL("../../plugin/src/shared/sqlite.ts", import.meta.url),
+		"utf8",
+	);
+	const sqlite = ts.createSourceFile(
+		"sqlite.ts",
+		sqliteSource,
+		ts.ScriptTarget.Latest,
+		true,
+	);
+	const leaseNames = new Set([
+		"NativeWaitLease",
+		"nativeWaitScope",
+		"releaseNativeWaitLease",
+		"withSqliteTurnDeadline",
+	]);
+	const leaseDeclarations = sqlite.statements.filter((node) =>
+		(ts.isFunctionDeclaration(node) || ts.isInterfaceDeclaration(node)) &&
+		node.name
+			? leaseNames.has(node.name.text)
+			: ts.isVariableStatement(node) &&
+				node.declarationList.declarations.some(
+					(declaration) =>
+						ts.isIdentifier(declaration.name) &&
+						leaseNames.has(declaration.name.text),
+				),
+	);
+	expect(leaseDeclarations).toHaveLength(leaseNames.size);
+	// The host/storage stubs skip SQL, but the real native-budget lease still
+	// participates in request retention. Exercise its actual lifetime helpers.
+	sources.unshift(...leaseDeclarations.map((node) => node.getText(sqlite)));
 	sources.push(
 		await readFile(
 			new URL(

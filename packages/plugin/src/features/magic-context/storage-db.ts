@@ -30,8 +30,10 @@ import {
     readProcessProbeEvidence,
 } from "../../shared/rpc-utils";
 import {
+    createSqliteTurnDatabase,
     Database,
     detectSqliteRuntime,
+    hasSqliteTurnDeadlineRouting,
     isTransientSqliteError,
     registerSlowWriteReporter,
     registerSqliteDiagnosticSink,
@@ -200,6 +202,8 @@ export interface OpenDatabaseOptions {
     latestSupportedVersion?: number;
     /** Test/diagnostic override; production uses BOOT_SQLITE_BUSY_TIMEOUT_MS. */
     busyTimeoutMs?: number;
+    /** Pi's serving handle opts in before initialization creates cached statements. */
+    nativeTurnDeadlines?: boolean;
     /** Boot-only timing sink; omitted by ordinary storage callers. */
     onBootTimings?: (timings: DatabaseBootTimings) => void;
     /** Receives the exact busy-timeout diagnostic emitted during a fresh database open. */
@@ -2661,6 +2665,12 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
         return null;
     }
     if (existing) {
+        if (options?.nativeTurnDeadlines && !hasSqliteTurnDeadlineRouting(existing)) {
+            log(
+                "[magic-context] storage unavailable: native turn deadlines must be selected on the first open; restart the host",
+            );
+            return null;
+        }
         if (!enforceSchemaFence(existing, dbPath, latestSupportedVersion)) {
             return null;
         }
@@ -2690,7 +2700,7 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
             }
         }
 
-        db = new Database(dbPath);
+        db = options?.nativeTurnDeadlines ? createSqliteTurnDatabase(dbPath) : new Database(dbPath);
         installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);
         if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
             closeQuietly(db);
@@ -2756,6 +2766,12 @@ export async function openDatabaseAsync(
     lastMigrationOnOpenRefusal = null;
     const existing = databases.get(dbPath);
     if (existing) {
+        if (options?.nativeTurnDeadlines && !hasSqliteTurnDeadlineRouting(existing)) {
+            log(
+                "[magic-context] storage unavailable: native turn deadlines must be selected on the first open; restart the host",
+            );
+            return null;
+        }
         const startedAt = performance.now();
         const accepted = enforceSchemaFence(existing, dbPath, latestSupportedVersion);
         if (accepted) {
@@ -2771,7 +2787,11 @@ export async function openDatabaseAsync(
     }
 
     const pending = pendingAsyncOpens.get(dbPath);
-    if (pending) return pending;
+    if (pending) {
+        if (!options?.nativeTurnDeadlines) return pending;
+        const opened = await pending;
+        return opened && hasSqliteTurnDeadlineRouting(opened) ? opened : null;
+    }
 
     // A worker cannot share an in-memory connection. Reject before file creation
     // or permission hardening can mistake a SQLite pseudo-path for a real file.
@@ -2802,7 +2822,9 @@ export async function openDatabaseAsync(
                 }
             }
 
-            db = new Database(dbPath);
+            db = options?.nativeTurnDeadlines
+                ? createSqliteTurnDatabase(dbPath)
+                : new Database(dbPath);
             installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);
             openMs = performance.now() - openStartedAt;
             guardStartedAt = performance.now();

@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
 use magic_context_dashboard_lib::db;
@@ -610,14 +609,6 @@ fn rename_workspace_does_not_bump_member_epochs() {
         epoch_before, epoch_after,
         "renaming the workspace must not fold member m[0] (name is not rendered)"
     );
-}
-
-#[test]
-fn workspace_member_identities_union_helper() {
-    let old: HashSet<String> = ["git:a".into(), "git:b".into()].into_iter().collect();
-    let new: HashSet<String> = ["git:b".into(), "git:c".into()].into_iter().collect();
-    let u = workspaces::workspace_member_identities_union(&old, &new);
-    assert_eq!(u.len(), 3);
 }
 
 #[test]

@@ -101,7 +101,34 @@ const GATED_VERSION: u8 = 3;
 /// (on `RunStarted` and queued sends); this reader never reads tools.
 /// `runner-tags/v2` adds `computed_tags` (a tag checkpoint) to a run's config
 /// and a `tag_checkpoint` with its cut to a compaction Setup message; this
-/// reader uses neither.
+/// reader uses neither. `structured-output-paragraph/v1` adds a boolean
+/// `instructions_paragraph_break` to a run's frozen structured-output render
+/// config (on `RunStarted` and `RunConfigRefrozen`); it affects only how the
+/// schema instructions are rendered, so this reader ignores it.
+/// `client-message-id/v1` adds a `client_message_id` member inside the
+/// `request_identity_digest` JSON of a `run_started`, `queued` or `steered`
+/// record; this reader never reads request identity. `compaction-ride-wait/v1`
+/// adds an optional `ride_wait_ms` to a compaction Setup message and two
+/// records, `compaction_ride_wait` and `compaction_ride_wait_ended`, written
+/// while a step waits for the compaction provider's answer before a prompt
+/// rewrite; this reader ignores all three
+/// and keeps the step's usage and timestamps. `auth-selection-method/v1` adds
+/// an optional `auth_method` to the frozen `config.auth_selection` on
+/// `RunStarted` (and a refreeze record) and makes `credential_id` an opaque
+/// vault id; this reader reads neither. `tool-times/v1` records when each
+/// new tool call started and finished; this reader takes a step's timing from
+/// its own records, so it ignores the tool times. `message-times/v1` adds an
+/// optional `written_at_ms` to `run_started`, `model_step_finished`,
+/// `steered`, `queued` and `send_delivered`; this reader keeps using `ts_ms`
+/// and ignores it. `plan-reference-slots/v1` adds an optional
+/// `reference_slots` map (tool name to `{name, kind}` slots) beside `reply` on
+/// an answered fetch in a run's frozen plan manifest, and
+/// `provider-declarations/v1` adds `declarations_frozen` (tool result formats
+/// and the `late_results` capability) to the same answered fetch; this reader
+/// never reads the manifest. `provider-held/v1` adds held-call records and a
+/// `tool_held` pause reason; this reader skips record types it doesn't use and
+/// never reads pause reasons. `tool-schema-pins/v1` adds frozen `schema_pins`
+/// to the run's plan manifest; this reader never reads the manifest.
 const KNOWN_FEATURES: &[&str] = &[
     "flow-scopes/v1",
     "plan-manifest/v1",
@@ -133,6 +160,16 @@ const KNOWN_FEATURES: &[&str] = &[
     "chatgpt-codex-wire/v1",
     "tool-reply/v1",
     "runner-tags/v2",
+    "structured-output-paragraph/v1",
+    "client-message-id/v1",
+    "compaction-ride-wait/v1",
+    "auth-selection-method/v1",
+    "tool-times/v1",
+    "message-times/v1",
+    "plan-reference-slots/v1",
+    "provider-declarations/v1",
+    "provider-held/v1",
+    "tool-schema-pins/v1",
 ];
 
 #[derive(serde::Deserialize)]
@@ -1870,6 +1907,16 @@ pub(crate) mod tests {
             "chatgpt-codex-wire/v1",
             "tool-reply/v1",
             "runner-tags/v2",
+            "structured-output-paragraph/v1",
+            "client-message-id/v1",
+            "compaction-ride-wait/v1",
+            "auth-selection-method/v1",
+            "tool-times/v1",
+            "message-times/v1",
+            "plan-reference-slots/v1",
+            "provider-declarations/v1",
+            "provider-held/v1",
+            "tool-schema-pins/v1",
         ] {
             let bytes = wal_bytes(&[
                 json!({"requires": [feature], "record": run_started("r1", 1)}),
@@ -1891,6 +1938,191 @@ pub(crate) mod tests {
             step_finished(1, usage(1, 2, 3, 4)),
         ]);
         let runs = decode(&bytes).expect("tool-reply/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `client-message-id/v1` carries the sender's message id inside the run's
+    /// request identity digest; such a run still yields its steps.
+    #[test]
+    fn a_client_message_id_run_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["request_identity_digest"] = json!({"client_message_id": "msg-1", "digest": "00"});
+        let bytes = wal_bytes(&[
+            json!({"requires": ["client-message-id/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("client-message-id/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `compaction-ride-wait/v1` records a step that waited for the compaction
+    /// provider's answer before a prompt rewrite; that step keeps its usage.
+    #[test]
+    fn a_compaction_ride_wait_keeps_the_step() {
+        let bytes = wal_bytes(&[
+            json!(run_started("r1", 1)),
+            json!({"requires": ["compaction-ride-wait/v1"],
+                   "record": {"type": "compaction_ride_wait", "step_id": 1,
+                              "deadline_ms": 10_000}}),
+            json!({"requires": ["compaction-ride-wait/v1"],
+                   "record": {"type": "compaction_ride_wait_ended", "step_id": 1}}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("compaction-ride-wait/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `auth-selection-method/v1` records the vault's method for the run's
+    /// credential in its frozen auth selection; such a run still yields its
+    /// steps.
+    #[test]
+    fn an_auth_selection_method_run_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["config"]["auth_selection"] =
+            json!({"credential_id": "cred_01opaque", "auth_method": "oauth"});
+        let bytes = wal_bytes(&[
+            json!({"requires": ["auth-selection-method/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("auth-selection-method/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `tool-times/v1` adds an optional time to existing tool records (when a
+    /// call was dispatched, when its result finished, when an approval
+    /// closed it). These are the record bodies Broca's encoder writes; a run
+    /// that carries them still yields its steps.
+    #[test]
+    fn a_tool_times_run_keeps_its_steps() {
+        let bytes = wal_bytes(&[
+            json!(run_started("r1", 1)),
+            json!({"requires": ["tool-times/v1"],
+                   "record": {"type": "tool_dispatch_intent", "batch_id": "b",
+                              "tool_call_id": "c", "args": {},
+                              "dispatched_at_ms": 1_800_000_000_123u64}}),
+            json!({"requires": ["tool-times/v1"],
+                   "record": {"type": "tool_result", "batch_id": "b",
+                              "result": {"tool_call_id": "c",
+                                         "output": {"kind": "text", "text": "ok"},
+                                         "is_error": false},
+                              "outcome": "completed",
+                              "finished_at_ms": 1_800_000_000_123u64}}),
+            json!({"requires": ["tool-times/v1"],
+                   "record": {"type": "approval_recorded", "call_key": "key",
+                              "call_id": "c", "decision": "declined",
+                              "closing_result": {"tool_call_id": "c",
+                                                 "output": {"kind": "text",
+                                                            "text": "pre_tool_declined"},
+                                                 "is_error": true},
+                              "closed_at_ms": 1_800_000_000_123u64}}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("tool-times/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `message-times/v1` adds an optional `written_at_ms` to the run's start
+    /// and to its finished steps; a run carrying it still yields its steps.
+    #[test]
+    fn a_message_times_run_keeps_its_steps() {
+        let mut started = run_started("r1", 1_000);
+        started["written_at_ms"] = json!(1_800_000_000_123u64);
+        let mut finished = step_finished(1, usage(1, 2, 3, 4));
+        finished["written_at_ms"] = json!(1_800_000_000_456u64);
+        let bytes = wal_bytes(&[
+            json!({"requires": ["message-times/v1"], "record": started}),
+            json!(step_started(1)),
+            json!(attempt(1, 1_010)),
+            json!({"requires": ["message-times/v1"], "record": finished}),
+        ]);
+        let runs = decode(&bytes).expect("message-times/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `plan-reference-slots/v1` adds `reference_slots` beside `reply` on an
+    /// answered fetch in the run's frozen plan manifest. This reader never
+    /// reads the manifest, so a run carrying it still yields its steps.
+    #[test]
+    fn a_plan_reference_slots_run_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["manifest"] = json!({"items": [{"outcome": {"answered": {
+            "reply": {"research": {"max_ms": 120000}},
+            "reference_slots": {"read": [{"name": "path", "kind": "file"}]},
+        }}}]});
+        let bytes = wal_bytes(&[
+            json!({"requires": ["plan-reference-slots/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("plan-reference-slots/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `provider-declarations/v1` adds `declarations_frozen` beside `reply` on
+    /// an answered fetch in the run's frozen plan manifest. This reader never
+    /// reads the manifest, so a run carrying it still yields its steps.
+    #[test]
+    fn a_provider_declarations_run_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["manifest"] = json!({"items": [{"outcome": {"answered": {
+            "reply": {},
+            "declarations_frozen": {"result_formats": {"read": "text"}, "late_results": true},
+        }}}]});
+        let bytes = wal_bytes(&[
+            json!({"requires": ["provider-declarations/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("provider-declarations/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `provider-held/v1` adds held-call records and a `tool_held` pause
+    /// reason. This reader skips record types it doesn't use, so a run that
+    /// carries them still yields its steps.
+    #[test]
+    fn a_provider_held_run_keeps_its_steps() {
+        let bytes = wal_bytes(&[
+            json!(run_started("r1", 1)),
+            json!({"requires": ["provider-held/v1"],
+                   "record": {"type": "tool_call_held", "tool_call_id": "c"}}),
+            json!({"requires": ["provider-held/v1"],
+                   "record": {"type": "run_paused", "reason": "tool_held"}}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("provider-held/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `tool-schema-pins/v1` adds frozen `schema_pins` to the run's plan
+    /// manifest. This reader never reads the manifest, so a run carrying it
+    /// still yields its steps.
+    #[test]
+    fn a_tool_schema_pins_run_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["manifest"] = json!({
+            "items": [{"outcome": {"answered": {"reply": {}}}}],
+            "schema_pins": {"read": "sha256:00"},
+        });
+        let bytes = wal_bytes(&[
+            json!({"requires": ["tool-schema-pins/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("tool-schema-pins/v1 run decodes");
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+    }
+
+    /// `structured-output-paragraph/v1` marks a structured-output run whose
+    /// schema instructions start a new paragraph; such a run still yields its
+    /// steps.
+    #[test]
+    fn a_structured_output_paragraph_run_keeps_its_steps() {
+        let mut record = run_started("r1", 1);
+        record["config"]["frozen_render_config"] =
+            json!({"structured_output": {"instructions_paragraph_break": true}});
+        let bytes = wal_bytes(&[
+            json!({"requires": ["structured-output-paragraph/v1"], "record": record}),
+            step_finished(1, usage(1, 2, 3, 4)),
+        ]);
+        let runs = decode(&bytes).expect("structured-output-paragraph/v1 run decodes");
         assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
     }
 

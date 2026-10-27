@@ -5,6 +5,8 @@ export interface ResolvedModelEntry {
     model: string;
     /** OpenCode variant or Pi thinking level, selected for the active entry only. */
     qualifier?: string;
+    /** Config location that supplied this attempt, for accurate failure diagnostics. */
+    sourceConfigKey?: string;
 }
 
 export type ModelInput = string | ResolvedModelEntry;
@@ -33,6 +35,10 @@ function resolveHarnessBlock(
 ): ConfigRecord | undefined {
     const selected = harness === "omp" ? (container?.omp ?? container?.pi) : container?.[harness];
     return asRecord(selected);
+}
+
+function sourceHarness(container: ConfigRecord | undefined, harness: ModelHarness): ModelHarness {
+    return harness === "omp" && container?.omp == null ? "pi" : harness;
 }
 
 /**
@@ -116,14 +122,20 @@ export function resolveHistorianModel(
     const historian = asRecord(asRecord(config)?.historian);
     const block = resolveHarnessBlock(historian, harness);
     if (!block) return { fallbacks: [] };
+    const source = `historian.${sourceHarness(historian, harness)}`;
+    const primary = resolvePrimaryEntry({
+        entry: block.model,
+        defaultQualifier: block[harness === "opencode" ? "variant" : "thinking_level"],
+        harness,
+    });
+    const fallbacks = resolveFallbackEntries(block.fallback_models, harness);
 
     return {
-        primary: resolvePrimaryEntry({
-            entry: block.model,
-            defaultQualifier: block[harness === "opencode" ? "variant" : "thinking_level"],
-            harness,
-        }),
-        fallbacks: resolveFallbackEntries(block.fallback_models, harness),
+        primary: primary ? { ...primary, sourceConfigKey: `${source}.model` } : undefined,
+        fallbacks: fallbacks.map((entry) => ({
+            ...entry,
+            sourceConfigKey: `${source}.fallback_models`,
+        })),
     };
 }
 
@@ -171,19 +183,34 @@ export function resolveDreamerTaskModel(args: {
         harnessBlock[args.harness === "opencode" ? "variant" : "thinking_level"] ??
         normalizeModelEntry(harnessBlock.model, args.harness)?.qualifier;
     const taskHasModel = taskBlock !== undefined && hasOwn(taskBlock, "model");
+    const taskHasFallbacks = taskBlock !== undefined && hasOwn(taskBlock, "fallback_models");
     const primarySource = taskHasModel ? taskBlock?.model : harnessBlock.model;
-    const fallbackSource =
-        taskBlock !== undefined && hasOwn(taskBlock, "fallback_models")
-            ? taskBlock.fallback_models
-            : harnessBlock.fallback_models;
+    const fallbackSource = taskHasFallbacks
+        ? taskBlock?.fallback_models
+        : harnessBlock.fallback_models;
+    const source = `dreamer.${sourceHarness(dreamer, args.harness)}`;
+    const primary = resolvePrimaryEntry({
+        entry: primarySource,
+        defaultQualifier: taskQualifier ?? harnessQualifier,
+        harness: args.harness,
+    });
+    const fallbacks = resolveFallbackEntries(fallbackSource, args.harness);
 
     return {
-        primary: resolvePrimaryEntry({
-            entry: primarySource,
-            defaultQualifier: taskQualifier ?? harnessQualifier,
-            harness: args.harness,
-        }),
-        fallbacks: resolveFallbackEntries(fallbackSource, args.harness),
+        primary: primary
+            ? {
+                  ...primary,
+                  sourceConfigKey: taskHasModel
+                      ? `${source}.tasks.${args.task}.model`
+                      : `${source}.model`,
+              }
+            : undefined,
+        fallbacks: fallbacks.map((entry) => ({
+            ...entry,
+            sourceConfigKey: taskHasFallbacks
+                ? `${source}.tasks.${args.task}.fallback_models`
+                : `${source}.fallback_models`,
+        })),
         schedule: readString(schedulingTask?.schedule),
         timeoutMinutes:
             typeof taskBlock?.timeout_minutes === "number" ? taskBlock.timeout_minutes : undefined,

@@ -197,7 +197,6 @@ describe("Synapse rerank protocol (unit doubles only; measurements use the daemo
 				candidates: ["a", "b"],
 				required_fingerprint: lane.fingerprint,
 				allow_equivalent: false,
-				accept_declared: false,
 				max_queue_ms: 50,
 				deadline_ms: 50,
 			},

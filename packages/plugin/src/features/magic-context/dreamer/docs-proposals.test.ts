@@ -9,6 +9,7 @@ import {
     docsChangeSet,
     hasCurrentDocsProposal,
     listPendingDocsProposals,
+    parseDocsProposalOutput,
     validateDocsProposal,
     writeDocsProposal,
 } from "./docs-proposals";
@@ -39,6 +40,30 @@ const replacement = JSON.stringify([
 ]);
 
 describe("docs proposals", () => {
+    test.each([
+        "not JSON",
+        "{}",
+        "[null]",
+        JSON.stringify([{ file: "README.md" }]),
+        JSON.stringify([{ ...JSON.parse(replacement)[0], action: "edit" }]),
+        JSON.stringify([{ ...JSON.parse(replacement)[0], heading: "no heading" }]),
+        JSON.stringify([{ ...JSON.parse(replacement)[0], text: null }]),
+        JSON.stringify([{ ...JSON.parse(replacement)[0], reason: "\n" }]),
+        JSON.stringify([...JSON.parse(replacement), ...JSON.parse(replacement)]),
+    ])("rejects malformed proposal output %j without reading docs", (output) => {
+        expect(() => parseDocsProposalOutput(output)).toThrow();
+    });
+
+    test("parses fenced changes and permits the same heading in different files", () => {
+        const changes = [
+            ...JSON.parse(replacement),
+            { ...JSON.parse(replacement)[0], file: "STRUCTURE.md" },
+        ];
+        expect(
+            parseDocsProposalOutput(`Proposed:\n\`\`\`json\n${JSON.stringify(changes)}\n\`\`\``),
+        ).toEqual(changes);
+    });
+
     test("rejects protected changes, budget overflow and base drift without writing docs", () => {
         const dir = fixture();
         const before = readFileSync(join(dir, "ARCHITECTURE.md"));

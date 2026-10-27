@@ -59,6 +59,7 @@ const restarted = await run(search);
 assert.deepEqual(restarted.results, result.results);
 const sqlite = await import(process.versions.bun ? 'bun:sqlite' : 'node:sqlite');
 const owner = new (sqlite.Database ?? sqlite.DatabaseSync)(path);
+owner.exec('PRAGMA busy_timeout = 5000');
 owner.exec('BEGIN IMMEDIATE');
 try {
   const read = await run(search);

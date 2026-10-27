@@ -451,6 +451,31 @@ describe("debug RPC guard", () => {
         expect(memory.native.quickJs.loaded).toBeTypeOf("boolean");
         expect(memory.holders.lkgSlots.totalBytes).toBeTypeOf("number");
         expect(memory.holders.messageIndexQueue.activeBufferBytes).toBeTypeOf("number");
+        expect(memory.holders.generateReplay).toEqual({ sessionCount: 0, estimatedBytes: 0 });
+    });
+
+    test("reports OpenCode 2's kept side-question requests in total and per session", () => {
+        const memory = buildDebugMemoryUsage({
+            generateReplay: {
+                totalBytes: 300,
+                sessions: [
+                    { sessionId: "ses_b", bytes: 200 },
+                    { sessionId: "ses_a", bytes: 100 },
+                ],
+            },
+        });
+        expect(memory.holders.generateReplay).toEqual({ sessionCount: 2, estimatedBytes: 300 });
+        expect(
+            memory.holders.sessions
+                .filter(({ sessionId }) => sessionId === "ses_a" || sessionId === "ses_b")
+                .map(({ sessionId, generateReplayBytes }) => ({
+                    sessionId,
+                    generateReplayBytes,
+                })),
+        ).toEqual([
+            { sessionId: "ses_a", generateReplayBytes: 100 },
+            { sessionId: "ses_b", generateReplayBytes: 200 },
+        ]);
     });
 
     test("does not register heap diagnostics when the flag is off by default", () => {

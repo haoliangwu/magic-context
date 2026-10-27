@@ -405,6 +405,8 @@ export interface PiHistorianDeps {
 	runner: SubagentRunner;
 	/** Historian model id (provider/model) — required for PiSubagentRunner. */
 	historianModel: string;
+	/** Config key supplying the selected historian model. */
+	modelConfigKey?: string;
 	/** Optional ordered fallback chain, retaining each entry's Pi thinking level. */
 	fallbackModels?: readonly ModelInput[];
 	/** Live session model for host context; never appended to the configured chain. */
@@ -1090,6 +1092,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					onProgress: buildProgressLogger("first"),
 					accountingSessionId: sessionId,
 					accountingSubagent: "historian",
+					accountingModelConfigKey: deps.modelConfigKey,
 				},
 			});
 
@@ -1205,6 +1208,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 							onProgress: buildProgressLogger("fallback"),
 							accountingSessionId: sessionId,
 							accountingSubagent: "historian",
+							accountingModelConfigKey:
+								candidate.sourceConfigKey ?? deps.modelConfigKey,
 							accountingTask: "fallback",
 						},
 					});
@@ -1295,6 +1300,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 							onProgress: buildProgressLogger("editor"),
 							accountingSessionId: sessionId,
 							accountingSubagent: "historian_editor",
+							accountingModelConfigKey: deps.modelConfigKey,
 						},
 					});
 					const editorPass = await validateHistorianResult(

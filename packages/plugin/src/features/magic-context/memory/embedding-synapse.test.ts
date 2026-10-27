@@ -132,12 +132,12 @@ describe("SynapseEmbeddingProvider", () => {
         const vector = await provider.embed("hello", undefined, "query");
         expect(vector).toEqual(new Float32Array([1, 2, 3]));
         const request = client.requests.find((entry) => entry.method === "embed.query");
+        expect(request?.params).not.toHaveProperty("accept_declared");
         expect(request?.params).toMatchObject({
             model: "gte-modernbert-base-f16",
             required_fingerprint: "fp-live",
             required_epoch: 0,
             allow_equivalent: false,
-            accept_declared: false,
             purpose: "query",
         });
     });
@@ -163,6 +163,8 @@ describe("SynapseEmbeddingProvider", () => {
         expect(vectors.size).toBe(2);
         const batchRequests = client.requests.filter((entry) => entry.method === "embed.batch");
         expect(batchRequests).toHaveLength(3);
+        for (const request of batchRequests)
+            expect(request.params).not.toHaveProperty("accept_declared");
         expect(batchRequests[0]?.params).toMatchObject({ purpose: "query" });
         const keys = client.requests
             .filter((entry) => entry.method === "embed.batch")

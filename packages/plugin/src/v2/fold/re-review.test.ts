@@ -133,7 +133,6 @@ test("re-review: another capture cannot replace an admitted cut's native bytes",
 });
 
 // Unsupported: out-of-band direct database edits to hidden user rows have no public host update signal.
-test.skip("re-review: a hidden edit between capture and admission cannot be blessed by fresh stamps", () => {});
 
 test("re-review: bounded replay does not load covered raw cache blobs", async () => {
     const f = fixture();
@@ -207,7 +206,6 @@ test("re-review: an open reader's identity cannot switch to a replacement file",
 // Skipped as unsupported: hidden rows (those behind the latest checkpoint, served
 // from this cache) are refreshed only when OpenCode sends an event. Editing one
 // directly in OpenCode's database sends no event, so the cache cannot detect it.
-test.skip("re-review control: equal-time equal-size hidden edits are fenced by raw JSON", () => {});
 
 test("re-review control: a cold copied host store has no owned admission", async () => {
     const f = fixture();
@@ -250,4 +248,3 @@ test("re-review control: VACUUM retains raw rows and only replays the same autho
 // Not applicable: the cache lives only in its own process's memory, so no owner
 // or lease is ever written where another process could see it. When a process
 // dies its cache goes with it, leaving nothing for another process to reclaim.
-test.skip("re-review control: a dead owner is reclaimed only after its lease, never a live owner", () => {});

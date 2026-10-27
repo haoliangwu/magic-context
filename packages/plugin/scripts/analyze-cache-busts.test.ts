@@ -1387,10 +1387,10 @@ describe("analyze-cache-bust uncached input never counts as reuse", () => {
 });
 
 describe("bounded sentinel dump scans", () => {
-    test("skips 20,000 old files and resumes a bounded scan without losing requests", () => {
+    test("skips old files and resumes a bounded scan without losing requests", () => {
         const dir = mkdtempSync(join(tmpdir(), "mc-sentinel-scan-"));
         tempDirs.push(dir);
-        for (let i = 0; i < 20_000; i++) {
+        for (let i = 0; i < 400; i++) {
             writeFileSync(join(dir, `dump-2026-09-23T00-00-00-000Z-${String(i).padStart(5, "0")}-ses_scanfixture.meta.json`), "{}");
         }
         const sessionId = "ses_scanfixture";

@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
+import { scaleTest } from "./slow-test";
 import { stableStringify } from "./stable-json";
 
 /** stableStringify as it was before it collected pieces: joins at every level. */
@@ -96,14 +97,21 @@ describe("stableStringify", () => {
         expect(holes).toBeGreaterThan(50);
     });
 
-    it("copies a deeply nested value once, not once per level", () => {
-        // 3,000 levels around a 2 MB string: joining at every level copied about
-        // 6 GB of text (over a second); one copy takes a few milliseconds.
-        let node: unknown = { body: "x".repeat(2_000_000) };
-        for (let depth = 0; depth < 3_000; depth += 1) node = { child: node, depth };
-        const started = performance.now();
-        const text = stableStringify(node);
-        expect(text.length).toBeGreaterThan(2_000_000);
-        expect(performance.now() - started).toBeLessThan(300);
-    }, 30_000);
+    scaleTest(
+        "copies a deeply nested value once, not once per level",
+        (slow) => {
+            // The slow fixture wraps 2 MB in 3,000 levels: joining at every level
+            // copied about 6 GB of text; the unit fixture retains nested-byte coverage.
+            const size = slow ? 2_000_000 : 4096;
+            let node: unknown = { body: "x".repeat(size) };
+            for (let depth = 0; depth < (slow ? 3_000 : 64); depth += 1)
+                node = { child: node, depth };
+            const started = performance.now();
+            const text = stableStringify(node);
+            expect(text.length).toBeGreaterThan(size);
+            expect(text).toContain("x".repeat(size));
+            if (slow) expect(performance.now() - started).toBeLessThan(300);
+        },
+        30_000,
+    );
 });

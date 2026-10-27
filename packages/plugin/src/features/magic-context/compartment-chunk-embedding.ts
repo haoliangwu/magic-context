@@ -88,6 +88,18 @@ const SEARCH_SCOPE_METADATA_FIELDS = [
     "endTime",
 ] as const;
 
+/**
+ * Count, highest id and id sum of every chunk row of one session, across all
+ * projects and models. `idx_cce_session` covers it, so reading it never visits
+ * the table rows that hold the vectors. Inserts and deletes change it; an
+ * in-place metadata edit (a window renumber, a title change) does not.
+ */
+interface SessionChunkSignature {
+    rowCount: number;
+    maxRowId: number;
+    rowIdSum: number;
+}
+
 interface DecodedSearchPoolEntry {
     pool: Map<string, DecodedSearchPoolEntry>;
     key: string;
@@ -97,6 +109,12 @@ interface DecodedSearchPoolEntry {
     metadata: Map<number, SearchScopeMetadataRow>;
     ids: readonly number[];
     rows: StoredCompartmentChunkEmbedding[];
+    /** Decoded row per row id; null for a row the search read excludes. */
+    decodedById: Map<number, StoredCompartmentChunkEmbedding | null>;
+    /** The session signature read before the probe that built this entry. */
+    sessionSignature: SessionChunkSignature;
+    /** When a probe last compared every row's metadata (performance.now()). */
+    fullProbeAt: number;
     byteSize: number;
 }
 
@@ -171,9 +189,14 @@ const existingHashByProjectStatements = new WeakMap<Database, PreparedStatement>
 const deleteByCompartmentStatements = new WeakMap<Database, PreparedStatement>();
 const insertEmbeddingStatements = new WeakMap<Database, PreparedStatement>();
 const renumberEmbeddingWindowStatements = new WeakMap<Database, PreparedStatement>();
-const searchRowsStatements = new WeakMap<Database, PreparedStatement>();
-const searchRowsByModelStatements = new WeakMap<Database, PreparedStatement>();
+const searchRowsByIdStatements = new WeakMap<Database, PreparedStatement>();
 const searchPoolProbeStatements = new WeakMap<Database, PreparedStatement>();
+const sessionSignatureStatements = new WeakMap<Database, PreparedStatement>();
+const sessionPrefixStatements = new WeakMap<Database, PreparedStatement>();
+const revisionStatements = new WeakMap<
+    Database,
+    { version: PreparedStatement; changes: PreparedStatement }
+>();
 const pendingSearchPools = new WeakMap<Database, Map<string, Promise<void>>>();
 const backfillCandidateStatements = new WeakMap<Database, PreparedStatement>();
 const shadowBackfillCandidateStatements = new WeakMap<Database, PreparedStatement>();
@@ -182,7 +205,17 @@ const DECODED_SEARCH_POOL_CACHE_MAX_BYTES = 256 * 1024 * 1024;
 const decodedSearchPools = new WeakMap<Database, Map<string, DecodedSearchPoolEntry>>();
 const decodedSearchPoolLru = new Map<DecodedSearchPoolEntry, true>();
 let decodedSearchPoolBytes = 0;
-const searchPoolStats = { fullRebuilds: 0, appends: 0, probes: 0, probeMs: 0, probePages: 0 };
+const searchPoolStats = {
+    fullRebuilds: 0,
+    appends: 0,
+    partialRefreshes: 0,
+    rowsDecoded: 0,
+    probes: 0,
+    tailProbes: 0,
+    endProbes: 0,
+    probeMs: 0,
+    probePages: 0,
+};
 
 export function _getCompartmentChunkSearchCacheStatsForTests(): typeof searchPoolStats & {
     bytes: number;
@@ -297,24 +330,34 @@ function sameScopeMetadata(left: SearchScopeMetadataRow, right: SearchScopeMetad
     return true;
 }
 
+/**
+ * Read the metadata of the scope's rows and reuse every unchanged record from
+ * `previous`. With `tailOnly`, the caller has already established that no row
+ * at or below `previous.maxRowId` was inserted or deleted, so only rows above
+ * it are read; in-place edits of the older rows are then not seen until the
+ * next full probe.
+ */
 async function probeSearchScope(
     db: Database,
     sessionId: string,
     projectPath: string,
     modelId: string,
     previous?: SearchPoolProbeRow,
+    options: { tailOnly?: boolean; signal?: AbortSignal } = {},
 ): Promise<SearchPoolProbeRow> {
     const started = performance.now();
-    searchPoolStats.probes++;
+    const tailOnly = options.tailOnly === true && previous !== undefined;
+    if (tailOnly) searchPoolStats.tailProbes++;
+    else searchPoolStats.probes++;
     const probe: SearchPoolProbeRow = {
-        rowCount: 0,
-        maxRowId: 0,
-        rowIdSum: 0,
+        rowCount: tailOnly ? previous.rowCount : 0,
+        maxRowId: tailOnly ? previous.maxRowId : 0,
+        rowIdSum: tailOnly ? previous.rowIdSum : 0,
         metadata: previous?.metadata ?? new Map(),
         ids: previous?.ids ?? [],
     };
     let copied = previous === undefined;
-    let oldIndex = 0;
+    let oldIndex = tailOnly ? previous.ids.length : 0;
     // Reuse unchanged records and the map itself. A warm probe must not allocate
     // another full metadata pool and force a large main-thread garbage collection.
     const writable = () => {
@@ -326,6 +369,7 @@ async function probeSearchScope(
     };
     await yieldSearchPool();
     for (;;) {
+        options.signal?.throwIfAborted();
         const rows = getSearchPoolProbeStatement(db).all(
             sessionId,
             projectPath,
@@ -362,6 +406,82 @@ async function probeSearchScope(
     }
 }
 
+function getSessionSignatureStatement(db: Database): PreparedStatement {
+    let stmt = sessionSignatureStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            `SELECT COUNT(*) AS rowCount, COALESCE(MAX(id), 0) AS maxRowId,
+                    COALESCE(SUM(id), 0) AS rowIdSum
+             FROM compartment_chunk_embeddings WHERE session_id = ?`,
+        );
+        sessionSignatureStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function readSessionChunkSignature(db: Database, sessionId: string): SessionChunkSignature {
+    const row = getSessionSignatureStatement(db).get(sessionId) as SessionChunkSignature | null;
+    return {
+        rowCount: Number(row?.rowCount ?? 0),
+        maxRowId: Number(row?.maxRowId ?? 0),
+        rowIdSum: Number(row?.rowIdSum ?? 0),
+    };
+}
+
+function sameSessionSignature(left: SessionChunkSignature, right: SessionChunkSignature): boolean {
+    return (
+        left.rowCount === right.rowCount &&
+        left.maxRowId === right.maxRowId &&
+        left.rowIdSum === right.rowIdSum
+    );
+}
+
+/** True when the session's rows up to the signature's highest id are still exactly those rows. */
+function sessionPrefixUnchanged(
+    db: Database,
+    sessionId: string,
+    signature: SessionChunkSignature,
+): boolean {
+    let stmt = sessionPrefixStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            `SELECT COUNT(*) AS rowCount, COALESCE(SUM(id), 0) AS rowIdSum
+             FROM compartment_chunk_embeddings WHERE session_id = ? AND id <= ?`,
+        );
+        sessionPrefixStatements.set(db, stmt);
+    }
+    const row = stmt.get(sessionId, signature.maxRowId) as {
+        rowCount: number;
+        rowIdSum: number;
+    } | null;
+    return (
+        Number(row?.rowCount ?? 0) === signature.rowCount &&
+        Number(row?.rowIdSum ?? 0) === signature.rowIdSum
+    );
+}
+
+/**
+ * Every write to the database since the last call is visible as a change of
+ * one of these: `data_version` changes when another connection commits, and
+ * `total_changes()` counts this connection's own row changes.
+ */
+function readDatabaseRevision(db: Database): string | null {
+    let statements = revisionStatements.get(db);
+    if (!statements) {
+        statements = {
+            version: db.prepare("PRAGMA data_version"),
+            changes: db.prepare("SELECT total_changes() AS changes"),
+        };
+        revisionStatements.set(db, statements);
+    }
+    const version = statements.version.get() as { data_version?: number } | null;
+    const changes = statements.changes.get() as { changes?: number } | null;
+    // Without both counters nothing proves the absence of writes.
+    if (typeof version?.data_version !== "number" || typeof changes?.changes !== "number")
+        return null;
+    return `${version.data_version}:${changes.changes}`;
+}
+
 function sameSearchScope(left: SearchPoolProbeRow, right: SearchPoolProbeRow): boolean {
     return (
         left.rowCount === right.rowCount &&
@@ -369,22 +489,6 @@ function sameSearchScope(left: SearchPoolProbeRow, right: SearchPoolProbeRow): b
         left.rowIdSum === right.rowIdSum &&
         (left.metadata === right.metadata ||
             [...left.metadata].every(([id, value]) => right.metadata.get(id) === value))
-    );
-}
-
-function scopeOnlyAppended(cached: SearchPoolProbeRow, probe: SearchPoolProbeRow): boolean {
-    if (probe.rowCount <= cached.rowCount) return false;
-    let addedCount = 0;
-    let addedSum = 0;
-    for (const [id, fingerprint] of probe.metadata) {
-        if (id > cached.maxRowId) {
-            addedCount++;
-            addedSum += id;
-        } else if (cached.metadata.get(id) !== fingerprint) return false;
-    }
-    return (
-        addedCount === probe.rowCount - cached.rowCount &&
-        cached.rowIdSum + addedSum === probe.rowIdSum
     );
 }
 
@@ -406,9 +510,11 @@ function filterSearchPoolDates(
     });
 }
 
-function getSearchRowsStatement(db: Database, withModel: boolean): PreparedStatement {
-    const map = withModel ? searchRowsByModelStatements : searchRowsStatements;
-    let stmt = map.get(db);
+/** Rows the search read decodes per statement; the loader yields between batches. */
+const SEARCH_READ_BATCH = 16;
+
+function getSearchRowsByIdStatement(db: Database): PreparedStatement {
+    let stmt = searchRowsByIdStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
             `SELECT e.id AS rowId, e.compartment_id AS compartmentId,
@@ -432,11 +538,11 @@ function getSearchRowsStatement(db: Database, withModel: boolean): PreparedState
                 ON end_map.session_id = c.session_id AND end_map.message_ordinal = c.end_message
              WHERE e.session_id = ?
                AND e.project_path = ?
-                ${withModel ? "AND e.model_id = ?" : ""}
-                AND e.id > ? AND e.id <= ?
-              ORDER BY e.id ASC LIMIT 16`,
+               AND e.model_id = ?
+               AND e.id IN (${Array.from({ length: SEARCH_READ_BATCH }, () => "?").join(", ")})
+             ORDER BY e.id ASC`,
         );
-        map.set(db, stmt);
+        searchRowsByIdStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -543,6 +649,9 @@ function cacheDecodedSearchPool(
     key: string,
     probe: SearchPoolProbeRow,
     rows: StoredCompartmentChunkEmbedding[],
+    decodedById: Map<number, StoredCompartmentChunkEmbedding | null>,
+    sessionSignature: SessionChunkSignature,
+    fullProbeAt: number,
 ): void {
     const existing = pool.get(key);
     if (existing) removeDecodedSearchPoolEntry(existing);
@@ -552,9 +661,13 @@ function cacheDecodedSearchPool(
         key,
         ...probe,
         rows,
+        decodedById,
+        sessionSignature,
+        fullProbeAt,
         byteSize: estimateDecodedSearchPoolBytes(rows),
     };
-    entry.byteSize += probe.ids.length * 8;
+    // Sorted id list plus one decoded-row map entry per id.
+    entry.byteSize += probe.ids.length * 24;
     for (const metadata of probe.metadata.values()) {
         entry.byteSize += 320;
         for (const key of SEARCH_SCOPE_METADATA_FIELDS) {
@@ -582,13 +695,9 @@ export function _resetCompartmentChunkSearchCacheForTests(): void {
     }
     decodedSearchPoolLru.clear();
     decodedSearchPoolBytes = 0;
-    Object.assign(searchPoolStats, {
-        fullRebuilds: 0,
-        appends: 0,
-        probes: 0,
-        probeMs: 0,
-        probePages: 0,
-    });
+    lastChunkPoolWarm = null;
+    for (const key of Object.keys(searchPoolStats) as (keyof typeof searchPoolStats)[])
+        searchPoolStats[key] = 0;
 }
 
 function isFinitePositiveInteger(value: unknown): value is number {
@@ -1085,107 +1194,233 @@ function searchPoolInTransaction(db: Database): boolean {
     return connection.inTransaction === true || connection.isTransaction === true;
 }
 
+/** Where one pool refresh spent its time. Holds counts and durations only. */
+export interface CompartmentChunkPoolRefreshTimings {
+    probeMs: number;
+    readMs: number;
+    decodeMs: number;
+    probedRows: number;
+    decodedRows: number;
+    attempts: number;
+}
+
+function emptyRefreshTimings(): CompartmentChunkPoolRefreshTimings {
+    return { probeMs: 0, readMs: 0, decodeMs: 0, probedRows: 0, decodedRows: 0, attempts: 0 };
+}
+
+interface RefreshOptions {
+    /**
+     * A refresh outside any search. It trusts the session's unchanged rows: when
+     * no row at or below the cached highest id was inserted or deleted it probes
+     * only newer rows, and it checks for writes that landed while it ran with
+     * the session signature alone. An in-place metadata edit is then picked up
+     * by the next full probe; {@link warmCompartmentChunkSearchPool} runs one at
+     * least every CHUNK_POOL_FULL_PROBE_INTERVAL_MS.
+     */
+    background?: boolean;
+    signal?: AbortSignal;
+    timings?: CompartmentChunkPoolRefreshTimings;
+}
+
+function decodeSearchRow(row: SearchChunkRow): StoredCompartmentChunkEmbedding | null {
+    if (
+        typeof row.compartmentId !== "number" ||
+        typeof row.sessionId !== "string" ||
+        typeof row.title !== "string" ||
+        typeof row.compartmentStart !== "number" ||
+        typeof row.compartmentEnd !== "number" ||
+        typeof row.windowIndex !== "number" ||
+        typeof row.windowStart !== "number" ||
+        typeof row.windowEnd !== "number" ||
+        typeof row.chunkHash !== "string" ||
+        typeof row.modelId !== "string" ||
+        typeof row.dims !== "number" ||
+        !(row.vector instanceof Uint8Array || row.vector instanceof ArrayBuffer)
+    )
+        return null;
+    const decoded: StoredCompartmentChunkEmbedding = {
+        compartmentId: row.compartmentId,
+        sessionId: row.sessionId,
+        title: row.title,
+        startOrdinal: row.compartmentStart,
+        endOrdinal: row.compartmentEnd,
+        windowIndex: row.windowIndex,
+        windowStartOrdinal: row.windowStart,
+        windowEndOrdinal: row.windowEnd,
+        chunkHash: row.chunkHash,
+        modelId: row.modelId,
+        dims: row.dims,
+        vector: toFloat32Array(row.vector),
+    };
+    searchPoolDates.set(decoded, { startTime: row.startTime, endTime: row.endTime });
+    return decoded;
+}
+
+/**
+ * Bring one scope's decoded pool up to date and return its rows.
+ *
+ * Vectors and dimensions are immutable at a rowid (refreshes delete and insert
+ * new rows; the writer guard test enforces it), and every other field a decoded
+ * row carries is part of the probed metadata. So a row whose metadata record is
+ * unchanged keeps its decoded vector, and only new or changed rows are read and
+ * decoded.
+ */
 async function refreshDecodedSearchPool(
     db: Database,
     sessionId: string,
     projectPath: string,
     modelId: string,
+    options: RefreshOptions = {},
 ): Promise<StoredCompartmentChunkEmbedding[]> {
     const key = searchPoolKey(sessionId, projectPath, modelId);
     const pool = getDecodedSearchPool(db);
+    const timings = options.timings ?? emptyRefreshTimings();
+    const { signal } = options;
     for (;;) {
+        signal?.throwIfAborted();
+        timings.attempts++;
         const inTransaction = searchPoolInTransaction(db);
+        // Both are read before the probe, so neither can describe a newer state
+        // than the rows read below.
+        const revision = readDatabaseRevision(db);
+        const sessionSignature = readSessionChunkSignature(db, sessionId);
         const previous = pool.get(key);
-        const probe = await probeSearchScope(db, sessionId, projectPath, modelId, previous);
-        const rowCount = probe.rowCount;
-        const maxRowId = probe.maxRowId;
+        const tailOnly =
+            options.background === true &&
+            !inTransaction &&
+            previous !== undefined &&
+            sessionPrefixUnchanged(db, sessionId, previous.sessionSignature);
+        const probeStarted = performance.now();
+        const probe = await probeSearchScope(db, sessionId, projectPath, modelId, previous, {
+            tailOnly,
+            signal,
+        });
+        timings.probeMs += performance.now() - probeStarted;
+        timings.probedRows = probe.rowCount;
+        const fullProbeAt = tailOnly && previous ? previous.fullProbeAt : probeStarted;
         // Another scope may evict the snapshot while the probe yields. Re-read
         // the retained entry before touching the LRU or reusing cached vectors.
         const cached = pool.get(key);
         if (!inTransaction && cached && sameSearchScope(cached, probe)) {
+            cached.sessionSignature = sessionSignature;
+            cached.fullProbeAt = Math.max(cached.fullProbeAt, fullProbeAt);
             touchDecodedSearchPoolEntry(cached);
             return cached.rows;
         }
 
-        // Vectors/dims are immutable at a rowid: refreshes delete/insert new rows.
-        // In-place writers change window_index/project_path/harness, all covered
-        // by the exact metadata probe (and protected by the writer guard test).
-        // No database-wide commit/change counter participates in certification.
-        const append = !inTransaction && cached && scopeOnlyAppended(cached, probe);
-        if (append) searchPoolStats.appends++;
-        else searchPoolStats.fullRebuilds++;
-        let afterId = append ? cached.maxRowId : 0;
-        const added: StoredCompartmentChunkEmbedding[] = [];
-        let appendedCount = 0;
+        // A transaction-local view must not reuse or publish cached rows. An
+        // evicted `previous` still holds valid decoded rows for its records.
+        const reusable = inTransaction ? undefined : previous;
+        const decodedById = new Map<number, StoredCompartmentChunkEmbedding | null>();
+        const missing: number[] = [];
+        for (const id of probe.ids) {
+            const prior =
+                reusable !== undefined && reusable.metadata.get(id) === probe.metadata.get(id)
+                    ? reusable.decodedById.get(id)
+                    : undefined;
+            if (prior === undefined) missing.push(id);
+            else decodedById.set(id, prior);
+        }
+        if (!reusable || missing.length === probe.ids.length) searchPoolStats.fullRebuilds++;
+        else if (
+            probe.ids.length - missing.length === reusable.ids.length &&
+            missing.every((id) => id > reusable.maxRowId)
+        )
+            searchPoolStats.appends++;
+        else searchPoolStats.partialRefreshes++;
+
         // Yield before the first read as well: callers must never pay a cold
         // synchronous full-pool allocation before receiving their Promise.
         await yieldSearchPool();
-        for (;;) {
-            const rows = getSearchRowsStatement(db, true).all(
-                sessionId,
-                projectPath,
-                modelId,
-                afterId,
-                maxRowId,
-            ) as SearchChunkRow[];
-            if (rows.length === 0) break;
-            afterId = rows[rows.length - 1].rowId;
-            appendedCount += rows.length;
-            for (const row of rows) {
-                if (
-                    typeof row.compartmentId !== "number" ||
-                    typeof row.sessionId !== "string" ||
-                    typeof row.title !== "string" ||
-                    typeof row.compartmentStart !== "number" ||
-                    typeof row.compartmentEnd !== "number" ||
-                    typeof row.windowIndex !== "number" ||
-                    typeof row.windowStart !== "number" ||
-                    typeof row.windowEnd !== "number" ||
-                    typeof row.chunkHash !== "string" ||
-                    typeof row.modelId !== "string" ||
-                    typeof row.dims !== "number" ||
-                    !(row.vector instanceof Uint8Array || row.vector instanceof ArrayBuffer)
-                )
-                    continue;
-                added.push({
-                    compartmentId: row.compartmentId,
-                    sessionId: row.sessionId,
-                    title: row.title,
-                    startOrdinal: row.compartmentStart,
-                    endOrdinal: row.compartmentEnd,
-                    windowIndex: row.windowIndex,
-                    windowStartOrdinal: row.windowStart,
-                    windowEndOrdinal: row.windowEnd,
-                    chunkHash: row.chunkHash,
-                    modelId: row.modelId,
-                    dims: row.dims,
-                    vector: toFloat32Array(row.vector),
-                });
-                searchPoolDates.set(added[added.length - 1], {
-                    startTime: row.startTime,
-                    endTime: row.endTime,
-                });
-            }
+        const read = getSearchRowsByIdStatement(db);
+        for (let start = 0; start < missing.length; start += SEARCH_READ_BATCH) {
+            signal?.throwIfAborted();
+            const batch = missing.slice(start, start + SEARCH_READ_BATCH);
+            // Pad the fixed-size id list with an id no row has.
+            const ids = batch.concat(Array(SEARCH_READ_BATCH - batch.length).fill(-1));
+            const readStarted = performance.now();
+            const rows = read.all(sessionId, projectPath, modelId, ...ids) as SearchChunkRow[];
+            const decodeStarted = performance.now();
+            timings.readMs += decodeStarted - readStarted;
+            // A probed row the read does not return (no compartment row, or
+            // deleted since the probe) is recorded as excluded.
+            for (const id of batch) decodedById.set(id, null);
+            for (const row of rows) decodedById.set(row.rowId, decodeSearchRow(row));
+            timings.decodeMs += performance.now() - decodeStarted;
+            timings.decodedRows += rows.length;
+            searchPoolStats.rowsDecoded += rows.length;
             await yieldSearchPool();
         }
-        const endProbe = await probeSearchScope(db, sessionId, projectPath, modelId, probe);
-        if (!sameSearchScope(probe, endProbe) || searchPoolInTransaction(db) !== inTransaction) {
-            // No transaction spans a yield on this shared connection. Discard a
-            // raced read and retry rather than publishing a mixed/partial pool.
-            continue;
+
+        // Discard a read that raced a write and retry, rather than publishing a
+        // mixed or partial pool. No transaction spans a yield on this connection.
+        let unchanged: boolean;
+        if (options.background) {
+            unchanged = sameSessionSignature(
+                readSessionChunkSignature(db, sessionId),
+                sessionSignature,
+            );
+        } else if (revision !== null && readDatabaseRevision(db) === revision) {
+            // Nothing at all was written while this refresh ran.
+            unchanged = true;
+        } else {
+            searchPoolStats.endProbes++;
+            unchanged = sameSearchScope(
+                probe,
+                await probeSearchScope(db, sessionId, projectPath, modelId, probe, { signal }),
+            );
         }
-        if (append && appendedCount !== rowCount - cached.rowCount) {
-            // Explicit low-id inserts are not an append, even if the total row
-            // count grew. Rebuild to include them in the original SQL order.
-            removeDecodedSearchPoolEntry(cached);
-            continue;
+        if (!unchanged || searchPoolInTransaction(db) !== inTransaction) continue;
+
+        const decoded: StoredCompartmentChunkEmbedding[] = [];
+        for (const id of probe.ids) {
+            const row = decodedById.get(id);
+            if (row) decoded.push(row);
         }
-        const decoded = append ? cached.rows.concat(added) : added;
         decoded.sort((a, b) => a.compartmentId - b.compartmentId || a.windowIndex - b.windowIndex);
         // A transaction-local snapshot must not become a reusable cache entry
         // after its transaction ends or rolls back.
-        if (!inTransaction) cacheDecodedSearchPool(pool, key, probe, decoded);
+        if (!inTransaction)
+            cacheDecodedSearchPool(
+                pool,
+                key,
+                probe,
+                decoded,
+                decodedById,
+                sessionSignature,
+                fullProbeAt,
+            );
         return decoded;
+    }
+}
+
+/** One refresh per scope at a time; later callers wait for it, then refresh themselves. */
+async function refreshSearchPoolOnce(
+    db: Database,
+    sessionId: string,
+    projectPath: string,
+    modelId: string,
+    options: RefreshOptions,
+): Promise<StoredCompartmentChunkEmbedding[]> {
+    const key = searchPoolKey(sessionId, projectPath, modelId);
+    let pending = pendingSearchPools.get(db);
+    if (!pending) {
+        pending = new Map();
+        pendingSearchPools.set(db, pending);
+    }
+    while (pending.has(key)) await pending.get(key);
+    const operation = refreshDecodedSearchPool(db, sessionId, projectPath, modelId, options);
+    // Waiters only need to know the refresh ended. A failed or aborted refresh
+    // belongs to its own caller; each waiter then runs its own.
+    const completion = operation.then(
+        () => {},
+        () => {},
+    );
+    pending.set(key, completion);
+    try {
+        return await operation;
+    } finally {
+        if (pending.get(key) === completion) pending.delete(key);
     }
 }
 
@@ -1195,30 +1430,162 @@ export async function loadCompartmentChunkEmbeddingsForSearch(
     projectPath: string,
     modelId: string,
     dateRange: { from: number; to: number } | null = null,
+    signal?: AbortSignal,
 ): Promise<StoredCompartmentChunkEmbedding[]> {
     if (!modelId) {
         throw new Error("loadCompartmentChunkEmbeddingsForSearch requires a current model id");
     }
-    const key = searchPoolKey(sessionId, projectPath, modelId);
-    let pending = pendingSearchPools.get(db);
-    if (!pending) {
-        pending = new Map();
-        pendingSearchPools.set(db, pending);
+    const rows = await refreshSearchPoolOnce(db, sessionId, projectPath, modelId, { signal });
+    return filterSearchPoolDates(rows, dateRange);
+}
+
+/** How long a background-warmed pool may go without a probe of every row's metadata. */
+const CHUNK_POOL_FULL_PROBE_INTERVAL_MS = 60_000;
+/** Scopes a background maintainer keeps warm, most recently used last. */
+const TRACKED_SEARCH_POOL_LIMIT = 8;
+const trackedSearchPools = new WeakMap<
+    Database,
+    Map<string, { sessionId: string; projectPath: string; modelId: string }>
+>();
+
+function trackSearchPool(db: Database, sessionId: string, projectPath: string, modelId: string) {
+    let tracked = trackedSearchPools.get(db);
+    if (!tracked) {
+        tracked = new Map();
+        trackedSearchPools.set(db, tracked);
     }
-    for (;;) {
-        while (pending.has(key)) await pending.get(key);
-        const operation = refreshDecodedSearchPool(db, sessionId, projectPath, modelId);
-        const completion = operation.then(() => {});
-        pending.set(key, completion);
-        try {
-            const rows = await operation;
-            return filterSearchPoolDates(rows, dateRange);
-        } finally {
-            pending.delete(key);
-            // The result promise carries errors to the caller; the coordination
-            // promise must also be handled when there are no concurrent waiters.
-            void completion.catch(() => {});
+    const key = searchPoolKey(sessionId, projectPath, modelId);
+    tracked.delete(key);
+    tracked.set(key, { sessionId, projectPath, modelId });
+    while (tracked.size > TRACKED_SEARCH_POOL_LIMIT) {
+        const oldest = tracked.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        tracked.delete(oldest);
+    }
+}
+
+/** Outcome and timings of one background warm. Counts and durations only, no content. */
+export interface CompartmentChunkPoolWarmReport extends CompartmentChunkPoolRefreshTimings {
+    /** too-large: the decoded pool does not fit the decoded-pool memory budget. */
+    outcome: "current" | "in-progress" | "refreshed" | "too-large" | "failed";
+    totalMs: number;
+    finishedAtUnixMs: number;
+}
+
+let lastChunkPoolWarm: CompartmentChunkPoolWarmReport | null = null;
+/**
+ * Scopes whose decoded pool was not retained after a background warm (it is
+ * larger than DECODED_SEARCH_POOL_CACHE_MAX_BYTES), with the session signature
+ * at that time. Until the session's rows change, a warm of such a scope does
+ * nothing, so periodic maintenance never rebuilds a pool that cannot be kept.
+ */
+const unretainedSearchPools = new WeakMap<Database, Map<string, SessionChunkSignature>>();
+
+/** The last background warm that refreshed (or failed to refresh) a pool on this thread. */
+export function getLastCompartmentChunkPoolWarm(): CompartmentChunkPoolWarmReport | null {
+    return lastChunkPoolWarm;
+}
+
+/**
+ * The scope's decoded rows if its pool is warm, without waiting: the pool
+ * exists and the session's chunk rows were neither inserted nor deleted since
+ * it was built. Returns null otherwise; the caller then searches without these
+ * rows and starts {@link warmCompartmentChunkSearchPool}. Costs one index-only
+ * count of the session's rows.
+ */
+export function peekCompartmentChunkSearchPool(
+    db: Database,
+    sessionId: string,
+    projectPath: string,
+    modelId: string,
+    dateRange: { from: number; to: number } | null = null,
+): StoredCompartmentChunkEmbedding[] | null {
+    if (!modelId) return null;
+    trackSearchPool(db, sessionId, projectPath, modelId);
+    const entry = getDecodedSearchPool(db).get(searchPoolKey(sessionId, projectPath, modelId));
+    if (!entry || searchPoolInTransaction(db)) return null;
+    if (!sameSessionSignature(readSessionChunkSignature(db, sessionId), entry.sessionSignature))
+        return null;
+    touchDecodedSearchPoolEntry(entry);
+    return filterSearchPoolDates(entry.rows, dateRange);
+}
+
+/**
+ * Bring a scope's pool up to date outside any search. Decodes only new or
+ * changed rows and, while the session's older rows are unchanged, probes only
+ * newer ones. Does nothing when the pool is current and had a full probe
+ * within CHUNK_POOL_FULL_PROBE_INTERVAL_MS, or when a refresh of the scope is
+ * already running. Never throws; a failure is reported in the result.
+ */
+export async function warmCompartmentChunkSearchPool(
+    db: Database,
+    sessionId: string,
+    projectPath: string,
+    modelId: string,
+): Promise<CompartmentChunkPoolWarmReport> {
+    const started = performance.now();
+    const timings = emptyRefreshTimings();
+    const report = (outcome: CompartmentChunkPoolWarmReport["outcome"]) => ({
+        ...timings,
+        outcome,
+        totalMs: performance.now() - started,
+        finishedAtUnixMs: Date.now(),
+    });
+    if (!modelId) return report("current");
+    trackSearchPool(db, sessionId, projectPath, modelId);
+    const key = searchPoolKey(sessionId, projectPath, modelId);
+    try {
+        if (pendingSearchPools.get(db)?.has(key)) return report("in-progress");
+        const unretained = unretainedSearchPools.get(db)?.get(key);
+        if (
+            unretained &&
+            sameSessionSignature(readSessionChunkSignature(db, sessionId), unretained)
+        )
+            return report("too-large");
+        const entry = getDecodedSearchPool(db).get(key);
+        const fullProbeDue =
+            entry !== undefined &&
+            performance.now() - entry.fullProbeAt >= CHUNK_POOL_FULL_PROBE_INTERVAL_MS;
+        if (
+            entry &&
+            !fullProbeDue &&
+            !searchPoolInTransaction(db) &&
+            sameSessionSignature(readSessionChunkSignature(db, sessionId), entry.sessionSignature)
+        )
+            return report("current");
+        const signature = readSessionChunkSignature(db, sessionId);
+        await refreshSearchPoolOnce(db, sessionId, projectPath, modelId, {
+            background: !fullProbeDue,
+            timings,
+        });
+        let unretainedPools = unretainedSearchPools.get(db);
+        if (!getDecodedSearchPool(db).has(key)) {
+            if (!unretainedPools) {
+                unretainedPools = new Map();
+                unretainedSearchPools.set(db, unretainedPools);
+            }
+            unretainedPools.set(key, signature);
+            const tooLarge = report("too-large");
+            lastChunkPoolWarm = tooLarge;
+            return tooLarge;
         }
+        unretainedPools?.delete(key);
+        const refreshed = report("refreshed");
+        lastChunkPoolWarm = refreshed;
+        return refreshed;
+    } catch {
+        const failed = report("failed");
+        lastChunkPoolWarm = failed;
+        return failed;
+    }
+}
+
+/** Warm every recently searched scope on this connection, one after another. */
+export async function maintainCompartmentChunkSearchPools(db: Database): Promise<void> {
+    const tracked = trackedSearchPools.get(db);
+    if (!tracked) return;
+    for (const scope of [...tracked.values()]) {
+        await warmCompartmentChunkSearchPool(db, scope.sessionId, scope.projectPath, scope.modelId);
     }
 }
 

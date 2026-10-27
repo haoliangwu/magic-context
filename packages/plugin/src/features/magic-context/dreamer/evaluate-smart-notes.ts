@@ -508,6 +508,8 @@ async function confirmReadOnly(
             startedAt,
             status: params.status,
             messages: params.messages,
+            attemptedModel: args.model,
+            configuredModels: args.fallbackModels,
             error: params.error,
         });
     };

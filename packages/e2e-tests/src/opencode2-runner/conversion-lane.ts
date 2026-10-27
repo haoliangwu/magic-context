@@ -271,6 +271,7 @@ export async function spawnOpencode1(
 		OPENCODE_DISABLE_AUTOUPDATE: "true",
 		MAGIC_CONTEXT_STORAGE_DIR: fixture.storageDir,
 		MAGIC_CONTEXT_LOG_PATH: fixture.logPath(options.logLabel ?? "v1"),
+		MAGIC_CONTEXT_LOG_SYNC: "1",
 		ANTHROPIC_API_KEY: "mock-key-not-real",
 	};
 	// Same environment guard the v2 runner applies, against the same root.

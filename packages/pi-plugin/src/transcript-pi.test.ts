@@ -44,6 +44,37 @@ class LegacyAggregateToolTokenCache extends CountingToolTokenCache {
 }
 
 describe("createPiTranscript", () => {
+	it("keeps preserved whole copied tags inert and byte-identical across passes", () => {
+		const db = createTestDb();
+		try {
+			const tagger = createTagger();
+			for (const text of ["§58§", " \n§58§ ", "§§", "§42$"]) {
+				for (let pass = 0; pass < 3; pass++) {
+					const messages = [
+						{
+							role: "assistant",
+							provider: "openai",
+							content: [{ type: "text", text }],
+							timestamp: 1,
+						},
+					];
+					const transcript = createPiTranscript(messages, "copied-only", [
+						"entry",
+					]);
+					tagger.initFromDb("copied-only", db);
+					const result = tagTranscript("copied-only", transcript, tagger, db, {
+						preserveTagOnlyAssistantText: true,
+					});
+					transcript.commit();
+					expect(result.targets.size).toBe(0);
+					expect(messages[0].content[0].text).toBe(text);
+				}
+			}
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("retains notice provenance on string, array and mixed authored user content", () => {
 		for (const provenance of [{ synthetic: true }, { ignored: true }]) {
 			for (const content of [

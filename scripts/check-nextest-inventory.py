@@ -59,10 +59,10 @@ def check(directory):
     if nextest_names(all_tests) != expected or nextest_names(all_tests, ignored_only=True) != ignored:
         raise ValueError("archive discovery or ignored-test policy differs from cargo libtest")
     partitions = []
-    for label in ["lib-1", "lib-2", "lib-3", "lib-4", "parity"]:
+    for label in ["lib-1", "lib-2", "lib-3", "lib-4"]:
         document = json.loads((directory / (label + ".json")).read_text())
         names = nextest_names(document, selected_only=True)
-        if label != "parity" and not names:
+        if not names:
             raise ValueError("empty lib partition: " + label)
         partitions.append(names)
         (directory / (label + "-names.txt")).write_text("".join(name + "\n" for name in names))
@@ -76,7 +76,7 @@ def check(directory):
 
 class InventoryTests(unittest.TestCase):
     def test_exact_union(self):
-        self.assertEqual(assert_union(["a", "b"], [["b"], ["a"], []]), ["a", "b"])
+        self.assertEqual(assert_union(["a", "b", "c", "d"], [["b"], ["d"], ["a"], ["c"]]), ["a", "b", "c", "d"])
 
     def test_missing_duplicate_and_empty_are_rejected(self):
         for expected, parts in [(["a", "b"], [["a"]]), (["a"], [["a"], ["a"]]), ([], [[]])]:

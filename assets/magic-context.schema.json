@@ -2376,6 +2376,47 @@
         }
       }
     },
+    "rerank": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "default": "synapse",
+          "description": "Explicit ctx_search reranker: local Synapse by default, remote for hosted scoring, or off. Projects may only select off.",
+          "type": "string",
+          "enum": [
+            "synapse",
+            "remote",
+            "off"
+          ]
+        },
+        "endpoint": {
+          "description": "User-level rerank API base URL; prefix with tei+ for Hugging Face TEI.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Hosted reranker model name.",
+          "type": "string"
+        },
+        "api_key": {
+          "description": "Bearer API key; supports {env:NAME} in user config, like embedding.api_key.",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "Hosted request timeout in milliseconds, clamped to 50–15000; also cancelled by ctx_search's abort signal.",
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        },
+        "top_n": {
+          "default": 20,
+          "description": "Maximum fused candidates sent to the hosted reranker (1–20). Requests ask for a score for every submitted document; partial replies are rejected.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20
+        }
+      },
+      "description": "Explicit ctx_search reranking only. Defaults to local Synapse. Hosted settings are user-level only; projects may only select off."
+    },
     "embedding": {
       "description": "Embedding provider configuration",
       "type": "object",

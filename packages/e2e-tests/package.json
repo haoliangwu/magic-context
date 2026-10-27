@@ -11,9 +11,6 @@
     "validate-mode-manifest": "bun scripts/validate-mode-manifest.ts --mode ts",
     "adjudicate:thinking-block": "bash scripts/adjudicate-thinking-block.sh",
     "test:rust-e2e": "bun test --timeout 600000 --max-concurrency=1 tests/rust-*.test.ts",
-    "mutation:rust-historian": "bun scripts/run-rust-historian-producer-mutation.ts",
-    "mutation:rust-ctx-reduce": "bun scripts/run-rust-ctx-reduce-mutation.ts",
-    "mutation:paired-replay": "bun scripts/run-paired-replay-mutation.ts",
     "measure:mid-turn-ab": "bun scripts/run-mid-turn-prefix-ab.ts",
     "measure:native-memory": "bun scripts/capture-heap-long-session.ts",
     "replay:transform-wire-parity": "bun scripts/replay-transform-wire-parity.ts"

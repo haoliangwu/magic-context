@@ -705,7 +705,9 @@ Controls semantic search for cross-session memories.
 
 Instruction-tuned embedding models are trained to distinguish retrieval queries from passages, so Magic Context automatically prepends the model card's query recipe for Qwen3-Embedding, gte-Qwen instruct, e5 instruct, and Nomic families. Plain local encoders are unchanged. Query instructions affect only live search vectors, not stored document vectors, so changing `query_instruction` does not re-embed the corpus; changing a non-empty `document_prefix` does because it changes every stored vector.
 
-The local provider downloads model files from Hugging Face. Set the standard `HF_ENDPOINT` environment variable to the base URL of a Hugging Face-compatible mirror when `huggingface.co` is unavailable; a trailing slash is optional. The mirror only changes where identical model files are downloaded and does not change embedding identities or trigger re-embedding.
+The local provider downloads model files from Hugging Face. Set the standard `HF_ENDPOINT` environment variable to the base URL of a Hugging Face-compatible mirror when `huggingface.co` is unavailable; a trailing slash is optional. The mirror only changes where identical model files are downloaded and does not change embedding identities or trigger re-embedding. Local embeddings follow each model's declared sentence-transformers pooling mode and normalization; models without a pooling declaration keep the existing mean-pooling behavior. If remote pooling metadata cannot be fetched, the local provider temporarily keeps legacy mean pooling with normalization, and a later background setup retries fetching the metadata; a later declared non-mean mode receives its own embedding identity.
+
+When a local model's pooling changes, background jobs re-embed memory and git-commit vectors. Inactive sessions' old history vectors are excluded from semantic search, so that history uses keyword search until the session is active again; in Pi, run `/ctx-embed start` in that session to re-embed it on demand. OpenCode exposes the same per-session history embed action in the TUI.
 
 When `provider: "off"`:
 
@@ -732,6 +734,31 @@ When `provider: "off"`:
 > **Local provider — `local_dtype` (issue #259):** The default `Xenova/all-MiniLM-L6-v2` model is lightweight but performs poorly when matching queries in one language (e.g. Chinese) to memories in another (e.g. English). A multilingual model such as `Xenova/paraphrase-multilingual-MiniLM-L12-v2` fixes the recall, but its full-precision (`fp32`) ONNX weights are large (~448 MiB) and memory-hungry for a coding-agent process that may run parallel subagents. Set `embedding.local_dtype` to a quantized variant (e.g. `"q8"`) to load a smaller ONNX model (~113 MiB) with comparable retrieval quality and far lower peak RSS. The dtype is passed to the transformers.js `feature-extraction` pipeline and, because it changes the produced vectors, a non-default value folds into the embedding model identity — so switching dtype re-embeds your corpus rather than mixing incompatible vector spaces. Omit the field to keep the default `fp32` behavior; existing installs see zero change on upgrade.
 
 ---
+
+## `rerank`
+
+Optional reranking for **explicit `ctx_search` only**, shared by OpenCode and Pi. With no block configured, today's local Synapse reranker and ranking fallback are unchanged. Automatic per-turn hints never call a reranker.
+
+Configure hosted scoring in **user config**, beside `embedding` (the providers are independent):
+
+```jsonc
+"rerank": {
+  "provider": "remote",
+  "endpoint": "https://api.cohere.com/v2",
+  "model": "rerank-v3.5",
+  "api_key": "{env:RERANK_API_KEY}",
+  "timeout_ms": 1500,
+  "top_n": 20
+}
+```
+
+`provider` accepts `synapse` (default), `remote`, or `off`. Remote mode requires `endpoint` and `model`; `api_key` is an optional Bearer token and supports the same user-level `{env:NAME}` / `{file:path}` expansion as embedding keys. Project config may only set `"rerank": {"provider": "off"}`. Project endpoint, model, credentials and limits are dropped with a warning, and no project variable tokens expand. Restart the host after changing this block.
+
+The client posts to `<endpoint>/rerank` with `{model, query, documents, top_n}` and reads `results: [{index, relevance_score}]`, compatible with Cohere, Voyage, OpenRouter and Jina-style services. Use a `tei+` base URL (for example `tei+http://localhost:8080`) for Hugging Face TEI's `{query, texts}` request and `[{index, score}]` response.
+
+`timeout_ms` defaults to 1500 and is clamped to 50–15000; the tool's abort signal also cancels the call. `top_n` (1–20, default 20) caps the existing fused candidate pool; requests ask for every submitted document's score. Batches larger than 20 are refused rather than split. Each location/title/body document is UTF-8-safe truncated to 1024 bytes to bound disclosure and latency. Missing, duplicate, out-of-range or non-finite scores reject the entire reply. Results sort descending with stable ties.
+
+Any hosted failure keeps the original unreranked order and adds one short, redacted “Reranking skipped” line to the tool result. Remote mode never falls back to Synapse. Doctor reports the provider and limits without printing keys or routing strings. The dashboard currently supports this block through Raw JSONC only; a dedicated form is a follow-up.
 
 ## `memory`
 

@@ -19,6 +19,13 @@ import { classifyLocalEmbeddingFailure, type EmbeddingFailure } from "./embeddin
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./embedding-provider";
 import { EmbeddingWorkerClient, type EmbeddingWorkerReply } from "./embedding-worker-client";
+import {
+    getCachedLocalEmbeddingPooling,
+    type LocalEmbeddingPoolingMetadata,
+    logLocalEmbeddingPoolingDecisionOnce,
+    logLocalEmbeddingPoolingUnavailableOnce,
+    UNRESOLVED_LOCAL_EMBEDDING_POOLING,
+} from "./local-embedding-pooling";
 import { configureTransformersRemoteHost } from "./transformers-remote-host";
 
 /** The dtype enum values accepted by @huggingface/transformers' feature-extraction
@@ -625,7 +632,10 @@ type EmbeddingPipelineResult = {
 type EmbeddingPipeline = {
     (
         input: string | string[],
-        options: { pooling: "mean"; normalize: true },
+        options: {
+            pooling: "mean" | "cls" | "last_token";
+            normalize: boolean;
+        },
     ): Promise<EmbeddingPipelineResult>;
     dispose?: () => Promise<void> | void;
 };
@@ -791,6 +801,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     private readonly dtype: LocalEmbeddingDtype;
     private readonly runtimePreference: LocalEmbeddingRuntime;
     private pipeline: EmbeddingPipeline | null = null;
+    private poolingMetadata: LocalEmbeddingPoolingMetadata | null = null;
     private readonly workerClient: EmbeddingWorkerClient | null;
     private workerLoaded = false;
     private initPromise: Promise<void> | null = null;
@@ -908,6 +919,34 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 // can be inaccessible or non-writable, causing "Unable to get model file path
                 // or buffer" failures. Using our own storage dir survives plugin updates too.
                 const modelCacheDir = modelCacheDirForRuntime();
+                const cachedPoolingMetadata = getCachedLocalEmbeddingPooling(
+                    this.model,
+                    modelCacheDir,
+                );
+                const poolingMetadata =
+                    cachedPoolingMetadata?.status === "unresolved" || !cachedPoolingMetadata
+                        ? UNRESOLVED_LOCAL_EMBEDDING_POOLING
+                        : cachedPoolingMetadata;
+                if (poolingMetadata.status === "unsupported" || !poolingMetadata.pooling) {
+                    throw new Error(
+                        `unsupported pooling for local model '${this.model}': ${poolingMetadata.reason}`,
+                    );
+                }
+                if (poolingMetadata.status === "unresolved") {
+                    logLocalEmbeddingPoolingUnavailableOnce(
+                        this.model,
+                        poolingMetadata.reason,
+                        logForRuntime,
+                    );
+                }
+                this.poolingMetadata = poolingMetadata;
+                if (!workerData?.magicContextEmbeddingWorker) {
+                    logLocalEmbeddingPoolingDecisionOnce(
+                        this.model,
+                        poolingMetadata,
+                        logForRuntime,
+                    );
+                }
                 try {
                     ensureStorageDirectorySync(modelCacheDir);
                     env.cacheDir = modelCacheDir;
@@ -1081,8 +1120,8 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
 
             const result = await withQuietConsole(() =>
                 pipeline(text, {
-                    pooling: "mean",
-                    normalize: true,
+                    pooling: this.poolingMetadata?.pooling ?? "mean",
+                    normalize: this.poolingMetadata?.normalize ?? true,
                 }),
             );
 
@@ -1151,14 +1190,25 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 return Array.from({ length: texts.length }, () => null);
             }
 
-            const result = await withQuietConsole(() =>
-                pipeline(texts, {
-                    pooling: "mean",
-                    normalize: true,
-                }),
-            );
-
-            const embeddings = extractBatchEmbeddings(result, texts.length);
+            const pooling = this.poolingMetadata?.pooling ?? "mean";
+            const normalize = this.poolingMetadata?.normalize ?? true;
+            let embeddings: (Float32Array | null)[];
+            if (pooling === "last_token" && texts.length > 1) {
+                // Transformers.js selects the final sequence position for last_token.
+                // Run each text alone so batch padding cannot replace its last real token.
+                embeddings = [];
+                for (const text of texts) {
+                    const result = await withQuietConsole(() =>
+                        pipeline(text, { pooling, normalize }),
+                    );
+                    embeddings.push(extractBatchEmbeddings(result, 1)[0] ?? null);
+                }
+            } else {
+                const result = await withQuietConsole(() =>
+                    pipeline(texts, { pooling, normalize }),
+                );
+                embeddings = extractBatchEmbeddings(result, texts.length);
+            }
             if (embeddings.every((embedding) => embedding === null)) {
                 this.lastFailureReason = classifyLocalEmbeddingFailure(
                     new Error("local embedding pipeline returned no vectors"),

@@ -60,6 +60,7 @@ export function registerV2DreamScheduleTimer(args: {
     config: MagicContextPluginConfig;
     dreamer: DreamerConfig | undefined;
     rustModeModuleClient?: TransformDeps["rustModeModuleClient"];
+    ensureRegistered?: typeof ensureProjectRegisteredFromOpenCodeDirectory;
     /** The live configuration, re-read before each timer pass. */
     liveConfig: () => MagicContextPluginConfig;
     executor: HiddenCompletionExecutor;
@@ -107,7 +108,7 @@ export function registerV2DreamScheduleTimer(args: {
                   max_commits: gitCommitIndexing.max_commits,
               }
             : undefined,
-        ensureRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+        ensureRegistered: args.ensureRegistered ?? ensureProjectRegisteredFromOpenCodeDirectory,
     }).catch((error: unknown) => {
         log(`[magic-context] v2 dream timer registration failed (continuing without it): ${error}`);
         return undefined;

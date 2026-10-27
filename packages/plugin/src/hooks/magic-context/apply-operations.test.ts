@@ -274,9 +274,12 @@ describe("pending drop writer admission", () => {
 
         // A child holds the independent SQLite writer lock because the main test
         // thread blocks synchronously while the flush pass waits to acquire it.
+        // The busy timeout lets the child wait out any other brief writer on the
+        // test database instead of failing before the code under test runs.
         const script = `
             import { Database } from "bun:sqlite";
             const db = new Database(process.env.FLUSH_LOCK_DB);
+            db.exec("PRAGMA busy_timeout = 5000");
             db.exec("BEGIN IMMEDIATE");
             console.log("LOCKED");
             setTimeout(() => {
@@ -297,7 +300,15 @@ describe("pending drop writer admission", () => {
         try {
             while (!output.includes("LOCKED")) {
                 const next = await reader.read();
-                if (next.done) throw new Error("writer lock helper exited before locking");
+                if (next.done) {
+                    const [exitCode, stderr] = await Promise.all([
+                        locker.exited,
+                        new Response(locker.stderr).text(),
+                    ]);
+                    throw new Error(
+                        `writer lock helper exited before locking (exit ${exitCode}): ${stderr.trim() || "<no stderr>"}`,
+                    );
+                }
                 output += new TextDecoder().decode(next.value);
             }
             const started = performance.now();

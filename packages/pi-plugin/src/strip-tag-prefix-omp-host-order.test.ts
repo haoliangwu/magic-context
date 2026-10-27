@@ -17,6 +17,11 @@ import { join } from "node:path";
 import { stripPersistedAssistantText } from "@magic-context/core/hooks/magic-context/tag-content-primitives";
 import { createTestTempDir } from "../../plugin/src/shared/test-temp-dir";
 import {
+	exerciseOmpLoggerFiles,
+	pinOmpLoggerFiles,
+	reportOmpLogDescriptors,
+} from "./__tests__/omp-log-files";
+import {
 	registerOmpAssistantMessageStrip,
 	stripTagPrefixFromAssistantMessage,
 } from "./strip-tag-prefix";
@@ -65,7 +70,11 @@ afterAll(() => {
 // Loaded by a non-literal name so TypeScript does not pull Oh My Pi's own type
 // declarations into this package's typecheck; the module is used untyped.
 const OMP_PACKAGE = "omp-coding-agent-1812";
+const ompLoggerAliases = ["omp-pi-ai-1812", OMP_PACKAGE];
+await pinOmpLoggerFiles(root, ompLoggerAliases);
 const omp = await import(OMP_PACKAGE);
+await exerciseOmpLoggerFiles(ompLoggerAliases);
+reportOmpLogDescriptors();
 
 type ExtensionFactory = (api: unknown) => void;
 

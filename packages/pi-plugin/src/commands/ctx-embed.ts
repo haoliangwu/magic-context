@@ -270,7 +270,9 @@ export function maybeAutoEmbedPiSession(
 			db: deps.db,
 			projectIdentity,
 			ensureRegistered: () =>
-				ensureProjectRegisteredFromPiDirectory(projectDir, deps.db),
+				ensureProjectRegisteredFromPiDirectory(projectDir, deps.db, {
+					preflightLocalPooling: true,
+				}),
 		},
 		sessionId,
 	);

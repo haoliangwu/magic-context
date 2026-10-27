@@ -6,6 +6,7 @@ import { closeDatabase, openDatabase } from "../../features/magic-context/storag
 import { getSubagentInvocations } from "../../features/magic-context/storage-subagent-invocations";
 import type { PluginContext } from "../../plugin/types";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
+import { recordPromptSessionError } from "../../shared/prompt-async-transport";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     resolveHiddenCompletionExecutor,
@@ -83,6 +84,60 @@ test("historian ledger distinguishes empty, reasoning-only, length-capped and va
     }
 });
 
+test("OpenCode 1 records the configured model and session.error when a child has no assistant", async () => {
+    const directory = createTestTempDirFromPath(join(tmpdir(), "mc-historian-model-refusal-"));
+    tempDirs.push(directory);
+    process.env.XDG_DATA_HOME = directory;
+    const db = openDatabase();
+    const model = "provider-not-configured/model-missing";
+    const suggestion = "provider-not-configured/model-available";
+    const hostError = {
+        name: "ProviderModelNotFoundError",
+        data: {
+            message: `Model not found: ${model}. Did you mean: ${suggestion}?`,
+            prompt: "PRIVATE_PROMPT_SENTINEL",
+        },
+    };
+    const client = {
+        session: {
+            create: async () => ({ data: { id: "child-model-refusal" } }),
+            promptAsync: async () => {
+                setTimeout(() => recordPromptSessionError("child-model-refusal", hostError), 10);
+                return { data: undefined };
+            },
+            status: async () => ({ data: {} }),
+            messages: async () => ({ data: [] }),
+            abort: async () => ({}),
+            update: async () => ({}),
+            delete: async () => ({}),
+        },
+    } as unknown as PluginContext["client"];
+
+    await runValidatedHistorianPass({
+        client,
+        db,
+        parentSessionId: "parent-model-refusal",
+        sessionDirectory: directory,
+        prompt: "Messages 1-1:\n1: U: preserve this",
+        timeoutMs: 5_000,
+        model: { model, sourceConfigKey: "historian.opencode.model" },
+        chunk: { startIndex: 1, endIndex: 1, lines: [{ ordinal: 1, messageId: "message-1" }] },
+        priorCompartments: [],
+        sequenceOffset: 0,
+        dumpLabelBase: "model-refusal",
+    });
+
+    const [row] = getSubagentInvocations(db, "parent-model-refusal");
+    expect(row).toMatchObject({
+        providerId: "provider-not-configured",
+        modelId: "model-missing",
+        status: "empty",
+    });
+    expect(row?.error).toContain("No reply: OpenCode refused the model");
+    expect(row?.error).toContain(suggestion);
+    expect(row?.error).not.toContain("PRIVATE_PROMPT_SENTINEL");
+});
+
 test("a resolving timed-out historian prompt is archived and recorded as timed_out", async () => {
     const directory = createTestTempDirFromPath(join(tmpdir(), "mc-historian-timeout-"));
     tempDirs.push(directory);
@@ -109,6 +164,7 @@ test("a resolving timed-out historian prompt is archived and recorded as timed_o
         sessionDirectory: directory,
         prompt: "Messages 1-1:\n1: U: preserve this",
         timeoutMs: 20,
+        model: { model: "provider/timeout-model", sourceConfigKey: "historian.opencode.model" },
         chunk: { startIndex: 1, endIndex: 1, lines: [{ ordinal: 1, messageId: "message-1" }] },
         priorCompartments: [],
         sequenceOffset: 0,
@@ -117,6 +173,8 @@ test("a resolving timed-out historian prompt is archived and recorded as timed_o
     const rows = getSubagentInvocations(db, "parent-timeout");
     expect(rows[0]?.status).toBe("timed_out");
     expect(rows[0]?.error).toContain("prompt timed out after 20ms");
+    expect(rows[0]?.providerId).toBe("provider");
+    expect(rows[0]?.modelId).toBe("timeout-model");
     expect(abort).toHaveBeenCalledTimes(1);
     expect(update).toHaveBeenCalledTimes(1);
     expect(remove).not.toHaveBeenCalled();

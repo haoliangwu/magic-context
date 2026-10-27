@@ -66,6 +66,85 @@ function observeWriterWait(onWait: () => void) {
 	);
 }
 
+for (const warmSnapshot of [true, false]) {
+	test(
+		warmSnapshot
+			? "Pi bounds a native read by the remaining turn allowance before writer admission"
+			: "Pi bounds rooted snapshot preparation while a turn awaits hydration",
+		async () => {
+			const dir = createTestTempDirFromPath(join(tmpdir(), "pi-native-read-"));
+			const path = join(dir, "context.db");
+			const db = createTestDb(path);
+			db.exec("PRAGMA journal_mode=DELETE; PRAGMA busy_timeout=900");
+			const handler = install(db);
+			if (warmSnapshot) {
+				const warm = [userMessage("late native read", 1)];
+				await handler(
+					{ messages: warm },
+					fakeContext("waiter", dir, ["u"], warm),
+				);
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			}
+			const holder = Bun.spawn(
+				[
+					process.execPath,
+					"-e",
+					`
+		const { Database } = require('bun:sqlite');
+		const db = new Database(process.argv[1]);
+		db.exec('PRAGMA busy_timeout=5000; BEGIN EXCLUSIVE'); console.log('HELD');
+		setInterval(() => {}, 1000);
+	`,
+					path,
+				],
+				{ stdout: "pipe", stderr: "pipe", windowsHide: true },
+			);
+			const ready = holder.stdout.getReader();
+			const first = await ready.read();
+			ready.releaseLock();
+			expect(new TextDecoder().decode(first.value)).toContain("HELD");
+			const start = performance.now();
+			// Shorten the registered turn's native allowance without delaying the suite
+			// for 23 seconds. This still executes the real handler and native lock wait.
+			const deadline = sqlite.withSqliteTurnDeadline;
+			const remaining = spyOn(
+				sqlite,
+				"withSqliteTurnDeadline",
+			).mockImplementation((remainingMs, operation) =>
+				deadline(
+					() =>
+						Math.min(
+							remainingMs(),
+							Math.max(0, 80 - (performance.now() - start)),
+						),
+					operation,
+				),
+			);
+			let aborted = false;
+			try {
+				const raw = [userMessage("late native read", 1)];
+				await handler(
+					{ messages: raw },
+					Object.assign(fakeContext("waiter", dir, ["u"], raw), {
+						abort: () => {
+							aborted = true;
+						},
+					}),
+				);
+				expect(aborted).toBe(true);
+				expect(performance.now() - start).toBeLessThan(500);
+			} finally {
+				remaining.mockRestore();
+				holder.kill();
+				await holder.exited;
+				db.close();
+				clearContextHandlerSession("waiter");
+				rmSync(dir, { recursive: true, force: true });
+			}
+		},
+	);
+}
+
 test("a usable Pi LKG is replayed before any backed-off writer wait", async () => {
 	await underWriter(async (db, locker, dir) => {
 		locker.exec("ROLLBACK");

@@ -22,12 +22,12 @@ afterEach(() => {
     if (dir) rmSync(dir, { recursive: true, force: true });
 });
 
-test("maintain-docs stub model cannot edit docs, emits a proposal and skips the next run", async () => {
+function fixture(architecture = "# Architecture\n\n## Core\nOld sentence.\n") {
     dir = createTestTempDirFromPath(join(tmpdir(), "mc-docs-e2e-"));
     const git = (...args: string[]) =>
         execFileSync("git", args, { windowsHide: true, cwd: dir, encoding: "utf8" }).trim();
     const file = join(dir, "ARCHITECTURE.md");
-    writeFileSync(file, "# Architecture\n\n## Core\nOld sentence.\n");
+    writeFileSync(file, architecture);
     writeFileSync(join(dir, "STRUCTURE.md"), "# Structure\n\n## Layout\nLayout.\n");
     git("init", "-q");
     git("config", "user.email", "test@example.com");
@@ -38,22 +38,78 @@ test("maintain-docs stub model cannot edit docs, emits a proposal and skips the 
     git("add", ".");
     git("commit", "-qm", "core implementation");
     const before = readFileSync(file);
-    expect(DREAMER_DOCS_ALLOWED_TOOLS).not.toContain("write");
-    expect(DREAMER_DOCS_ALLOWED_TOOLS).not.toContain("edit");
-    expect(DREAMER_DOCS_ALLOWED_TOOLS).not.toContain("bash");
+    const structureBefore = readFileSync(join(dir, "STRUCTURE.md"));
     db = new Database(":memory:");
     initializeDatabase(db);
     runMigrations(db);
-    let prompts = 0;
-    const proposal = JSON.stringify([
-        {
-            file: "ARCHITECTURE.md",
-            action: "replace",
-            heading: "## Core",
-            text: "## Core\nCurrent sentence.",
-            reason: "Core source contradicts old description",
+    return { git, file, before, structureBefore };
+}
+
+const validChange = {
+    file: "ARCHITECTURE.md",
+    action: "replace",
+    heading: "## Core",
+    text: "## Core\nCurrent sentence.",
+    reason: "Core source contradicts old description",
+};
+const proposal = JSON.stringify([validChange]);
+const primary = { providerID: "test", modelID: "docs-primary" };
+const fallback = { providerID: "test", modelID: "docs-fallback" };
+
+function retryFixture(
+    outputs: string[],
+    options: { architecture?: string; docsMaxTokens?: number; onPrompt?: () => void } = {},
+) {
+    const repo = fixture(options.architecture);
+    const models: unknown[] = [];
+    const client = {
+        session: {
+            list: async () => ({ data: [{ id: "parent" }] }),
+            create: async () => ({ data: { id: "child" } }),
+            prompt: async (args: { body: { model: unknown } }) => {
+                models.push(args.body.model);
+                options.onPrompt?.();
+                return {};
+            },
+            messages: async () => ({
+                data: [
+                    {
+                        info: { role: "assistant", time: { created: Date.now() } },
+                        parts: [{ type: "text", text: outputs[models.length - 1] }],
+                    },
+                ],
+            }),
+            delete: async () => ({}),
         },
-    ]);
+    };
+    const executor = createDreamTaskExecutor({
+        client: client as never,
+        sessionDirectory: dir,
+        openOpenCodeDb: () => null,
+    });
+    const leaseKey = leaseKeyFor("maintain-docs", dir);
+    expect(acquireLease(db, "holder", leaseKey)).toBe(true);
+    const run = () =>
+        executor(
+            {
+                task: "maintain-docs",
+                schedule: "0 4 * * *",
+                timeoutMinutes: 20,
+                model: "test/docs-primary",
+                fallbackModels: ["test/docs-fallback"],
+                docsMaxTokens: options.docsMaxTokens,
+            },
+            { db, projectIdentity: dir, holderId: "holder", leaseKey },
+        );
+    return { ...repo, models, run };
+}
+
+test("maintain-docs stub model cannot edit docs, emits a proposal and skips the next run", async () => {
+    const { git, file, before } = fixture();
+    expect(DREAMER_DOCS_ALLOWED_TOOLS).not.toContain("write");
+    expect(DREAMER_DOCS_ALLOWED_TOOLS).not.toContain("edit");
+    expect(DREAMER_DOCS_ALLOWED_TOOLS).not.toContain("bash");
+    let prompts = 0;
     const client = {
         session: {
             list: async () => ({ data: [{ id: "parent" }] }),
@@ -107,4 +163,89 @@ test("maintain-docs stub model cannot edit docs, emits a proposal and skips the 
     expect(second.detail).toBe("no commits since last run");
     expect(prompts).toBe(1);
     expect(readFileSync(file)).toEqual(before);
+});
+
+test("maintain-docs retries non-JSON prose with the fallback and writes only a proposal", async () => {
+    const { run, models, file, before, structureBefore, git } = retryFixture([
+        "I could not produce the proposal.",
+        `\`\`\`json\n${proposal}\n\`\`\``,
+    ]);
+    const result = await run();
+    expect(models).toEqual([primary, fallback]);
+    expect(result.status).toBe("completed");
+    expect(JSON.parse(result.schedulePatch?.taskStateJson ?? "null")).toEqual({
+        head: git("rev-parse", "HEAD"),
+    });
+    const pending = listPendingDocsProposals(dir);
+    expect(pending).toHaveLength(1);
+    expect(readFileSync(pending[0]!, "utf8")).toContain("Current sentence.");
+    expect(readFileSync(file)).toEqual(before);
+    expect(readFileSync(join(dir, "STRUCTURE.md"))).toEqual(structureBefore);
+});
+
+test("maintain-docs fails exhausted invalid output without an anchor or proposal", async () => {
+    const { run, models, file, before, structureBefore } = retryFixture([
+        "I could not produce the proposal.",
+        JSON.stringify([{ ...validChange, reason: "" }]),
+    ]);
+    const result = await run();
+    expect(models).toEqual([primary, fallback]);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("All models exhausted");
+    expect(result.schedulePatch?.taskStateJson).toBeUndefined();
+    expect(listPendingDocsProposals(dir)).toEqual([]);
+    expect(readFileSync(file)).toEqual(before);
+    expect(readFileSync(join(dir, "STRUCTURE.md"))).toEqual(structureBefore);
+});
+
+test.each([
+    "[]",
+    " \n [] \t",
+    "```json\n[]\n```",
+    " \n```json\n [] \n```\n",
+])("maintain-docs normalizes empty proposal %j as no corrections", async (output) => {
+    const { run, models, file, before, structureBefore, git } = retryFixture([output]);
+    const result = await run();
+    expect(models).toEqual([primary]);
+    expect(result.status).toBe("completed");
+    expect(result.detail).toBe("no corrections proposed");
+    expect(JSON.parse(result.schedulePatch?.taskStateJson ?? "null")).toEqual({
+        head: git("rev-parse", "HEAD"),
+    });
+    expect(listPendingDocsProposals(dir)).toEqual([]);
+    expect(readFileSync(file)).toEqual(before);
+    expect(readFileSync(join(dir, "STRUCTURE.md"))).toEqual(structureBefore);
+});
+
+test.each([
+    ["protected region", { text: "## Core\nRemoved hand authored text." }],
+    ["base drifted", {}],
+    ["over budget", {}],
+    ["markdown structure", { action: "add", heading: "## Extra", text: "## Extra\n### Sneaked\n" }],
+    ["invalid replacement", { text: "## Wrong heading\nCurrent sentence." }],
+] as const)("maintain-docs rejects %s host validation without retrying", async (failure, change) => {
+    const { run, models, file, before, structureBefore } = retryFixture(
+        [JSON.stringify([{ ...validChange, ...change }]), "[]"],
+        {
+            architecture:
+                failure === "protected region"
+                    ? "# Architecture\n\n## Core\n<!-- mc:protected START -->\nHand authored\n<!-- mc:protected END -->\n"
+                    : undefined,
+            docsMaxTokens: failure === "over budget" ? 1 : undefined,
+            onPrompt:
+                failure === "base drifted"
+                    ? () => writeFileSync(join(dir, "STRUCTURE.md"), "# Structure\n\nDrifted.\n")
+                    : undefined,
+        },
+    );
+    const result = await run();
+    expect(models).toEqual([primary]);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain(failure);
+    expect(result.schedulePatch?.taskStateJson).toBeUndefined();
+    expect(listPendingDocsProposals(dir)).toEqual([]);
+    expect(readFileSync(file)).toEqual(before);
+    expect(readFileSync(join(dir, "STRUCTURE.md"))).toEqual(
+        failure === "base drifted" ? Buffer.from("# Structure\n\nDrifted.\n") : structureBefore,
+    );
 });

@@ -12,8 +12,10 @@ interface RequestState extends SystemDateRequest {
     systemDone: boolean;
     messagesSeen: boolean;
     permitted: boolean | undefined;
+    /** The messages pass left signed thinking on the wire. */
+    signedThinkingKept: boolean | undefined;
     ambiguous: boolean;
-    waiting?: (permitted: boolean) => void;
+    waiting?: (permitted: boolean, signedThinkingKept: boolean | undefined) => void;
 }
 type Channel = Map<string, Map<SystemDateRequestIdentity, RequestState>>;
 const channels = new WeakMap<Set<string>, Channel>();
@@ -122,6 +124,7 @@ export function beginSystemDateRequest(
             systemDone: false,
             messagesSeen: false,
             permitted: undefined,
+            signedThinkingKept: undefined,
             ambiguous: identity === undefined && (turnId === undefined || sameTurn),
         };
         const blocked = [...requests.values()].filter(
@@ -153,10 +156,22 @@ export function systemDateRefreshPermission(
     const current = state(history, request);
     return current?.ambiguous ? undefined : current?.permitted;
 }
+/**
+ * Whether the paired messages pass reported that it left signed thinking on
+ * the wire; undefined until that pass has finished, when the pairing is
+ * ambiguous, or when the pass could not report it.
+ */
+export function systemDateSignedThinkingKept(
+    history: Set<string>,
+    request: SystemDateRequest | undefined,
+): boolean | undefined {
+    const current = state(history, request);
+    return current?.ambiguous ? undefined : current?.signedThinkingKept;
+}
 export function waitForSystemDateRefresh(
     history: Set<string>,
     request: SystemDateRequest | undefined,
-    apply: (permitted: boolean) => void,
+    apply: (permitted: boolean, signedThinkingKept: boolean | undefined) => void,
 ): boolean {
     const current = state(history, request);
     if (!current) return false;
@@ -169,24 +184,33 @@ function retire(history: Set<string>, current: RequestState): void {
     if (unpairable) {
         const apply = current.waiting;
         current.waiting = undefined;
-        apply?.(false);
+        apply?.(false, undefined);
     }
     const channel = channels.get(history);
     const requests = channel?.get(current.sessionId);
     requests?.delete(current.identity);
     if (requests?.size === 0) channel?.delete(current.sessionId);
 }
+/**
+ * Records the messages pass's decision. `permitted` lets a queued date refresh
+ * ride this pass's rebuild. `signedThinkingKept` says the pass served signed
+ * thinking, so nothing in front of it, the system
+ * date included, may change on this request even when the provider cache
+ * expired; omit it when the pass cannot tell.
+ */
 export function finishSystemDateRefresh(
     history: Set<string>,
     request: SystemDateRequest | undefined,
     permitted: boolean,
+    signedThinkingKept?: boolean,
 ): void {
     const current = state(history, request);
     if (!current) return;
     current.permitted = current.ambiguous ? false : permitted;
+    current.signedThinkingKept = current.ambiguous ? undefined : signedThinkingKept;
     const apply = current.waiting;
     current.waiting = undefined;
-    apply?.(current.permitted);
+    apply?.(current.permitted, current.signedThinkingKept);
     retire(history, current);
 }
 export function finishSystemDateHook(

@@ -63,6 +63,8 @@ export interface ResolvedBoundaryContext {
     protectedTailPolicyVersion: number;
     migrationFloorActive: boolean;
     emergencyTailScale?: 0.5 | 0.25;
+    /** One admitted trigger evaluation may cross the live prompt without changing any other fence. */
+    liftLivePromptFloor?: boolean;
     providerShapeVersion: "opencode-v1" | "pi-folded-v1";
     cacheNamespace: string;
     createdAt?: number;
@@ -127,7 +129,12 @@ export interface BoundaryDiagnostics {
     drainBudget: "not-reserved; does-not-size-cap";
     sizeWalkStart: number;
     protectedTailStart: number;
-    livePromptFloor: { ordinal: number | null; from: number; to: number };
+    livePromptFloor: {
+        ordinal: number | null;
+        messageId?: string | null;
+        from: number;
+        to: number;
+    };
     head: HeadCapDiagnostics;
 }
 
@@ -697,7 +704,7 @@ export function resolveProtectedTailBoundary(
     let runtimeFloor = offset;
     if (ctx.migrationFloorActive) runtimeFloor = Math.max(runtimeFloor, ctx.priorBoundaryOrdinal);
     let protectedTailStart = Math.max(boundary, runtimeFloor);
-    // Live-prompt floor: on routine (non-emergency) passes the boundary must
+    // Live-prompt floor: on routine passes without a one-shot escape the boundary must
     // never cross the newest MEANINGFUL user message — compacting the prompt
     // the agent is actively answering replaces it with a narration mid-turn
     // and renders the compaction divider at the live tail (observed in
@@ -730,7 +737,8 @@ export function resolveProtectedTailBoundary(
             break;
         }
         livePromptFloor.ordinal = lastMeaningfulUserOrdinal || null;
-        if (lastMeaningfulUserOrdinal >= offset) {
+        livePromptFloor.messageId = boundaryMessageId(index, lastMeaningfulUserOrdinal);
+        if (!ctx.liftLivePromptFloor && lastMeaningfulUserOrdinal >= offset) {
             protectedTailStart = Math.min(protectedTailStart, lastMeaningfulUserOrdinal);
         }
     }
@@ -855,6 +863,7 @@ export function resolveBoundaryContext(args: {
     usageSource?: ResolvedBoundaryContext["usageSource"];
     emergencyTailScale?: 0.5 | 0.25;
     providerShapeVersion?: "opencode-v1" | "pi-folded-v1";
+    liftLivePromptFloor?: boolean;
     cacheNamespace?: string;
     /**
      * Tagger load-scoping floor (OpenCode only). When > 0, the stored-token map
@@ -939,6 +948,7 @@ export function resolveBoundaryContext(args: {
         protectedTailPolicyVersion: meta.protectedTailPolicyVersion,
         migrationFloorActive,
         emergencyTailScale: args.emergencyTailScale,
+        liftLivePromptFloor: args.liftLivePromptFloor,
         providerShapeVersion: args.providerShapeVersion ?? "opencode-v1",
         cacheNamespace: args.cacheNamespace ?? `opencode:${args.sessionId}`,
         storedTokenTotalsForMessages,

@@ -12,7 +12,10 @@ import {
 	lkgContentFields,
 } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import { log } from "@magic-context/core/shared/logger";
-import { withSqliteTransformPass } from "@magic-context/core/shared/sqlite";
+import {
+	withSqliteTransformPass,
+	withSqliteTurnDeadline,
+} from "@magic-context/core/shared/sqlite";
 import { isOmpDumpContext } from "./omp-diagnostic-context";
 import {
 	isOmpAdvisorRequest,
@@ -846,7 +849,7 @@ export function registerPiGuardedContext(
 				inputs = messageSnapshots(event.messages);
 				active.inputMessages = inputs;
 			}
-			// Share at most 250 ms of synchronous waiting for later turn writes,
+			// Share at most 2,000 ms of synchronous waiting for later turn writes,
 			// including autocommit statements. Initial session-meta admission uses
 			// the separate yielding writer budget shared with OpenCode.
 			// Do not rerun the handler: it may already have committed earlier writes.
@@ -857,7 +860,17 @@ export function registerPiGuardedContext(
 			// further writes.
 			const result = await budget.waitMandatory(
 				Promise.resolve(
-					withSqliteTransformPass(() => handler(event, ctx, budget)),
+					// Native busy handlers cannot yield to the outcome timer. Leave
+					// recovery its existing reserve even for reads and final COMMIT.
+					withSqliteTurnDeadline(
+						() =>
+							Math.max(
+								0,
+								budget.remainingOutcome() -
+									PI_CONTEXT_BUDGET.completionReserveMs,
+							),
+						() => withSqliteTransformPass(() => handler(event, ctx, budget)),
+					),
 				),
 			);
 			if (result?.messages) {

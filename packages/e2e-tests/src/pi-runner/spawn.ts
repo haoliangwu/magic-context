@@ -325,6 +325,7 @@ export function childEnv(env: PiIsolatedEnv): Record<string, string> {
   result.XDG_RUNTIME_DIR = join(env.baseDir, "runtime");
   result.OPENCODE_DB = join(env.dataDir, "opencode", "opencode.db");
   result.MAGIC_CONTEXT_STORAGE_DIR = join(env.dataDir, "cortexkit", "magic-context");
+  result.MAGIC_CONTEXT_LOG_SYNC = "1";
   for (const dir of [result.XDG_STATE_HOME, result.XDG_RUNTIME_DIR, result.MAGIC_CONTEXT_STORAGE_DIR]) mkdirSync(dir, { recursive: true });
   result.ANTHROPIC_API_KEY = "test-key-not-real";
   result.PI_OFFLINE = "1";

@@ -98,6 +98,7 @@ import {
 } from "../lib/pi-package-entry";
 import { type PromptIO, promptIO } from "../lib/prompts";
 import { sanitizeDiagnosticEndpoint, sanitizeDiagnosticText } from "../lib/redaction";
+import { rerankConfigSummary } from "../lib/rerank-summary";
 import {
     checkStorageVersionFence,
     formatStorageVersions,
@@ -718,6 +719,7 @@ async function runHealthChecks(options: {
     }
 
     const loadedConfig = loadPiConfig({ cwd: options.cwd });
+    add(results, "info", rerankConfigSummary(loadedConfig.config.rerank));
     if (loadedConfig.warnings.length > 0) {
         for (const warning of loadedConfig.warnings.slice(0, 4)) add(results, "warn", warning);
         if (loadedConfig.warnings.length > 4) {

@@ -1,10 +1,11 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import * as logger from "../../../shared/logger";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
@@ -29,6 +30,7 @@ import {
     shouldRequeueIndependentMapping,
     validateClientMapMemories,
 } from "./map-memories";
+import { DreamTokenBudgetExceeded, TOKEN_BUDGET_FINALIZE_MESSAGE } from "./token-budget";
 
 const tempDirs: string[] = [];
 
@@ -1413,6 +1415,141 @@ test("a budget-finalized mapping manifest banks its closed subset", async () => 
         closeQuietly(db);
     }
 });
+
+test("a wrong-root finalize refuses fallback without claiming a retry and preserves earlier mappings", async () => {
+    const db = freshDb();
+    const log = spyOn(logger, "log").mockImplementation(() => {});
+    try {
+        const projectIdentity = "git:wrong-root-budget-map";
+        const dir = tempProject();
+        for (let index = 0; index < 15; index++)
+            insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: `Mapping fact ${index}.`,
+            });
+        const inputs = selectMapMemoryInputs(db, projectIdentity, dir);
+        const messages: unknown[] = [];
+        const models: unknown[] = [];
+        const states: Array<{ spent: number; finalizeFired: boolean }> = [];
+        let children = 0;
+        let sends = 0;
+        let aborted = false;
+        let batchIds: number[] = [];
+        const args = mapArgs(db, dir, projectIdentity);
+        args.tokenBudget = 2_500_000;
+        args.model = "nvidia/nemotron";
+        args.fallbackModels = ["other/fallback"];
+        args.onBudgetUpdate = (state) => states.push(state);
+        args.client = {
+            session: {
+                create: async () => {
+                    children++;
+                    sends = 0;
+                    aborted = false;
+                    messages.length = 0;
+                    return { data: { id: `map-budget-child-${children}` } };
+                },
+                messages: async () => ({ data: [...messages] }),
+                abort: async () => {
+                    aborted = true;
+                    return { data: true };
+                },
+                status: async () => {
+                    if (sends === 1 && !aborted) {
+                        if (messages.length === 1)
+                            messages.push({
+                                info: {
+                                    id: "step",
+                                    role: "assistant",
+                                    finish: "tool-calls",
+                                    tokens: { input: children === 1 ? 2_035_462 : 2_055_519 },
+                                    time: { completed: 1 },
+                                },
+                                parts: [{ type: "tool" }],
+                            });
+                        return { data: { [`map-budget-child-${children}`]: { type: "busy" } } };
+                    }
+                    if (sends === 2 && messages.length === 3) {
+                        const root = children === 1 ? "mappings" : "branch";
+                        messages.push({
+                            info: {
+                                id: "final",
+                                role: "assistant",
+                                finish: "stop",
+                                tokens: { input: children === 1 ? 100_000 : 110_593 },
+                                time: { completed: 2 },
+                            },
+                            parts: [
+                                {
+                                    type: "text",
+                                    text: `<${root}>${batchIds.map((id) => `<memory id="${id}" files="src/fact.ts"/>`).join("")}</${root}>`,
+                                },
+                            ],
+                        });
+                    }
+                    return { data: {} };
+                },
+                promptAsync: async (request: {
+                    body: { model: unknown; parts: Array<{ text: string }> };
+                }) => {
+                    sends++;
+                    models.push(request.body.model);
+                    const text = request.body.parts[0]?.text ?? "";
+                    if (sends === 1)
+                        batchIds = [...text.matchAll(/^\[(\d+)\]/gm)].map((match) =>
+                            Number(match[1]),
+                        );
+                    else expect(text).toBe(TOKEN_BUDGET_FINALIZE_MESSAGE);
+                    messages.push({
+                        info: { id: `user-${sends}`, role: "user" },
+                        parts: request.body.parts,
+                    });
+                    return { data: undefined };
+                },
+                delete: async () => ({}),
+            },
+        } as never;
+
+        let failure: unknown;
+        try {
+            await mapMemories(args);
+        } catch (error) {
+            failure = error;
+        }
+        expect(failure).toBeInstanceOf(DreamTokenBudgetExceeded);
+        expect(failure).toMatchObject({ sessionId: "map-budget-child-2", spent: 2_166_112 });
+        expect(states.at(-1)).toMatchObject({
+            spent: 2_166_112,
+            finalizeFired: true,
+            hardStopped: false,
+        });
+        // Finalization closes the child to retries even below the numeric hard cap.
+        expect(children).toBe(2);
+        expect(models).toEqual(Array(4).fill({ providerID: "nvidia", modelID: "nemotron" }));
+        const logs = log.mock.calls.map(([message]) => message);
+        expect(logs).toContain(
+            "[dreamer:map-memories] primary (nvidia/nemotron) failed validation/prompt: root <branch> unrecognized; expected <mappings> with <memory> entries; 1 fallback(s) configured, subject to remaining budget",
+        );
+        expect(logs.some((message) => message.includes("trying 1 fallback(s)"))).toBe(false);
+        expect(logs).toContain(
+            "[dreamer] map-memories: accepted partial manifest after token budget: 0/5",
+        );
+        const verifications = getMemoryVerifications(
+            db,
+            inputs.map((memory) => memory.id),
+        );
+        for (const memory of inputs.slice(0, 5))
+            expect(verifications.get(memory.id)?.files).toEqual(["src/fact.ts"]);
+        for (const memory of inputs.slice(5)) expect(verifications.has(memory.id)).toBe(false);
+        expect(selectMapMemoryInputs(db, projectIdentity, dir).map((memory) => memory.id)).toEqual(
+            inputs.slice(5).map((memory) => memory.id),
+        );
+    } finally {
+        log.mockRestore();
+        closeQuietly(db);
+    }
+}, 15_000);
 
 test("non-budget mapping rejects a 10/52 manifest without writes", async () => {
     const db = freshDb();

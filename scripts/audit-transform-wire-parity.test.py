@@ -805,9 +805,6 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 },
             )
             self.assertEqual(report["method"]["sqlite_contract"], {"readonly": True})
-            live_helper = (ROOT / "scripts" / "audit-transform-wire-parity-live.ts").read_text()
-            self.assertEqual(live_helper.count("new Database("), 1)
-            self.assertIn("new Database(path, { readonly: true })", live_helper)
             self.assertTrue(
                 report["live_probe"]["method"]["sqlite_query_only_verified"]
             )

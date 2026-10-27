@@ -22,6 +22,7 @@ import { stripPersistedAssistantText } from "@magic-context/core/hooks/magic-con
 
 export function stripTagPrefixFromAssistantMessage(message: {
 	role: string;
+	provider?: string;
 
 	content: unknown;
 }): boolean {
@@ -44,7 +45,10 @@ export function stripTagPrefixFromAssistantMessage(message: {
 
 		if (typeof textPart.text !== "string") continue;
 
-		const stripped = stripPersistedAssistantText(textPart.text);
+		const stripped = stripPersistedAssistantText(
+			textPart.text,
+			message.provider === "anthropic",
+		);
 
 		if (stripped !== textPart.text) {
 			textPart.text = stripped;
@@ -65,6 +69,7 @@ export function stripTagPrefixFromAssistantMessage(message: {
  */
 export function strippedAssistantContent(
 	content: unknown,
+	provider = "anthropic",
 ): unknown[] | undefined {
 	if (!Array.isArray(content)) return undefined;
 	let copy: unknown[] | undefined;
@@ -74,7 +79,10 @@ export function strippedAssistantContent(
 			continue;
 		}
 		if (typeof part.text !== "string") continue;
-		const stripped = stripPersistedAssistantText(part.text);
+		const stripped = stripPersistedAssistantText(
+			part.text,
+			provider === "anthropic",
+		);
 		if (stripped === part.text) continue;
 		copy ??= content.slice();
 		copy[index] = { ...part, text: stripped };
@@ -110,10 +118,13 @@ export function registerOmpAssistantMessageStrip(
 		try {
 			if (!isActive()) return undefined;
 			const message = (event as { message?: unknown } | null)?.message as
-				| { role?: unknown; content?: unknown }
+				| { role?: unknown; content?: unknown; provider?: string }
 				| undefined;
 			if (message?.role !== "assistant") return undefined;
-			const content = strippedAssistantContent(message.content);
+			const content = strippedAssistantContent(
+				message.content,
+				message.provider ?? "unknown",
+			);
 			return content === undefined ? undefined : { content };
 		} catch {
 			return undefined;

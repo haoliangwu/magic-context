@@ -124,6 +124,8 @@ Remember: output only the JSON object described by the system prompt.`;
             startedAt,
             status: params.status,
             messages: params.messages,
+            attemptedModel: args.model,
+            configuredModels: args.fallbackModels,
             error: params.error,
         });
     };

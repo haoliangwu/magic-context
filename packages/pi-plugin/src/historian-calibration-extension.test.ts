@@ -206,6 +206,7 @@ it("observes the effective context prompt rather than before-agent input", async
 			(event: unknown, ctx: { getSystemPrompt(): unknown }) => unknown
 		>();
 		extension({
+			registerFlag: () => {},
 			on: (
 				name: string,
 				handler: (
@@ -254,7 +255,10 @@ it("does not apply historian sampling calibration to provenance-only dreamer chi
 		process.env.MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY = "1";
 		process.env.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE = "0.1";
 		const events: string[] = [];
-		extension({ on: (name: string) => events.push(name) } as never);
+		extension({
+			registerFlag: () => {},
+			on: (name: string) => events.push(name),
+		} as never);
 		expect(events).not.toContain("before_provider_request");
 	} finally {
 		if (previous === undefined)
@@ -321,6 +325,7 @@ async function withCalibrationHook(
 			| ((event: { payload: unknown }, ctx: { model?: unknown }) => unknown)
 			| undefined;
 		extension({
+			registerFlag: () => {},
 			on(name: string, handler: typeof hook) {
 				if (name === "before_provider_request") hook = handler;
 			},

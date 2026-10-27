@@ -30,6 +30,7 @@ import { registerExitAbort } from "../../shared/exit-abort-registry";
 import type { HarnessId } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import { type Database, getSqliteDatabasePath, releaseIndexOwner } from "../../shared/sqlite";
+import { createWorkerShutdown, type WorkerShutdown } from "../../shared/worker-shutdown";
 import {
     countRawSessionMessageOrdinalsFromDb,
     getRawSessionSummaryEpoch,
@@ -109,6 +110,14 @@ export interface RawOrdinalWarmupOptions {
 const ACCEPT_TIMEOUT_MS = 2_000;
 /** A cold scan of a session of hundreds of thousands of messages on a large store. */
 const RESULT_TIMEOUT_MS = 10 * 60_000;
+/**
+ * How long a stopped warm-up may take to close its connections and exit before
+ * it is terminated. The worker reads the close request between awaits: an index
+ * or orphan-sweep chunk waits at most its 250 ms busy timeout and then writes a
+ * short batch. A single summary scan cannot be interrupted; one still running
+ * after this is terminated, as every stopped warm-up was before.
+ */
+const WARMUP_CLOSE_DEADLINE_MS = 2_000;
 const FAILURE_BACKOFF_MS = 5 * 60_000;
 
 const inFlight = new Map<string, SharedScan>();
@@ -164,6 +173,7 @@ export function runSessionWarmupWorker(
             new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
         );
         let worker: Worker | undefined;
+        let shutdown: WorkerShutdown | undefined;
         let deadline: ReturnType<typeof setTimeout> | undefined;
         let settled = false;
         const finish = (
@@ -191,7 +201,7 @@ export function runSessionWarmupWorker(
             options.signal?.removeEventListener("abort", abort);
             if (worker) {
                 activeWorkers.delete(worker);
-                const stopped = worker.terminate();
+                const stopped = shutdown?.close() ?? worker.terminate();
                 worker.unref();
                 void stopped.finally(() => {
                     releaseIndexOwner(input);
@@ -223,6 +233,7 @@ export function runSessionWarmupWorker(
                         workerData: { ...input, openCancellation: openCancellation.buffer },
                     }),
             );
+            shutdown = createWorkerShutdown(worker, "raw-ordinal-warmup", WARMUP_CLOSE_DEADLINE_MS);
         } catch (error) {
             finish({ failure: "start-failed", detail: String(error) });
             return;

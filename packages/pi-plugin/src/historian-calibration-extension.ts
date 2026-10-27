@@ -4,6 +4,7 @@ import { withoutHistorianTailCache } from "@magic-context/core/shared/historian-
 import { subagentTemperature } from "@magic-context/core/shared/subagent-temperature";
 import { readHostSystemPrompt } from "./host-system-prompt";
 import { promptFingerprint } from "./subagent-telemetry";
+import { registerSubagentToolBoundary } from "./subagent-tool-boundary";
 
 export const HISTORIAN_TEMPERATURE_ENV = "MAGIC_CONTEXT_HISTORIAN_TEMPERATURE";
 export const HISTORIAN_CACHE_TAIL_ENV = "MAGIC_CONTEXT_HISTORIAN_CACHE_TAIL";
@@ -171,6 +172,7 @@ export function withoutProviderTemperature(payload: unknown): unknown {
 }
 
 export default function historianCalibrationExtension(pi: ExtensionAPI): void {
+	registerSubagentToolBoundary(pi);
 	// Only the hidden-child launcher sets this admission flag. Ordinary sessions
 	// and other subagents never register a cache-rewriting listener.
 	if (process.env[HISTORIAN_CACHE_TAIL_ENV] === "skip") {

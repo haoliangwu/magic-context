@@ -219,6 +219,14 @@ describe("peelLeadingMcTagNotation", () => {
 });
 
 describe("stripPersistedAssistantText edge cases", () => {
+    it("keeps tag-only and model-authored blank bytes when empty content is unsafe", () => {
+        for (const value of ["§58§", " §58§ \n", "§12§ §14§", "§42$", "§§", " \n\t ", ""]) {
+            expect(stripPersistedAssistantText(value, false)).toBe(value);
+        }
+        expect(stripPersistedAssistantText("§12§ Done", false)).toBe("Done");
+        expect(stripPersistedAssistantText("§58§", true)).toBe("");
+    });
+
     it("#given malformed prefix with trailing space #when strip runs #then trims result", () => {
         expect(stripPersistedAssistantText(`${SECTION}15298">§15298§ `)).toBe("");
     });

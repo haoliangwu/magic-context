@@ -1,4 +1,5 @@
 import { readFileSync, statSync } from "node:fs";
+
 import { type LoadResultDetailed, loadPluginConfigDetailed } from "../config";
 import {
     cortexKitProjectConfigBasePath,
@@ -13,6 +14,7 @@ import {
     unregisterProjectShadowEmbedding,
 } from "../features/magic-context/memory/embedding";
 import { invalidateProject } from "../features/magic-context/memory/embedding-cache";
+import { preflightLocalEmbeddingPooling } from "../features/magic-context/memory/local-embedding-pooling";
 import { resolveProjectIdentityForSession } from "../features/magic-context/memory/project-identity";
 import { log } from "../shared/logger";
 import type { Database } from "../shared/sqlite";
@@ -60,6 +62,10 @@ function loadRegistrationConfig(directory: string): LoadResultDetailed {
 export async function ensureProjectRegisteredFromOpenCodeDirectory(
     directory: string,
     db: Database,
+    options: {
+        preflightLocalPooling?: boolean;
+        onRegistered?: (projectIdentity: string) => void;
+    } = {},
 ): Promise<void> {
     const detailed = loadRegistrationConfig(directory);
     const projectIdentity = resolveProjectIdentityForSession(
@@ -85,6 +91,9 @@ export async function ensureProjectRegisteredFromOpenCodeDirectory(
         memoryEnabled: detailed.config.memory.enabled,
         gitCommitEnabled: detailed.config.memory.git_commit_indexing.enabled,
     };
+    if (options.preflightLocalPooling && routing.primary.provider === "local") {
+        await preflightLocalEmbeddingPooling(routing.primary.model ?? "Xenova/all-MiniLM-L6-v2");
+    }
     const before = getProjectEmbeddingSnapshot(projectIdentity);
     const registered = registerProjectEmbedding(
         db,
@@ -104,4 +113,5 @@ export async function ensureProjectRegisteredFromOpenCodeDirectory(
     } else {
         unregisterProjectShadowEmbedding(projectIdentity);
     }
+    options.onRegistered?.(projectIdentity);
 }

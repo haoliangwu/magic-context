@@ -54,6 +54,7 @@ import {
     onNoteTrigger,
     resetNoteNudgeCooldownOnly,
 } from "./note-nudger";
+import { logNudgeEvaluation } from "./nudge-evaluation-log";
 import { readRawSessionMessageById, readRawSessionMessages } from "./read-session-chunk";
 import {
     clearIgnoredMessages,
@@ -567,7 +568,7 @@ function maybeInjectChannel1Nudge(
         evaluable: state.evaluable,
         generationInvalidated: state.generationInvalidated,
     });
-    sessionLog(sessionId, formatChannel1Evaluation(decision));
+    logNudgeEvaluation(sessionId, "tool-completion", formatChannel1Evaluation(decision));
 
     // Store the cadence level and dampening ordinal together so one persisted state stays in sync.
     setLastNudgeUndropped(args.db, sessionId, decision.nextLastNudge);

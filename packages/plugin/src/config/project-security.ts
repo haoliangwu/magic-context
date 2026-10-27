@@ -499,6 +499,21 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         }
     }
 
+    // A repository may opt out, but must not redirect private search text or
+    // expand a user's secrets into a repository-chosen hosted request.
+    if ("rerank" in projectRaw) {
+        const rerank = projectRaw.rerank;
+        const off = isPlainObject(rerank) && rerank.provider === "off";
+        const removed =
+            !isPlainObject(rerank) || Object.keys(rerank).some((key) => key !== "provider") || !off;
+        if (off) projectRaw.rerank = { provider: "off" };
+        else delete projectRaw.rerank;
+        if (removed)
+            warnings.push(
+                "Ignoring rerank settings from project config (security: projects may only set rerank.provider to off; hosted routing, credentials and limits are user-level only).",
+            );
+    }
+
     const embedding = projectRaw.embedding;
     if (isPlainObject(embedding)) {
         const removed: string[] = [];

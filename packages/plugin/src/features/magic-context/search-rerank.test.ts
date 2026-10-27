@@ -169,7 +169,6 @@ test("pins certified catalog fingerprint and orders raw logits with stable ties 
                 candidates: texts,
                 required_fingerprint: fingerprint,
                 allow_equivalent: false,
-                accept_declared: false,
                 max_queue_ms: 100,
                 deadline_ms: 1500,
             });

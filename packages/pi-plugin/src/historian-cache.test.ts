@@ -37,6 +37,7 @@ function listeners(cacheTail?: string) {
 			delete process.env[key];
 		if (cacheTail) process.env[HISTORIAN_CACHE_TAIL_ENV] = cacheTail;
 		extension({
+			registerFlag: () => {},
 			on: (
 				event: string,
 				callback: (event: { payload: unknown }) => unknown,

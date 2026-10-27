@@ -20,9 +20,6 @@ describe("Log live polling", () => {
       measured.push(reads);
     }
     expect(measured).toEqual([20, 2, 0]);
-    console.log(
-      "Log backend refreshes/minute (excluding mount): before=20/20/20, after=20/2/0 (focused/unfocused/hidden)",
-    );
   });
 
   test("hidden and paused return events never dispatch backend work", async () => {

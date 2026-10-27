@@ -63,6 +63,7 @@ async function whileWriterIsLocked<T>(dbPath: string, operation: () => T): Promi
             "-e",
             `import { Database } from "bun:sqlite";
          const db = new Database(process.env.OPENCODE_DB);
+         db.exec("PRAGMA busy_timeout = 5000");
          db.exec("BEGIN IMMEDIATE");
          console.log("locked");
          await Bun.sleep(1200);
@@ -76,8 +77,20 @@ async function whileWriterIsLocked<T>(dbPath: string, operation: () => T): Promi
         },
     );
     const reader = child.stdout.getReader();
+    const signal = await reader.read();
+    if (signal.done) {
+        // Report why the helper never locked; asserting only its exit code would
+        // hide the SQLite error it printed.
+        reader.releaseLock();
+        const [exitCode, stderr] = await Promise.all([
+            child.exited,
+            new Response(child.stderr).text(),
+        ]);
+        throw new Error(
+            `writer lock helper exited before locking (exit ${exitCode}): ${stderr.trim() || "<no stderr>"}`,
+        );
+    }
     try {
-        const signal = await reader.read();
         expect(new TextDecoder().decode(signal.value)).toContain("locked");
         return operation();
     } finally {

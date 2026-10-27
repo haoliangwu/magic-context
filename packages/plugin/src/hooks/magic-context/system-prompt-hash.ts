@@ -1,4 +1,5 @@
 import { buildMagicContextSection } from "../../agents/magic-context-prompt";
+import { isPrefixBoundThinkingModel } from "../../features/magic-context/overflow-detection";
 import { computeHardCacheExpired } from "../../features/magic-context/scheduler";
 import {
     type ContextDatabase,
@@ -32,6 +33,10 @@ import {
     type SystemPromptSnapshot,
     snapshotSystemPrompt,
 } from "./system-prompt-diagnostics";
+import {
+    persistSystemPromptStickyDate,
+    readPersistedSystemPromptStickyDate,
+} from "./system-prompt-sticky-date";
 
 const MAGIC_CONTEXT_MARKER = "## Magic Context";
 const SYSTEM_PROMPT_GUIDANCE_SEPARATOR = "\n\n";
@@ -247,6 +252,18 @@ export function createSystemPromptHashHandler(deps: {
     // and only update it on cache-busting passes. This prevents a midnight date
     // flip from causing an unnecessary flush + cache rebuild.
     const stickyDateBySession = new Map<string, string>();
+    // The sticky date as last read from or written to the session's persisted
+    // record (null: none recorded), so the record is read once per session and
+    // written only when the date it holds changes.
+    const recordedStickyDateBySession = new Map<string, string | null>();
+    const recordedStickyDate = (sessionId: string): string | undefined => {
+        let recorded = recordedStickyDateBySession.get(sessionId);
+        if (recorded === undefined) {
+            recorded = readPersistedSystemPromptStickyDate(deps.db, sessionId) ?? null;
+            recordedStickyDateBySession.set(sessionId, recorded);
+        }
+        return recorded ?? undefined;
+    };
     // Only the previous in-process prompt is retained for byte offsets. It is
     // never persisted; a cold handler explicitly reports an unknown baseline.
     const diagnosticPrompts = new Map<string, SystemPromptSnapshot>();
@@ -483,11 +500,73 @@ export function createSystemPromptHashHandler(deps: {
         if (liveSystemContent.length === 0) return;
         const previousHash = sessionMetaEarly?.systemPromptHash ?? "";
         const hasPersistedHash = previousHash !== "" && previousHash !== "0";
-        // When the durable system-prompt hash is cleared, the new host must
-        // establish a new baseline. Discard the session's sticky date instead of
-        // reusing the date line frozen for the earlier host projection.
-        if (!hasPersistedHash) stickyDateBySession.delete(sessionId);
-        const stickyDate = stickyDateBySession.get(sessionId);
+        const prefixBoundModel = isPrefixBoundThinkingModel(
+            liveModel?.providerID,
+            liveModel?.modelID,
+        );
+        // When the durable system-prompt hash is cleared (a store-generation
+        // rebase, a host conversion), the request establishes a new baseline.
+        // A known non-prefix-bound model can adopt the live date with that baseline.
+        // For prefix-bound or unknown models, the date still sits in front of
+        // whatever signed thinking the request serves. If the new prompt has as
+        // many host date fields as the previous
+        // sticky date, that date stays in force and the new date is adopted only
+        // through the same rule as any other date change (`systemDateMayMove`
+        // below). If the counts differ, the previous date cannot be applied
+        // position by position: it is discarded and the new prompt's dates become
+        // the baseline unchecked, because the prompt layout itself changed in
+        // front of that thinking anyway.
+        let stickyDate = stickyDateBySession.get(sessionId);
+        if (!hasPersistedHash) {
+            const previous = stickyDate ?? recordedStickyDate(sessionId);
+            const live = systemPromptDates(liveSystemContent).live;
+            const fieldCount = (dates: string | undefined) =>
+                dates === undefined ? 0 : (JSON.parse(dates) as unknown[]).length;
+            stickyDate =
+                (!modelKey || prefixBoundModel) &&
+                previous !== undefined &&
+                live !== undefined &&
+                fieldCount(previous) === fieldCount(live)
+                    ? previous
+                    : undefined;
+            if (stickyDate === undefined) stickyDateBySession.delete(sessionId);
+            else stickyDateBySession.set(sessionId, stickyDate);
+        }
+        // A new process has no sticky date in memory. Restore the recorded one
+        // when it reproduces the persisted hash: that is the date the session's
+        // requests carried before the restart, and the signed thinking they
+        // produced is bound to it. Without this the first request after a
+        // restart past midnight would carry the new date in front of that
+        // thinking on a pass that may not rebuild the prompt.
+        if (stickyDate === undefined && hasPersistedHash) {
+            const recorded = recordedStickyDate(sessionId);
+            const live = systemPromptDates(liveSystemContent).live;
+            if (
+                recorded !== undefined &&
+                live !== undefined &&
+                recorded !== live &&
+                systemPromptFingerprint(
+                    systemPromptDates(liveSystemContent, recorded).stable,
+                    promptSurface.preset,
+                ) === previousHash
+            ) {
+                stickyDate = recorded;
+                stickyDateBySession.set(sessionId, recorded);
+                sessionLog(
+                    sessionId,
+                    `system prompt date restored after restart: real=${live}, using=${recorded}`,
+                );
+            }
+        }
+        // Record every change of the sticky date, so a restart can restore the
+        // latest date that was saved successfully.
+        const setStickyDate = (value: string) => {
+            stickyDateBySession.set(sessionId, value);
+            if (value !== recordedStickyDate(sessionId)) {
+                if (persistSystemPromptStickyDate(deps.db, sessionId, value))
+                    recordedStickyDateBySession.set(sessionId, value);
+            }
+        };
         const dates = systemPromptDates(liveSystemContent, stickyDate);
         const currentDate = dates.live;
         const stableCandidate = dates.stable;
@@ -497,17 +576,41 @@ export function createSystemPromptHashHandler(deps: {
             deps.historyRefreshSessions,
             dateRequest,
         );
+        // An idle-expired request rewrites the provider cache, but a signed
+        // thinking block the messages pass kept on the wire stays bound to every
+        // byte in front of it, the system date included. On a prefix-bound model
+        // the date therefore stays frozen while the messages pass reports that
+        // it served signed thinking, as on any other bust.
+        const signedThinkingKept = systemDateSignedThinkingKept(
+            deps.historyRefreshSessions,
+            dateRequest,
+        );
+        // The one rule for moving the date: the request must be allowed to
+        // rewrite the prefix (a permitted rebuild, or an expired provider cache)
+        // and its messages pass must not report that it served signed thinking.
+        // A pass that cannot report it (an ambiguous pairing, the Rust transform)
+        // counts as not kept, as before. A held pass keeps that thinking even
+        // when it is permitted to apply other work, so its date stays frozen.
+        // The date can therefore lag for days: compaction-off strips earlier
+        // turns' thinking only when a fold changes m[0]/m[1] or the mode
+        // switches, so a session whose docs and memory stay the same keeps its
+        // first date. That is deliberate. A stale date costs the model some
+        // accuracy about today; a moved date in front of served signed thinking
+        // invalidates it, and the provider rejects the request.
+        const systemDateMayMove = (rewrite: boolean, keptSignedThinking: boolean | undefined) =>
+            (rewrite || idleCacheExpired) && keptSignedThinking !== true;
         // A queued refresh alone cannot change the prompt before an assistant's
         // encrypted thinking that still requires its original earlier messages.
         // If the system hook runs first, wait for a permitted messages rebuild;
         // if the messages hook ran first, use its completed rebuild decision.
+        // On a prefix-bound model an idle-expired request waits the same way,
+        // for the messages pass to say whether it served signed thinking.
         let deferredDateRefresh = false;
         if (
             currentDate &&
             stickyDate &&
             currentDate !== stickyDate &&
-            isCacheBusting &&
-            !idleCacheExpired &&
+            (idleCacheExpired ? prefixBoundModel : isCacheBusting) &&
             !contentOrPresetChanged &&
             !requestMessagesFinal
         ) {
@@ -515,8 +618,8 @@ export function createSystemPromptHashHandler(deps: {
             deferredDateRefresh = waitForSystemDateRefresh(
                 deps.historyRefreshSessions,
                 dateRequest,
-                (permitted) => {
-                    if (!permitted) {
+                (permitted, keptSignedThinking) => {
+                    if (!systemDateMayMove(permitted, keptSignedThinking)) {
                         deps.systemPromptRefreshSessions.add(sessionId);
                         return;
                     }
@@ -528,7 +631,7 @@ export function createSystemPromptHashHandler(deps: {
                             cachedM0SystemHash: hash,
                             systemPromptTokens: estimateTokens(content),
                         });
-                        stickyDateBySession.set(sessionId, currentDate);
+                        setStickyDate(currentDate);
                         output.system.splice(0, output.system.length, ...liveElements);
                         publishSystemDateOutput(output.system);
                         deps.systemPromptRefreshSessions.delete(sessionId);
@@ -548,17 +651,19 @@ export function createSystemPromptHashHandler(deps: {
             );
         }
         const dateMayAdvance =
-            idleCacheExpired ||
             contentOrPresetChanged ||
-            (isCacheBusting &&
-                !deferredDateRefresh &&
-                (dateRequest ? rewritePermission === true : rewritePermission !== false));
+            (!deferredDateRefresh &&
+                systemDateMayMove(
+                    isCacheBusting &&
+                        (dateRequest ? rewritePermission === true : rewritePermission !== false),
+                    signedThinkingKept,
+                ));
 
         if (currentDate && !stickyDate) {
-            stickyDateBySession.set(sessionId, currentDate);
+            setStickyDate(currentDate);
         } else if (currentDate && stickyDate && currentDate !== stickyDate) {
             if (dateMayAdvance) {
-                stickyDateBySession.set(sessionId, currentDate);
+                setStickyDate(currentDate);
                 sessionLog(
                     sessionId,
                     `system prompt date updated: ${stickyDate} → ${currentDate} (cache-busting pass)`,
@@ -728,7 +833,9 @@ export function createSystemPromptHashHandler(deps: {
                 !currentDate ||
                 currentDate === stickyDate ||
                 !dateRequest ||
-                rewritePermission === true)
+                // A permitted pass that kept signed thinking left the date
+                // frozen; keep the refresh for the pass that can move it.
+                (rewritePermission === true && signedThinkingKept !== true))
         ) {
             deps.systemPromptRefreshSessions.delete(sessionId);
         }
@@ -748,6 +855,7 @@ export function createSystemPromptHashHandler(deps: {
         handler,
         clearSession: (sessionId: string) => {
             diagnosticPrompts.delete(sessionId);
+            recordedStickyDateBySession.delete(sessionId);
             clearSystemDateRefresh(deps.historyRefreshSessions, sessionId);
             guidanceEpochs.clear(sessionId);
             clearSystemPromptHashSession(sessionId, {
@@ -769,5 +877,6 @@ import {
     type SystemDateRequestIdentity,
     systemDateRefreshPermission,
     systemDateRequestForOutput,
+    systemDateSignedThinkingKept,
     waitForSystemDateRefresh,
 } from "./system-date-refresh";

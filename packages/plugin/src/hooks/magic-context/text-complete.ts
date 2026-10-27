@@ -24,12 +24,17 @@ import { stripPersistedAssistantText } from "./tag-content-primitives";
  * sentinels like `[dropped §N§]`.
  */
 
-export function createTextCompleteHandler() {
+export function createTextCompleteHandler(
+    providerForSession?: (sessionID: string) => string | undefined,
+) {
     return async (
         _input: { sessionID: string; messageID: string; partID: string },
 
         output: { text: string },
     ): Promise<void> => {
-        output.text = stripPersistedAssistantText(output.text);
+        output.text = stripPersistedAssistantText(
+            output.text,
+            providerForSession ? providerForSession(_input.sessionID) === "anthropic" : true,
+        );
     };
 }

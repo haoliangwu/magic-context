@@ -37,6 +37,16 @@ type HotPathScenarioResult = {
     statCalls: number;
 };
 
+type ImmediateWriteScenarioResult = {
+    afterLog: string;
+    afterForward: string;
+};
+
+type BufferedWriteScenarioResult = {
+    beforeFlush: string;
+    afterFlush: string;
+};
+
 const loggerScenario = `
 import fs from "node:fs";
 import * as path from "node:path";
@@ -74,7 +84,19 @@ if (scenario === "hot-path") {
 
 const logger = await import(loggerModuleUrl);
 
-if (scenario === "retry") {
+if (scenario === "sync-write") {
+    logger.log("synchronous log line");
+    const afterLog = fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : "";
+    logger.writeForwardedLogLine("forwarded worker line\\n");
+    const afterForward = fs.readFileSync(logPath, "utf8");
+    console.log(JSON.stringify({ afterLog, afterForward }));
+} else if (scenario === "default-buffering") {
+    logger.log("buffered log line");
+    const beforeFlush = fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : "";
+    logger.flushLogger();
+    const afterFlush = fs.readFileSync(logPath, "utf8");
+    console.log(JSON.stringify({ beforeFlush, afterFlush }));
+} else if (scenario === "retry") {
     logger.log("first buffered line");
     logger.log("second buffered line");
     logger.flushLogger();
@@ -203,6 +225,8 @@ async function runLoggerScenario<T>(
     scenario:
         | "recovery"
         | "diagnostics"
+        | "sync-write"
+        | "default-buffering"
         | "rotation"
         | "stale-rotation"
         | "hot-path"
@@ -222,6 +246,7 @@ async function runLoggerScenario<T>(
             LOGGER_MODULE_URL: new URL("./logger.ts", import.meta.url).href,
             LOGGER_SCENARIO: scenario,
             LOGGER_SCENARIO_ROOT: root,
+            MAGIC_CONTEXT_LOG_SYNC: scenario === "sync-write" ? "1" : "",
         },
         stdout: "pipe",
         stderr: "pipe",
@@ -236,6 +261,22 @@ async function runLoggerScenario<T>(
 }
 
 describe("logger", () => {
+    test("writes local and forwarded lines immediately when sync logging is enabled", async () => {
+        const result = await runLoggerScenario<ImmediateWriteScenarioResult>("sync-write");
+
+        expect(result.afterLog).toContain("synchronous log line");
+        expect(result.afterLog).not.toContain("forwarded worker line");
+        expect(result.afterForward).toContain("synchronous log line");
+        expect(result.afterForward).toContain("forwarded worker line");
+    });
+
+    test("keeps lines buffered before the flush interval by default", async () => {
+        const result = await runLoggerScenario<BufferedWriteScenarioResult>("default-buffering");
+
+        expect(result.beforeFlush).toBe("");
+        expect(result.afterFlush).toContain("buffered log line");
+    });
+
     test("retries the whole buffered batch after a transient append failure", async () => {
         const result = await runLoggerScenario<RetryScenarioResult>("retry");
         expect(result.failed).toBe(1);

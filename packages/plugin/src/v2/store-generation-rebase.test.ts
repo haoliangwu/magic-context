@@ -20,7 +20,7 @@ import {
     readCoordinateRebaseNotice,
     rebaseSessionCoordinates,
 } from "../features/magic-context/store-generation-rebase";
-import { v2NonNarrativeStoredGapRanges } from "../hooks/magic-context/compartment-runner-incremental";
+import { nonNarrativeStoredGapRanges } from "../hooks/magic-context/compartment-runner-incremental";
 import { validateStoredCompartments } from "../hooks/magic-context/compartment-runner-validation";
 import {
     clearCtxReduceAvailability,
@@ -348,7 +348,7 @@ test("v2 notice compatibility tolerates an older synthetic-only stored gap", () 
         { readMessages: () => messages, getMessageCount: () => messages.length },
         () => {
             const compartments = getCompartments(db, "ses_a");
-            const safeRanges = v2NonNarrativeStoredGapRanges(db, "ses_a", compartments);
+            const safeRanges = nonNarrativeStoredGapRanges(db, "ses_a", compartments);
             expect(safeRanges).toEqual([{ start: 4, end: 4 }]);
             return validateStoredCompartments(compartments, safeRanges);
         },

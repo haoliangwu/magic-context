@@ -2340,18 +2340,21 @@ export const MIGRATIONS: Migration[] = [
         version: 55,
         description: "make managed-write privilege connection-local",
         up(db: Database): void {
-            // Guard triggers must never consult a persistent flag: a crashed or second
-            // connection must not inherit permission to write module-owned rows.
+            // The privilege flag the guards read is only ever enabled inside a
+            // privileged writer's own BEGIN IMMEDIATE transaction, so a crashed or
+            // second connection cannot inherit permission to write module-owned rows.
             const memoriesPresent = tableExists(db, "memories");
             const notesPresent = tableExists(db, "notes");
-            const native = db as unknown as {
-                function?: unknown;
-                createFunction?: unknown;
-            };
-            const privilegeCheck =
-                typeof native.function === "function" || typeof native.createFunction === "function"
-                    ? "mc_privileged_writer() = 0"
-                    : "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0";
+            // This migration used to bake `mc_privileged_writer() = 0` into the guards
+            // whenever the migrating runtime could register scalar functions
+            // (`db.function` / `db.createFunction`). Nothing registers that function any
+            // more, and Bun 1.4.4 and node:sqlite both expose `db.function`, so an
+            // upgrade crossing v55 on those runtimes left guards that failed every
+            // memories/notes write with `no such function` until v71 rebuilt them. A
+            // stopped upgrade (or any step that writes those tables before v71) would
+            // hit that. Always emit the durable state-table predicate, which every
+            // connection can evaluate; see authorityPrivilegeCheck.
+            const privilegeCheck = authorityPrivilegeCheck();
             if (memoriesPresent) {
                 db.exec(`
                     DROP TRIGGER IF EXISTS memories_authority_guard_insert;

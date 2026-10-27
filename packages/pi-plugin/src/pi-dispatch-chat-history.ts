@@ -2,6 +2,7 @@
  * History-only equivalences for Oh My Pi (OMP) 18.10.4's Chat serializer.
  * Source citations below are in @oh-my-pi/pi-ai/src/providers/.
  */
+import { piOmitsTruncatedAssistant } from "./pi-dispatch-assistant-history";
 import { piToolCallPairing } from "./pi-dispatch-tool-pairing";
 
 export interface PiChatHistoryModel {
@@ -33,27 +34,18 @@ function omitsAssistant(
 	compat: Record<string, unknown>,
 ): boolean {
 	if (!Array.isArray(message.content)) return false;
+	if (piOmitsTruncatedAssistant(message)) return true;
 	let thinking = false;
-	let hasTextBlock = false;
 	for (const value of message.content) {
 		const block = object(value);
 		if (!block) return false;
 		if (block.type === "text") {
-			hasTextBlock = true;
 			if (typeof block.text !== "string" || block.text.trim()) return false;
 		} else if (block.type === "thinking") {
 			if (typeof block.thinking !== "string") return false;
 			thinking ||= block.thinking.trim().length > 0;
 		} else return false;
 	}
-	// Interrupted reasoning without an answer or tool call is not replayed by
-	// Oh My Pi, so it cannot contribute an outgoing assistant row.
-	// transform-messages.ts:1340-1354.
-	if (
-		!hasTextBlock &&
-		["length", "error", "aborted"].includes(String(message.stopReason))
-	)
-		return true;
 	if (compat.requiresReasoningContentForAllAssistantTurns === true)
 		return false;
 	if (!thinking) return true;

@@ -377,7 +377,6 @@ export function getSynapseBatchRequestKey(args: {
             required_fingerprint: args.fingerprint,
             required_epoch: args.tableEpoch,
             allow_equivalent: false,
-            accept_declared: false,
             ids: args.items.map((item) => item.id),
             content_sha256: args.items.map((item) => item.contentSha256),
             ...(args.purpose === "query" ? { purpose: args.purpose } : {}),
@@ -1004,7 +1003,6 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             required_fingerprint: metadata.fingerprint,
             required_epoch: metadata.table_epoch,
             allow_equivalent: false,
-            accept_declared: false,
         };
     }
 

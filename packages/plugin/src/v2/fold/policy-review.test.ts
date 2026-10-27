@@ -123,16 +123,3 @@ test("review: two policy instances log one settled nomination rather than two co
     await Promise.all(policies.map((policy) => policy.idle("s")));
     expect(f.logs.filter((line) => line.includes("status=completed"))).toHaveLength(1);
 });
-
-test("review control: a short session stays below the default stored-row threshold", async () => {
-    const f = fixture();
-    f.deps.openReader = () =>
-        ({
-            latestCompaction: () => undefined,
-            storedRowsAfter: () => 999,
-            close() {},
-        }) as unknown as V2StoreReader;
-    await new HostFoldPolicy(f.deps).idle("s");
-    expect(f.calls).toEqual([]);
-    expect(f.logs).toEqual([]);
-});

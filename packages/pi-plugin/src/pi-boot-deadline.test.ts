@@ -48,14 +48,7 @@ describe("Pi runtime boot deadline", () => {
 			report: () => {},
 		});
 
-		const observed = await Promise.race([
-			boot,
-			new Promise<"host_timeout">((resolve) =>
-				setTimeout(() => resolve("host_timeout"), 40),
-			),
-		]);
-		expect(observed).not.toBe("host_timeout");
-		if (observed === "host_timeout") return;
+		const observed = await boot;
 		expect(observed.status).toBe("timed_out");
 		expect(registration?.reason).toEqual({
 			kind: "storage_failure",

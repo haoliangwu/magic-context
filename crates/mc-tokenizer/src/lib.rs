@@ -365,18 +365,19 @@ mod history_cache_tests {
     #[test]
     fn history_cache_is_byte_bounded_and_evicts_least_recently_used() {
         let mut cache = HistoryCounts::default();
-        let recent = format!("0{}", "x ".repeat(25_000));
-        cache.count(&recent, false);
-        for index in 1..100 {
-            let text = format!("{index}{}", "x ".repeat(25_000));
-            cache.count(&text, false);
-            cache.count(&recent, false);
-        }
-        assert!(cache.bytes <= HISTORY_CACHE_BYTES);
-        assert!(cache.entries.contains_key(recent.as_str()));
-        assert!(!cache
-            .entries
-            .contains_key(format!("1{}", "x ".repeat(25_000)).as_str()));
+        // Three six-byte texts fit in this budget; a fourth must evict one.
+        let budget = 420;
+        cache.count_within("recent", false, budget);
+        cache.count_within("oldest", false, budget);
+        cache.count_within("middle", false, budget);
+        cache.count_within("recent", false, budget);
+        cache.count_within("newest", false, budget);
+        assert!(cache.bytes <= budget);
+        assert_eq!(cache.entries.len(), 3);
+        assert!(cache.entries.contains_key("recent"));
+        assert!(cache.entries.contains_key("middle"));
+        assert!(cache.entries.contains_key("newest"));
+        assert!(!cache.entries.contains_key("oldest"));
         assert_eq!(
             cache.bytes,
             cache

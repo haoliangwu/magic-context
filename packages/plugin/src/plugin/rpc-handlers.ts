@@ -1201,6 +1201,11 @@ interface RuntimeDebugMemoryHolders {
             estimatedBytes: number;
         }>;
     };
+    /** OpenCode 2's copies of each session's last served request, kept for side questions. */
+    generateReplay?: {
+        totalBytes: number;
+        sessions: Array<{ sessionId: string; bytes: number }>;
+    };
 }
 
 const EMPTY_TAGGER_HEAP_STATS = {
@@ -1232,6 +1237,7 @@ export function buildDebugMemoryUsage(
     const lkg = getLkgSlotHeapStats();
     const tagger = runtimeHolders.taggerCache ?? EMPTY_TAGGER_HEAP_STATS;
     const wire = runtimeHolders.wireCache ?? EMPTY_WIRE_HEAP_STATS;
+    const replay = runtimeHolders.generateReplay ?? { totalBytes: 0, sessions: [] };
 
     const messageIndexQueue = getMessageIndexQueueHeapStats();
     const sessions = new Map<string, DebugMemoryHolders["sessions"][number]>();
@@ -1247,6 +1253,7 @@ export function buildDebugMemoryUsage(
                 wireMessages: 0,
                 wireContentSnapshots: 0,
                 wireEstimatedBytes: 0,
+                generateReplayBytes: 0,
             };
             sessions.set(sessionId, current);
         }
@@ -1265,6 +1272,8 @@ export function buildDebugMemoryUsage(
         target.wireContentSnapshots += entry.rawContentSnapshots;
         target.wireEstimatedBytes += entry.estimatedBytes;
     }
+    for (const entry of replay.sessions)
+        session(entry.sessionId).generateReplayBytes += entry.bytes;
 
     return {
         pid: process.pid,
@@ -1299,6 +1308,10 @@ export function buildDebugMemoryUsage(
                 estimatedBytes: wire.estimatedBytes,
             },
             compartmentMirrors: { entries: 0 },
+            generateReplay: {
+                sessionCount: replay.sessions.length,
+                estimatedBytes: replay.totalBytes,
+            },
             messageIndexQueue,
             sessions: [...sessions.values()].sort((a, b) => a.sessionId.localeCompare(b.sessionId)),
         },

@@ -31,6 +31,10 @@ import { initializeDatabase } from "@magic-context/core/features/magic-context/s
 import { getSubagentInvocations } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
 import { extractLatestAssistantText } from "@magic-context/core/shared/assistant-message-extractor";
 import * as logger from "@magic-context/core/shared/logger";
+import {
+	getPromptFailureDetail,
+	promptSyncWithValidatedOutputRetry,
+} from "@magic-context/core/shared/model-suggestion-retry";
 import { createPromptAsyncTransport } from "@magic-context/core/shared/prompt-async-transport";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
@@ -167,6 +171,163 @@ afterEach(() => {
 });
 
 describe("Pi dreamer wiring", () => {
+	for (const harness of ["pi", "omp"] as const) {
+		for (const streaming of [false, true]) {
+			test(`${harness} dreamer ${streaming ? "streamed primary keeps its full timeout" : "silent primary is cut and fallback completes"}`, async () => {
+				const dataDir = createTestTempDirFromPath(
+					join(tmpdir(), "mc-pi-first-output-"),
+				);
+				const previous = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+				process.env.MAGIC_CONTEXT_TEST_DATA_DIR = dataDir;
+				closeDatabase();
+				db = openDatabase();
+				if (!db) throw new Error("test database unavailable");
+				try {
+					let client!: CapturedDreamClient;
+					const models: string[] = [];
+					__test.setStartDreamScheduleTimerFactory(async (registration) => {
+						client = registration.client as CapturedDreamClient;
+						return () => {};
+					});
+					__test.setPiSubagentRunnerFactory(
+						() =>
+							new PiSubagentRunner({
+								invocation: {
+									command: "pi-fixture",
+									prefixArgs: [],
+									targetHarness: harness,
+								},
+								spawnImpl: mock((_command, args) => {
+									models.push(String(args[args.indexOf("--model") + 1]));
+									const child = createEventStreamChild();
+									child.kill.mockImplementation(() => {
+										child.emitClose();
+										return true;
+									});
+									const primary = models.length === 1;
+									setTimeout(() => {
+										if (!primary) {
+											const message = {
+												role: "assistant",
+												stopReason: "stop",
+												content: [{ type: "text", text: "fallback answer" }],
+											};
+											child.writeStdoutLine({ type: "message_end", message });
+											child.writeStdoutLine({
+												type: "agent_end",
+												messages: [message],
+											});
+											child.emitClose();
+											return;
+										}
+										child.writeStdoutLine({ type: "agent_start" });
+										child.writeStdoutLine({
+											type: "message_start",
+											message: { role: "assistant", content: [] },
+										});
+										if (streaming)
+											child.writeStdoutLine({
+												type: "message_update",
+												...(harness === "pi"
+													? {
+															message: {
+																role: "assistant",
+																content: [{ type: "text", text: "x" }],
+															},
+														}
+													: {}),
+												assistantMessageEvent: {
+													type: "text_delta",
+													delta: "x",
+												},
+											});
+									}, 0);
+									return child as never;
+								}) as never,
+							}),
+					);
+					registerPiDreamerProject(
+						dreamerOptions({
+							database: db,
+							projectIdentity: `git:silent-${harness}`,
+							projectDir: dataDir,
+							harness,
+						}),
+					);
+					await flushMicrotasks();
+					const child = (await client.session.create({
+						body: { title: "magic-context-dream-classify-memories" },
+					})) as { id: string };
+					const startedAt = Date.now();
+					// Leave the fallback ample time even when another suite deschedules this worker.
+					const timeoutMs = streaming ? 500 : 5_000;
+					const run = promptSyncWithValidatedOutputRetry(
+						client as never,
+						{
+							path: { id: child.id },
+							body: {
+								model: { providerID: "test", modelID: "primary" },
+								parts: [{ type: "text", text: "classify" }],
+							},
+						},
+						{
+							timeoutMs,
+							firstOutputTimeoutMs: 60,
+							fallbackModels: ["test/fallback"],
+							fetchOutput: async () =>
+								(
+									(await client.session.messages({
+										path: { id: child.id },
+									})) as { data: unknown[] }
+								).data,
+							validateOutput: (messages) =>
+								extractLatestAssistantText(messages),
+						},
+					);
+					if (streaming) {
+						let caught: unknown;
+						try {
+							await run;
+						} catch (error) {
+							caught = error;
+						}
+						expect((caught as Error).message).toBe(
+							"prompt timed out after 500ms",
+						);
+						expect(getPromptFailureDetail(caught)?.failureClass).toBe(
+							"provider_timeout",
+						);
+						expect(models).toEqual(["test/primary"]);
+						expect(Date.now() - startedAt).toBeGreaterThanOrEqual(450);
+					} else {
+						expect((await run).validated).toBe("fallback answer");
+						expect(models).toEqual(["test/primary", "test/fallback"]);
+						expect(Date.now() - startedAt).toBeGreaterThanOrEqual(55);
+						expect(Date.now() - startedAt).toBeLessThan(4_000);
+						expect(
+							getSubagentInvocations(db, `git:silent-${harness}`),
+						).toMatchObject([
+							{ modelId: "fallback", status: "completed" },
+							{
+								modelId: "primary",
+								status: "timed_out",
+								error: expect.stringContaining(
+									"prompt timed out after 60ms with no model output",
+								),
+							},
+						]);
+					}
+				} finally {
+					closeDatabase();
+					db = null;
+					if (previous === undefined)
+						delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+					else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = previous;
+					rmSync(dataDir, { recursive: true, force: true });
+				}
+			});
+		}
+	}
 	test("shutdown aborts an owner-bound dreamer child and ps finds no survivor", async () => {
 		db = createDb();
 		const owner = {};

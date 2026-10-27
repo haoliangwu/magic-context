@@ -118,12 +118,22 @@ describe("model-resolution", () => {
         // Inheritance is deliberately absent because a fallback model may not support the
         // qualifier selected for the primary model.
         expect(resolveHistorianModel(config, "opencode")).toEqual({
-            primary: { model: "open/primary", qualifier: "primary-only" },
-            fallbacks: [{ model: "open/fallback" }],
+            primary: {
+                model: "open/primary",
+                qualifier: "primary-only",
+                sourceConfigKey: "historian.opencode.model",
+            },
+            fallbacks: [
+                { model: "open/fallback", sourceConfigKey: "historian.opencode.fallback_models" },
+            ],
         });
         expect(resolveHistorianModel(config, "pi")).toEqual({
-            primary: { model: "pi/primary", qualifier: "high" },
-            fallbacks: [{ model: "pi/fallback" }],
+            primary: {
+                model: "pi/primary",
+                qualifier: "high",
+                sourceConfigKey: "historian.pi.model",
+            },
+            fallbacks: [{ model: "pi/fallback", sourceConfigKey: "historian.pi.fallback_models" }],
         });
     });
 
@@ -143,12 +153,32 @@ describe("model-resolution", () => {
         };
 
         expect(resolveHistorianModel(config, "opencode")).toEqual({
-            primary: { model: "open/code", qualifier: "oc-primary" },
-            fallbacks: [{ model: "open/fallback", qualifier: "oc-fallback" }],
+            primary: {
+                model: "open/code",
+                qualifier: "oc-primary",
+                sourceConfigKey: "historian.opencode.model",
+            },
+            fallbacks: [
+                {
+                    model: "open/fallback",
+                    qualifier: "oc-fallback",
+                    sourceConfigKey: "historian.opencode.fallback_models",
+                },
+            ],
         });
         expect(resolveHistorianModel(config, "pi")).toEqual({
-            primary: { model: "pi/model", qualifier: "high" },
-            fallbacks: [{ model: "pi/fallback", qualifier: "max" }],
+            primary: {
+                model: "pi/model",
+                qualifier: "high",
+                sourceConfigKey: "historian.pi.model",
+            },
+            fallbacks: [
+                {
+                    model: "pi/fallback",
+                    qualifier: "max",
+                    sourceConfigKey: "historian.pi.fallback_models",
+                },
+            ],
         });
     });
 
@@ -182,8 +212,18 @@ describe("model-resolution", () => {
         };
 
         expect(resolveHistorianModel(configured, "omp")).toEqual({
-            primary: { model: "omp/historian", qualifier: "auto" },
-            fallbacks: [{ model: "omp/historian-fallback", qualifier: "max" }],
+            primary: {
+                model: "omp/historian",
+                qualifier: "auto",
+                sourceConfigKey: "historian.omp.model",
+            },
+            fallbacks: [
+                {
+                    model: "omp/historian-fallback",
+                    qualifier: "max",
+                    sourceConfigKey: "historian.omp.fallback_models",
+                },
+            ],
         });
         expect(
             resolveDreamerTaskModel({ config: configured, harness: "omp", task: "verify" }),
@@ -197,6 +237,7 @@ describe("model-resolution", () => {
         expect(resolveHistorianModel(piFallback, "omp")?.primary).toEqual({
             model: "pi/historian",
             qualifier: "high",
+            sourceConfigKey: "historian.pi.model",
         });
         expect(
             resolveDreamerTaskModel({ config: piFallback, harness: "omp", task: "verify" }),
@@ -245,8 +286,22 @@ describe("model-resolution", () => {
         };
 
         expect(resolveDreamerTaskModel({ config, harness: "opencode", task: "curate" })).toEqual({
-            primary: { model: "open/task", qualifier: "task-variant" },
-            fallbacks: [{ model: "open/bare" }, { model: "open/qualified", qualifier: "fb" }],
+            primary: {
+                model: "open/task",
+                qualifier: "task-variant",
+                sourceConfigKey: "dreamer.opencode.tasks.curate.model",
+            },
+            fallbacks: [
+                {
+                    model: "open/bare",
+                    sourceConfigKey: "dreamer.opencode.tasks.curate.fallback_models",
+                },
+                {
+                    model: "open/qualified",
+                    qualifier: "fb",
+                    sourceConfigKey: "dreamer.opencode.tasks.curate.fallback_models",
+                },
+            ],
             schedule: "0 4 * * *",
             timeoutMinutes: 12,
             promotionThreshold: 3,

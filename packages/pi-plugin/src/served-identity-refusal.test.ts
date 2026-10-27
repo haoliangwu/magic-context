@@ -61,7 +61,7 @@ test("identity mirror failure serves the committed pair and repairs the mirror o
 	try {
 		const first = [userMessage("already served", 1)];
 		await handler({ messages: structuredClone(first) }, context(first));
-		await Bun.sleep(50);
+		await until(() => getSlot(sessionId) !== undefined);
 		expect(getSlot(sessionId)).toBeDefined();
 		publication.reset();
 		const write = storagePermissions.writeStorageFileSync;
@@ -84,7 +84,15 @@ test("identity mirror failure serves the committed pair and repairs the mirror o
 			"§2§ served despite mirror failure",
 		);
 		expect(identityAttempts).toBe(1);
-		await Bun.sleep(50);
+		await until(
+			() =>
+				getSlot(sessionId)?.jsonPrefix?.includes(
+					"served despite mirror failure",
+				) === true &&
+				publication.samples.some(
+					(sample) => sample.publication?.status === "mirror_failed",
+				),
+		);
 		// The request and identities already committed. An optional mirror failure
 		// must neither block the managed result nor discard its authoritative pair.
 		expect(getSlot(sessionId)?.jsonPrefix).toContain(
@@ -108,3 +116,9 @@ test("identity mirror failure serves the committed pair and repairs the mirror o
 		db.close();
 	}
 });
+
+async function until(complete: () => boolean) {
+	const deadline = performance.now() + 2000;
+	while (!complete() && performance.now() < deadline) await Bun.sleep(1);
+	expect(complete()).toBe(true);
+}

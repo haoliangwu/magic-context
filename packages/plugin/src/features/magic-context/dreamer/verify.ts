@@ -42,7 +42,7 @@ import {
     sumTokensFromChildMessages,
 } from "../subagent-token-capture";
 import { readFailedChildMessages } from "./failed-invocation-evidence";
-import { runHiddenSingleShotPrompt } from "./hidden-single-shot";
+import { DREAMER_FIRST_OUTPUT_TIMEOUT_MS, runHiddenSingleShotPrompt } from "./hidden-single-shot";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertNoDuplicateManifestIds } from "./manifest-parser";
 import { isDirectiveShapedProjectRule } from "./memory-claim-safety";
@@ -184,6 +184,9 @@ export interface VerifyArgs {
     forceBroad?: boolean;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
+    /** How long a model may stay silent before the chain moves to the next model.
+     *  Defaults to DREAMER_FIRST_OUTPUT_TIMEOUT_MS. */
+    firstOutputTimeoutMs?: number;
     tokenBudget?: number;
     onBudgetUpdate?: (state: { spent: number; finalizeFired: boolean; sessionId?: string }) => void;
     language?: string;
@@ -485,6 +488,7 @@ async function verifyOneBatch(
                 fallbackModels: args.fallbackModels,
                 language: args.language,
                 timeoutMs: sliceMs,
+                firstOutputTimeoutMs: args.firstOutputTimeoutMs ?? DREAMER_FIRST_OUTPUT_TIMEOUT_MS,
                 signal: batchSignal,
                 onFailureOutput: (completion) => {
                     failedCompletion = completion;
@@ -573,6 +577,7 @@ async function verifyOneBatch(
                     onBudgetUpdate,
                 }),
                 timeoutMs: sliceMs,
+                firstOutputTimeoutMs: args.firstOutputTimeoutMs ?? DREAMER_FIRST_OUTPUT_TIMEOUT_MS,
                 signal: batchSignal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:verify",
@@ -1012,12 +1017,14 @@ function recordInvocation(
     recordChildInvocation({
         db: args.db,
         parentSessionId: args.parentSessionId,
-        harness: "opencode",
+        harness: args.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
         subagent: "dreamer",
         task: args.forceBroad ? "verify-broad" : "verify",
         startedAt,
         status: params.status,
         messages: params.messages,
+        attemptedModel: args.model,
+        configuredModels: args.fallbackModels,
         error: params.error,
     });
 }

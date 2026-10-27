@@ -2,6 +2,7 @@ import { expect, it } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { installTagIdentityRevisionTrigger } from "@magic-context/core/features/magic-context/storage-tag-identity-revision";
@@ -11,6 +12,7 @@ import {
 	TAG_SELECT_COLUMNS,
 } from "@magic-context/core/features/magic-context/storage-tags";
 import { Database } from "@magic-context/core/shared/sqlite";
+import { getWorkerShutdownStats } from "@magic-context/core/shared/worker-shutdown";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import { PiContextBudget } from "./pi-context-budget";
 import {
@@ -120,6 +122,138 @@ it("hydration publishes an empty complete session", async () => {
 		close();
 	}
 });
+
+for (const legacy of [true, false]) {
+	it(`${legacy ? "legacy nonempty" : "revisioned nonempty"} hydration accepts its own first status update`, async () => {
+		const { db, close } = fixture();
+		try {
+			seed(db);
+			if (legacy)
+				db.exec(
+					"DELETE FROM schema_migrations_meta WHERE key = 'tag_revision:s'",
+				);
+			await ensurePiTagSnapshotReady(db, "s", new PiContextBudget());
+			const before = getPiTagSnapshotView(db, "s");
+			expect(before).toEqual(getTagsBySession(db, "s"));
+			expect(before.find((tag) => tag.tagNumber === 8)?.status).toBe("active");
+			db.exec(
+				"UPDATE tags SET status = 'dropped' WHERE session_id = 's' AND tag_number = 8",
+			);
+			const after = getPiTagSnapshotView(db, "s");
+			expect(after).toEqual(getTagsBySession(db, "s"));
+			expect(after.find((tag) => tag.tagNumber === 8)?.status).toBe("dropped");
+			expect(after[0]).toBe(before[0]);
+		} finally {
+			await drainPiTagSnapshotSession("s");
+			close();
+		}
+	});
+}
+
+for (const mode of [
+	"foreign allocation",
+	"foreign write after own allocation",
+	"untracked foreign write before own allocation",
+] as const) {
+	it(`legacy nonempty hydration refuses ${mode}`, async () => {
+		const { db, foreign, path, close } = fixture();
+		const writer = mode.startsWith("untracked") ? new Database(path) : foreign;
+		try {
+			seed(db);
+			db.exec(
+				"DELETE FROM schema_migrations_meta WHERE key = 'tag_revision:s'",
+			);
+			await ensurePiTagSnapshotReady(db, "s", new PiContextBudget());
+			expect(getPiTagSnapshotView(db, "s")).toEqual(getTagsBySession(db, "s"));
+			if (mode === "foreign write after own allocation")
+				db.exec(
+					"UPDATE tags SET status = 'dropped' WHERE session_id = 's' AND tag_number = 8",
+				);
+			writer.exec(
+				"UPDATE tags SET status = 'active' WHERE session_id = 's' AND tag_number = 2",
+			);
+			if (mode.startsWith("untracked"))
+				db.exec(
+					"UPDATE tags SET status = 'dropped' WHERE session_id = 's' AND tag_number = 8",
+				);
+			expect(() => getPiTagSnapshotView(db, "s")).toThrow(
+				"tag snapshot is not ready",
+			);
+		} finally {
+			await drainPiTagSnapshotSession("s");
+			if (writer !== foreign) writer.close();
+			close();
+		}
+	});
+}
+
+for (const mode of [
+	"recreated revision",
+	"recreated first allocation",
+	"recreated accepted allocation",
+	"regressed first allocation",
+] as const) {
+	it(`nonempty hydration refuses a ${mode} on its own connection`, async () => {
+		const { db, close } = fixture();
+		try {
+			seed(db);
+			if (mode !== "recreated revision")
+				db.exec(
+					"DELETE FROM schema_migrations_meta WHERE key = 'tag_revision:s'",
+				);
+			await ensurePiTagSnapshotReady(db, "s", new PiContextBudget());
+			expect(getPiTagSnapshotView(db, "s")).toEqual(getTagsBySession(db, "s"));
+			if (mode !== "recreated revision")
+				db.exec(
+					"UPDATE tags SET status = 'dropped' WHERE session_id = 's' AND tag_number = 8",
+				);
+			if (mode === "recreated accepted allocation")
+				expect(getPiTagSnapshotView(db, "s")).toEqual(
+					getTagsBySession(db, "s"),
+				);
+			if (mode === "regressed first allocation")
+				db.exec(`UPDATE schema_migrations_meta SET value = substr(value, 1, instr(value, ':')) || '0'
+					WHERE key = 'tag_revision:s'`);
+			else
+				db.exec(
+					"DELETE FROM schema_migrations_meta WHERE key = 'tag_revision:s'",
+				);
+			db.exec(
+				"UPDATE tags SET status = 'active' WHERE session_id = 's' AND tag_number = 2",
+			);
+			expect(() => getPiTagSnapshotView(db, "s")).toThrow(
+				"tag snapshot is not ready",
+			);
+		} finally {
+			await drainPiTagSnapshotSession("s");
+			close();
+		}
+	});
+}
+
+for (const evidence of ["pi_tag_first_allocation", "pi_tag_changes"] as const) {
+	it(`legacy nonempty hydration refuses its own allocation without ${evidence}`, async () => {
+		const { db, close } = fixture();
+		try {
+			seed(db);
+			db.exec(
+				"DELETE FROM schema_migrations_meta WHERE key = 'tag_revision:s'",
+			);
+			await ensurePiTagSnapshotReady(db, "s", new PiContextBudget());
+			getPiTagSnapshotView(db, "s");
+			db.exec(
+				"UPDATE tags SET status = 'dropped' WHERE session_id = 's' AND tag_number = 8",
+			);
+			db.exec(`DELETE FROM ${evidence} WHERE session_id = 's'`);
+			expect(() => getPiTagSnapshotView(db, "s")).toThrow(
+				"tag snapshot is not ready",
+			);
+		} finally {
+			await drainPiTagSnapshotSession("s");
+			close();
+		}
+	});
+}
 
 it("candidate matches the independent synchronous process oracle including fallback order and legacy normalization", async () => {
 	const { db, path, close } = fixture();
@@ -414,6 +548,54 @@ it("worker hydrates full active and fallback projections with bounded credited p
 	}
 });
 
+it("worker finishes module evaluation before it needs its first packet ACK", async () => {
+	// Bun 1.3.14 delivers no parent message to a worker until the worker's
+	// entry module has finished evaluating. A job awaited at module top level
+	// then waits forever for its first ACK. The fixture entry reports when the
+	// real worker module has settled, and this parent holds every ACK until
+	// then, so the same deadlock shows up on any runtime.
+	const { db, path, close } = fixture();
+	const worker = new Worker(
+		new URL("./tag-snapshot-worker-evaluation.fixture.ts", import.meta.url),
+		{ workerData: requestFor(path) },
+	);
+	try {
+		seedPages(db);
+		let evaluated = false;
+		const held: PiHydrationMessage[] = [];
+		const ack = (message: PiHydrationMessage) => {
+			const bytes = message.type === "packet" ? message.bytes : undefined;
+			worker.postMessage(
+				{ type: "ack", sequence: message.sequence, bytes },
+				bytes ? [bytes] : [],
+			);
+		};
+		const outcome = await new Promise<string>((resolve) => {
+			const timer = setTimeout(() => resolve("no completion"), 5_000);
+			worker.on(
+				"message",
+				(message: PiHydrationMessage | { type: "evaluated" }) => {
+					if (message.type === "evaluated") {
+						evaluated = true;
+						for (const waiting of held.splice(0)) ack(waiting);
+					} else if (message.type === "done" || message.type === "failed") {
+						clearTimeout(timer);
+						resolve(message.type);
+					} else if (evaluated) ack(message);
+					else held.push(message);
+				},
+			);
+		});
+		expect({ outcome, evaluated }).toEqual({
+			outcome: "done",
+			evaluated: true,
+		});
+	} finally {
+		await worker.terminate();
+		close();
+	}
+});
+
 it("worker releases read transactions before slow acknowledgments in WAL and rollback journal modes", async () => {
 	for (const mode of ["WAL", "DELETE"] as const) {
 		const { db, foreign, path, close } = fixture(mode);
@@ -634,6 +816,34 @@ it("worker deadline and cancellation wait for release and never return a candida
 		cancelled.cancel();
 		await expect(cancelled.result).rejects.toThrow("cancelled");
 		await cancelled.released;
+	} finally {
+		close();
+	}
+});
+
+it("a cancelled job closes its connection and exits instead of being terminated", async () => {
+	const { db, path, close } = fixture();
+	try {
+		const before = getWorkerShutdownStats().get("pi-tag-snapshot") ?? {
+			graceful: 0,
+			forced: 0,
+		};
+		// The page delay pauses the job before its first page read, with its
+		// connection already open.
+		const cancelled = startPiTagSnapshotWorker({
+			...requestFor(path),
+			test: { pageDelayMs: 500 },
+		});
+		cancelled.cancel();
+		await expect(cancelled.result).rejects.toThrow("cancelled");
+		await cancelled.released;
+		expect(getWorkerShutdownStats().get("pi-tag-snapshot")).toEqual({
+			graceful: before.graceful + 1,
+			forced: before.forced,
+		});
+		db.exec("PRAGMA busy_timeout=0");
+		db.exec("BEGIN IMMEDIATE");
+		db.exec("ROLLBACK");
 	} finally {
 		close();
 	}

@@ -99,6 +99,8 @@ export function rawMessagePage(rows: readonly StoreRow[], afterOrdinal: number):
 }
 
 export interface V2RawMessageReader {
+    getRevision(sessionID: string): number;
+    getCountAfterRevision(sessionID: string, after: number, through: number): number;
     readPage(
         sessionID: string,
         afterOrdinal: number,
@@ -228,6 +230,22 @@ export function* readV2RawMessagePagesForConversion(
 export function createV2RawMessageReader(openReader: () => V2StoreReader): V2RawMessageReader {
     const servedBoundaryCache = new Map<string, string | null>();
     return {
+        getRevision: (sessionID) => {
+            const reader = openReader();
+            try {
+                return reader.latestSequence(sessionID);
+            } finally {
+                reader.close();
+            }
+        },
+        getCountAfterRevision: (sessionID, after, through) => {
+            const reader = openReader();
+            try {
+                return reader.messageCountAfterSequence(sessionID, after, through);
+            } finally {
+                reader.close();
+            }
+        },
         readPage: (
             sessionID: string,
             afterOrdinal: number,

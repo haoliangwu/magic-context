@@ -28,6 +28,10 @@ async function doctor(name: string, config: string) {
             XDG_RUNTIME_DIR: join(home, "runtime"),
             XDG_CACHE_HOME: join(home, "cache"),
             MAGIC_CONTEXT_STORAGE_DIR: join(home, "mc"),
+            // Doctor asks the npm registry for the latest version. Point it at a closed
+            // local port so the lookup fails at once: on a busy runner the real
+            // registry round trip pushed this spawn past the test timeout.
+            npm_config_registry: "http://127.0.0.1:9",
         },
         cwd: home,
         stdout: "pipe",

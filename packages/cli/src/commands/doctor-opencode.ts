@@ -102,6 +102,7 @@ import {
     sanitizeDiagnosticText,
     sanitizePathString,
 } from "../lib/redaction";
+import { rerankConfigSummary } from "../lib/rerank-summary";
 import {
     checkStorageVersionFence,
     formatStorageVersions,
@@ -1406,6 +1407,7 @@ export async function runDoctor(
         // load and report them without bailing on the doctor run.
         try {
             const result = loadPluginConfig(process.cwd());
+            log.info(rerankConfigSummary(result.rerank));
             autoUpdateEnabled = result.auto_update !== false;
             checkConfiguredVariantCatalog(result, hostGeneration, warn);
             const warnings = result.configWarnings ?? [];
@@ -1423,6 +1425,7 @@ export async function runDoctor(
         }
     } else {
         warn(`No magic-context.jsonc found — using defaults`);
+        log.info(rerankConfigSummary());
         log.info("  Run 'setup' to create one with model recommendations");
     }
 

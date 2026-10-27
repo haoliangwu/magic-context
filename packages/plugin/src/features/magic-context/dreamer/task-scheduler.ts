@@ -46,6 +46,8 @@ export interface DreamTaskRuntimeConfig {
     schedule: string;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
+    /** Source of the selected task model, retained for host refusal diagnostics. */
+    modelConfigKey?: string;
     /** Configured Pi chain contained no models in Pi's registry. */
     modelChainUnavailable?: boolean;
     thinkingLevel?: PiThinkingLevel;

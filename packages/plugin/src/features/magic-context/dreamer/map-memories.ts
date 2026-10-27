@@ -30,7 +30,7 @@ import {
 import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
 import { failedInvocationStatus, recordChildInvocation } from "../subagent-token-capture";
 import { readFailedChildMessages } from "./failed-invocation-evidence";
-import { runHiddenSingleShotPrompt } from "./hidden-single-shot";
+import { DREAMER_FIRST_OUTPUT_TIMEOUT_MS, runHiddenSingleShotPrompt } from "./hidden-single-shot";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertNoDuplicateManifestIds } from "./manifest-parser";
 import {
@@ -105,6 +105,9 @@ export interface MapMemoriesArgs {
     leaseAcquisition?: LeaseAcquisition;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
+    /** How long a model may stay silent before the chain moves to the next model.
+     *  Defaults to DREAMER_FIRST_OUTPUT_TIMEOUT_MS. */
+    firstOutputTimeoutMs?: number;
     tokenBudget?: number;
     onBudgetUpdate?: (state: { spent: number; finalizeFired: boolean }) => void;
     moduleRoute?: DreamerModuleRoute;
@@ -524,6 +527,7 @@ async function mapOneBatch(
                 model: args.model,
                 fallbackModels: args.fallbackModels,
                 timeoutMs: sliceMs,
+                firstOutputTimeoutMs: args.firstOutputTimeoutMs ?? DREAMER_FIRST_OUTPUT_TIMEOUT_MS,
                 signal,
                 onOpened: () => {
                     stage = "prompt";
@@ -604,6 +608,7 @@ async function mapOneBatch(
                     onBudgetUpdate,
                 }),
                 timeoutMs: sliceMs,
+                firstOutputTimeoutMs: args.firstOutputTimeoutMs ?? DREAMER_FIRST_OUTPUT_TIMEOUT_MS,
                 signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:map-memories",
@@ -903,12 +908,14 @@ function recordInvocation(
     recordChildInvocation({
         db: args.db,
         parentSessionId: args.parentSessionId,
-        harness: "opencode",
+        harness: args.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
         subagent: "dreamer",
         task: "map-memories",
         startedAt,
         status: params.status,
         messages: params.messages,
+        attemptedModel: args.model,
+        configuredModels: args.fallbackModels,
         error: params.error,
     });
 }

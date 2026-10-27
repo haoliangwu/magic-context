@@ -1,4 +1,4 @@
-//! Opt-in thread CPU clocks for the in-process release profiling test.
+//! Opt-in thread CPU clocks for test-only performance checks.
 //!
 //! Spans are inclusive, just like the production wall timers. A current-thread
 //! Tokio runtime is required: thread CPU would be meaningless across migration.
@@ -29,33 +29,10 @@ pub(crate) fn end_pass() -> BTreeMap<&'static str, Cost> {
     COSTS.with(|costs| costs.borrow_mut().take().expect("profiling pass active"))
 }
 
-pub(crate) fn report_clock_overhead() {
-    let mut inclusive = Vec::new();
-    let mut recorded = Vec::new();
-    for _ in 0..23 {
-        begin_pass();
-        let before = ThreadTime::now().as_duration();
-        for _ in 0..23_000 {
-            finish(start("empty"));
-        }
-        let elapsed = ThreadTime::now().as_duration().saturating_sub(before);
-        let costs = end_pass();
-        inclusive.push(elapsed.as_secs_f64() * 1_000.0 / 23_000.0);
-        recorded.push(costs["empty"].thread_cpu_ms / 23_000.0);
-    }
-    inclusive.sort_by(f64::total_cmp);
-    recorded.sort_by(f64::total_cmp);
-    println!(
-        "COST_CLOCK {}",
-        serde_json::json!({"n":23,"spans_per_sample":23_000,
-        "inclusive_cpu_ms_per_span":inclusive[11],"recorded_cpu_ms_per_span":recorded[11]})
-    );
-}
-
 // `ThreadTime` is deliberately !Send, and spans live across awaits in the
 // transform handler, so a span keeps the thread clock's reading as a plain
-// `Duration`. The profiling test runs on a current-thread runtime, so start and
-// end are read on the same thread.
+// `Duration`. Callers must use a current-thread runtime to read start and end on
+// the same thread.
 pub(crate) struct Span {
     name: &'static str,
     wall: Instant,

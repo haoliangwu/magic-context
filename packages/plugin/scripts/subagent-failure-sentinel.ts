@@ -25,11 +25,14 @@ const DEFAULT_SETTLE_MS = 5 * 60_000;
 // and starts between 5 seconds before and this long after the primary ends.
 const FALLBACK_START_WINDOW_MS = 120_000;
 // Failures a working fallback makes routine: an exhausted or rate-limited
-// provider, and the summarizer refusing before sending because the prompt is
-// larger than that model's window (no model call was made). Any other failure
-// stays eligible for the alert rules even when a fallback recovered it.
+// provider; the summarizer refusing before sending because the prompt is
+// larger than that model's window (no model call was made); and a primary that
+// never answered before the prompt deadline (a model that is down). A timeout
+// counts only when a fallback then completed the same work, so a prompt too slow
+// for every model in the chain still alerts. Any other failure stays eligible for
+// the alert rules even when a fallback recovered it.
 const RECOVERABLE_ERROR =
-    /account pool has no account|quota|rate[ _-]?limit|too many requests|\b429\b|resource_exhausted|usage limit|producer_prompt_exceeds_window/i;
+    /account pool has no account|quota|rate[ _-]?limit|too many requests|\b429\b|resource_exhausted|usage limit|producer_prompt_exceeds_window|prompt timed out after/i;
 
 type Row = {
     id: number;
@@ -116,27 +119,43 @@ function key(alert: Alert): string {
 
 /**
  * Ids of routine failures (see RECOVERABLE_ERROR) that a completed fallback attempt
- * recovered. The run produced its result on the fallback model, so the primary's
- * failure is expected and is not worth a wake. A fallback that also fails leaves the
- * primary unrecovered, so its failure stays eligible for the alert rules.
+ * recovered. The run produced its result on a fallback model, so the earlier
+ * failures are expected and not worth a wake. A chain can fail on several models
+ * before one completes, for example when two models share one exhausted account
+ * pool, so recovery follows the chain to the completed attempt. Only routine
+ * failures are excused. A non-routine step on the way, such as a fallback that
+ * returned an empty reply, still lets the chain reach its completion, but that step
+ * itself stays eligible for the alert rules. A chain that ends without a completed
+ * attempt leaves all its failures eligible.
  */
 export function recoveredByFallback(rows: Row[]): Set<number> {
+    const isRoutineFailure = (row: Row) =>
+        (row.status === "failed" || row.status === "timed_out") && RECOVERABLE_ERROR.test(row.error ?? "");
+    const nextAttempts = (row: Row) =>
+        rows.filter(
+            (candidate) =>
+                candidate.parent_invocation_id === row.id ||
+                (candidate.parent_invocation_id === null &&
+                    candidate.task === "fallback" &&
+                    candidate.subagent === row.subagent &&
+                    candidate.session_id === row.session_id &&
+                    candidate.started_at >= row.ended_at - 5_000 &&
+                    candidate.started_at <= row.ended_at + FALLBACK_START_WINDOW_MS),
+        );
+    // True when a completed attempt follows this failure further down its chain.
+    // `seen` guards against a malformed chain that loops.
+    const reachesCompletion = (row: Row, seen: Set<number>): boolean => {
+        for (const next of nextAttempts(row)) {
+            if (seen.has(next.id)) continue;
+            if (next.status === "completed") return true;
+            seen.add(next.id);
+            if (reachesCompletion(next, seen)) return true;
+        }
+        return false;
+    };
     const recovered = new Set<number>();
     for (const row of rows) {
-        if (row.status !== "failed" && row.status !== "timed_out") continue;
-        if (!RECOVERABLE_ERROR.test(row.error ?? "")) continue;
-        const fallbackCompleted = rows.some(
-            (candidate) =>
-                candidate.status === "completed" &&
-                (candidate.parent_invocation_id === row.id ||
-                    (candidate.parent_invocation_id === null &&
-                        candidate.task === "fallback" &&
-                        candidate.subagent === row.subagent &&
-                        candidate.session_id === row.session_id &&
-                        candidate.started_at >= row.ended_at - 5_000 &&
-                        candidate.started_at <= row.ended_at + FALLBACK_START_WINDOW_MS)),
-        );
-        if (fallbackCompleted) recovered.add(row.id);
+        if (isRoutineFailure(row) && reachesCompletion(row, new Set([row.id]))) recovered.add(row.id);
     }
     return recovered;
 }

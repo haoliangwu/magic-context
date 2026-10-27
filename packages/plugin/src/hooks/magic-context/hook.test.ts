@@ -6,11 +6,12 @@ import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 // to prevent the TUI toast path from intercepting sendIgnoredMessage calls.
 process.env.OPENCODE_CLIENT = "desktop";
 
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import type { execFileSync } from "node:child_process";
 import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { inspect } from "node:util";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { writeTaskScheduleState } from "../../features/magic-context/dreamer/storage-task-schedule";
 import { ensureContextStoreUuid } from "../../features/magic-context/legacy-authority-fixture.test-support";
@@ -45,6 +46,7 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import type { Tagger } from "../../features/magic-context/tagger";
+import * as logger from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import {
     autoEmbedAttemptedBySession,
@@ -655,17 +657,57 @@ describe("magic-context hook", () => {
             ];
             await hook["experimental.chat.messages.transform"]!({}, { messages });
         };
-        const waitUntil = async (predicate: () => boolean): Promise<void> => {
-            const deadline = Date.now() + 3_000;
-            while (!predicate() && Date.now() < deadline) {
-                await new Promise((resolve) => setTimeout(resolve, 10));
+        // Each transform starts a background drain (registration, a database
+        // worker, the provider batches) that outlives the transform. Its finally
+        // block releases the session's run claim and, unless the drain was
+        // aborted or the embedding identity changed, records the completion
+        // latch or a retry. Wait for that outcome instead of a fixed deadline,
+        // which a loaded CI runner can overrun while the drain is still working;
+        // a drain that never settles fails on the test timeout.
+        //
+        // A drain can also stop short and record a short retry (lease
+        // contention or a busy interruption sets it one second ahead). In
+        // production the session's next context pass after that delay starts
+        // the drain again, so the test drives the same extra idle pass, a
+        // bounded number of times. A long retry delay is a real failure (an
+        // error or deferred work) and is not waited out.
+        const maxRetryPasses = 3;
+        const maxWaitedRetryDelayMs = 2_000;
+        // The logger is silent under bun test. Capture its calls so a failed
+        // drain reports the original error or deferral, not just its retry time.
+        const drainLogs: string[] = [];
+        const logSpy = spyOn(logger, "log").mockImplementation((message, data) => {
+            if (/^\[magic-context\] (?:auto-embed|session backfill)/.test(message)) {
+                drainLogs.push(data === undefined ? message : `${message} ${inspect(data)}`);
             }
-            expect(predicate()).toBe(true);
+        });
+        const waitForDrainOutcome = async (): Promise<void> => {
+            const settled = () =>
+                !embedRunStateBySession.has(sessionId) &&
+                (autoEmbedAttemptedBySession.has(sessionId) ||
+                    autoEmbedRetryAfterBySession.has(sessionId));
+            let retryPasses = 0;
+            let retryDelayMs = 0;
+            for (;;) {
+                while (!settled()) {
+                    await new Promise((resolve) => setTimeout(resolve, 10));
+                }
+                if (autoEmbedAttemptedBySession.has(sessionId)) break;
+                retryDelayMs = (autoEmbedRetryAfterBySession.get(sessionId) ?? 0) - Date.now();
+                if (retryPasses >= maxRetryPasses || retryDelayMs > maxWaitedRetryDelayMs) break;
+                retryPasses++;
+                await new Promise((resolve) => setTimeout(resolve, Math.max(0, retryDelayMs) + 10));
+                await runTransform();
+            }
+            // A retry instead of the latch means the drain stopped short.
+            const failure = `auto-embed drain never latched: ${retryPasses} retry pass(es), next retry in ${retryDelayMs} ms\n${drainLogs.join("\n")}`;
+            if (!autoEmbedAttemptedBySession.has(sessionId)) console.error(failure);
+            expect(autoEmbedAttemptedBySession.has(sessionId), failure).toBe(true);
         };
 
         try {
             await runTransform();
-            await waitUntil(() => autoEmbedAttemptedBySession.has(sessionId));
+            await waitForDrainOutcome();
 
             for (let i = 1; i <= 7; i++) {
                 appendCompartments(db, sessionId, [
@@ -685,14 +727,15 @@ describe("magic-context hook", () => {
                 ).run(sessionId, i, `u${i}`, "user", `Source text ${i}`);
             }
 
+            // These direct FTS inserts bypass the indexer's source and rowid-map
+            // entries. Canonical chunk text defers such legacy-shaped spans until
+            // the startup rowid-map backfill completes, so join it before draining.
+            await startMessageFtsRowidMapBackfill(db);
             await runTransform();
-            await waitUntil(() => {
-                const coverage = getEmbeddingCoverageStatus(db, projectIdentity, sessionId);
-                return (
-                    coverage.session.total === 7 &&
-                    coverage.session.embedded === 7 &&
-                    autoEmbedAttemptedBySession.has(sessionId)
-                );
+            await waitForDrainOutcome();
+            expect(getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session).toEqual({
+                total: 7,
+                embedded: 7,
             });
             await new Promise((resolve) => setTimeout(resolve, 30));
             expect(userRows()).toEqual([]);
@@ -718,11 +761,10 @@ describe("magic-context hook", () => {
                 "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
             ).run(sessionId, 8, "u8", "user", "Later source text");
             await runTransform();
-            await waitUntil(
-                () =>
-                    getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session.embedded ===
-                    8,
-            );
+            await waitForDrainOutcome();
+            expect(
+                getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session.embedded,
+            ).toBe(8);
             expect(embedBatch.mock.calls.length).toBeGreaterThan(calls);
             expect(getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session).toEqual({
                 total: 8,
@@ -730,6 +772,7 @@ describe("magic-context hook", () => {
             });
             expect(userRows()).toEqual([]);
         } finally {
+            logSpy.mockRestore();
             clearEmbedSessionState(sessionId);
             hostDb.close();
         }

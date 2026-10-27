@@ -31,6 +31,7 @@ export async function registerTools(
     config: MagicContextPluginConfig,
     rustToolBackends?: RustToolBackends,
     isInternalChild?: (sessionId: string) => boolean,
+    ensureProjectRegistered = ensureProjectRegisteredFromOpenCodeDirectory,
 ) {
     const compaction = isCompactionEnabled(config);
     setCtxReduceRegisteredGlobally(compaction);
@@ -38,7 +39,7 @@ export async function registerTools(
         db,
         resolveProjectPath: (directory: string) =>
             resolveProjectIdentityForSession(directory, config.allow_home_project),
-        ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+        ensureProjectRegistered,
     };
     const definitions = {
         ...(compaction
@@ -54,14 +55,22 @@ export async function registerTools(
                   ...(rustToolBackends ? { rustToolBackends } : {}),
               })
             : {}),
-        ...createCtxExpandTools({ db, expandTools: config.historian?.expand_tools }),
+        ...createCtxExpandTools({
+            db,
+            expandTools: config.historian?.expand_tools,
+            transformMode: config.transform_mode,
+        }),
         ...createCtxNoteTools({
             ...project,
             dreamerEnabled: isDreamerRunnable(config),
             smartNotesEnabled: config.smart_notes.enabled,
             ...(rustToolBackends ? { rustToolBackends } : {}),
         }),
-        ...createCtxSearchTools({ ...project, rerankConnectionFile: config.subc?.connection_file }),
+        ...createCtxSearchTools({
+            ...project,
+            rerankConnectionFile: config.subc?.connection_file,
+            rerankConfig: config.rerank,
+        }),
         ...(config.memory.enabled
             ? {
                   ...createCtxMemoryTools({

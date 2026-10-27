@@ -347,12 +347,20 @@ it(
         expect(first).toContain("## Magic Context");
 
         // The transform recognised the host's own compaction pair at the window head.
-        expect(pluginLog()).toContain(
-            `native host compaction heads the window (request ${summary?.parentId}, summary ${summary?.id},`,
-        );
+        // The plugin buffers log writes for up to half a second, so each log check
+        // waits for its line; a missing line still fails on the assertion after it.
+        const headLine = `native host compaction heads the window (request ${summary?.parentId}, summary ${summary?.id},`;
+        await h.waitFor(() => pluginLog().includes(headLine), { timeoutMs: 5000, label: "host compaction head log line" }).catch(() => undefined);
+        expect(pluginLog()).toContain(headLine);
 
         // Exactly one fold after the compaction: the next pass replays it.
+        const logOffsetBeforeSecondPrompt = pluginLog().length;
         await h.sendPrompt(sessionId, "second prompt after the native compaction");
+        // A pass's lines are buffered together, so once its scheduler line is on
+        // disk the rest of that pass's lines are too.
+        const secondPassLogged = () =>
+            pluginLog().slice(logOffsetBeforeSecondPrompt).includes(`[magic-context][${sessionId}] transform scheduler:`);
+        await h.waitFor(secondPassLogged, { timeoutMs: 5000, label: "second pass scheduler log line" }).catch(() => undefined);
         const lines = pluginLog().split("\n");
         const compactedAt = lines.findIndex((line) => line.includes("compaction-marker: removed on session cleanup"));
         expect(compactedAt).toBeGreaterThan(-1);

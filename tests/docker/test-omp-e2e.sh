@@ -127,9 +127,24 @@ check "OMP emits a terminal agent_end protocol event" \
     "grep -qE '\"type\"[[:space:]]*:[[:space:]]*\"agent_end\"' /tmp/omp.log"
 
 section "OMP subagent argv contract"
-cat > /tmp/omp-subagent-system.txt <<'PROMPT'
-Reply once, then stop.
-PROMPT
+# A discovered tool must not leak into the historian, even with discovery enabled.
+# Observe the active tool list in the context callback after OMP applies the
+# child's tool restrictions.
+mkdir -p "$HOME/.omp/agent/extensions"
+cat > "$HOME/.omp/agent/extensions/child-tool-inventory.ts" <<'EXTENSION'
+import { writeFileSync } from "node:fs";
+export default function(pi) {
+    pi.registerTool({
+        name: "e2e_marker", label: "Inert smoke marker", description: "An inert discovered tool",
+        parameters: { type: "object", properties: {} },
+        async execute() { return { content: [{ type: "text", text: "marked" }], details: {} }; },
+    });
+    pi.on("context", () => {
+        writeFileSync("/tmp/omp-subagent-active-tools.json", JSON.stringify(pi.getActiveTools()));
+    });
+}
+EXTENSION
+rm -f /tmp/omp-subagent-active-tools.json
 OMP_PACKAGE_DIR="$(npm root -g)/@oh-my-pi/pi-coding-agent"
 node -e 'const m = require(process.argv[1]); console.log(`OMP package manifest: name=${m.name} version=${m.version} bin=${JSON.stringify(m.bin)}`)' \
     "$OMP_PACKAGE_DIR/package.json"
@@ -139,6 +154,9 @@ MAGIC_CONTEXT_PI_SUBAGENT=1 \
     OMP_BIN_PATH="$OMP_BIN_PATH" \
     BUN_EXEC_PATH="$BUN_EXEC_PATH" \
     node --input-type=module > /tmp/omp-subagent-invocation <<'NODE'
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { __test } from "/test/e2e/subagent-runner-e2e.mjs";
 
 const invocation = __test.resolvePiInvocation({
@@ -149,6 +167,11 @@ const invocation = __test.resolvePiInvocation({
 if (invocation.targetHarness !== "omp") {
     throw new Error(`resolved real OMP installation as ${invocation.targetHarness}`);
 }
+const childDir = mkdtempSync(join(tmpdir(), "mc-pi-prompt-"));
+const systemPromptPath = join(childDir, "system-prompt.txt");
+writeFileSync(systemPromptPath, "Reply once, then stop.\n", "utf8");
+const ompToolConfigPath = join(childDir, "tool-boundary.yml");
+writeFileSync(ompToolConfigPath, __test.OMP_CHILD_TOOL_CONFIG, "utf8");
 const args = __test.buildArgs(
     {
         agent: "historian",
@@ -158,7 +181,8 @@ const args = __test.buildArgs(
     },
     {
         targetHarness: invocation.targetHarness,
-        systemPromptPath: "/tmp/omp-subagent-system.txt",
+        systemPromptPath,
+        ompToolConfigPath,
         modelRef: "mock/mock-model",
     },
 );
@@ -188,6 +212,13 @@ tail -20 /tmp/omp-subagent.log
 check "OMP accepts the translated subagent argv" "test \"$OMP_SUBAGENT_EXIT\" -eq 0"
 check "OMP subagent emits a terminal agent_end protocol event" \
     "grep -qE '\"type\"[[:space:]]*:[[:space:]]*\"agent_end\"' /tmp/omp-subagent.log"
+check "OMP historian child has no active tools" "node --input-type=module" <<'NODE'
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+const active = JSON.parse(readFileSync("/tmp/omp-subagent-active-tools.json", "utf8"));
+console.log(`OMP historian active tools: ${JSON.stringify(active)}`);
+assert.deepEqual(active, []);
+NODE
 
 check "OMP produced protocol output" "test -s /tmp/omp.log"
 check "Magic Context extension initialized" "test -s $PLUGIN_LOG"

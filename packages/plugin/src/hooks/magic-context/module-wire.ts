@@ -5,6 +5,7 @@ import {
     readRawSessionMessageOrdinalPage,
 } from "./read-session-chunk";
 import {
+    areRustHistorianSyntheticParts,
     isRawCompactionSummaryInfo,
     type RawMessageOrdinalAnchor,
     type RawMessageParts,
@@ -1014,21 +1015,7 @@ export function encodeOpenCodeMessagesToCk(messages: unknown[]): Array<{
                     ? info.timeCompleted
                     : undefined;
         const parts = Array.isArray(raw.parts) ? raw.parts : [];
-        const syntheticParts = parts.filter(
-            (part) =>
-                part === null ||
-                typeof part !== "object" ||
-                (part as Record<string, unknown>).type !== "compaction",
-        );
-        const synthetic =
-            syntheticParts.length > 0 &&
-            syntheticParts.every(
-                (part) =>
-                    part !== null &&
-                    typeof part === "object" &&
-                    ((part as Record<string, unknown>).synthetic === true ||
-                        (part as Record<string, unknown>).syntheticTodoMarker === true),
-            );
+        const synthetic = areRustHistorianSyntheticParts(parts);
         const content: Record<string, unknown>[] = [];
         const recoveryToolTitles: Record<string, string> = {};
         const userAnswerBlocks: number[] = [];

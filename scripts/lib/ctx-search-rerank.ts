@@ -199,7 +199,6 @@ export async function scorePool(
 				candidates: pool.map((row) => row.text),
 				required_fingerprint: lane.fingerprint,
 				allow_equivalent: false,
-				accept_declared: false,
 				max_queue_ms: Math.min(100, deadlineMs),
 				deadline_ms: deadlineMs,
 			},

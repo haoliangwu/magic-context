@@ -275,6 +275,34 @@ function diff(name: string, before: string, after: string): string {
     }
 }
 
+// Validate only the model's output here so malformed proposals can use a fallback.
+// Applying changes and checking the current docs remain host-side responsibilities.
+export function parseDocsProposalOutput(output: string): DocsSectionChange[] {
+    const match = output.match(/```json\s*([\s\S]*?)```/);
+    const parsed: unknown = JSON.parse(match?.[1] ?? output);
+    if (!Array.isArray(parsed)) throw new Error("proposal must be a JSON array");
+    const changes = parsed as DocsSectionChange[];
+    if (changes.some((item) => !item || !FILES.includes(item.file)))
+        throw new Error("unknown proposal file");
+    const seen = new Set<string>();
+    for (const change of changes) {
+        const key = `${change.file}:${change.heading}`;
+        if (
+            !(["replace", "add", "remove"] as unknown[]).includes(change.action) ||
+            typeof change.heading !== "string" ||
+            !/^#{1,6} [^\r\n]+$/.test(change.heading) ||
+            typeof change.text !== "string" ||
+            typeof change.reason !== "string" ||
+            !change.reason.trim() ||
+            /[\r\n]/.test(change.reason) ||
+            seen.has(key)
+        )
+            throw new Error(`invalid section change in ${change.file}`);
+        seen.add(key);
+    }
+    return changes;
+}
+
 export function validateDocsProposal(
     projectDir: string,
     output: string,
@@ -285,13 +313,8 @@ export function validateDocsProposal(
         Object.entries(expected).some(([name, value]) => docsBaseHashes(projectDir)[name] !== value)
     )
         throw new Error("base drifted");
-    const match = output.match(/```json\s*([\s\S]*?)```/);
-    const parsed: unknown = JSON.parse(match?.[1] ?? output);
-    if (!Array.isArray(parsed)) throw new Error("proposal must be a JSON array");
-    const changes = parsed as DocsSectionChange[];
+    const changes = parseDocsProposalOutput(output);
     if (!changes.length) throw new Error("empty proposal");
-    if (changes.some((item) => !item || !FILES.includes(item.file)))
-        throw new Error("unknown proposal file");
     let tokens = 0;
     let diffs = "";
     for (const file of FILES) {
@@ -299,20 +322,7 @@ export function validateDocsProposal(
             ? readFileSync(join(projectDir, file), "utf8")
             : "";
         let after = before;
-        const seen = new Set<string>();
         for (const change of changes.filter((item) => item.file === file)) {
-            if (
-                !(["replace", "add", "remove"] as unknown[]).includes(change.action) ||
-                typeof change.heading !== "string" ||
-                !/^#{1,6} [^\r\n]+$/.test(change.heading) ||
-                typeof change.text !== "string" ||
-                typeof change.reason !== "string" ||
-                !change.reason.trim() ||
-                /[\r\n]/.test(change.reason) ||
-                seen.has(change.heading)
-            )
-                throw new Error(`invalid section change in ${file}`);
-            seen.add(change.heading);
             const section = sections(after).find((item) => item.heading === change.heading);
             if (change.action === "add") {
                 if (section || !change.text.startsWith(`${change.heading}\n`))

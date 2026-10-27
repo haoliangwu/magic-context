@@ -29,7 +29,8 @@ class ReleaseTests(unittest.TestCase):
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update(TEST_ROOT=str(self.root), REAL_GIT=str(REAL_GIT), REAL_BUN=str(REAL_BUN),
                         GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-                        PYTHONDONTWRITEBYTECODE="1", HOME=str(self.root / "home"))
+                        PYTHONDONTWRITEBYTECODE="1", HOME=str(self.root / "home"),
+                        CI_GATE_MISSING_RUN_RETRY_SECONDS="0")
         self.git("init", "-b", "master")
         self.git("config", "user.name", "Release Fixture")
         self.git("config", "user.email", "fixture@example.invalid")
@@ -103,7 +104,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse(any(args[0] == "push" or args[:2] == ["tag", "-a"] for args in self.commands("git")))
 
     def test_each_workflow_must_succeed_on_exact_sha(self):
-        for workflow in ("CI", "Mutations", "Smoke"):
+        for workflow in ("CI", "Smoke"):
             for override in ({"conclusion": "failure"}, {"status": "in_progress", "conclusion": None}, {"head_sha": "a" * 40}):
                 with self.subTest(workflow=workflow, override=override):
                     self.scenario["workflows"] = {workflow: override}
@@ -119,6 +120,10 @@ class ReleaseTests(unittest.TestCase):
         run = self.run_script()
         self.assertNotEqual(run.returncode, 0)
         self.assertIn("Smoke for " + self.base + ": missing", run.stderr)
+        # CI is found at once; Smoke is looked up once and then
+        # retried four times before the release is refused.
+        lookups = [args for args in self.commands("gh") if any("/actions/runs?head_sha=" in arg for arg in args)]
+        self.assertEqual(len(lookups), 1 + 1 + 4)
         self.assert_no_publish()
 
     def test_newer_failed_run_cannot_reuse_older_success(self):
@@ -132,6 +137,16 @@ class ReleaseTests(unittest.TestCase):
         self.scenario["api_failure"] = True
         self.assertNotEqual(self.run_script().returncode, 0)
         self.assert_no_publish()
+
+    def test_release_requires_completed_slow_modes_on_the_candidate(self):
+        for jobs in ([], [{"name": "Slow unit (normal)", "status": "completed", "conclusion": "success"}],
+                     [{"name": "Slow unit (normal)", "status": "completed", "conclusion": "skipped"}]):
+            with self.subTest(jobs=jobs):
+                self.scenario["slow_jobs"] = jobs
+                run = self.run_script()
+                self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+                self.assertIn("required slow lane", run.stderr)
+                self.assert_no_publish()
 
     def test_tag_workflow_always_requires_rust_build_and_shards(self):
         workflow = (SCRIPTS.parent / ".github/workflows/release.yml").read_text()

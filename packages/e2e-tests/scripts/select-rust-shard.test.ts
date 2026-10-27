@@ -5,17 +5,25 @@ import { selectRustShard } from "./select-rust-shard";
 import { selectWeightedShard } from "./select-weighted-shard";
 
 describe("rust hermetic shard coverage", () => {
-    test("four disjoint shards cover the manifest rust list exactly once", () => {
+    test("CI and release shard matrices cover the manifest rust list exactly once", async () => {
         const validation = validateModeManifest();
         const files = filesForMode(validation, "rust");
-        const shards = Array.from({ length: 4 }, (_, i) => selectRustShard(files, `${i}/4`));
-        const selected = shards.flat();
-        expect(selected.length).toBe(files.length);
-        expect(new Set(selected).size).toBe(files.length);
-        expect([...selected].sort()).toEqual(files);
-        expect(shards.every((shard) => shard.length > 0)).toBe(true);
-        for (const entry of validation.manifest.entries) {
-            if (!entry.invocation.rust) expect(selected).not.toContain(entry.path);
+        for (const name of ["ci", "release"]) {
+            const document = Bun.YAML.parse(await Bun.file(new URL(`../../../.github/workflows/${name}.yml`, import.meta.url)).text()) as {
+                jobs: Record<string, { strategy: { matrix: { shard: number[] } }; steps: Array<{ env?: Record<string, string> }> }>;
+            };
+            const job = document.jobs["e2e-rust-hermetic"]!;
+            const matrix = job.strategy.matrix.shard;
+            const template = job.steps.find((step) => step.env?.MC_E2E_SHARD)?.env!.MC_E2E_SHARD!;
+            const shards = matrix.map((index) => selectRustShard(files, template.replace("${{ matrix.shard }}", String(index))));
+            const selected = shards.flat();
+            expect(selected.length).toBe(files.length);
+            expect(new Set(selected).size).toBe(files.length);
+            expect([...selected].sort()).toEqual(files);
+            expect(shards.every((shard) => shard.length > 0)).toBe(true);
+            for (const entry of validation.manifest.entries) {
+                if (!entry.invocation.rust) expect(selected).not.toContain(entry.path);
+            }
         }
     });
 

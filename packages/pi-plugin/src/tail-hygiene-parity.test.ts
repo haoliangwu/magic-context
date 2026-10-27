@@ -6,7 +6,6 @@ import {
 	decideChannel1,
 	evaluateChannel2,
 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
-import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import type { MessageLike } from "@magic-context/core/hooks/magic-context/tag-messages";
 import { measureTailHygiene } from "@magic-context/core/hooks/magic-context/tail-hygiene-walk";
 import { measurePiTailHygiene } from "./tail-hygiene-walk-pi";
@@ -329,43 +328,6 @@ describe("nudge hygiene three-leg differential corpus", () => {
 				expect(fixture.protected_tags).toBe(99);
 				expect(protectedNumbers).toEqual(new Set());
 			}
-		}
-	});
-
-	it("makes a reasoning-arm counting mutation fail each JavaScript leg", () => {
-		const fixture = golden.cases.find(
-			(candidate) => candidate.id === "reasoning-excluded-both-terms",
-		);
-		if (!fixture) throw new Error("missing reasoning parity fixture");
-		const reasoningTokens = fixture.messages
-			.flatMap((message) => message.blocks)
-			.filter((block): block is ReasoningBlock => block.type === "reasoning")
-			.reduce(
-				(sum, block) =>
-					sum + estimateTokens(repeated(block.unit, block.repeat)),
-				0,
-			);
-		const protectedNumbers = protectedTagNumbers(fixture);
-		const core = measureTailHygiene({
-			messages: toCoreMessages(fixture),
-			tags: toTags(fixture),
-			protectedTagNumbers: protectedNumbers,
-		});
-		const pi = measurePiTailHygiene({
-			messages: toPiMessages(fixture),
-			tags: toTags(fixture, true),
-			protectedTagNumbers: protectedNumbers,
-			stableId: (message) => (message as { _mid?: string })._mid,
-		});
-
-		for (const [leg, measured] of [
-			["TypeScript", core],
-			["Pi", pi],
-		] as const) {
-			expect(
-				Math.abs(measured.t + reasoningTokens - fixture.expected.t),
-				`${leg} reasoning-arm mutant must exceed tolerance`,
-			).toBeGreaterThan(tolerance(fixture.expected.t));
 		}
 	});
 

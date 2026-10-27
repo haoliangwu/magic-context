@@ -18,14 +18,16 @@ const bytes = (value: unknown) =>
 	JSON.stringify(value, (key, item) =>
 		key === "cache_control" ? undefined : item,
 	);
-const thinking = (step: number) => ({
+const thinking = (step: number, heavy = false) => ({
 	type: "thinking",
-	thinking: `Reason ${step}`,
+	thinking: heavy && step === 1
+		? `Reason ${step} ${"weighing the next step carefully ".repeat(400)}`
+		: `Reason ${step}`,
 	signature: `signed-${step}`,
 });
 type WireMessage = { role: string; content: Array<{ type: string }> };
 
-test("OC2 signed tool loop holds queued drops on a plain real-user pass until ctx-flush", async () => {
+async function runSignedReclaimScenario(held: boolean) {
 	const fixture = isolation();
 	const mock = new MockProvider();
 	const provider = await mock.start({
@@ -41,7 +43,7 @@ test("OC2 signed tool loop holds queued drops on a plain real-user pass until ct
 		modelOutputLimit: 1024,
 		compactionAuto: false,
 		magicContextConfig: {
-			execute_threshold_tokens: { default: 5000 },
+			execute_threshold_tokens: { default: held ? 65_000 : 5000 },
 			protected_tokens: 4000,
 			dreamer: { disable: true },
 			memory: { enabled: false },
@@ -95,12 +97,12 @@ test("OC2 signed tool loop holds queued drops on a plain real-user pass until ct
 				input_tokens: 0,
 				output_tokens: 20,
 				cache_read_input_tokens:
-					step >= 4 ? Math.ceil(0.76 * (100_000 - 1024)) : 100,
+					step >= 4 ? Math.ceil((held ? 0.70 : 0.76) * (100_000 - 1024)) : 100,
 				cache_creation_input_tokens: 0,
 			};
 			const tool = (name: string, input: unknown) => ({
 				content: [
-					thinking(step),
+					thinking(step, held),
 					{ type: "tool_use", id: `call-${step}`, name, input },
 				],
 				stop_reason: "tool_use" as const,
@@ -149,6 +151,23 @@ test("OC2 signed tool loop holds queued drops on a plain real-user pass until ct
 		);
 		expect(pending()).toContainEqual({ tag_id: tag });
 		const previous = wire.at(-1)!;
+		if (held) {
+			const hold = readPluginLog(host.env).match(/signed thinking hold: held=true reason=heavy_reasoning heavyStepsBack=(\d+) heavyStepTokens=(\d+) usage=([\d.]+)% cap=([\d.]+)%/);
+			expect(hold).not.toBeNull();
+			expect(Number(hold![1])).toBeLessThanOrEqual(15);
+			expect(Number(hold![2])).toBeGreaterThan(1500);
+			expect(Number(hold![3])).toBeLessThan(Number(hold![4]));
+			// Heavy reasoning remains inside the 15-step window at 70% usage,
+			// below this route's 65% execute threshold plus the ten-point hold cap.
+			for (const request of wire.slice(6)) expect(bytes(request)).toContain("SPENT-b");
+			expect(previous.flatMap((message) => message.content).filter((part) => part.type === "thinking"))
+				.toEqual(Array.from({ length: 8 }, (_, n) => thinking(n + 1, true)));
+			await client.session.command({ sessionID: session.id, name: "ctx-flush", text: "" });
+			await prompt("End the held turn and apply the explicitly requested rebuild; finish.");
+			expect(bytes(wire.at(-1))).not.toContain("SPENT-b");
+			expect(pending()).toHaveLength(0);
+			return;
+		}
 		const lastRequest = () =>
 			mock
 				.requests()
@@ -160,44 +179,35 @@ test("OC2 signed tool loop holds queued drops on a plain real-user pass until ct
 						),
 				)
 				.at(-1)!.body;
-		const previousBody = lastRequest();
-		const logOffset = readPluginLog(host.env).length;
 		await prompt("Next real user turn; finish.");
-		const held = wire.at(-1)!;
-		// A real user ends the signed turn, but does not pay for a prefix rewrite.
-		expect(bytes(held.slice(0, previous.length))).toBe(bytes(previous));
-		expect(bytes(lastRequest().system)).toBe(bytes(previousBody.system));
-		expect(bytes(lastRequest().tools)).toBe(bytes(previousBody.tools));
-		expect(bytes(held)).toContain("SPENT-b");
+		const rebuilt = wire.at(-1)!;
+		const rebuiltBody = lastRequest();
+		// The short reasoning never grants a hold. A worthwhile execute reclaim
+		// is a permitted bust and removes signatures bound to the dropped output.
+		expect(bytes(rebuilt)).not.toContain("SPENT-b");
 		expect(
-			held
+			rebuilt
 				.flatMap((message) => message.content)
 				.filter((part) => part.type === "thinking"),
-		).toEqual(Array.from({ length: 8 }, (_, n) => thinking(n + 1)));
-		expect(pending()).toContainEqual({ tag_id: tag });
-		// The plugin buffers log writes for up to half a second, so poll the part of
-		// the log written after this turn began instead of reading it once. An earlier
-		// pass of the tool loop can log the same line, so only the new part counts.
-		const holdLine =
-			"pending ops held — reason=no originating cache-bust opportunity; scheduler=execute, historianRunning=false";
-		let sinceTurn = "";
-		for (const deadline = Date.now() + 5_000; ; ) {
-			sinceTurn = readPluginLog(host.env).slice(logOffset);
-			if (sinceTurn.includes(holdLine) || Date.now() >= deadline) break;
-			await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-		}
-		expect(sinceTurn).toContain(holdLine);
-		// The public flush command grants the same permission as a genuine rebuild.
-		await client.session.command({
-			sessionID: session.id,
-			name: "ctx-flush",
-			text: "",
-		});
-		await prompt("Apply the explicitly requested rebuild; finish.");
-		expect(bytes(wire.at(-1))).not.toContain("SPENT-b");
+		).toEqual([]);
 		expect(pending()).toHaveLength(0);
+		const frozen = () => db.query("SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?").get(session.id);
+		const stripped = frozen();
+		expect(JSON.stringify(stripped)).not.toMatch(/null|\[\]/);
+		await prompt("Defer with no newly queued reductions; finish.");
+		expect(bytes(wire.at(-1)!.slice(0, rebuilt.length))).toBe(bytes(rebuilt));
+		expect(bytes(lastRequest().system)).toBe(bytes(rebuiltBody.system));
+		expect(bytes(lastRequest().tools)).toBe(bytes(rebuiltBody.tools));
+		expect(frozen()).toEqual(stripped);
 	} finally {
 		db.close();
 		await host.stop();
 	}
-}, 180_000);
+}
+
+for (const held of [false, true])
+	test(
+		`OC2 ${held ? "heavy reasoning holds queued drops below the hold cap until a permitted bust" : "unheld execute reclaim strips thinking once and replays the rebuilt prefix"}`,
+		() => runSignedReclaimScenario(held),
+		180_000,
+	);

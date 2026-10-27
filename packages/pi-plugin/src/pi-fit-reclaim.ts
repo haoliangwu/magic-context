@@ -5,6 +5,10 @@ import {
 	readReplayEnvelope,
 	updateReplayDocument,
 } from "@magic-context/core/features/magic-context/storage-replay-document";
+import {
+	withoutSqliteTransformPass,
+	withSqliteTurnDeadline,
+} from "@magic-context/core/shared/sqlite";
 import type { PiLkgPassSnapshot } from "./pi-lkg";
 import { piFitMessageBytes } from "./tokenize-pi-messages";
 
@@ -198,15 +202,26 @@ export function releasePiUpperEstimateReclaim(
 	cursor: UpperReclaimCursor,
 	reservation: string,
 ): void {
-	if (
-		!updateReplayDocument(db, cursor.sessionId, (doc) => {
-			if (claimFrom(doc[KEY], cursor.sessionId)?.reservation !== reservation)
-				return false;
-			delete doc[KEY];
-			return true;
-		})
-	)
-		throw new Error("Could not release upper-estimate reclaim");
+	// Releasing only this owner's claim is safe after the turn's deadline, but
+	// cleanup must add no native lock wait before replay or refusal. A busy claim stays durable.
+	withoutSqliteTransformPass(() =>
+		withSqliteTurnDeadline(
+			() => 0,
+			() => {
+				if (
+					!updateReplayDocument(db, cursor.sessionId, (doc) => {
+						if (
+							claimFrom(doc[KEY], cursor.sessionId)?.reservation !== reservation
+						)
+							return false;
+						delete doc[KEY];
+						return true;
+					})
+				)
+					throw new Error("Could not release upper-estimate reclaim");
+			},
+		),
+	);
 }
 
 export function resetPiUpperEstimateReclaim(

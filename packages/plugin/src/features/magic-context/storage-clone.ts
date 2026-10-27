@@ -8,6 +8,7 @@ import {
 } from "./merged-reasoning-decisions";
 import { decodePiContentDecision, encodePiContentDecision } from "./pi-content-decisions";
 import {
+    COMPACTION_OFF_THINKING_FROZEN_PREFIX,
     getPendingPiCompactionMarkerState,
     logPiCompactionMarkerClear,
     type PendingPiCompactionMarker,
@@ -192,13 +193,16 @@ function clonePiContentDecisions(
             continue;
         }
         // Thinking-binding recovery decisions name the message whose reasoning
-        // was stripped after a provider rejected the thinking prefix.
-        if (entry.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) {
-            const messageId = entry.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
+        // was stripped after a provider rejected the thinking prefix; the
+        // compaction-off strip entries name messages the same way.
+        const thinkingPrefix = [
+            THINKING_BINDING_RECOVERY_FROZEN_PREFIX,
+            COMPACTION_OFF_THINKING_FROZEN_PREFIX,
+        ].find((prefix) => entry.startsWith(prefix));
+        if (thinkingPrefix) {
+            const messageId = entry.slice(thinkingPrefix.length);
             if (messageId.length === 0 || !filter.includeMessageId(messageId)) continue;
-            copied.push(
-                `${THINKING_BINDING_RECOVERY_FROZEN_PREFIX}${mapMessageId(filter, messageId) ?? messageId}`,
-            );
+            copied.push(`${thinkingPrefix}${mapMessageId(filter, messageId) ?? messageId}`);
             continue;
         }
         // Anything else that is not a recognised record prefix is a bare

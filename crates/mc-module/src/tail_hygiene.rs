@@ -149,63 +149,6 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     crate::digest::hex(&Sha256::digest(bytes.as_ref()))
 }
 
-#[cfg(test)]
-pub(crate) fn profile_part_hash_variants(session: &str, projection: &FlatProjection) {
-    let mut samples = std::collections::BTreeMap::<&str, Vec<f64>>::new();
-    for sample in 0..23 {
-        let variants = if sample % 2 == 0 {
-            ["concat_formatter", "stream_formatter", "stream_table"]
-        } else {
-            ["stream_table", "stream_formatter", "concat_formatter"]
-        };
-        for variant in variants {
-            crate::per_pass_profile::begin_pass();
-            profile_start!(perf_operation, "hash_variant");
-            for block in &projection.blocks {
-                // Mirror the production child-clock overhead in every variant.
-                profile_start!(perf_hash, "variant_part");
-                let hash = if variant == "concat_formatter" {
-                    let mut input = String::with_capacity(9 + block.bytes.len());
-                    input.push_str("excluded");
-                    input.push('\0');
-                    input.push_str(&block.bytes);
-                    format!("{:x}", Sha256::digest(input.as_bytes()))
-                } else {
-                    let mut hash = Sha256::new();
-                    hash.update(b"excluded");
-                    hash.update([0]);
-                    hash.update(block.bytes.as_bytes());
-                    let digest = hash.finalize();
-                    if variant == "stream_formatter" {
-                        format!("{digest:x}")
-                    } else {
-                        crate::digest::hex(&digest)
-                    }
-                };
-                std::hint::black_box(hash);
-                profile_end!(perf_hash);
-            }
-            profile_end!(perf_operation);
-            let costs = crate::per_pass_profile::end_pass();
-            if sample >= 3 {
-                samples
-                    .entry(variant)
-                    .or_default()
-                    .push(costs["hash_variant"].thread_cpu_ms);
-            }
-        }
-    }
-    for (variant, mut samples) in samples {
-        samples.sort_by(f64::total_cmp);
-        println!(
-            "COST_MICRO {}",
-            serde_json::json!({"session":session,"finding":"RT-3",
-            "shape":variant,"n":samples.len(),"parts":projection.blocks.len(),
-            "thread_cpu_p50_ms":(samples[9]+samples[10])/2.0})
-        );
-    }
-}
-
 fn strip_channel1_reminder_spans(output: &str) -> &str {
     let mut stripped = output;
     while stripped.ends_with(CHANNEL1_REMINDER_CLOSE) {

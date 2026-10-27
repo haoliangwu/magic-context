@@ -34,6 +34,7 @@ async function lock(path: string, mode: "read" | "write" | "exclusive", holdMs: 
             "--eval",
             `import { Database } from "bun:sqlite";
         const db = new Database(process.argv[1]);
+        db.exec("PRAGMA busy_timeout = 5000");
         db.exec(process.argv[2] === "read" ? "BEGIN; SELECT * FROM result"
             : process.argv[2] === "write" ? "BEGIN IMMEDIATE" : "BEGIN EXCLUSIVE");
         console.log("LOCKED");
@@ -51,7 +52,11 @@ async function lock(path: string, mode: "read" | "write" | "exclusive", holdMs: 
     while (!output.includes("LOCKED\n")) {
         const chunk = await reader.read();
         if (chunk.done) {
-            throw new Error(`locker failed: ${await new Response(child.stderr).text()}`);
+            const [exitCode, stderr] = await Promise.all([
+                child.exited,
+                new Response(child.stderr).text(),
+            ]);
+            throw new Error(`locker failed (exit ${exitCode}): ${stderr.trim() || "<no stderr>"}`);
         }
         output += new TextDecoder().decode(chunk.value);
     }

@@ -125,7 +125,7 @@ test("v2 wires autoSearch", () => {
         scoreThreshold: 0.73,
         minPromptChars: 37,
         directory: dir,
-        ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+        ensureProjectRegistered: deps.ensureProjectRegistered,
     });
     expect(deps.autoSearch?.wordRules).toBeDefined();
 });
@@ -138,8 +138,10 @@ test("v2 wires commitClusterTrigger", () =>
     expect(deps.commitClusterTrigger).toEqual(config.commit_cluster_trigger));
 test("v2 wires allowHomeProject", () => expect(deps.allowHomeProject).toBe(true));
 test("v2 wires injectDocs", () => expect(deps.injectDocs).toBe(false));
-test("v2 wires ensureProjectRegistered", () =>
-    expect(deps.ensureProjectRegistered).toBe(ensureProjectRegisteredFromOpenCodeDirectory));
+test("v2 wires ensureProjectRegistered through context ownership", () => {
+    expect(deps.ensureProjectRegistered).toBeFunction();
+    expect(deps.ensureProjectRegistered).not.toBe(ensureProjectRegisteredFromOpenCodeDirectory);
+});
 test("v2 wires historyBudgetPercentage", () => expect(deps.historyBudgetPercentage).toBe(0.23));
 // This config disables the dreamer, so review-user-memories can never run and
 // the historian neither stores user observations nor is asked for them.

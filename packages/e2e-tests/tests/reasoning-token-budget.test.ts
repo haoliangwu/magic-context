@@ -68,6 +68,10 @@ test("OpenCode 1 reasoning budget rides rebuilds and replays the frozen thinking
         expect(kept.reduce((sum, part) => sum + estimateTokens(part.thinking), 0)).toBeLessThanOrEqual(300);
         expect(watermark()).toBeGreaterThan(0);
         expect(JSON.stringify(rebuilt.body)).not.toContain("[cleared]");
+        // The plugin buffers log writes for up to half a second, so wait for the
+        // line to be flushed. A missing line still fails on the assertion below.
+        const cleanupLogged = () => readFileSync(logPath, "utf8").slice(offset).includes("reasoning cleanup:");
+        await h.waitFor(cleanupLogged, { timeoutMs: 5000, label: "reasoning cleanup log line" }).catch(() => undefined);
         expect(readFileSync(logPath, "utf8").slice(offset)).toContain("reasoning cleanup:");
         const frozen = watermark();
         await h.sendPrompt(session, "budget-seed replay after rebuild");

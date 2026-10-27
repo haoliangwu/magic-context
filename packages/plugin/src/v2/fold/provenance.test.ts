@@ -8,7 +8,7 @@ import { nativeFoldCache } from "./memory-cache";
 import { NativeFoldReplay } from "./native-replay";
 import { foldDigest } from "./owner";
 
-function fixture() {
+function fixture(getSetOnly = false) {
     const db = new Database(":memory:");
     initializeDatabase(db);
     runMigrations(db);
@@ -31,6 +31,10 @@ function fixture() {
             };
         },
     };
+    if (getSetOnly) {
+        delete storage.remove;
+        delete storage.scan;
+    }
     const reader = {
         hostIdentity: () => "private-store",
         latestRunningCompaction: () => ({ id: "cut" }),
@@ -48,6 +52,34 @@ function fixture() {
     const replay = () => new NativeFoldReplay(nativeFoldCache(db), () => reader, storage);
     return { db, records, reader, cut, replay };
 }
+
+test("session deletion before the first post-restart context pass revokes durable fold admission", async () => {
+    // A get/set-only host cannot remove admissions through optional storage APIs.
+    const f = fixture(true);
+    try {
+        const first = f.replay();
+        await first.observeSource("s", f.reader);
+        await first.storage.saveTail(
+            "s",
+            JSON.stringify({ model: "p/m", sourceSeq: 1, baseline: "PRIVATE_SUMMARY" }),
+            [],
+        );
+        expect(
+            await first.supply({
+                draft: { sessionID: "s", model: { providerID: "p", id: "m" } } as SessionContext,
+                reader: f.reader,
+                summary: "PRIVATE_SUMMARY",
+            }),
+        ).toBe(true);
+        expect(f.records.size).toBe(1);
+
+        // Deletion may arrive before the restarted replay has observed the host store.
+        await f.replay().forget("s");
+        expect(await f.replay().admits("s", f.cut, f.reader)).toBe(false);
+    } finally {
+        f.db.close();
+    }
+});
 
 test("durable provenance stores digests and rejects every mismatched coordinate after restart", async () => {
     const f = fixture();

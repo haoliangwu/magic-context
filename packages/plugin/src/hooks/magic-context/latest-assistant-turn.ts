@@ -47,6 +47,24 @@ export function latestAssistantTurnMessages<T>(messages: readonly T[]): Set<T> {
     return new Set(messages.slice(latestAssistantTurnStart(messages)));
 }
 
+/**
+ * True for a part the route serves as Anthropic thinking: any reasoning,
+ * thinking or redacted-thinking part on an Anthropic-family route (the
+ * Anthropic API, Bedrock, Vertex, Copilot), whatever metadata key the host
+ * stores its signature under, and on any other route one that carries
+ * Anthropic metadata.
+ */
+export function isAnthropicThinkingPart(
+    part: unknown,
+    familyRoute: boolean,
+): part is Record<string, unknown> {
+    return (
+        isRecord(part) &&
+        THINKING_TYPES.has(String(part.type ?? part.kind)) &&
+        (familyRoute || (isRecord(part.metadata) && isRecord(part.metadata.anthropic)))
+    );
+}
+
 export function hasActiveAnthropicThinkingTurn(
     messages: readonly unknown[],
     provider?: string,
@@ -57,15 +75,7 @@ export function hasActiveAnthropicThinkingTurn(
         if (role(message) !== "assistant") continue;
         const parts = content(message);
         if (!Array.isArray(parts)) continue;
-        if (
-            parts.some(
-                (part) =>
-                    isRecord(part) &&
-                    THINKING_TYPES.has(String(part.type ?? part.kind)) &&
-                    (familyRoute || (isRecord(part.metadata) && isRecord(part.metadata.anthropic))),
-            )
-        )
-            return true;
+        if (parts.some((part) => isAnthropicThinkingPart(part, familyRoute))) return true;
     }
     return false;
 }

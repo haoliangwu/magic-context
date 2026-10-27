@@ -169,6 +169,30 @@ const SECTION_ORDER: Array<{ keys: string[]; title: string; intro: string; outro
         intro: "Durable project memory, semantic search, and recall features. OpenAI-compatible instruction-tuned embedding families receive their documented query instruction automatically because those models were trained to distinguish retrieval queries from passages; plain local encoders remain unchanged. Query instructions affect only live search vectors, not stored vectors, so changing `embedding.query_instruction` does not re-embed the corpus. A non-empty `embedding.document_prefix` does affect stored vectors and therefore changes the embedding identity.",
     },
     {
+        keys: ["rerank"],
+        title: "Explicit search reranking",
+        intro: `Reranking reuses the existing prose-query gate, candidate preparation and stable score sorting for explicit \`ctx_search\` on OpenCode and Pi. Automatic per-turn search hints never call a reranker. With no block configured, local Synapse remains the default.
+
+Hosted reranking sends retrieved text to a user-chosen service. Put this block in user config beside \`embedding\` (it is independent of the embedding provider):
+
+\`\`\`jsonc
+"rerank": {
+  "provider": "remote",
+  "endpoint": "https://api.cohere.com/v2",
+  "model": "rerank-v3.5",
+  "api_key": "{env:RERANK_API_KEY}",
+  "timeout_ms": 1500,
+  "top_n": 20
+}
+\`\`\`
+
+The client posts to \`<endpoint>/rerank\` with \`{model, query, documents, top_n}\` and reads \`results: [{index, relevance_score}]\` (Cohere, Voyage, OpenRouter and Jina-compatible). Prefix the base URL with \`tei+\` for Hugging Face TEI: \`{query, texts}\` in and \`[{index, score}]\` out. API keys are sent as Bearer tokens; user-level \`{env:NAME}\` and \`{file:path}\` expansion follows the embedding configuration rules.
+
+Each document uses the existing location/title/body recipe, truncated at a UTF-8 character boundary to 1024 bytes. At most 20 documents are allowed per request; larger batches are refused, never split. \`top_n\` caps the fused candidate pool, and the wire request asks for all submitted scores. Scores must cover each document index exactly once and be finite; ties retain candidate order. Any failure preserves the original unreranked order, adds one short skip reason to the tool result, and never falls back to Synapse while remote is configured.
+
+Project config may only set \`"rerank": {"provider": "off"}\`. Project routing, credentials and limits are stripped with a warning, and project \`{env:}\` / \`{file:}\` tokens never expand. Changes require a host restart. The dashboard currently requires its raw JSONC editor for this block.`,
+    },
+    {
         keys: ["dreamer"],
         title: "Background agents",
         intro: "Off-hours maintenance through Dreamer.",

@@ -84,7 +84,8 @@ function pass(db: DatabaseType, tagger: Tagger, messages: V2Message[]): V2Messag
     const mapped = adaptPayload(context);
     tagger.initFromDb(SESSION, db);
     tagMessages(SESSION, mapped.messages, tagger, db, {
-        normalizeRestoredAssistantText: stripCopiedTagNotation,
+        normalizeRestoredAssistantText: (text, providerID) =>
+            stripCopiedTagNotation(text, providerID === "anthropic"),
     });
     mapped.commit();
     return context.messages;
@@ -111,6 +112,22 @@ describe("stripCopiedTagNotation", () => {
 });
 
 describe("OpenCode 2 request copy of assistant text with copied tags", () => {
+    it("recovers stored tag-only text followed by error turns on a strict provider", () => {
+        const poisoned: V2Message[] = [
+            { id: "question", role: "user", content: [{ type: "text", text: "read it" }] },
+            { id: "tag-only", role: "assistant", content: [{ type: "text", text: "§58§" }] },
+            { id: "error-1", role: "assistant", content: [], finish: "error" },
+            { id: "error-2", role: "assistant", content: [], finish: "error" },
+            { id: "retry", role: "user", content: [{ type: "text", text: "try again" }] },
+        ];
+        const context = draft(poisoned);
+        adaptPayload(context).commit();
+        expect(context.messages.find((message) => message.id === "tag-only")?.content).toEqual([
+            { type: "text", text: "§58§" },
+        ]);
+        expect(poisoned[1].content[0].text).toBe("§58§");
+    });
+
     it("strips assistant text only, leaving user text, reasoning and tool parts as stored", () => {
         const context = draft(stored);
         adaptPayload(context).commit();

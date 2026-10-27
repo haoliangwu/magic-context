@@ -17,6 +17,7 @@ import * as search from "../../hooks/magic-context/auto-search-worker-client";
 import { resetLkgSlotsForTest } from "../../hooks/magic-context/lkg-slot";
 import { createTransform, type TransformDeps } from "../../hooks/magic-context/transform";
 import type { MessageLike } from "../../hooks/magic-context/transform-operations";
+import { scaleTest } from "../../shared/slow-test";
 import { cleanupTestTempDir, createTestTempDir } from "../../shared/test-temp-dir";
 import { createV2AutoEmbedSession, createV2TransformFeatureDeps } from "./transform-features";
 
@@ -102,40 +103,45 @@ function messages(session: string, turns: number, salt = 0): MessageLike[] {
     }));
 }
 
-test("v2 disabled features preserve baseline bytes over 240 randomized passes", async () => {
-    let random = 709;
-    const next = () => {
-        random = (Math.imul(random, 1664525) + 1013904223) >>> 0;
-        return random;
-    };
-    for (let pass = 0; pass < 240; pass++) {
-        const session = `ses709diff-${pass}`;
-        const decision = next() % 3 ? "defer" : "execute";
-        const source = messages(session, 1 + (next() % 12), next() % 200);
-        if (next() % 2) source.pop();
-        const oldOutput = { messages: structuredClone(source) };
-        const newOutput = { messages: structuredClone(source) };
-        resetLkgSlotsForTest();
-        await transform(baselineDb, session, () => decision)({}, oldOutput);
-        resetLkgSlotsForTest();
-        await transform(wiredDb, session, () => decision, {
-            ...createV2TransformFeatureDeps(config, false, dir),
-            commitSeenLastPass: new Map(),
-            projectPath: resolveProjectIdentityForSession(dir),
-            maybeAutoEmbedSession: createV2AutoEmbedSession({
-                db: wiredDb,
-                resolveDirectory: () => dir,
-                recompProgressBySession: new Map(),
-            }),
-            getHistorianChunkTokens: () => 20000,
-            getFallbackModelId: () => "openai/gpt-4.1",
-        })({}, newOutput);
-        expect(JSON.stringify(newOutput), `randomized pass ${pass} (${decision})`).toBe(
-            JSON.stringify(oldOutput),
-        );
-    }
-    await new Promise((resolve) => setTimeout(resolve, 0));
-}, 60000);
+const disabledParity = "v2 disabled features preserve baseline bytes over randomized passes";
+scaleTest(
+    disabledParity,
+    async (slow) => {
+        let random = 709;
+        const next = () => {
+            random = (Math.imul(random, 1664525) + 1013904223) >>> 0;
+            return random;
+        };
+        for (let pass = 0; pass < (slow ? 240 : 48); pass++) {
+            const session = `ses709diff-${pass}`;
+            const decision = next() % 3 ? "defer" : "execute";
+            const source = messages(session, 1 + (next() % 12), next() % 200);
+            if (next() % 2) source.pop();
+            const oldOutput = { messages: structuredClone(source) };
+            const newOutput = { messages: structuredClone(source) };
+            resetLkgSlotsForTest();
+            await transform(baselineDb, session, () => decision)({}, oldOutput);
+            resetLkgSlotsForTest();
+            await transform(wiredDb, session, () => decision, {
+                ...createV2TransformFeatureDeps(config, false, dir),
+                commitSeenLastPass: new Map(),
+                projectPath: resolveProjectIdentityForSession(dir),
+                maybeAutoEmbedSession: createV2AutoEmbedSession({
+                    db: wiredDb,
+                    resolveDirectory: () => dir,
+                    recompProgressBySession: new Map(),
+                }),
+                getHistorianChunkTokens: () => 20000,
+                getFallbackModelId: () => "openai/gpt-4.1",
+            })({}, newOutput);
+            expect(JSON.stringify(newOutput), `randomized pass ${pass} (${decision})`).toBe(
+                JSON.stringify(oldOutput),
+            );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 0));
+    },
+    60000,
+);
 
 test("enabling caveman and autoSearch cannot first-edit a same-turn defer prefix", async () => {
     const session = "ses709toggle";

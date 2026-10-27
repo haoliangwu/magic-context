@@ -13,6 +13,8 @@ assert spec and spec.loader
 gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
 SHA = "a" * 40
+SLOW_JOBS = [{"name": f"Slow unit ({mode})", "status": "completed", "conclusion": "success"}
+             for mode in ("normal", "assertions")]
 
 
 class GateTests(unittest.TestCase):
@@ -56,6 +58,84 @@ class GateTests(unittest.TestCase):
                     patch.object(gate, "inventory", return_value=[{"name": "broken job", "conclusion": conclusion}]):
                 with self.assertRaisesRegex(RuntimeError, f"CI job broken job: {conclusion}"):
                     gate.wait_ci(SHA, "train/check-pr-123", 23, 10)
+
+    def test_latest_slow_run_ignores_fast_master_but_not_newer_failed_candidate(self):
+        candidate = {"id": 1, "name": "CI", "head_sha": SHA, "head_branch": "train/check-pr-123", "event": "push"}
+        runs = [candidate, dict(candidate, id=3, head_branch="master"),
+                dict(candidate, id=2, conclusion="failure"), dict(candidate, id=4, head_sha="b" * 40)]
+        with patch.object(gate, "inventory", return_value=runs):
+            self.assertEqual(gate.latest_run(SHA, "CI", slow_only=True), dict(candidate, id=2, conclusion="failure"))
+
+    def test_check_branch_success_requires_both_slow_modes(self):
+        for jobs in ([], SLOW_JOBS[:1], [dict(job, conclusion="skipped") for job in SLOW_JOBS]):
+            with self.subTest(jobs=jobs), \
+                    patch.object(gate, "latest_run", return_value={"id": 1, "status": "completed", "conclusion": "success"}), \
+                    patch.object(gate, "inventory", return_value=jobs):
+                with self.assertRaisesRegex(RuntimeError, "required slow lane"):
+                    gate.wait_ci(SHA, "train/check-pr-123", 23, 10)
+        with patch.object(gate, "latest_run", return_value={"id": 1, "status": "completed", "conclusion": "success"}), \
+                patch.object(gate, "inventory", return_value=SLOW_JOBS):
+            gate.wait_ci(SHA, "train/check-pr-123", 23, 10)
+
+
+GREEN = {"id": 7, "status": "completed", "conclusion": "success"}
+
+
+class ReleaseRetryTests(unittest.TestCase):
+    """verify_release looks again for a run GitHub's list has not shown yet, and only for that."""
+
+    def verify(self, lookups):
+        calls = []
+        sleeps = []
+
+        def latest_run(sha, name, slow_only=False):
+            if slow_only:
+                return GREEN
+            calls.append(name)
+            return lookups(name, calls.count(name))
+
+        with patch.object(gate, "latest_run", side_effect=latest_run), \
+                patch.object(gate, "inventory", return_value=SLOW_JOBS), \
+                patch.dict(gate.os.environ, {}, clear=False):
+            gate.os.environ.pop("CI_GATE_MISSING_RUN_RETRY_SECONDS", None)
+            try:
+                gate.verify_release(SHA, sleep=sleeps.append)
+                error = None
+            except RuntimeError as raised:
+                error = raised
+        return calls, sleeps, error
+
+    def test_run_missing_on_first_lookup_and_green_on_second_passes(self):
+        calls, sleeps, error = self.verify(
+            lambda name, attempt: None if name == "Smoke" and attempt == 1 else GREEN)
+        self.assertIsNone(error)
+        self.assertEqual(calls, ["CI", "Smoke", "Smoke"])
+        self.assertEqual(sleeps, [15])
+
+    def test_run_missing_every_time_refuses_after_the_retries(self):
+        calls, sleeps, error = self.verify(lambda name, attempt: None if name == "Smoke" else GREEN)
+        self.assertIsNotNone(error)
+        self.assertIn(f"Smoke for {SHA}: missing, not completed/success", str(error))
+        self.assertEqual(calls, ["CI"] + ["Smoke"] * 5)
+        self.assertEqual(sleeps, [15] * 4)
+
+    def test_present_but_unsuccessful_run_refuses_without_retry(self):
+        for status, conclusion in (("completed", "failure"), ("completed", "cancelled"), ("in_progress", None)):
+            with self.subTest(status=status, conclusion=conclusion):
+                run = {"id": 8, "status": status, "conclusion": conclusion}
+                calls, sleeps, error = self.verify(lambda name, attempt: run if name == "CI" else GREEN)
+                self.assertIsNotNone(error)
+                self.assertIn(f"CI for {SHA}: {status}/{conclusion}, not completed/success", str(error))
+                self.assertEqual(calls, ["CI"])
+                self.assertEqual(sleeps, [])
+
+    def test_release_refuses_skipped_missing_or_failed_slow_mode(self):
+        for jobs in ([], SLOW_JOBS[:1], [dict(job, conclusion="failure") for job in SLOW_JOBS],
+                     [dict(job, conclusion="skipped") for job in SLOW_JOBS]):
+            with self.subTest(jobs=jobs), patch.object(gate, "latest_run", return_value=GREEN), \
+                    patch.object(gate, "inventory", return_value=jobs):
+                with self.assertRaisesRegex(RuntimeError, "required slow lane"):
+                    gate.verify_release(SHA)
 
 
 if __name__ == "__main__":

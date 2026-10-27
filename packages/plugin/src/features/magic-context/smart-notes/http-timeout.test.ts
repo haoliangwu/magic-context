@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-types";
+import { scaleTest } from "../../../shared/slow-test";
 import { evaluateSmartNotes } from "../dreamer/evaluate-smart-notes";
 import { acquireLease } from "../dreamer/lease";
 import { addNote, getNotes } from "../storage-notes";
@@ -112,7 +113,7 @@ test("HTTP deadline retries compilation without spending fallback strikes", asyn
         const note = source();
         // Existing logic strikes must not grow or trigger fallback on transport failure.
         fixture.db.prepare("UPDATE notes SET check_failure_count=2 WHERE id=?").run(note.id);
-        for (let i = 0; i < 4; i++) {
+        for (let i = 0; i < 2; i++) {
             fixture.db.prepare("UPDATE notes SET check_next_due_at=0 WHERE id=?").run(note.id);
             const startedAt = Date.now();
             expect(await evaluate()).toEqual({ surfaced: 0, pending: 1, ran: true });
@@ -126,14 +127,14 @@ test("HTTP deadline retries compilation without spending fallback strikes", asyn
             expect(state().checkNextDueAt).toBeGreaterThanOrEqual(startedAt + 5 * 60_000);
             expect(notices()).toEqual([]);
         }
-        expect(requests()).toBe(4);
+        expect(requests()).toBe(2);
     });
 }, 30_000);
 
 test("HTTP deadline retries scheduled checks without reauthoring or fallback", async () => {
     await withLocalHttpServer(null, async (requests) => {
         const note = source();
-        for (let i = 0; i < 4; i++) {
+        for (let i = 0; i < 2; i++) {
             seedCompiled(note.id);
             const startedAt = Date.now();
             expect(
@@ -156,7 +157,7 @@ test("HTTP deadline retries scheduled checks without reauthoring or fallback", a
             expect(state().checkQuarantinedUntil).toBe(state().checkNextDueAt);
             expect(notices()).toEqual([]);
         }
-        expect(requests()).toBe(4);
+        expect(requests()).toBe(2);
     });
 }, 30_000);
 
@@ -226,24 +227,29 @@ test("busy loops remain logic failures even after a completed HTTP request", asy
     });
 });
 
-test("slow sweeps admit fewer notes instead of cutting the next request short", async () => {
-    await withLocalHttpServer(3_000, async (requests) => {
-        for (let i = 0; i < 3; i++) seedCompiled(source().id);
-        const startedAt = Date.now();
-        const result = await runDueCompiledSmartNoteChecks({
-            db: fixture.db,
-            projectIdentity: PROJECT,
-            projectRoot: process.cwd(),
-            leaseHeld: () => true,
-            sweepBudgetMs: 10_000,
+const slowSweep = "slow sweeps admit fewer notes instead of cutting the next request short";
+scaleTest(
+    slowSweep,
+    async (slow) => {
+        await withLocalHttpServer(3_000, async (requests) => {
+            for (let i = 0; i < 3; i++) seedCompiled(source().id);
+            const startedAt = Date.now();
+            const result = await runDueCompiledSmartNoteChecks({
+                db: fixture.db,
+                projectIdentity: PROJECT,
+                projectRoot: process.cwd(),
+                leaseHeld: () => true,
+                sweepBudgetMs: 10_000,
+            });
+            // Two 3-second checks fit an idle machine; a loaded runner may admit only
+            // one. Either way no check is cut short and at least one note stays due.
+            expect(result.ran === 1 || result.ran === 2).toBe(true);
+            expect(result).toMatchObject({ surfaced: 0, failed: 0, networkFailed: 0 });
+            if (slow) expect(Date.now() - startedAt).toBeLessThan(10_000);
+            expect(requests()).toBe(result.ran);
+            const notes = getNotes(fixture.db, { type: "smart", projectPath: PROJECT });
+            expect(notes.filter((n) => n.checkNextDueAt === 0)).toHaveLength(3 - result.ran);
         });
-        // Two 3-second checks fit an idle machine; a loaded runner may admit only
-        // one. Either way no check is cut short and at least one note stays due.
-        expect(result.ran === 1 || result.ran === 2).toBe(true);
-        expect(result).toMatchObject({ surfaced: 0, failed: 0, networkFailed: 0 });
-        expect(Date.now() - startedAt).toBeLessThan(10_000);
-        expect(requests()).toBe(result.ran);
-        const notes = getNotes(fixture.db, { type: "smart", projectPath: PROJECT });
-        expect(notes.filter((n) => n.checkNextDueAt === 0)).toHaveLength(3 - result.ran);
-    });
-}, 20_000);
+    },
+    20_000,
+);

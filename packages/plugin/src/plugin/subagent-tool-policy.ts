@@ -59,5 +59,24 @@ export function hideSubagentTools(
     db: Database,
 ): void {
     if (!getOrCreateSessionMeta(db, draft.sessionID).isSubagent) return;
-    for (const id of PRIMARY_ONLY_TOOLS) delete draft.tools[id];
+    removePrimaryOnlyTools(draft.tools);
+}
+
+/** Remove the tools a subagent session may not call from one request's tool map. */
+export function removePrimaryOnlyTools(tools: Record<string, unknown>): void {
+    for (const id of PRIMARY_ONLY_TOOLS) delete tools[id];
+}
+
+/**
+ * Whether the session's stored metadata already records it as a subagent,
+ * read without writing anything (a busy database can still be read). Undefined
+ * when the row is missing or does not record it yet; the next healthy pass
+ * then works it out and stores it.
+ */
+export function storedSubagentMode(db: Database, sessionId: string): boolean | undefined {
+    const row = db
+        .prepare("SELECT is_subagent FROM session_meta WHERE session_id = ?")
+        .get(sessionId) as { is_subagent: number | null } | null | undefined;
+    if (!row || typeof row.is_subagent !== "number") return undefined;
+    return row.is_subagent === 1;
 }

@@ -15,6 +15,7 @@ export function createV2TransformFeatureDeps(
     config: MagicContextPluginConfig,
     compactionOff: boolean,
     directory: string,
+    ensureProjectRegistered = ensureProjectRegisteredFromOpenCodeDirectory,
 ) {
     return {
         protectedTools: config.protected_tools,
@@ -26,7 +27,7 @@ export function createV2TransformFeatureDeps(
             injectionBudgetTokens: config.memory.injection_budget_tokens,
             autoPromote: config.memory.auto_promote,
         },
-        ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+        ensureProjectRegistered,
         historyBudgetPercentage: config.history_budget_percentage,
         experimentalUserMemories: userObservationCollectionEnabled(config.dreamer),
         userObservationsRequested: userObservationsRequested(config.dreamer),
@@ -37,7 +38,7 @@ export function createV2TransformFeatureDeps(
             scoreThreshold: config.memory.auto_search?.score_threshold ?? 0.6,
             minPromptChars: config.memory.auto_search?.min_prompt_chars ?? 20,
             directory,
-            ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+            ensureProjectRegistered,
             wordRules: cavemanWordRulesForLanguage(config.language),
         },
         cavemanTextCompression: compactionOff
@@ -53,7 +54,10 @@ export function createV2TransformFeatureDeps(
 }
 
 /** Share automatic drain scheduling and retry semantics with OpenCode 1 and Pi. */
-export function createV2AutoEmbedSession(deps: EmbedHistoryDeps): (sessionId: string) => void {
+export function createV2AutoEmbedSession(
+    deps: EmbedHistoryDeps,
+    ensureProjectRegistered = ensureProjectRegisteredFromOpenCodeDirectory,
+): (sessionId: string) => void {
     return (sessionId) => {
         const directory = deps.resolveDirectory(sessionId);
         const projectIdentity = resolveProjectIdentityForSession(directory, deps.allowHomeProject);
@@ -63,7 +67,7 @@ export function createV2AutoEmbedSession(deps: EmbedHistoryDeps): (sessionId: st
                 db: deps.db,
                 projectIdentity,
                 ensureRegistered: async () => {
-                    await ensureProjectRegisteredFromOpenCodeDirectory(directory, deps.db);
+                    await ensureProjectRegistered(directory, deps.db);
                     deps.onDirectoryResolved?.(sessionId, directory);
                 },
             },

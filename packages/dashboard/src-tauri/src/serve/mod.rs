@@ -782,12 +782,17 @@ mod tests {
 
     static SLOW_RESOLVER_ENTERED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    static SLOW_RESOLVER_RELEASE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+        (std::sync::Mutex::new(false), std::sync::Condvar::new());
 
     /// A database lookup that holds its thread like a SQLite call waiting on a
     /// busy lock.
     fn slow_resolver() -> Option<std::path::PathBuf> {
         SLOW_RESOLVER_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
-        std::thread::sleep(std::time::Duration::from_millis(800));
+        let (released, wake) = &SLOW_RESOLVER_RELEASE;
+        let _guard = wake
+            .wait_while(released.lock().unwrap(), |released| !*released)
+            .unwrap();
         None
     }
 
@@ -795,13 +800,29 @@ mod tests {
     // blocks its worker stalls the server and this test's own client with it.
     #[tokio::test]
     async fn a_slow_database_command_does_not_stall_other_requests() {
+        SLOW_RESOLVER_ENTERED.store(false, std::sync::atomic::Ordering::SeqCst);
+        *SLOW_RESOLVER_RELEASE.0.lock().unwrap() = false;
+        // An independent watchdog releases a blocked runtime so a regression fails
+        // instead of deadlocking the test's own HTTP client.
+        let watchdog = std::thread::spawn(|| {
+            let (released, wake) = &SLOW_RESOLVER_RELEASE;
+            let (mut released, timeout) = wake
+                .wait_timeout_while(
+                    released.lock().unwrap(),
+                    std::time::Duration::from_secs(10),
+                    |released| !*released,
+                )
+                .unwrap();
+            *released = true;
+            wake.notify_all();
+            timeout.timed_out()
+        });
         let server = spawn_test_server_with_state(
             AppState::with_resolver(slow_resolver),
             DEFAULT_HOST,
             false,
         )
         .await;
-        let started = std::time::Instant::now();
         let slow = {
             let base_url = server.base_url.clone();
             let token = server.token.clone();
@@ -821,10 +842,13 @@ mod tests {
 
         let fast = invoke(&server, json!({ "cmd": "pi_config_path", "args": {} })).await;
         assert_eq!(fast.status(), StatusCode::OK);
-        let fast_elapsed = started.elapsed();
+        let completed_while_blocked = !*SLOW_RESOLVER_RELEASE.0.lock().unwrap();
+        *SLOW_RESOLVER_RELEASE.0.lock().unwrap() = true;
+        SLOW_RESOLVER_RELEASE.1.notify_all();
+        assert!(!watchdog.join().unwrap(), "slow resolver watchdog expired");
         assert!(
-            fast_elapsed < std::time::Duration::from_millis(500),
-            "a request unrelated to the slow command waited {fast_elapsed:?}"
+            completed_while_blocked,
+            "unrelated request waited for the slow resolver"
         );
 
         let slow = slow.await.expect("slow task");

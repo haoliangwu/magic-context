@@ -7,6 +7,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 import { getOrCreateSessionMeta } from "./storage-meta-session";
+import { installTagIdentityRevisionTrigger } from "./storage-tag-identity-revision";
 import {
     adoptFallbackTagMessageId,
     adoptNullOwnerToolTag,
@@ -204,17 +205,37 @@ describe("migration v86: session-local tag versions", () => {
         const db = new Database(":memory:");
         try {
             initializeDatabase(db);
+            // Reproduce the on-disk v85 shape: no tags_version column and no durable
+            // triggers writing it. The TEMP tag-revision triggers initializeDatabase
+            // installs belong to this connection, not the file, and one of them updates
+            // session_meta.tags_version, so SQLite refuses the column drop while they
+            // exist. Drop them first and reinstall them after the upgrade, as the real
+            // openers do. Bun before 1.4.4 discarded that refusal inside a
+            // multi-statement exec, so this setup used to keep the column without
+            // noticing; the column check below makes that visible.
             db.exec(`
+                DROP TRIGGER temp.mc_tag_identity_revision_au;
+                DROP TRIGGER temp.mc_tag_revision_bi;
+                DROP TRIGGER temp.mc_tag_revision_ai;
+                DROP TRIGGER temp.mc_tag_revision_au;
+                DROP TRIGGER temp.mc_tag_revision_ad;
+                DROP TRIGGER temp.mc_tag_revision_seed_ai;
                 DROP TRIGGER tags_version_ai;
                 DROP TRIGGER tags_version_ad;
                 DROP TRIGGER tags_version_au;
                 ALTER TABLE session_meta DROP COLUMN tags_version;
             `);
+            expect(
+                (db.prepare("PRAGMA table_info(session_meta)").all() as Array<{ name: string }>)
+                    .map((column) => column.name)
+                    .includes("tags_version"),
+            ).toBe(false);
             seedAppliedVersion(db, 85);
             db.prepare("INSERT INTO session_meta(session_id, counter) VALUES(?, 0)").run("ses-a");
             db.prepare("INSERT INTO session_meta(session_id, counter) VALUES(?, 0)").run("ses-b");
 
             runMigrations(db);
+            installTagIdentityRevisionTrigger(db);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
             expect(tagsVersion(db, "ses-a")).toBe(0);
             expect(tagsVersion(db, "ses-b")).toBe(0);

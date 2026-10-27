@@ -7,10 +7,14 @@ import {
     releaseBudgetFinalizeChild,
     TOKEN_BUDGET_FINALIZE_MESSAGE,
 } from "../features/magic-context/dreamer/token-budget";
-import { sumTokensFromChildMessages } from "../features/magic-context/subagent-token-capture";
+import {
+    annotateSubagentInvocationError,
+    sumTokensFromChildMessages,
+} from "../features/magic-context/subagent-token-capture";
 import { describeAssistantError } from "./assistant-message-extractor";
 import { sessionLog } from "./logger";
 import type { PromptArgs, PromptTransport } from "./model-suggestion-retry";
+import { noteModelActivityMonitored, noteModelOutputReceived } from "./model-suggestion-retry";
 
 type Client = ReturnType<typeof createOpencodeClient> | undefined;
 
@@ -59,6 +63,7 @@ export interface PromptAsyncWaitOptions {
     pollIntervalMs?: number;
     startGraceMs?: number;
     tokenBudget?: number;
+    modelConfigKey?: string;
     /** Shared across retries of one child session. */
     budgetGuard?: ReturnType<typeof createDreamTokenBudget>;
     onBudgetUpdate?: (
@@ -90,6 +95,19 @@ export function isHostSessionError(error: unknown): boolean {
         typeof error === "object" &&
         (error as { [HOST_SESSION_ERROR]?: unknown })[HOST_SESSION_ERROR] === true
     );
+}
+
+/** Return the original host error carried by a marked child-session failure. */
+export function hostSessionErrorOf(error: unknown): unknown {
+    if (!isHostSessionError(error)) return undefined;
+    return (error as { hostError?: unknown }).hostError;
+}
+
+function requestModelRef(request: PromptArgs): string | undefined {
+    const model = request.body?.model;
+    if (model && typeof model.providerID === "string" && typeof model.modelID === "string")
+        return `${model.providerID}/${model.modelID}`;
+    return undefined;
 }
 
 /** True when the host client can send without waiting and report session status. */
@@ -200,6 +218,29 @@ function isTerminalAssistant(message: unknown): boolean {
             )
         )
     );
+}
+
+/**
+ * True when an assistant row shows the model has answered: any token usage, or a
+ * non-empty text or reasoning part, or a tool call. A row the host creates before
+ * the provider responds carries none of these.
+ */
+function showsModelOutput(message: unknown): boolean {
+    if (infoOf(message).role !== "assistant") return false;
+    const tokens = sumTokensFromChildMessages([message]);
+    if (tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite > 0) return true;
+    const parts = (message as { parts?: unknown } | null)?.parts;
+    if (!Array.isArray(parts)) return false;
+    return parts.some((part) => {
+        if (!part || typeof part !== "object") return false;
+        const { type, text } = part as { type?: unknown; text?: unknown };
+        if (type === "tool") return true;
+        return (
+            (type === "text" || type === "reasoning") &&
+            typeof text === "string" &&
+            text.trim().length > 0
+        );
+    });
 }
 
 function unwrapData(response: unknown): unknown {
@@ -315,15 +356,40 @@ export async function promptAsyncAndWaitForIdle(
     // retains that provider/model error while this child is actively awaited.
     activeSessionErrors.set(sessionId, undefined);
     try {
-        const sent = await session.promptAsync?.(request);
+        let sent: unknown;
+        try {
+            sent = await session.promptAsync?.(request);
+        } catch (error) {
+            annotateSubagentInvocationError(error, {
+                attemptedModel: requestModelRef(request),
+                modelConfigKey: options.modelConfigKey,
+                hostError: error,
+            });
+            throw error;
+        }
         if (sent && typeof sent === "object" && "error" in sent) {
             const rejection = (sent as { error?: unknown }).error;
             if (rejection) {
-                throw new Error(`prompt_async was rejected: ${describeRejection(rejection)}`);
+                const error = new Error(
+                    `prompt_async was rejected: ${describeRejection(rejection)}`,
+                    {
+                        cause: rejection,
+                    },
+                );
+                annotateSubagentInvocationError(error, {
+                    attemptedModel: requestModelRef(request),
+                    modelConfigKey: options.modelConfigKey,
+                    hostError: rejection,
+                });
+                throw error;
             }
         }
         let sentAt = Date.now();
         let sawBusy = false;
+        // From here on this wait reports whether the model has produced anything,
+        // which lets the model chain tell a silent model from a slow answer.
+        noteModelActivityMonitored(signal);
+        let sawOutput = false;
 
         for (;;) {
             await sleep(pollIntervalMs, signal);
@@ -336,11 +402,28 @@ export async function promptAsyncAndWaitForIdle(
                     name: "DreamerProviderOutputFailureError",
                     transient: true,
                     [HOST_SESSION_ERROR]: true,
+                    hostError,
+                });
+                annotateSubagentInvocationError(error, {
+                    attemptedModel: requestModelRef(request),
+                    modelConfigKey: options.modelConfigKey,
+                    hostError,
                 });
                 throw error;
             }
             const status = await readStatus(session, sessionId, dir, signal);
             const messages = await readMessages(session, sessionId, dir, signal);
+            if (
+                !sawOutput &&
+                messages.some((message) => {
+                    const id = messageId(message);
+                    // Rows from before this send belong to an earlier attempt.
+                    return id !== null && !initialBaseline.has(id) && showsModelOutput(message);
+                })
+            ) {
+                sawOutput = true;
+                noteModelOutputReceived(signal);
+            }
             if (budget) {
                 const latest = messages.at(-1);
                 const latestId = messageId(latest);

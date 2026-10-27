@@ -16,6 +16,34 @@ export interface RawMessage extends RawMessageParts {
     ordinal: number;
 }
 
+/**
+ * Rust's codec/opencode.rs:1627 is_synthetic_message and sidecar.rs:413
+ * is_synthetic_part classify non-empty, all-marked parts; historian_chunk.rs:584
+ * excludes meta.synthetic rows. Native decode tests the full parts array, while
+ * the OpenCode wire twin (module-wire.ts encodeOpenCodeMessagesToCk) ignores
+ * compaction markers first, as we do here. Neither checks role or content type.
+ * Synthetic content is model-visible, not ephemeral; this only classifies
+ * holes in existing Rust coverage, not what the TS historian should cover.
+ */
+export function areRustHistorianSyntheticParts(parts: readonly unknown[]): boolean {
+    const contentParts = parts.filter(
+        (part) =>
+            part === null ||
+            typeof part !== "object" ||
+            (part as Record<string, unknown>).type !== "compaction",
+    );
+    return (
+        contentParts.length > 0 &&
+        contentParts.every(
+            (part) =>
+                part !== null &&
+                typeof part === "object" &&
+                ((part as Record<string, unknown>).synthetic === true ||
+                    (part as Record<string, unknown>).syntheticTodoMarker === true),
+        )
+    );
+}
+
 /** Strictly classify rows that carry no user/assistant narrative and may fill a range gap. */
 export function isStrictGapHealingMessage(message: RawMessage): boolean {
     if (message.storeType === "synthetic") return true;

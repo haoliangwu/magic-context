@@ -403,11 +403,187 @@ export function getTagIdentityWriteGeneration(): number {
     return tagIdentityWriteGeneration;
 }
 
-/** Route native Bun and Node transaction entry through the same acquisition retry.
- * Native Bun transaction wrappers execute BEGIN internally, bypassing an exec override,
- * so both runtimes use this small synchronous wrapper instead. Writable handles
- * default to IMMEDIATE; explicit deferred calls and readonly handles keep read
- * snapshots without acquiring the writer lock. */
+/** Only Pi serving connections need a mirror of their native busy handler. */
+const busyTimeoutStates = new WeakMap<Database, { current: number }>();
+const BUSY_TIMEOUT_QUERY =
+    /^\s*PRAGMA\s+(?:(?:\w+|"[^"]+"|`[^`]+`|\[[^\]]+\])\s*\.\s*)?(?:busy_timeout|"busy_timeout"|`busy_timeout`|\[busy_timeout\])\s*;?\s*$/i;
+const BUSY_TIMEOUT_SETTER =
+    /^\s*PRAGMA\s+(?:(?:\w+|"[^"]+"|`[^`]+`|\[[^\]]+\])\s*\.\s*)?(?:busy_timeout|"busy_timeout"|`busy_timeout`|\[busy_timeout\])\s*(?==|\()/i;
+
+function literalBusyTimeout(sql: string): number | undefined {
+    const head = BUSY_TIMEOUT_SETTER.exec(sql);
+    if (!head) return undefined;
+    const match = /^(?:=\s*|\(\s*)(?:'(-?\d+)'|"(-?\d+)"|(-?\d+))\s*\)?\s*;?\s*$/.exec(
+        sql.slice(head[0].length),
+    );
+    if (!match) return undefined;
+    const value = Number(match[1] ?? match[2] ?? match[3]);
+    return value < 0 ? 0 : value <= 0x7fffffff ? value : undefined;
+}
+
+/** Split timeout-setting scripts without mistaking quoted text or comments for pragmas. */
+function busyTimeoutStatements(sql: string): string[] {
+    const statements: string[] = [];
+    let statement = "";
+    let quote = "";
+    for (let i = 0; i < sql.length; i++) {
+        const char = sql[i];
+        if (quote) {
+            statement += char;
+            if (char === quote) {
+                if (sql[i + 1] === quote) statement += sql[++i];
+                else quote = "";
+            }
+        } else if (char === "'" || char === '"' || char === "`" || char === "[") {
+            quote = char === "[" ? "]" : char;
+            statement += char;
+        } else if (char === "-" && sql[i + 1] === "-") {
+            while (i + 1 < sql.length && sql[i + 1] !== "\n") i++;
+            statement += " ";
+        } else if (char === "/" && sql[i + 1] === "*") {
+            i += 2;
+            while (i < sql.length && !(sql[i] === "*" && sql[i + 1] === "/")) i++;
+            i++;
+            statement += " ";
+        } else if (char === ";") {
+            statements.push(statement);
+            statement = "";
+        } else statement += char;
+    }
+    statements.push(statement);
+    return statements.filter((part) => part.trim().length > 0);
+}
+
+/** Install the native deadline layer only on a connection that will serve Pi turns. */
+function installNativeDeadlineRouting(db: BetterSqlite3.Database): void {
+    const rawExec = db.exec.bind(db);
+    const rawPrepare = db.prepare.bind(db);
+    const readTimeout = (): number => {
+        const statement = rawPrepare("PRAGMA busy_timeout");
+        try {
+            return Object.values(statement.get() as Record<string, number>)[0];
+        } finally {
+            (statement as Partial<FinalizableStatement>).finalize?.();
+        }
+    };
+    const timeoutState = { current: readTimeout() };
+    busyTimeoutStates.set(db, timeoutState);
+    const setBusyTimeout = (timeout: number): void => {
+        rawExec(`PRAGMA busy_timeout=${timeout}`);
+        timeoutState.current = timeout;
+    };
+    const withinDeadline = <T>(operation: () => T): T => {
+        const deadline = nativeWaitScope?.getStore();
+        if (!deadline?.active || !deadline.remainingMs) return operation();
+        const remaining = deadline.remainingMs();
+        if (remaining === Infinity) return operation();
+        const previous = timeoutState.current;
+        const timeout = Math.min(previous, Math.max(0, Math.floor(remaining)));
+        if (timeout === previous) return operation();
+        setBusyTimeout(timeout);
+        try {
+            return operation();
+        } finally {
+            setBusyTimeout(previous);
+        }
+    };
+    Object.defineProperty(db, "exec", {
+        configurable: true,
+        writable: true,
+        value: (sql: string) => {
+            const parts = /\bbusy_timeout\b/i.test(sql) ? busyTimeoutStatements(sql) : [];
+            if (parts.length === 1 && BUSY_TIMEOUT_QUERY.test(parts[0])) return rawExec(sql);
+            const singleSetter = parts.length === 1 && BUSY_TIMEOUT_SETTER.test(parts[0]);
+            const setting = singleSetter ? literalBusyTimeout(parts[0]) : undefined;
+            if (singleSetter) {
+                const result = rawExec(sql);
+                timeoutState.current = setting ?? readTimeout();
+                return result;
+            }
+            if (!/\bbusy_timeout\b/i.test(sql)) return withinDeadline(() => rawExec(sql));
+            const setters = parts.filter((part) => BUSY_TIMEOUT_SETTER.test(part));
+            return withinDeadline(() => {
+                try {
+                    const result = rawExec(sql);
+                    if (setters.length)
+                        timeoutState.current =
+                            literalBusyTimeout(setters[setters.length - 1]) ?? readTimeout();
+                    return result;
+                } catch (error) {
+                    // exec can apply a timeout-setting prefix before a later statement
+                    // fails. Only an ambiguous setting needs a native readback.
+                    if (setters.length) timeoutState.current = readTimeout();
+                    throw error;
+                }
+            });
+        },
+    });
+    // Timeout introspection cannot wait on a database lock. Its getter must
+    // report the configured timeout, not a temporary cap that a caller might save.
+    const nativePrepare = (sql: string) =>
+        BUSY_TIMEOUT_QUERY.test(sql) || BUSY_TIMEOUT_SETTER.test(sql)
+            ? rawPrepare(sql)
+            : withinDeadline(() => rawPrepare(sql));
+    Object.defineProperty(db, "prepare", {
+        configurable: true,
+        writable: true,
+        value: (sql: string) => {
+            // biome-ignore lint/suspicious/noExplicitAny: Bun adds values() to the common statement interface.
+            const statement: any = nativePrepare(sql);
+            const normalized = /\bbusy_timeout\b/i.test(sql)
+                ? (busyTimeoutStatements(sql)[0] ?? sql)
+                : sql;
+            const setting = literalBusyTimeout(normalized);
+            const timeoutSetter = BUSY_TIMEOUT_SETTER.test(normalized);
+            const timeoutQuery = BUSY_TIMEOUT_QUERY.test(normalized);
+            // SQLite applies this PRAGMA while preparing it, before get/run.
+            if (timeoutSetter) timeoutState.current = setting ?? readTimeout();
+            for (const method of ["run", "get", "all", "values"] as const) {
+                const execute = statement[method]?.bind(statement);
+                if (!execute) continue;
+                Object.defineProperty(statement, method, {
+                    configurable: true,
+                    // biome-ignore lint/suspicious/noExplicitAny: retain native binding overloads.
+                    value: (...args: any[]) => {
+                        if (timeoutQuery) return execute(...args);
+                        if (!timeoutSetter) return withinDeadline(() => execute(...args));
+                        const result = execute(...args);
+                        timeoutState.current = readTimeout();
+                        return result;
+                    },
+                });
+            }
+            if (typeof statement.iterate === "function") {
+                const iterate = statement.iterate.bind(statement);
+                Object.defineProperty(statement, "iterate", {
+                    configurable: true,
+                    // biome-ignore lint/suspicious/noExplicitAny: retain native binding overloads.
+                    value: (...args: any[]) => {
+                        const iterator =
+                            !timeoutSetter && !timeoutQuery
+                                ? withinDeadline(() => iterate(...args))
+                                : iterate(...args);
+                        const next = iterator.next.bind(iterator);
+                        if (timeoutSetter) timeoutState.current = readTimeout();
+                        iterator.next = () => {
+                            if (timeoutQuery) return next();
+                            if (!timeoutSetter) return withinDeadline(next);
+                            const result = next();
+                            timeoutState.current = readTimeout();
+                            return result;
+                        };
+                        return iterator;
+                    },
+                });
+            }
+            return statement;
+        },
+    });
+}
+
+/** Route native Bun and Node transactions through the same acquisition retry.
+ * Native Bun wrappers execute BEGIN internally, so both runtimes use this wrapper.
+ * Deadline routing, when selected, is installed underneath it at connection open. */
 function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean): void {
     const nativeExec = db.exec.bind(db);
     Object.defineProperty(db, "exec", {
@@ -565,6 +741,7 @@ function trackSqliteConnection(
     db: BetterSqlite3.Database,
     filename: unknown,
     options: unknown,
+    turnDeadlines = false,
 ): BetterSqlite3.Database {
     const originalClose = db.close.bind(db) as (...args: unknown[]) => unknown;
     const sequence = nextSqliteConnectionSequence++;
@@ -582,6 +759,7 @@ function trackSqliteConnection(
             ((options as { readonly?: unknown }).readonly === true ||
                 (options as { readOnly?: unknown }).readOnly === true),
     };
+    if (turnDeadlines) installNativeDeadlineRouting(db);
     installTransactionRouting(db, metadata.readonly);
     Object.defineProperty(db, "close", {
         configurable: true,
@@ -664,6 +842,18 @@ function buildNodeSqliteDatabaseClass(DatabaseSync: any): typeof BetterSqlite3 {
 
 export const Database: typeof BetterSqlite3 = TrackedDatabase;
 
+/** Open a Pi foreground connection with native-deadline routing before statements are prepared. */
+export function createSqliteTurnDatabase(
+    filename?: string | Buffer,
+    options?: BetterSqlite3.Options,
+): Database {
+    return trackSqliteConnection(new DatabaseImpl(filename, options), filename, options, true);
+}
+
+export function hasSqliteTurnDeadlineRouting(db: Database): boolean {
+    return busyTimeoutStates.has(db);
+}
+
 function immutableDatabaseImplementation(): typeof BetterSqlite3 {
     if (!isBun) return DatabaseImpl;
     if (immutableDatabaseImpl) return immutableDatabaseImpl;
@@ -728,6 +918,10 @@ function pragmaValue(db: BetterSqlite3.Database, name: string): unknown {
 }
 
 function pragmaNumber(db: BetterSqlite3.Database, name: string): number | null {
+    if (name === "busy_timeout") {
+        const state = busyTimeoutStates.get(db);
+        if (state) return state.current;
+    }
     try {
         const value = pragmaValue(db, name);
         return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -934,6 +1128,38 @@ export function prepareCachedStatement(db: Database, sql: string): Statement {
 }
 
 const privilegeDepth = new WeakMap<Database, number>();
+interface NativeWaitLease {
+    active: boolean;
+    remainingMs?: () => number;
+}
+let nativeWaitScope: AsyncLocalStorage<NativeWaitLease | undefined> | undefined;
+
+function releaseNativeWaitLease(lease: NativeWaitLease): void {
+    lease.active = false;
+    // Detached descendants can retain their async-local lease after the turn.
+    // Do not retain the completed request through its deadline callback.
+    lease.remainingMs = undefined;
+}
+
+/** Bound native lock waits for an awaited turn, without changing background timeouts. */
+export function withSqliteTurnDeadline<T>(remainingMs: () => number, operation: () => T): T {
+    const scope = (nativeWaitScope ??= new AsyncLocalStorage<NativeWaitLease | undefined>());
+    const lease: NativeWaitLease = { active: true, remainingMs };
+    return scope.run(lease, () => {
+        try {
+            const result = operation();
+            if (result && typeof (result as { then?: unknown }).then === "function")
+                return Promise.resolve(result).finally(
+                    releaseNativeWaitLease.bind(null, lease),
+                ) as T;
+            releaseNativeWaitLease(lease);
+            return result;
+        } catch (error) {
+            releaseNativeWaitLease(lease);
+            throw error;
+        }
+    });
+}
 const transformPassScope = new AsyncLocalStorage<
     | {
           active: boolean;
@@ -947,7 +1173,8 @@ const backgroundWriterScope = new AsyncLocalStorage<boolean>();
 
 /** Opt in only a writer that can safely defer its work after a busy acquisition. */
 export function withSqliteBackgroundWriter<T>(operation: () => T): T {
-    return backgroundWriterScope.run(true, operation);
+    if (!nativeWaitScope?.getStore()) return backgroundWriterScope.run(true, operation);
+    return nativeWaitScope.run(undefined, () => backgroundWriterScope.run(true, operation));
 }
 
 /** Only an awaited foreground transform may spend the extra acquisition budget.
@@ -984,7 +1211,8 @@ export function withSqliteTransformPass<T>(operation: () => T): T {
 
 /** Start detached maintenance work without borrowing a foreground pass's budget. */
 export function withoutSqliteTransformPass<T>(operation: () => T): T {
-    return transformPassScope.run(undefined, operation);
+    if (!nativeWaitScope?.getStore()) return transformPassScope.run(undefined, operation);
+    return nativeWaitScope.run(undefined, () => transformPassScope.run(undefined, operation));
 }
 
 /** Attach the adapter's existing generation/cancellation/deadline guard to writes. */
@@ -1283,7 +1511,7 @@ export async function withAsyncPrivilegedWriter<T>(
     operation: () => T,
     options: {
         signal?: AbortSignal;
-        beforeRetry?: (error: SqliteAcquisitionBusyError) => void;
+        beforeRetry?: (error: SqliteAcquisitionBusyError) => void | Promise<void>;
         jitter?: boolean;
         budgetMs?: number;
         assertCurrentPass?: () => void;
@@ -1326,7 +1554,9 @@ export async function withAsyncPrivilegedWriter<T>(
             if (entered || !(error instanceof SqliteAcquisitionBusyError)) throw error;
             // Adapters may serve a validated saved request instead of waiting.
             // This runs only after a failed BEGIN, never after callback writes.
-            options.beforeRetry?.(error);
+            // It may read asynchronously (OpenCode 2 reads its host store to
+            // rebuild the transform input); the retry waits for it.
+            await options.beforeRetry?.(error);
             const elapsed = performance.now() - started;
             if (elapsed >= budgetMs) {
                 reportSqliteDiagnostic(

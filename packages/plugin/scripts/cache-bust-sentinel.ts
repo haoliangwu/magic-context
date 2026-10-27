@@ -1352,16 +1352,24 @@ export async function runSentinelOnce(
             }
             updateOpenWindowState(sessionState, requests, windows);
             state.sessions[session.sessionId] = sessionState;
-            saveSentinelState(options.stateFile, state);
             if (analysis.scanBounded || clock() >= deadlineMs) {
                 counters.bounded = true;
                 break;
             }
         }
     } finally {
+        // Session watermarks are not saved after each session; this end-of-run
+        // write saves them, while alert sends still save the state before and
+        // after each send. The state file covers every session the sentinel has
+        // seen (over a megabyte), and a run walks thousands of them, so a
+        // per-session save rewrote gigabytes an hour. Saving here also keeps the
+        // progress of a run that throws. An abrupt exit before this write can lose
+        // watermark updates or an in-flight delivery outcome; the next run then
+        // re-reads those requests, but it never emits the same event id again,
+        // because each event id is saved before it is sent.
+        saveSentinelState(options.stateFile, state);
         await transport?.close?.();
     }
-    saveSentinelState(options.stateFile, state);
     stderr(JSON.stringify({ kind: "cache_bust_sentinel_summary", at: new Date(clock()).toISOString(), elapsedMs: clock() - nowMs, counters }));
     return counters;
 }

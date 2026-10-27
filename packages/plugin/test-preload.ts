@@ -27,6 +27,7 @@ import {
     installTestTempDirCleanup,
     sweepStaleTestTempDirs,
 } from "./src/shared/test-temp-dir";
+import { __setLocalEmbeddingPoolingTestFallback } from "./src/features/magic-context/memory/local-embedding-pooling";
 
 // Retry cleanup from interrupted earlier runs before creating this process's root.
 // `bun test --parallel` launches separate worker processes, so include the PID to
@@ -51,6 +52,16 @@ process.env.XDG_DATA_HOME = isolatedDataHome;
 // Keep it in the same throwaway tree so fixture-scoped loads cannot inherit a
 // developer's embedding destination or credentials from the real user tier.
 process.env.XDG_CONFIG_HOME = isolatedDataHome;
+
+// Provider tests use fake model IDs; treat those fixtures as legacy mean models
+// unless a test explicitly installs declared pooling metadata.
+__setLocalEmbeddingPoolingTestFallback({
+    status: "ready",
+    pooling: "mean",
+    normalize: true,
+    declared: false,
+    reason: "test fixture has no sentence-transformers pooling metadata",
+});
 
 afterAll(() => {
     const packageDir = process.cwd();

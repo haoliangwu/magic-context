@@ -331,7 +331,6 @@ forEachHost(import.meta.url, "thinking-block safety (Anthropic 400 regression)",
 			},
 		};
 
-		expect([intended, delayed][1]).toBe(delayed);
 		expect(selectRequestForMarker([intended, delayed], intendedMarker)).toBe(
 			intended,
 		);

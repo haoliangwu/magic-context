@@ -34,7 +34,10 @@ import type { SubagentRunOptions } from "@magic-context/core/shared/subagent-run
 import { __temperatureTest } from "@magic-context/core/shared/subagent-temperature";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 
-import { __setPiHarnessKindForTesting } from "./pi-harness-kind";
+import {
+	__setPiHarnessKindForTesting,
+	resolvePiHarnessKind,
+} from "./pi-harness-kind";
 import {
 	__test,
 	configurePiSubagentHostTools,
@@ -210,7 +213,11 @@ function buildArgsForTest(
 ) {
 	return __test.buildArgs(options, {
 		systemPromptPath: TEST_SYSTEM_PROMPT_PATH,
-		historianCalibrationEntryPath: null,
+		ompToolConfigPath: "/tmp/omp-child-tools.yml",
+		historianCalibrationEntryPath:
+			(opts?.targetHarness ?? resolvePiHarnessKind()) === "omp"
+				? "/tmp/historian-calibration.js"
+				: null,
 		...opts,
 	});
 }
@@ -1201,6 +1208,60 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).not.toContain("--tools");
 	});
 
+	it("selects exact OMP active tools without disabling discovered provider extensions", () => {
+		for (const [agent, tools] of __test.STRICT_TOOL_ALLOWLIST) {
+			const args = buildArgsForTest(
+				{ ...baseOptions, agent },
+				{ targetHarness: "omp" },
+			);
+			const index = args.indexOf("--magic-context-tool-allowlist");
+			const expected = [
+				...new Set(
+					tools.map((tool) =>
+						tool === "find" || tool === "ls" ? "glob" : tool,
+					),
+				),
+			];
+			expect(JSON.parse(args[index + 1])).toEqual(expected);
+			expect(args).not.toContain("--no-extensions");
+			expect(args).toContain("/tmp/historian-calibration.js");
+		}
+		const unknown = buildArgsForTest(
+			{ ...baseOptions, agent: "future-check" },
+			{ targetHarness: "omp" },
+		);
+		expect(unknown[unknown.indexOf("--magic-context-tool-allowlist") + 1]).toBe(
+			"[]",
+		);
+		const filtered = buildArgsForTest(
+			{ ...baseOptions, agent: "dreamer-primer-investigator" },
+			{ targetHarness: "omp", hostToolNames: ["read"] },
+		);
+		expect(
+			JSON.parse(
+				filtered[filtered.indexOf("--magic-context-tool-allowlist") + 1],
+			),
+		).toEqual(["read", "aft_outline", "aft_zoom", "aft_search", "ctx_search"]);
+	});
+
+	it("refuses an OMP child without the startup tool boundary entry", () => {
+		expect(() =>
+			buildArgsForTest(baseOptions, {
+				targetHarness: "omp",
+				historianCalibrationEntryPath: null,
+			}),
+		).toThrow("tool-boundary startup extension");
+	});
+
+	it("refuses an OMP child without its private tool config overlay", () => {
+		expect(() =>
+			buildArgsForTest(baseOptions, {
+				targetHarness: "omp",
+				ompToolConfigPath: undefined,
+			}),
+		).toThrow("tool-boundary config overlay");
+	});
+
 	it("locks dreamer-docs to read-only file tools and optional AFT reads", () => {
 		const args = buildArgsForTest({
 			...baseOptions,
@@ -1382,6 +1443,195 @@ describe("subagent-runner pure helpers", () => {
 });
 
 describe("PiSubagentRunner spawn lifecycle", () => {
+	for (const harness of ["omp", "pi"] as const) {
+		for (const delivery of ["argv", "windows-stdin", "large-stdin"] as const) {
+			it(`${harness} ${delivery} keeps transcript mentions literal only on OMP`, async () => {
+				const child = createMockChild();
+				const { runner, spawnImpl } = runnerWith(child, {
+					invocation: {
+						command: "host-test",
+						prefixArgs: [],
+						targetHarness: harness,
+					},
+					platform: delivery === "windows-stdin" ? "win32" : "linux",
+				});
+				const text = `see @skill://name @"some file" a@b.com${delivery === "large-stdin" ? " ".repeat(100_000) : ""}`;
+				const pending = runner.run({ ...baseOptions, userMessage: text });
+				await nextTick();
+				const args = spawnImpl.mock.calls[0]?.[1] as unknown as string[];
+				const delivered = delivery === "argv" ? args.at(-1) : child.stdinText;
+				expect(delivered).toBe(
+					harness === "omp" ? text.replaceAll(" @", " \u2060@") : text,
+				);
+				const reply = {
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					stopReason: "stop",
+				};
+				child.writeStdoutLine(agentEnd([reply]));
+				child.emitClose();
+				expect(await pending).toMatchObject({
+					ok: true,
+					assistantText: "done",
+				});
+			});
+		}
+	}
+
+	it("keeps an OMP token-budget child on print mode with a neutralized prompt", async () => {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, {
+			invocation: { command: "omp-test", prefixArgs: [], targetHarness: "omp" },
+		});
+		const pending = runner.run({
+			...baseOptions,
+			userMessage: "see @skill://name",
+			tokenBudget: 1_000,
+		});
+		await nextTick();
+		const args = spawnImpl.mock.calls[0]?.[1] as unknown as string[];
+		expect(args).toContain("--print");
+		expect(args).not.toContain("rpc");
+		expect(args.at(-1)).toBe("see \u2060@skill://name");
+		expect(child.stdinText).toBe("");
+		const configPath = args[args.indexOf("--config") + 1];
+		expect(readFileSync(configPath, "utf8")).toBe(
+			"tools:\n  xdev: false\nplan:\n  enabled: false\n  defaultOnStartup: false\n",
+		);
+		child.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "done" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		child.emitClose();
+		expect(await pending).toMatchObject({ ok: true, assistantText: "done" });
+		expect(existsSync(configPath)).toBe(false);
+	});
+
+	it("restores OMP output before streaming or returning nested summary, facts and memory text", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child, {
+			invocation: { command: "omp-test", prefixArgs: [], targetHarness: "omp" },
+		});
+		const events: unknown[] = [];
+		const pending = runner.run({
+			...baseOptions,
+			onProgress: (event) => {
+				if (event.type === "raw_event") events.push(event.event);
+			},
+		});
+		await nextTick();
+		const reply = {
+			role: "assistant",
+			content: [
+				{
+					type: "text",
+					text: '{"summary":"\u2060@skill://name","facts":["\u2060@agent://foo"],"memory":"\u2060@proc://bg_1"}',
+				},
+			],
+			stopReason: "stop",
+		};
+		// JSON escapes are decoded before restoration, not edited as raw bytes.
+		child.writeRawStdoutLine(
+			JSON.stringify(agentEnd([reply])).replaceAll("\u2060", "\\u2060"),
+		);
+		child.emitClose();
+		expect(await pending).toMatchObject({
+			ok: true,
+			assistantText:
+				'{"summary":"@skill://name","facts":["@agent://foo"],"memory":"@proc://bg_1"}',
+		});
+		expect(JSON.stringify(events)).not.toContain("\u2060");
+	});
+
+	it("leaves Pi output markers and unmarked OMP output byte-identical", () => {
+		for (const harness of ["pi", "omp"] as const) {
+			const text =
+				harness === "pi"
+					? "\u2060@skill://name"
+					: "@skill://name a@b.com 中文\nunchanged";
+			const event = agentEnd([
+				{ role: "assistant", content: [{ type: "text", text }] },
+			]);
+			expect(__test.parsePiEventLine(JSON.stringify(event), harness)).toEqual({
+				ok: true,
+				event,
+			});
+		}
+	});
+
+	for (const targetHarness of ["pi", "omp"] as const) {
+		it(`${targetHarness} records a refused model without an assistant reply`, async () => {
+			__setPiHarnessKindForTesting(targetHarness);
+			const child = createMockChild();
+			const { runner } = runnerWith(child, {
+				invocation: { command: targetHarness, prefixArgs: [], targetHarness },
+			});
+			const testDataDir = createTestTempDirFromPath(
+				join(tmpdir(), `mc-${targetHarness}-model-refusal-`),
+			);
+			const previousTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+			const previousXdgDataHome = process.env.XDG_DATA_HOME;
+			process.env.MAGIC_CONTEXT_TEST_DATA_DIR = testDataDir;
+			process.env.XDG_DATA_HOME = testDataDir;
+			closeDatabase();
+			try {
+				const model = "unknown-provider/model-not-installed";
+				const suggestion = "unknown-provider/model-available";
+				const resultPromise = runner.run({
+					...baseOptions,
+					model,
+					accountingSessionId: `${targetHarness}-model-refusal`,
+					accountingSubagent: "historian",
+					accountingModelConfigKey: `historian.${targetHarness}.model`,
+				});
+				const errorMessage = `ProviderModelNotFoundError: Model not found: ${model}. Did you mean: ${suggestion}?`;
+				const assistant = {
+					role: "assistant",
+					content: [],
+					stopReason: "error",
+					errorMessage,
+				};
+				child.writeStdoutLine({ type: "message_end", message: assistant });
+				child.writeStdoutLine(agentEnd([assistant]));
+				child.emitClose(0);
+
+				await expect(resultPromise).resolves.toMatchObject({
+					ok: false,
+					reason: "no_assistant",
+				});
+				const db = openDatabase();
+				if (!db) throw new Error("accounting test database did not open");
+				const [row] = getSubagentInvocations(
+					db,
+					`${targetHarness}-model-refusal`,
+				);
+				expect(row).toMatchObject({
+					harness: targetHarness,
+					providerId: "unknown-provider",
+					modelId: "model-not-installed",
+					status: "empty",
+				});
+				expect(row?.error).toContain(
+					`${targetHarness === "omp" ? "Oh My Pi" : "Pi"} refused the model`,
+				);
+				expect(row?.error).toContain(suggestion);
+			} finally {
+				closeDatabase();
+				if (previousTestDataDir === undefined)
+					delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+				else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = previousTestDataDir;
+				if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+				else process.env.XDG_DATA_HOME = previousXdgDataHome;
+				rmSync(testDataDir, { recursive: true, force: true });
+			}
+		});
+	}
+
 	it("records OMP usage and message provider for an unqualified model ref", async () => {
 		__setPiHarnessKindForTesting("omp");
 		const child = createMockChild();
@@ -2108,6 +2358,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				// observation is not under test here.
 				delete process.env.MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE;
 				extension({
+					registerFlag: () => {},
 					on: (
 						name: string,
 						handler: (event: { payload: unknown }) => unknown,

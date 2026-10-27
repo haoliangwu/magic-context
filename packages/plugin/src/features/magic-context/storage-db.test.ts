@@ -20,7 +20,7 @@ import {
     type AsyncProcessInspection,
     inspectWindowsProcessesSync,
 } from "../../shared/rpc-utils";
-import { Database } from "../../shared/sqlite";
+import { Database, hasSqliteTurnDeadlineRouting } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     __resetStoragePrivatePermissionEnforcementForTests,
@@ -230,6 +230,25 @@ describe("upstream migration version lane", () => {
 });
 
 describe("explicit shared storage resolution", () => {
+    for (const asynchronous of [false, true]) {
+        it(`selects native turn routing before the first ${asynchronous ? "async" : "sync"} open`, async () => {
+            const open = asynchronous ? openDatabaseAsync : openDatabase;
+            const dbPath = join(makeTempDir("storage-db-turn-routing-"), "context.db");
+            const db = await open({ dbPath, nativeTurnDeadlines: true });
+            expect(db).not.toBeNull();
+            expect(hasSqliteTurnDeadlineRouting(db!)).toBe(true);
+            expect(await open({ dbPath })).toBe(db);
+            await closeDatabase();
+
+            const ordinaryPath = join(makeTempDir("storage-db-ordinary-routing-"), "context.db");
+            const ordinary = await open({ dbPath: ordinaryPath });
+            expect(ordinary).not.toBeNull();
+            expect(hasSqliteTurnDeadlineRouting(ordinary!)).toBe(false);
+            expect(await open({ dbPath: ordinaryPath, nativeTurnDeadlines: true })).toBeNull();
+            await closeDatabase();
+        });
+    }
+
     it("keeps path resolution and database opening in the per-test XDG fixture", () => {
         process.env.MAGIC_CONTEXT_TEST_DATA_DIR = makeTempDir("storage-db-test-guard-");
         const perTestDataHome = makeTempDir("storage-db-preload-xdg-");

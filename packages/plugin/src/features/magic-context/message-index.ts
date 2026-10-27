@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
-import { clearLkgRecoveryFence } from "../../hooks/magic-context/lkg-recovery-fence";
+import {
+    clearLkgRecoveryFence,
+    sweepEmptyLkgRecoveryLockDirectories,
+} from "../../hooks/magic-context/lkg-recovery-fence";
 import {
     cleanUserText,
     extractTexts,
@@ -58,6 +61,8 @@ export interface MessageHistoryOrphanSweepResult {
 }
 
 export interface MessageHistoryOrphanSweepOptions {
+    /** Recovery-fence lock directory names collected by the timer in a bounded page. */
+    fenceLockNames?: string[];
     batchSize?: number;
     now?: number;
     safetyAgeMs?: number;
@@ -942,13 +947,19 @@ function getMessageHistoryOrphanSweepState(
     db: Database,
     harness: HarnessId,
 ): MessageHistoryOrphanSweepRow {
-    return (
+    const state =
         (db
             .prepare(
                 "SELECT cursor_session_id, last_swept_at FROM message_history_orphan_sweep WHERE harness = ?",
             )
-            .get(harness) as MessageHistoryOrphanSweepRow | null) ?? {}
-    );
+            .get(harness) as MessageHistoryOrphanSweepRow | null) ?? {};
+    // Older builds parked OC2 without ever reading session_v2. Version the
+    // cursor so that obsolete future parks cannot suppress the capable reader.
+    if (harness === "opencode2") {
+        if (!state.cursor_session_id?.startsWith("session_v2:")) return {};
+        return { ...state, cursor_session_id: state.cursor_session_id.slice("session_v2:".length) };
+    }
+    return state;
 }
 
 function persistMessageHistoryOrphanSweepState(
@@ -963,7 +974,7 @@ function persistMessageHistoryOrphanSweepState(
          ON CONFLICT(harness) DO UPDATE SET
              cursor_session_id = excluded.cursor_session_id,
              last_swept_at = excluded.last_swept_at`,
-    ).run(harness, cursor, lastSweptAt);
+    ).run(harness, harness === "opencode2" ? `session_v2:${cursor}` : cursor, lastSweptAt);
 }
 
 function getOpenCodeSessionScopedCandidateSourceSql(harness: "opencode" | "opencode2"): string {
@@ -1056,12 +1067,13 @@ function* sweepOrphanedOpenCodeMessageIndexesInBackground(
     let v2Reader: V2StoreReader | undefined;
     try {
         let sessionExists: (id: string) => boolean;
+        let liveIds: Set<string>;
         if (harness === "opencode2") {
             try {
                 const path = getSqliteDatabasePath(openCodeDb);
                 if (!path) throw new Error("OpenCode 2 source has no durable path");
                 v2Reader = new V2StoreReader(path);
-                const liveIds = new Set(v2Reader.sessionIds());
+                liveIds = new Set(v2Reader.sessionIds());
                 // An empty projection can mean an incomplete conversion or a
                 // wrong store. Never interpret it as permission to delete all state.
                 if (liveIds.size === 0) throw new Error("OpenCode 2 source has no sessions");
@@ -1076,8 +1088,40 @@ function* sweepOrphanedOpenCodeMessageIndexesInBackground(
                 return { status: "source_unavailable", scanned: 0, deleted: 0, cursor };
             }
         } else {
+            liveIds = new Set(
+                (openCodeDb.prepare("SELECT id FROM session").all() as { id: string }[]).map(
+                    (row) => row.id,
+                ),
+            );
             const query = openCodeDb.prepare("SELECT 1 FROM session WHERE id = ? LIMIT 1");
             sessionExists = (id) => !!query.get(id);
+        }
+        if (options.fenceLockNames?.length) {
+            const retainedIds = new Set(liveIds);
+            // Hash-only directory names have no host provenance. Protect every
+            // persisted session in the shared store, not just this host's rows.
+            const sources = SESSION_SCOPED_TABLES.map(
+                (def) =>
+                    `SELECT session_id FROM ${def.table}${def.extraPredicate ? ` WHERE ${def.extraPredicate}` : ""}`,
+            );
+            for (const row of db.prepare(sources.join(" UNION ")).all() as {
+                session_id: string;
+            }[]) {
+                if (typeof row.session_id === "string") retainedIds.add(row.session_id);
+            }
+            for (const row of db
+                .prepare("SELECT key FROM schema_migrations_meta WHERE key >= ? AND key < ?")
+                .all(TAG_TOMBSTONE_OWNER_PREFIX, "tag_revision_owner;") as { key: string }[]) {
+                try {
+                    const id = JSON.parse(
+                        row.key.slice(TAG_TOMBSTONE_OWNER_PREFIX.length, row.key.lastIndexOf(":")),
+                    );
+                    if (typeof id === "string") retainedIds.add(id);
+                } catch {
+                    /* Malformed owner markers cannot identify a session. */
+                }
+            }
+            sweepEmptyLkgRecoveryLockDirectories(options.fenceLockNames, retainedIds);
         }
         const cutoff = now - safetyAgeMs;
         const candidateSourceSql = getOpenCodeSessionScopedCandidateSourceSql(harness);

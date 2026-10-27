@@ -6,20 +6,30 @@ import {
     getPendingOps,
     getTagsBySession,
     queuePendingOp,
+    updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { createTagger } from "../../features/magic-context/tagger";
 import { adaptPayload } from "../../v2/hooks/payload";
 import type { SessionContext } from "../../v2/hooks/types";
 import { createAutoSearchReplayFixture } from "./auto-search-replay.fixture";
+import { type CompartmentTriggerResult, checkCompartmentTrigger } from "./compartment-trigger";
 import { opencode1ToModelMessages } from "./opencode1-to-model-messages.fixture";
 import { requestPendingMaterialization } from "./pending-materialization";
+import { resolveOpenCodeProtectedTailBoundary } from "./protected-tail-boundary";
+import { setRawMessageProvider } from "./read-session-chunk";
+import { buildInMemoryTailRawMessages } from "./read-session-raw";
 import { type MessageLike, tagMessages } from "./tag-messages";
 import { applyFlushedStatuses } from "./transform-operations";
 import { runPostTransformPhase } from "./transform-postprocess-phase";
 
-export function openCodeRideHarness(host: "opencode" | "opencode2", legacy = false) {
+export function openCodeRideHarness(
+    host: "opencode" | "opencode2",
+    legacy = false,
+    scenario?: "floor" | "small",
+) {
     const fixture = createAutoSearchReplayFixture(host, "deferred-ride");
-    const { db, sessionId: id } = fixture;
+    let db = fixture.db;
+    const id = fixture.sessionId;
     const pending = new Set<string>();
     const history = new Set<string>();
     const deferred = new Set<string>();
@@ -39,6 +49,24 @@ export function openCodeRideHarness(host: "opencode" | "opencode2", legacy = fal
             },
         ],
     }));
+    if (scenario === "floor") {
+        for (let i = 2; i < source.length; i++) {
+            source[i]!.parts[0]!.text =
+                i === 2
+                    ? "Implement the long autonomous task"
+                    : i % 2 === 0
+                      ? "<system-reminder>Continue working</system-reminder>"
+                      : `Work phase ${i}: inspected code and verified the next change. `.repeat(
+                            700,
+                        );
+        }
+    }
+    let lastTrigger: CompartmentTriggerResult | undefined;
+    let rebuilds = 0;
+    let protectQueued = false;
+    let publicationSequence = 1;
+    let systemRevision = 0;
+    let boundaryLimit = 96_000;
     appendCompartments(db, id, [
         {
             sequence: 0,
@@ -52,8 +80,79 @@ export function openCodeRideHarness(host: "opencode" | "opencode2", legacy = fal
         },
     ]);
     return {
-        db,
+        get db() {
+            return db;
+        },
         id,
+        source,
+        reopen() {
+            fixture.reopen();
+            db = fixture.db;
+        },
+        get lastTrigger() {
+            return lastTrigger;
+        },
+        get rebuilds() {
+            return rebuilds;
+        },
+        setBoundaryLimit(limit: number) {
+            boundaryLimit = limit;
+        },
+        inspectUnflooredBoundary() {
+            const raw = buildInMemoryTailRawMessages({
+                messages: source.map((m) => ({
+                    id: m.info.id!,
+                    role: m.info.role!,
+                    parts: m.parts,
+                })),
+                lastCompartmentEnd: 0,
+                anchorMessageId: null,
+            })!;
+            const unregister = setRawMessageProvider(id, { readMessages: () => raw.messages });
+            try {
+                return resolveOpenCodeProtectedTailBoundary({
+                    db,
+                    sessionId: id,
+                    mode: "trigger",
+                    contextLimit: boundaryLimit,
+                    executeThresholdPercentage: 75,
+                    usage: { percentage: 76, inputTokens: 72_960 },
+                    liftLivePromptFloor: true,
+                });
+            } finally {
+                unregister();
+            }
+        },
+        protectQueue(value: boolean) {
+            protectQueued = value;
+        },
+        fold() {
+            systemRevision++;
+        },
+        appendTurn(meaningful: boolean) {
+            const i = source.length;
+            source.push(
+                {
+                    info: { id: `msg_${String(i).padStart(4, "0")}`, role: "user", sessionID: id },
+                    parts: [
+                        {
+                            type: "text",
+                            text: meaningful
+                                ? `New human instruction ${i}`
+                                : "<system-reminder>Continue working</system-reminder>",
+                        },
+                    ],
+                },
+                {
+                    info: {
+                        id: `msg_${String(i + 1).padStart(4, "0")}`,
+                        role: "assistant",
+                        sessionID: id,
+                    },
+                    parts: [{ type: "text", text: `Work continuation ${i}` }],
+                },
+            );
+        },
         signal() {
             history.add(id);
             deferred.add(id);
@@ -62,14 +161,26 @@ export function openCodeRideHarness(host: "opencode" | "opencode2", legacy = fal
             requestPendingMaterialization(pending, id, "user_flush");
         },
         publish() {
+            updateSessionMeta(db, id, { compartmentInProgress: false });
             legacyBlock = "Fresh legacy history";
             appendCompartments(db, id, [
                 {
-                    sequence: 1,
-                    startMessage: 3,
-                    endMessage: 4,
-                    startMessageId: "msg_0002",
-                    endMessageId: "msg_0003",
+                    sequence: publicationSequence++,
+                    startMessage:
+                        scenario === "floor" ? (lastTrigger?.boundarySnapshot?.offset ?? 3) : 3,
+                    endMessage:
+                        scenario === "floor"
+                            ? (lastTrigger?.boundarySnapshot?.eligibleEndOrdinal ?? 5) - 1
+                            : 4,
+                    startMessageId:
+                        scenario === "floor"
+                            ? source[(lastTrigger?.boundarySnapshot?.offset ?? 3) - 1]!.info.id
+                            : "msg_0002",
+                    endMessageId:
+                        scenario === "floor"
+                            ? source[(lastTrigger?.boundarySnapshot?.eligibleEndOrdinal ?? 5) - 2]!
+                                  .info.id
+                            : "msg_0003",
                     title: "Fresh publication",
                     content: "New history facts.\n".repeat(20),
                     p1: "New history facts.\n".repeat(20),
@@ -106,7 +217,48 @@ export function openCodeRideHarness(host: "opencode" | "opencode2", legacy = fal
             const tagged = tagMessages(id, messages, tagger, db);
             const tags = getActiveTagsBySession(db, id);
             applyFlushedStatuses(id, db, tagged.targets, getTagsBySession(db, id));
-            await runPostTransformPhase({
+            if (scenario) {
+                const raw = buildInMemoryTailRawMessages({
+                    messages: source.map((m) => ({
+                        id: m.info.id!,
+                        role: m.info.role!,
+                        parts: m.parts,
+                    })),
+                    lastCompartmentEnd: 0,
+                    anchorMessageId: null,
+                })!;
+                const unregister = setRawMessageProvider(id, { readMessages: () => raw.messages });
+                const previousEnv = process.env.NODE_ENV;
+                try {
+                    process.env.NODE_ENV = "production";
+                    lastTrigger = checkCompartmentTrigger(
+                        db,
+                        id,
+                        getOrCreateSessionMeta(db, id),
+                        { percentage, inputTokens: percentage * 960 },
+                        0,
+                        75,
+                        10_000,
+                        undefined,
+                        undefined,
+                        undefined,
+                        boundaryLimit,
+                        raw,
+                        undefined,
+                        undefined,
+                        undefined,
+                        undefined,
+                        percentage >= 75,
+                    );
+                    if (lastTrigger.shouldFire)
+                        updateSessionMeta(db, id, { compartmentInProgress: true });
+                } finally {
+                    if (previousEnv === undefined) delete process.env.NODE_ENV;
+                    else process.env.NODE_ENV = previousEnv;
+                    unregister();
+                }
+            }
+            const result = await runPostTransformPhase({
                 sessionId: id,
                 db,
                 messages,
@@ -118,7 +270,7 @@ export function openCodeRideHarness(host: "opencode" | "opencode2", legacy = fal
                 batch: null,
                 contextUsage: { percentage, inputTokens: percentage * 1000 },
                 usableWindow: 96_000,
-                schedulerDecision: percentage >= 65 ? "execute" : "defer",
+                schedulerDecision: percentage >= (scenario ? 75 : 65) ? "execute" : "defer",
                 fullFeatureMode: true,
                 canRunCompartments: false,
                 awaitedCompartmentRun: false,
@@ -136,8 +288,12 @@ export function openCodeRideHarness(host: "opencode" | "opencode2", legacy = fal
                 deferredHistoryRefreshSessions: history,
                 deferredMaterializationSessions: deferred,
                 lastHeuristicsTurnId: new Map(),
-                protectedTagIds: new Set(),
-                protectedTagNumbers: new Set(),
+                protectedTagIds: new Set(
+                    protectQueued ? getPendingOps(db, id).map((op) => op.tagId) : [],
+                ),
+                protectedTagNumbers: new Set(
+                    protectQueued ? getPendingOps(db, id).map((op) => op.tagId) : [],
+                ),
                 protectedCutoff: null,
                 protectedCount: 0,
                 pendingCompartmentInjection: legacy
@@ -161,10 +317,15 @@ export function openCodeRideHarness(host: "opencode" | "opencode2", legacy = fal
                     ? undefined
                     : {
                           ...fixture.renderOptions("openai/gpt-test"),
-                          memoryEnabled: false,
+                          hardSignals: {
+                              ...fixture.renderOptions("openai/gpt-test").hardSignals,
+                              systemHash: systemRevision ? `system-${systemRevision}` : "system",
+                          },
+                          memoryEnabled: !!scenario,
                           temporalAwareness: false,
                       },
             });
+            if (result.bustedThisPass) rebuilds++;
             previous = structuredClone(messages);
             if (mapped) {
                 mapped.commit();

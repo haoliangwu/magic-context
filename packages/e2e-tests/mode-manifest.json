@@ -3,12 +3,44 @@
     "header": "CI push workflows run the manifest-derived TypeScript suites and Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh; tag releases run the same Rust invocation. Cargo.lock pins the Rust dependency versions and git revisions. CI mc-module daemon tests and push/release builders use the locked subconscious source to build ck-subc; the scheduled CI builder intentionally probes default-branch HEAD as drift, while test shards consume its prebuilt artifact.",
     "entries": [
         {
+            "path": "tests/pi-child-tool-boundary.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real Pi and OMP hidden children keep discovered provider extensions but deny unrelated tools, including forced provider tool calls. Child PID lsof verifies throwaway databases.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["omp", "pi"]
+        },
+        {
+            "path": "tests/pi-native-waits.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "A real Pi turn under a writer lock must replay its managed request or visibly refuse within the turn deadline.",
+            "contract_refs": ["packages/pi-plugin/PARITY.md#26-last-known-good-replay-is-shared-across-harnesses"],
+            "hosts": ["pi"]
+        },
+        {
+            "path": "tests/opencode2/message-index-continuity.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "A real OpenCode 2 host indexes a new message after the one-time generation stamp and an earlier reconciliation; message search and the ctx_expand archive renderer return its text. PID lsof proves isolated stores.",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
             "path": "tests/omp-compaction-marker.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
             "rationale": "A real OMP host supersedes shifted compaction markers with a verified entry-id boundary; the next provider request omits older raw history and duplicate summaries. Host PID lsof proves throwaway-store containment.",
             "contract_refs": ["FOLD-UNDER-PRESSURE"],
             "hosts": ["omp"]
+        },
+        {
+            "path": "tests/pi-context-tool-surface.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OMP and Pi provider requests capture their exact tool-list bytes across two turns; host PID lsof proves all stores stay under the dedicated throwaway root.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["omp", "pi"]
         },
         {
             "path": "tests/opencode2/native-fold-hidden-edit.test.ts",
@@ -2088,6 +2120,14 @@
             "hosts": [
                 "opencode"
             ]
+        },
+        {
+            "path": "tests/rust-compaction-marker-catchup.test.ts",
+            "tier": "rust-only",
+            "invocation": { "ts": false, "rust": true },
+            "rationale": "Mixed-history render epochs catch up lagging markers only on admitted rebuilds, preserving frozen provider bytes on byte-preserving HARD and subsequent SOFT+ turns.",
+            "contract_refs": ["RUST-E2E"],
+            "hosts": ["opencode"]
         },
         {
             "path": "tests/rust-ctx-reduce-roundtrip.test.ts",

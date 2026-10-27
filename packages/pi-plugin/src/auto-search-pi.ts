@@ -73,6 +73,7 @@ import {
 	selectAutoSearchResults,
 } from "@magic-context/core/hooks/magic-context/auto-search-hint";
 import {
+	AutoSearchBusyError,
 	coalesceAutoSearchTurn,
 	persistAutoSearchDecision,
 	queueAutoSearchBackfill,
@@ -458,6 +459,9 @@ export async function runAutoSearchHintForPi(args: {
 								// Leave primers out of automatic hints so primer updates cannot rewrite
 								// cached request prefixes. Explicit ctx_search and the dashboard expose them.
 								sources: ["memory", "message", "git_commit"],
+								// Never wait for the history-chunk pool to be built: a
+								// cold pool is warmed in the background for later turns.
+								chunkPoolWarmOnly: true,
 							};
 							return searchAutoHint(
 								db,
@@ -475,6 +479,16 @@ export async function runAutoSearchHintForPi(args: {
 				} catch (error) {
 					args.passGuard?.assert();
 					if (lifecycleSignal.aborted) return messages;
+					if (error instanceof AutoSearchBusyError) {
+						// An earlier search of this session is still running. Serve this
+						// turn without a hint and freeze that decision, as a timeout does.
+						sessionLog(
+							sessionId,
+							"auto-search: an earlier search of this session is still running, skipping hint for this turn",
+						);
+						void persistAutoSearchSkip(db, sessionId, userMsgId);
+						return messages;
+					}
 					// This pass serves the user message without a hint. Freeze that decision
 					// before returning so a recovered search cannot rewrite cached bytes.
 					log(
@@ -548,7 +562,7 @@ export async function runAutoSearchHintForPi(args: {
 					}
 					sessionLog(
 						sessionId,
-						`auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,
+						`auto-search: attached hint to ${userMsgId} (${results.length} fragments, top relevance ${(results[0].relevanceScore ?? results[0].score).toFixed(3)})`,
 					);
 
 					return messages;

@@ -26,6 +26,7 @@ import { setHarness } from "../../shared/harness";
 import * as logger from "../../shared/logger";
 import * as models from "../../shared/models-dev-cache";
 import { resetOpenCodeDbPathStateForTesting } from "../../shared/opencode-db-path";
+import { scaleTest } from "../../shared/slow-test";
 import { Database } from "../../shared/sqlite";
 import { cleanupTestTempDir, createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { rememberHostMedia, resetHostMediaForTests } from "../fold/host-media";
@@ -508,119 +509,130 @@ async function fixture(
     };
 }
 
-test("issue 709 review: features-on real OC2 hook replays defer bytes over 480 seeded passes", async () => {
-    const changes: Array<{ seed: number; step: number; logs: string[] }> = [];
-    const compactions: Array<{ seed: number; hard: string[] }> = [];
-    let passes = 0;
-    const coverage: unknown[] = [];
-    for (let seed = 709; seed < 729; seed++) {
-        const f = await fixture(seed);
-        try {
-            f.seedHistory();
-            let random = seed;
-            let previous: Awaited<ReturnType<typeof f.pass>> | undefined;
-            const next = () => {
-                random = (Math.imul(random, 1664525) + 1013904223) >>> 0;
-                return random;
-            };
-            for (let step = 0; step < 12; step++) {
-                // Storage changes alone must not authorize edits to a served prefix.
-                if (step === 2) f.changeExternalFeatures();
-                if (step === 3) await f.start();
-                if (step === 5) f.switchModel();
-                if (step === 9) await f.fold();
-                if (step === 7) await f.idle();
-                const inheritedDepths = step === 11 ? f.fork() : undefined;
-                const fresh = step > 0 && step < 9 && step !== 7 && next() % 3 === 0;
-                if (fresh) f.freshTurn();
-                const depthsBefore =
-                    inheritedDepths ??
-                    new Map(f.tags().map((t) => [t.messageId, t.cavemanDepth ?? 0]));
-                const first = await f.pass();
-                if (step === 9)
-                    compactions.push({
-                        seed,
-                        hard: first.logs.filter((line) => /HARD.*executed=true/.test(line)),
-                    });
-                if (previous && ![5, 7, 9, 11].includes(step)) {
-                    if (!fresh)
-                        expect(first.bytes, `same input seed ${seed} step ${step}`).toBe(
-                            previous.bytes,
-                        );
-                    else {
-                        expect(
-                            first.draft.messages.slice(0, previous.draft.messages.length),
-                            `old prefix seed ${seed} step ${step}`,
-                        ).toEqual(previous.draft.messages);
-                        expect(first.draft.system).toEqual(previous.draft.system);
-                        expect(first.draft.tools).toEqual(previous.draft.tools);
+const featuresOnReplay =
+    "issue 709 review: features-on real OC2 hook replays defer bytes over seeded passes";
+scaleTest(
+    featuresOnReplay,
+    async (slow) => {
+        const changes: Array<{ seed: number; step: number; logs: string[] }> = [];
+        const compactions: Array<{ seed: number; hard: string[] }> = [];
+        let passes = 0;
+        const coverage: unknown[] = [];
+        for (let seed = 709; seed < (slow ? 729 : 713); seed++) {
+            const f = await fixture(seed);
+            try {
+                f.seedHistory();
+                let random = seed;
+                let previous: Awaited<ReturnType<typeof f.pass>> | undefined;
+                const next = () => {
+                    random = (Math.imul(random, 1664525) + 1013904223) >>> 0;
+                    return random;
+                };
+                for (let step = 0; step < 12; step++) {
+                    // Storage changes alone must not authorize edits to a served prefix.
+                    if (step === 2) f.changeExternalFeatures();
+                    if (step === 3) await f.start();
+                    if (step === 5) f.switchModel();
+                    if (step === 9) await f.fold();
+                    if (step === 7) await f.idle();
+                    const inheritedDepths = step === 11 ? f.fork() : undefined;
+                    const fresh = step > 0 && step < 9 && step !== 7 && next() % 3 === 0;
+                    if (fresh) f.freshTurn();
+                    const depthsBefore =
+                        inheritedDepths ??
+                        new Map(f.tags().map((t) => [t.messageId, t.cavemanDepth ?? 0]));
+                    const first = await f.pass();
+                    if (step === 9)
+                        compactions.push({
+                            seed,
+                            hard: first.logs.filter((line) => /HARD.*executed=true/.test(line)),
+                        });
+                    if (previous && ![5, 7, 9, 11].includes(step)) {
+                        if (!fresh)
+                            expect(first.bytes, `same input seed ${seed} step ${step}`).toBe(
+                                previous.bytes,
+                            );
+                        else {
+                            expect(
+                                first.draft.messages.slice(0, previous.draft.messages.length),
+                                `old prefix seed ${seed} step ${step}`,
+                            ).toEqual(previous.draft.messages);
+                            expect(first.draft.system).toEqual(previous.draft.system);
+                            expect(first.draft.tools).toEqual(previous.draft.tools);
+                        }
                     }
+                    passes++;
+                    const newCompression = f
+                        .tags()
+                        .filter(
+                            (t) => (t.cavemanDepth ?? 0) > (depthsBefore.get(t.messageId) ?? 0),
+                        );
+                    if (newCompression.length)
+                        expect(
+                            first.logs.some(
+                                (line) =>
+                                    /first_render|ttl_idle|bustsServedPrefix=true/.test(line) ||
+                                    (step === 11 && line.includes("HARD reason=boot_recovery")),
+                            ),
+                            `compression first-apply seed ${seed} step ${step}: ${JSON.stringify({ newCompression, hard: first.logs.filter((line) => line.includes("HARD")) })}`,
+                        ).toBe(true);
+                    expect(first.bytes).toContain("Review preference");
+                    expect(first.bytes).toContain("Isolated architecture");
+                    expect(first.bytes).toContain("Persisted review history");
+                    expect(first.bytes).toContain("mediaType");
+                    expect(first.bytes).toContain("image/png");
+                    expect(first.bytes.includes(`Updated preference ${seed}.`)).toBe(step >= 5);
+                    expect(first.bytes.includes(`Updated architecture ${seed}.`)).toBe(step >= 5);
+                    expect(f.meta().cachedM0UpgradeState).toContain("mural-enabled:1");
+                    expect(f.meta().cachedM0UpgradeState).toContain(
+                        `hp${f.config.history_budget_percentage}:percentage:65`,
+                    );
+                    const decisionsBeforeReplay = f.decisions().length;
+                    const depthsBeforeReplay = f
+                        .tags()
+                        .map((t) => [t.messageId, t.cavemanDepth ?? 0]);
+                    const second = await f.pass();
+                    passes++;
+                    expect(f.decisions().length).toBe(decisionsBeforeReplay);
+                    expect(f.tags().map((t) => [t.messageId, t.cavemanDepth ?? 0])).toEqual(
+                        depthsBeforeReplay,
+                    );
+                    if (step !== 7)
+                        expect(
+                            second.logs.some((line) =>
+                                /transform scheduler: .*decision=defer/.test(line),
+                            ),
+                            `seed ${seed} step ${step}: ${second.logs.join("\n")}`,
+                        ).toBe(true);
+                    if (step === 7) expect(first.logs.join("\n")).toContain("ttl_idle");
+                    if (second.bytes !== first.bytes)
+                        changes.push({ seed, step, logs: second.logs });
+                    previous = second;
+                    f.completeResponse();
                 }
-                passes++;
-                const newCompression = f
-                    .tags()
-                    .filter((t) => (t.cavemanDepth ?? 0) > (depthsBefore.get(t.messageId) ?? 0));
-                if (newCompression.length)
-                    expect(
-                        first.logs.some(
-                            (line) =>
-                                /first_render|ttl_idle|bustsServedPrefix=true/.test(line) ||
-                                (step === 11 && line.includes("HARD reason=boot_recovery")),
-                        ),
-                        `compression first-apply seed ${seed} step ${step}: ${JSON.stringify({ newCompression, hard: first.logs.filter((line) => line.includes("HARD")) })}`,
-                    ).toBe(true);
-                expect(first.bytes).toContain("Review preference");
-                expect(first.bytes).toContain("Isolated architecture");
-                expect(first.bytes).toContain("Persisted review history");
-                expect(first.bytes).toContain("mediaType");
-                expect(first.bytes).toContain("image/png");
-                expect(first.bytes.includes(`Updated preference ${seed}.`)).toBe(step >= 5);
-                expect(first.bytes.includes(`Updated architecture ${seed}.`)).toBe(step >= 5);
-                expect(f.meta().cachedM0UpgradeState).toContain("mural-enabled:1");
-                expect(f.meta().cachedM0UpgradeState).toContain(
-                    `hp${f.config.history_budget_percentage}:percentage:65`,
-                );
-                const decisionsBeforeReplay = f.decisions().length;
-                const depthsBeforeReplay = f.tags().map((t) => [t.messageId, t.cavemanDepth ?? 0]);
-                const second = await f.pass();
-                passes++;
-                expect(f.decisions().length).toBe(decisionsBeforeReplay);
-                expect(f.tags().map((t) => [t.messageId, t.cavemanDepth ?? 0])).toEqual(
-                    depthsBeforeReplay,
-                );
-                if (step !== 7)
-                    expect(
-                        second.logs.some((line) =>
-                            /transform scheduler: .*decision=defer/.test(line),
-                        ),
-                        `seed ${seed} step ${step}: ${second.logs.join("\n")}`,
-                    ).toBe(true);
-                if (step === 7) expect(first.logs.join("\n")).toContain("ttl_idle");
-                if (second.bytes !== first.bytes) changes.push({ seed, step, logs: second.logs });
-                previous = second;
-                f.completeResponse();
+                expect(f.tags().some((t) => (t.cavemanDepth ?? 0) > 0)).toBe(true);
+                expect(f.decisions().some((d) => d.decision === "hint")).toBe(true);
+                coverage.push({
+                    seed,
+                    compressed: f.tags().filter((t) => (t.cavemanDepth ?? 0) > 0).length,
+                    hintDecisions: f.decisions().length,
+                    meta: f.db
+                        .prepare(
+                            "SELECT cached_m0_upgrade_state, cached_m0_mural_hash FROM session_meta WHERE session_id = ?",
+                        )
+                        .get(f.session),
+                });
+            } finally {
+                await f.cleanup();
             }
-            expect(f.tags().some((t) => (t.cavemanDepth ?? 0) > 0)).toBe(true);
-            expect(f.decisions().some((d) => d.decision === "hint")).toBe(true);
-            coverage.push({
-                seed,
-                compressed: f.tags().filter((t) => (t.cavemanDepth ?? 0) > 0).length,
-                hintDecisions: f.decisions().length,
-                meta: f.db
-                    .prepare(
-                        "SELECT cached_m0_upgrade_state, cached_m0_mural_hash FROM session_meta WHERE session_id = ?",
-                    )
-                    .get(f.session),
-            });
-        } finally {
-            await f.cleanup();
         }
-    }
-    console.log(JSON.stringify({ passes, deferChanges: changes, compactions, coverage }));
-    expect(passes).toBe(480);
-    expect(changes).toEqual([]);
-    expect(compactions.every((row) => row.hard.length === 0)).toBe(true);
-}, 120000);
+        console.log(JSON.stringify({ passes, deferChanges: changes, compactions, coverage }));
+        expect(passes).toBe(slow ? 480 : 96);
+        expect(changes).toEqual([]);
+        expect(compactions.every((row) => row.hard.length === 0)).toBe(true);
+    },
+    120000,
+);
 
 test.skipIf(!process.env.REVIEW709_BASELINE_MODULE)(
     "issue 709 review: upgrade from exact cb9ba1d1 OC2 callback",

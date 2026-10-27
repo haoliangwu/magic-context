@@ -36,6 +36,9 @@ RUN cd /test && \
     npm install --silent --no-audit --no-fund @copilotkit/aimock
 
 COPY packages/pi-plugin/dist/ /test/mc-pi/dist/
+# The argv renderer resolves the startup extension as a sibling, just as the
+# published plugin does. Keep that extension and its split chunks together.
+COPY packages/pi-plugin/dist/ /test/e2e/
 # Keep the Node renderer's split chunks together, as with the published plugin.
 # A monolithic Bun bundle of this async SQLite graph emits a Bun-only helper.
 COPY tests/docker/.generated/ /test/e2e/

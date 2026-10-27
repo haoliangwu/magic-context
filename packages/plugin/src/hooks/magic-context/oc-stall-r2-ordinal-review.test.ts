@@ -4,6 +4,7 @@ import { Database as ForeignDatabase } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { OPENCODE1_MESSAGE_PART_SCHEMA } from "../../features/magic-context/__tests__/opencode1-query-fixture";
+import { scaleTest } from "../../shared/slow-test";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDir } from "../../shared/test-temp-dir";
 import {
@@ -176,11 +177,11 @@ describe("stall r2 ordinal witnesses", () => {
 
 type Row = { id: string; session_id: string; time_created: number; data: string; rid: number };
 
-/** Six deterministic seeds, 1,000 writes each, using two actual WAL connections. */
-function differential(moveSessions: boolean, invalidateMoves: boolean): void {
+/** Deterministic seeds, 1,000 writes each, using two actual WAL connections. */
+function differential(moveSessions: boolean, invalidateMoves: boolean, slow: boolean): void {
     const mismatches: unknown[] = [];
     const operations = Array<number>(10).fill(0);
-    for (const seed of [1, 7, 42, 650, 0x5d0ee2b3, 0xffffffff]) {
+    for (const seed of slow ? [1, 7, 42, 650, 0x5d0ee2b3, 0xffffffff] : [1, 0xffffffff]) {
         withFile((reader, writer) => {
             let state = seed >>> 0;
             const random = () => (state = (Math.imul(state, 1664525) + 1013904223) >>> 0);
@@ -315,26 +316,26 @@ function differential(moveSessions: boolean, invalidateMoves: boolean): void {
             }
         });
     }
-    expect(operations).toEqual(Array(10).fill(600));
+    expect(operations).toEqual(Array(10).fill(slow ? 600 : 200));
     expect(mismatches).toEqual([]);
 }
 
-// Each variant runs 6,000 steps on two connections; under the parallel full
-// suite on a loaded host one took close to the suite's 30 s default.
+// Each full slow-lane variant runs 6,000 steps on two connections and needs
+// more headroom than the unit suite's default timeout on a loaded host.
 const DIFFERENTIAL_TIMEOUT_MS = 120_000;
 
-test(
-    "6,000-step differential: compaction, ties, time moves, suffix deletes, reused rowids, reinserted summaries and scan interleaving",
-    () => differential(false, false),
+scaleTest(
+    "ordinal differential: compaction, ties, time moves, suffix deletes, reused rowids, reinserted summaries and scan interleaving",
+    (slow) => differential(false, false, slow),
     DIFFERENTIAL_TIMEOUT_MS,
 );
-test(
-    "6,000-step differential: session moves must also match the old whole-prefix count",
-    () => differential(true, false),
+scaleTest(
+    "ordinal differential: session moves must also match the old whole-prefix count",
+    (slow) => differential(true, false, slow),
     DIFFERENTIAL_TIMEOUT_MS,
 );
-test(
-    "6,000-step differential: invalidating destinations of session moves restores parity",
-    () => differential(true, true),
+scaleTest(
+    "ordinal differential: invalidating destinations of session moves restores parity",
+    (slow) => differential(true, true, slow),
     DIFFERENTIAL_TIMEOUT_MS,
 );

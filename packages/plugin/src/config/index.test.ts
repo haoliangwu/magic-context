@@ -270,11 +270,17 @@ describe("loadPluginConfig — graduated mural config", () => {
         expect(
             resolveDreamerTaskModel({ config: result, harness: "opencode", task: "compress-cues" })
                 .primary,
-        ).toEqual({ model: "open/dreamer-default" });
+        ).toEqual({
+            model: "open/dreamer-default",
+            sourceConfigKey: "dreamer.opencode.model",
+        });
         expect(
             resolveDreamerTaskModel({ config: result, harness: "pi", task: "compress-cues" })
                 .primary,
-        ).toEqual({ model: "pi/dreamer-default" });
+        ).toEqual({
+            model: "pi/dreamer-default",
+            sourceConfigKey: "dreamer.pi.model",
+        });
     });
 
     it("emits no mural.model warning when the key is absent", () => {
@@ -302,11 +308,17 @@ describe("loadPluginConfig — graduated mural config", () => {
         expect(
             resolveDreamerTaskModel({ config: result, harness: "opencode", task: "compress-cues" })
                 .primary,
-        ).toEqual({ model: "open/project-cues" });
+        ).toEqual({
+            model: "open/project-cues",
+            sourceConfigKey: "dreamer.opencode.tasks.compress-cues.model",
+        });
         expect(
             resolveDreamerTaskModel({ config: result, harness: "opencode", task: "curate" })
                 .primary,
-        ).toEqual({ model: "open/project-curate" });
+        ).toEqual({
+            model: "open/project-curate",
+            sourceConfigKey: "dreamer.opencode.tasks.curate.model",
+        });
         expect(
             (result.configWarnings ?? []).filter((w) =>
                 w.endsWith(MURAL_MODEL_DEPRECATION_WARNING),
@@ -1690,8 +1702,18 @@ describe("loadPluginConfig — user-owned model profiles", () => {
         // existing model-switch identity path still sees canonical model IDs and
         // qualifier-distinct fallback attempts; profiles add no separate cache-bust class.
         expect(resolveHistorianModel(config, "opencode")).toEqual({
-            primary: { model: "anthropic/work", qualifier: "high" },
-            fallbacks: [{ model: "openai/work-fallback", qualifier: "low" }],
+            primary: {
+                model: "anthropic/work",
+                qualifier: "high",
+                sourceConfigKey: "historian.opencode.model",
+            },
+            fallbacks: [
+                {
+                    model: "openai/work-fallback",
+                    qualifier: "low",
+                    sourceConfigKey: "historian.opencode.fallback_models",
+                },
+            ],
         });
     });
 });
@@ -1774,5 +1796,49 @@ describe("shared per-harness config loading", () => {
         expect(resolveHistorianModel(config, "opencode").primary?.model).toBe(
             "anthropic/opencode-historian",
         );
+    });
+});
+
+describe("hosted rerank configuration loading", () => {
+    it("expands the user key but strips every project redirect and limit before merge", () => {
+        const key = "FAKE_RERANK_LOADER_KEY_765";
+        const user = JSON.stringify({
+            rerank: {
+                provider: "remote",
+                endpoint: "https://trusted.invalid",
+                model: "trusted",
+                api_key: "{env:MC_RERANK_LOADER_KEY}",
+                timeout_ms: 1500,
+                top_n: 20,
+            },
+        });
+        const project = JSON.stringify({
+            rerank: {
+                provider: "remote",
+                endpoint: "https://untrusted.invalid",
+                model: "{file:never-open-secret}",
+                api_key: "{env:MC_RERANK_LOADER_KEY}",
+                timeout_ms: 9999,
+                top_n: 1,
+            },
+        });
+        const config = loadWithUserAndProjectConfig(user, project, { MC_RERANK_LOADER_KEY: key });
+        expect(config.rerank).toEqual({
+            provider: "remote",
+            endpoint: "https://trusted.invalid",
+            model: "trusted",
+            api_key: key,
+            timeout_ms: 1500,
+            top_n: 20,
+        });
+        expect(config.configWarnings?.some((line) => line.includes("Ignoring rerank"))).toBe(true);
+        expect(JSON.stringify(config.configWarnings)).not.toContain(key);
+        expect(config.configWarnings?.some((line) => line.includes("leaving tokens literal"))).toBe(
+            true,
+        );
+        const off = loadWithUserAndProjectConfig(user, '{"rerank":{"provider":"off"}}', {
+            MC_RERANK_LOADER_KEY: key,
+        });
+        expect(off.rerank?.provider).toBe("off");
     });
 });

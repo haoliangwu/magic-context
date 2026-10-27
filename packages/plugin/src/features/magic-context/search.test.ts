@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { activeEmbeddingSessions } from "../../hooks/magic-context/embed-session-state";
 import { Database } from "../../shared/sqlite";
 
 let queryEmbedding: Float32Array | null = null;
@@ -17,6 +18,10 @@ import {
 } from "./compartment-chunk-embedding";
 import { appendCompartments, getCompartments, replaceSessionFacts } from "./compartment-storage";
 import { getMemoryById, insertMemory, resetEmbeddingCacheForTests, saveEmbedding } from "./memory";
+import {
+    __resetLocalEmbeddingPoolingForTests,
+    __setLocalEmbeddingPoolingForTests,
+} from "./memory/local-embedding-pooling";
 import { ensureMessagesIndexed } from "./message-index";
 import { runMigrations } from "./migrations";
 import {
@@ -102,6 +107,7 @@ afterEach(() => {
     rawMessagesBySession.clear();
     resetEmbeddingCacheForTests();
     _resetProjectEmbeddingRegistryForTests();
+    __resetLocalEmbeddingPoolingForTests();
 });
 
 describe("unifiedSearch", () => {
@@ -1719,6 +1725,74 @@ describe("unifiedSearch", () => {
             endOrdinal: 2,
             matchType: "semantic",
         });
+    });
+
+    it("never returns an inactive history chunk stored under an old pooling identity", async () => {
+        const sessionId = "ses-inactive-pooling";
+        const projectPath = "/repo/inactive-pooling";
+        activeEmbeddingSessions.delete(sessionId);
+        expect(activeEmbeddingSessions.has(sessionId)).toBe(false);
+        rawMessagesBySession.set(sessionId, [
+            {
+                ordinal: 1,
+                id: "u1",
+                role: "user",
+                parts: [{ type: "text", text: "queue saturation problem" }],
+            },
+            {
+                ordinal: 2,
+                id: "a2",
+                role: "assistant",
+                parts: [{ type: "text", text: "bounded drains with backpressure" }],
+            },
+        ]);
+        ensureMessagesIndexed(db, sessionId, readMessages);
+        const localModel = "mock-model";
+        __setLocalEmbeddingPoolingForTests(localModel, {
+            status: "ready",
+            pooling: "mean",
+            normalize: true,
+            declared: true,
+            reason: "fixture mean pooling",
+        });
+        const oldSnapshot = registerEmbeddingProject(db, projectPath);
+        const oldCompartmentId = seedCompartmentChunkEmbedding(
+            db,
+            sessionId,
+            projectPath,
+            new Float32Array([0, 1]),
+            oldSnapshot.chunkModelId,
+        );
+
+        __setLocalEmbeddingPoolingForTests(localModel, {
+            status: "ready",
+            pooling: "cls",
+            normalize: true,
+            declared: true,
+            reason: "fixture CLS pooling",
+        });
+        const currentSnapshot = registerEmbeddingProject(db, projectPath);
+        expect(currentSnapshot.chunkModelId).not.toBe(oldSnapshot.chunkModelId);
+        queryEmbedding = new Float32Array([0, 1]);
+
+        const results = await unifiedSearch(db, sessionId, projectPath, "hydraulic flow", {
+            limit: 5,
+            memoryEnabled: true,
+            embeddingEnabled: true,
+            readMessages,
+            embedQuery,
+            isEmbeddingRuntimeEnabled,
+            sources: ["message"],
+            maxMessageOrdinal: 2,
+        });
+
+        expect(embeddingQueries).toEqual(["hydraulic flow"]);
+        expect(
+            results.some(
+                (result) =>
+                    result.source === "compartment" && result.compartmentId === oldCompartmentId,
+            ),
+        ).toBe(false);
     });
 
     it("deduplicates FTS hits inside semantic compartment ranges and keeps a snippet", async () => {

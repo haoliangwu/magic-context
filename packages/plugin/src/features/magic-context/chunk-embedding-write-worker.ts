@@ -2,6 +2,7 @@ import { parentPort, workerData } from "node:worker_threads";
 import { setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
 import { configureContextDatabasePragmas } from "../../shared/sqlite-context-pragmas";
+import { exitOnWorkerClose, isWorkerCloseMessage } from "../../shared/worker-shutdown";
 import type { ChunkEmbeddingWorkerRequest } from "./chunk-embedding-writer";
 import {
     countUnembeddedSessionCompartments,
@@ -28,7 +29,11 @@ if (!enforceSchemaFence(db, workerData.path, LATEST_SUPPORTED_VERSION)) {
 const timeout = Math.max(0, Math.floor(workerData.timeout));
 db.exec(`PRAGMA busy_timeout=${timeout}; PRAGMA foreign_keys=ON`);
 configureContextDatabasePragmas(db);
+// Close this writable connection before the thread ends; see worker-shutdown.ts.
+exitOnWorkerClose(port, () => db.close());
 port.on("message", (input: ChunkEmbeddingWorkerRequest) => {
+    // The owner's close request is not an operation and gets no reply.
+    if (isWorkerCloseMessage(input)) return;
     try {
         let value: unknown;
         switch (input.kind) {

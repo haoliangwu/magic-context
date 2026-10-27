@@ -1,4 +1,5 @@
 import { Worker } from "node:worker_threads";
+import type { CompartmentChunkPoolWarmReport } from "../../features/magic-context/compartment-chunk-embedding";
 import {
     embedBatchForProject,
     embedTextForProject,
@@ -11,6 +12,7 @@ import type {
     MessageHistorySearchRequest,
     UnifiedSearchOptions,
     UnifiedSearchResult,
+    UnifiedSearchStepTimings,
 } from "../../features/magic-context/search";
 import {
     type AutoSearchHintDecision,
@@ -31,6 +33,7 @@ import {
     getSqliteDatabasePath,
     isTransientSqliteError,
 } from "../../shared/sqlite";
+import { createWorkerShutdown, type WorkerShutdown } from "../../shared/worker-shutdown";
 import {
     AUTO_SEARCH_TIMEOUT_MS,
     AUTO_SEARCH_VECTOR_TIMEOUT_MS,
@@ -195,6 +198,7 @@ export interface AutoSearchWorkerInput {
         | "signal"
         | "readMessages"
         | "searchMessageHistory"
+        | "stepTimings"
     >;
     embeddingRuntimeEnabled: boolean;
     embeddingHostBusy: boolean;
@@ -204,13 +208,20 @@ export interface AutoSearchWorkerInput {
     messageRequest?: MessageHistorySearchRequest;
 }
 export type AutoSearchWorkerReply =
-    | { kind: "result"; results: UnifiedSearchResult[] }
+    | { kind: "result"; results: UnifiedSearchResult[]; timings?: AutoSearchJobTimings }
     | { kind: "messages"; outcome: MessageHistorySearchOutcome }
     /** Sent by a "messages" job as soon as its thread runs, before loading search code. */
     | { kind: "accepted" }
     | { kind: "error"; error: string }
     | { kind: "query"; id: number; text: string }
     | { kind: "batch"; id: number; texts: string[]; purpose: EmbeddingPurpose };
+/** Where a search job spent its time, reported with its result. Durations and counts only. */
+export interface AutoSearchJobTimings {
+    steps: UnifiedSearchStepTimings;
+    jobMs: number;
+    /** The worker's last background refresh of a history-chunk pool. */
+    lastPoolWarm: CompartmentChunkPoolWarmReport | null;
+}
 export type AutoSearchEmbeddingReply = {
     id: number;
     embeddingHostBusy?: boolean;
@@ -227,12 +238,28 @@ export type AutoSearchEmbeddingReply = {
 };
 
 /**
+ * Thrown by {@link searchAutoHint} when an earlier search of the same session
+ * is still running on the worker (typically one whose deadline already
+ * passed). The turn is served without a hint instead of queueing behind it.
+ */
+export class AutoSearchBusyError extends Error {
+    constructor() {
+        super("an earlier auto-search of this session is still running");
+        this.name = "AutoSearchBusyError";
+    }
+}
+
+/**
  * Keep every search SELECT and vector scan off the prompt thread.
  * Workers are cached by database, harness, project, job and entry URL so matching
  * searches reuse their SQLite connection and incremental decoded-vector pool.
- * On abort, discard the worker without awaiting termination. Only the owner
- * appends hint decisions; search workers return results on read-only connections.
- * All provider calls stay with the owner and share the caller's abort signal.
+ * When the caller's deadline passes, the caller stops waiting but the worker,
+ * its connection and its decoded pool are kept: the job finishes in the
+ * background and the worker serves the next turn. A search of a session whose
+ * earlier search is still running rejects with {@link AutoSearchBusyError} at
+ * once. Only the owner appends hint decisions; search workers return results on
+ * read-only connections. All provider calls stay with the owner and share the
+ * caller's abort signal.
  */
 export async function searchAutoHint(
     db: Database,
@@ -247,7 +274,26 @@ export async function searchAutoHint(
         import.meta.url,
     ),
 ): Promise<UnifiedSearchResult[]> {
-    return executeAutoSearchWorker(db, sessionId, projectPath, query, options, entry, "search");
+    // Automatic hints must never score remotely, even if a caller reuses the
+    // explicit-search options. Keep credentials and non-cloneable clients out
+    // of the worker message as well as disabling reranking there.
+    const {
+        rerankConfig: _rerankConfig,
+        rerankClient: _rerankClient,
+        rerankConnectionFile: _rerankConnectionFile,
+        onRerankSkipped: _onRerankSkipped,
+        captureRerankLanes: _captureRerankLanes,
+        ...hintOptions
+    } = options;
+    return executeAutoSearchWorker(
+        db,
+        sessionId,
+        projectPath,
+        query,
+        { ...hintOptions, explicitSearch: false, rerank: false },
+        entry,
+        "search",
+    );
 }
 
 const pendingBackfills = new WeakMap<Database, Map<string, Promise<void>>>();
@@ -256,6 +302,14 @@ interface SearchWorkerSlot {
     worker: Worker;
     busy?: Promise<void>;
     release?: () => void;
+    /** Session of the job holding the lease. */
+    busySessionId?: string;
+    /** Resolves when the lease holder's caller stops waiting at its deadline. */
+    detachedSignal?: Promise<void>;
+    markDetached?: () => void;
+    /** The lease holder's caller has stopped waiting; the job still runs. */
+    detached?: boolean;
+    disposed?: boolean;
     idleTimer?: ReturnType<typeof setTimeout>;
     dispose(): void;
 }
@@ -263,15 +317,41 @@ const searchWorkers = new WeakMap<Database, Map<string, SearchWorkerSlot>>();
 const liveSearchWorkers = new Set<SearchWorkerSlot>();
 const MAX_IDLE_SEARCH_WORKERS = 4;
 const SEARCH_WORKER_IDLE_MS = 5 * 60_000;
+/**
+ * How long a search may keep running after its caller's deadline before its
+ * worker is disposed anyway. A search that has not answered by then is still
+ * holding the worker (in a long statement, or waiting on a provider that
+ * ignores cancellation), and every later turn of its session would otherwise
+ * be skipped behind it.
+ */
+const DETACHED_SEARCH_LIMIT_MS = 30_000;
+/**
+ * How long a disposed pool worker may take to close its connection and exit
+ * before it is terminated. It reads the close request only between pieces of
+ * synchronous work. An idle worker, or one waiting for an embedding reply,
+ * exits at once; a backfill write transaction waits at most its 250 ms busy
+ * timeout and then writes at most 50 vector rows. A search still inside a long
+ * synchronous statement (a message-history FTS query on a large session can
+ * take seconds) is terminated when this passes, as every disposed worker was
+ * before.
+ */
+const AUTO_SEARCH_WORKER_CLOSE_DEADLINE_MS = 2_000;
 let workersCreated = 0;
 let workersReused = 0;
+let searchesSkippedBusy = 0;
 
-export function getAutoSearchWorkerStats(): { created: number; reused: number } {
-    return { created: workersCreated, reused: workersReused };
+export function getAutoSearchWorkerStats(): {
+    created: number;
+    reused: number;
+    skippedBusy: number;
+} {
+    return { created: workersCreated, reused: workersReused, skippedBusy: searchesSkippedBusy };
 }
 
+/** Dispose every worker nobody is waiting for: idle ones, and ones still
+ * finishing a search whose caller already stopped waiting. */
 export function disposeIdleAutoSearchWorkers(): void {
-    for (const slot of liveSearchWorkers) if (!slot.busy) slot.dispose();
+    for (const slot of liveSearchWorkers) if (!slot.busy || slot.detached) slot.dispose();
 }
 
 async function acquireSearchWorker(
@@ -280,12 +360,17 @@ async function acquireSearchWorker(
     entry: URL,
     input: AutoSearchWorkerInput,
     signal: AbortSignal,
-): Promise<{ slot: SearchWorkerSlot; fresh: boolean } | null> {
+): Promise<{ slot: SearchWorkerSlot; fresh: boolean } | "busy" | null> {
     const pool = searchWorkers.get(db) ?? new Map<string, SearchWorkerSlot>();
     searchWorkers.set(db, pool);
     while (!signal.aborted) {
         let slot = pool.get(key);
         if (slot?.busy) {
+            // Never queue a search behind one whose caller has stopped waiting,
+            // or behind another search of the same session. Report busy, and
+            // this turn goes without a hint.
+            if (input.job === "search" && (slot.detached || slot.busySessionId === input.sessionId))
+                return "busy";
             const current = slot;
             await new Promise<void>((resolve) => {
                 const done = () => {
@@ -294,6 +379,7 @@ async function acquireSearchWorker(
                 };
                 signal.addEventListener("abort", done, { once: true });
                 void current.busy?.then(done);
+                if (!current.detached) void current.detachedSignal?.then(done);
                 if (signal.aborted) done();
             });
             continue;
@@ -303,13 +389,19 @@ async function acquireSearchWorker(
             const worker = inRootAsyncContext(
                 () => new Worker(entry, { workerData: { ...input, persistent: true } }),
             );
+            const shutdown = createWorkerShutdown(
+                worker,
+                "auto-search",
+                AUTO_SEARCH_WORKER_CLOSE_DEADLINE_MS,
+            );
             slot = {
                 worker,
                 dispose() {
+                    this.disposed = true;
                     clearTimeout(this.idleTimer);
                     if (pool.get(key) === this) pool.delete(key);
                     liveSearchWorkers.delete(this);
-                    void worker.terminate();
+                    void shutdown.close();
                     worker.unref();
                 },
             };
@@ -322,8 +414,13 @@ async function acquireSearchWorker(
         } else workersReused++;
         clearTimeout(slot.idleTimer);
         const current = slot;
+        current.busySessionId = input.sessionId;
+        current.detached = false;
         current.busy = new Promise<void>((resolve) => {
             current.release = resolve;
+        });
+        current.detachedSignal = new Promise<void>((resolve) => {
+            current.markDetached = resolve;
         });
         current.worker.ref();
         return { slot: current, fresh };
@@ -332,7 +429,10 @@ async function acquireSearchWorker(
 }
 
 /** Called only after the owner has decided the hint. No background result can
- * change that decision, and cleanup cancels both queued and active jobs. */
+ * change that decision, and cleanup cancels both queued and active jobs.
+ * The backfill embeds missing memory vectors only, so it is not queued at all
+ * when the project's registration has embedding or memory turned off: the
+ * worker would open a writable connection and do nothing. */
 export function queueAutoSearchBackfill(
     db: Database,
     sessionId: string,
@@ -340,6 +440,8 @@ export function queueAutoSearchBackfill(
     query: string,
 ): Promise<void> {
     if (isEmbeddingHostBusy()) return Promise.resolve();
+    const snapshot = getProjectEmbeddingSnapshot(projectPath);
+    if (!snapshot?.enabled || !snapshot.features.memoryEnabled) return Promise.resolve();
     const key = `${sessionId}\0${projectPath}`;
     const pending = pendingBackfills.get(db) ?? new Map<string, Promise<void>>();
     pendingBackfills.set(db, pending);
@@ -409,6 +511,7 @@ async function executeAutoSearchWorker(
         signal: deadlineSignal,
         readMessages: _readMessages,
         searchMessageHistory: _searchMessageHistory,
+        stepTimings: _stepTimings,
         ...serializable
     } = options;
     const lifecycle = registerAutoSearchWork(sessionId);
@@ -452,47 +555,111 @@ async function executeAutoSearchWorker(
         lifecycle.done();
         return [];
     }
+    if (lease === "busy") {
+        lifecycle.done();
+        searchesSkippedBusy++;
+        throw new AutoSearchBusyError();
+    }
     const { slot, fresh } = lease;
     const worker = slot.worker;
+    // Only pooled searches keep running past their caller's deadline. A backfill
+    // is disposed when it is cancelled, and a test entry is never reused.
+    const detachable = job === "search" && entry.href === defaultAutoSearchWorkerEntry().href;
+    const startedAt = performance.now();
+    let detachedAt: number | undefined;
+    let ownerVectorMs: number | undefined;
+    let abandonTimer: ReturnType<typeof setTimeout> | undefined;
     return new Promise((resolve, reject) => {
+        // `settled`: the caller has its answer. `released`: the worker is free
+        // again (or disposed). They differ only while a detached job finishes.
         let settled = false;
-        const finish = (results: UnifiedSearchResult[], error?: Error) => {
+        let released = false;
+        const settle = (results: UnifiedSearchResult[], error?: Error) => {
             if (settled) return;
             settled = true;
+            if (error) reject(error);
+            else resolve(results);
+        };
+        const release = (dispose: boolean) => {
+            if (released) return;
+            released = true;
+            clearTimeout(abandonTimer);
             signal?.removeEventListener("abort", abort);
             lifecycle.signal.removeEventListener("abort", abort);
             lifecycle.done();
             worker.off("message", onMessage);
             worker.off("error", onError);
             worker.off("exit", onExit);
-            if (error || signal.aborted || entry.href !== defaultAutoSearchWorkerEntry().href)
-                slot.dispose();
-            else {
+            if (dispose || !detachable) slot.dispose();
+            else if (!slot.disposed) {
                 slot.idleTimer = setTimeout(() => slot.dispose(), SEARCH_WORKER_IDLE_MS);
                 slot.idleTimer.unref?.();
             }
-            const release = slot.release;
+            const free = slot.release;
             slot.busy = undefined;
             slot.release = undefined;
-            release?.();
+            slot.busySessionId = undefined;
+            slot.detached = false;
+            slot.detachedSignal = undefined;
+            slot.markDetached = undefined;
+            free?.();
             const reusable = liveSearchWorkers.delete(slot);
             if (reusable) liveSearchWorkers.add(slot);
             const idle = [...liveSearchWorkers].filter((candidate) => !candidate.busy);
             for (const prior of idle.slice(0, Math.max(0, idle.length - MAX_IDLE_SEARCH_WORKERS)))
                 prior.dispose();
             worker.unref();
-            if (error) reject(error);
-            else resolve(results);
         };
-        const abort = () => finish([]);
+        const finish = (results: UnifiedSearchResult[], error?: Error) => {
+            settle(results, error);
+            release(Boolean(error) || signal.aborted);
+        };
+        const abort = () => {
+            // Session cleanup, or a job that cannot outlive its caller: stop it.
+            if (lifecycle.signal.aborted || !detachable) {
+                finish([]);
+                return;
+            }
+            if (settled) return;
+            // The caller's deadline: stop waiting, but keep the worker, its
+            // connection and its decoded pool. The job finishes in the
+            // background and the worker then serves the next turn.
+            detachedAt = performance.now();
+            slot.detached = true;
+            slot.markDetached?.();
+            settle([]);
+            abandonTimer = setTimeout(() => {
+                log(
+                    `[auto-search] session ${sessionId}: search still running ${DETACHED_SEARCH_LIMIT_MS} ms after its deadline; disposing its worker (owner vector wait ${formatMs(ownerVectorMs)})`,
+                );
+                release(true);
+            }, DETACHED_SEARCH_LIMIT_MS);
+            abandonTimer.unref?.();
+        };
         signal?.addEventListener("abort", abort, { once: true });
         lifecycle.signal.addEventListener("abort", abort, { once: true });
         const onError = (error: Error) => finish([], error);
         const onExit = (code: number) =>
             finish([], new Error(`auto-search worker exited (${code})`));
         const onMessage = async (reply: AutoSearchWorkerReply) => {
-            if (settled) return;
-            if (reply.kind === "result") {
+            if (released) return;
+            if (reply.kind === "result" || reply.kind === "error") {
+                if (detachedAt !== undefined) {
+                    logLateSearch(
+                        sessionId,
+                        performance.now() - detachedAt,
+                        detachedAt - startedAt,
+                        ownerVectorMs,
+                        reply.kind === "result" ? reply.timings : undefined,
+                        reply.kind === "error",
+                    );
+                    release(reply.kind === "error");
+                    return;
+                }
+                if (reply.kind === "error") {
+                    finish([], new Error(reply.error));
+                    return;
+                }
                 // A registration can change while the worker is ranking. Never serve
                 // vectors from a generation that the owner has since replaced.
                 if (
@@ -503,46 +670,56 @@ async function executeAutoSearchWorker(
                 else finish(reply.results);
                 return;
             }
-            if (reply.kind === "error") {
-                finish([], new Error(reply.error));
-                return;
-            }
             // Only the "messages" job answers with these.
             if (reply.kind === "messages" || reply.kind === "accepted") return;
             const response: AutoSearchEmbeddingReply = { id: reply.id };
-            try {
-                if (reply.kind === "query")
-                    response.result =
-                        (await (job === "backfill"
-                            ? embedTextForProject(projectPath, reply.text, signal, "query")
-                            : boundedHintEmbedding(embedQuery, reply.text, signal))) ?? null;
-                else {
-                    const passage = await embedBatchForProject(
-                        projectPath,
-                        reply.texts,
-                        signal,
-                        reply.purpose,
-                    );
-                    const current = getProjectEmbeddingSnapshot(projectPath);
-                    response.passage =
-                        passage && current
-                            ? {
-                                  ...passage,
-                                  providerIdentity: current.providerIdentity,
-                                  runtimeFingerprint: current.runtimeFingerprint,
-                                  dimensions:
-                                      passage.vectors.find((vector) => vector !== null)?.length ??
-                                      null,
-                              }
-                            : null;
+            // After the deadline, answer at once without a vector so the job
+            // can finish; nobody uses its result.
+            if (!signal.aborted) {
+                const requestedAt = performance.now();
+                try {
+                    if (reply.kind === "query")
+                        response.result =
+                            (await (job === "backfill"
+                                ? embedTextForProject(projectPath, reply.text, signal, "query")
+                                : boundedHintEmbedding(embedQuery, reply.text, signal))) ?? null;
+                    else {
+                        const passage = await embedBatchForProject(
+                            projectPath,
+                            reply.texts,
+                            signal,
+                            reply.purpose,
+                        );
+                        const current = getProjectEmbeddingSnapshot(projectPath);
+                        response.passage =
+                            passage && current
+                                ? {
+                                      ...passage,
+                                      providerIdentity: current.providerIdentity,
+                                      runtimeFingerprint: current.runtimeFingerprint,
+                                      dimensions:
+                                          passage.vectors.find((vector) => vector !== null)
+                                              ?.length ?? null,
+                                  }
+                                : null;
+                    }
+                } catch (error) {
+                    response.error = error instanceof Error ? error.message : String(error);
                 }
-            } catch (error) {
-                response.error = error instanceof Error ? error.message : String(error);
+                if (reply.kind === "query") ownerVectorMs = performance.now() - requestedAt;
+                // Providers that ignore abort can complete late. Their vector
+                // is no longer wanted once the deadline has passed.
+                if (signal.aborted) {
+                    response.result = undefined;
+                    response.passage = undefined;
+                    response.error = undefined;
+                }
             }
             response.embeddingHostBusy = isEmbeddingHostBusy();
-            // Providers that ignore abort can complete late. Never send their
-            // continuation into a dead worker or a subsequent turn's request.
-            if (!settled && !signal?.aborted) {
+            // Never send a continuation into a disposed worker or into a later
+            // job's request. A detached job still holds the lease, so its
+            // requests are still this job's.
+            if (!released) {
                 try {
                     worker.postMessage(response);
                 } catch (error) {
@@ -562,6 +739,33 @@ async function executeAutoSearchWorker(
             }
         }
     });
+}
+
+function formatMs(value: number | undefined): string {
+    return value === undefined ? "n/a" : `${Math.round(value)} ms`;
+}
+
+/**
+ * One line per search that finished after its caller's deadline, with where
+ * the time went. Durations, row counts and states only: never the query or
+ * any result text.
+ */
+function logLateSearch(
+    sessionId: string,
+    lateMs: number,
+    waitedMs: number,
+    ownerVectorMs: number | undefined,
+    timings: AutoSearchJobTimings | undefined,
+    failed: boolean,
+): void {
+    const steps = timings?.steps;
+    const warm = timings?.lastPoolWarm;
+    const pool = warm
+        ? `last pool refresh ${warm.outcome} in ${formatMs(warm.totalMs)} (probe ${formatMs(warm.probeMs)}, read ${formatMs(warm.readMs)}, decode ${formatMs(warm.decodeMs)}, ${warm.probedRows} rows probed, ${warm.decodedRows} decoded)`
+        : "no pool refresh yet";
+    log(
+        `[auto-search] session ${sessionId}: deadline passed after ${formatMs(waitedMs)}; the search ${failed ? "failed" : "finished"} ${formatMs(lateMs)} later. Steps: message FTS ${formatMs(steps?.messageMs)}, vector wait ${formatMs(steps?.vectorWaitMs)} (owner embedding ${formatMs(ownerVectorMs)}), chunk lane ${formatMs(steps?.chunkMs)} (pool ${steps?.chunkPool ?? "n/a"}), other lanes ${formatMs(steps?.otherLanesMs)}, job ${formatMs(timings?.jobMs)}; ${pool}`,
+    );
 }
 
 async function boundedHintEmbedding(
@@ -604,6 +808,13 @@ function defaultAutoSearchWorkerEntry(): URL {
 const MESSAGE_WORKER_ACCEPT_TIMEOUT_MS = 400;
 /** How long an accepted message-search worker may take to answer. */
 const MESSAGE_WORKER_RESULT_TIMEOUT_MS = 30_000;
+/**
+ * How long a finished or abandoned message-search worker may take to close its
+ * read-only connection and exit before it is terminated. One FTS statement of
+ * a large session's history can run for seconds; a worker still inside one when
+ * this passes is terminated, as every message-search worker was before.
+ */
+const MESSAGE_SEARCH_WORKER_CLOSE_DEADLINE_MS = 2_000;
 
 export type MessageSearchWorkerFallbackReason =
     | "no-file"
@@ -676,6 +887,7 @@ export function searchMessageHistoryOffThread(
     return new Promise((resolve) => {
         let settled = false;
         let worker: Worker | undefined;
+        let shutdown: WorkerShutdown | undefined;
         let deadline: ReturnType<typeof setTimeout> | undefined;
         const finish = (
             outcome: MessageHistorySearchOutcome | null,
@@ -686,7 +898,7 @@ export function searchMessageHistoryOffThread(
             settled = true;
             clearTimeout(deadline);
             if (reason) fallback(reason, detail);
-            void worker?.terminate();
+            void shutdown?.close();
             worker?.unref();
             resolve(outcome);
         };
@@ -697,6 +909,11 @@ export function searchMessageHistoryOffThread(
         };
         try {
             worker = inRootAsyncContext(() => new Worker(entry, { workerData: input }));
+            shutdown = createWorkerShutdown(
+                worker,
+                "message-search",
+                MESSAGE_SEARCH_WORKER_CLOSE_DEADLINE_MS,
+            );
         } catch (error) {
             finish(null, "start-failed", error);
             return;

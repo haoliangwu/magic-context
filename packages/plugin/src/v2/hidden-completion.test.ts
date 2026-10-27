@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { parsePluginConfig } from "../config";
 import { parseMapMemoriesCompletion } from "../features/magic-context/dreamer/map-memories";
 import { inspectCurateMemoryOperations } from "../features/magic-context/dreamer/task-executor";
-import { closeDatabase } from "../features/magic-context/storage";
+import { runMigrations } from "../features/magic-context/migrations";
+import { closeDatabase, openDatabase } from "../features/magic-context/storage";
+import { initializeDatabase } from "../features/magic-context/storage-db";
+import { getSubagentInvocations } from "../features/magic-context/storage-subagent-invocations";
 import { runValidatedHistorianPass } from "../hooks/magic-context/compartment-runner-historian";
 import {
     HiddenCompletionRefusal,
@@ -24,6 +27,7 @@ import {
     type HiddenChildHost,
     toolLoopMessages,
 } from "./hidden-completion";
+import { HiddenModelActivity } from "./hidden-model-activity";
 import {
     HIDDEN_CURATE_AGENT,
     HIDDEN_DREAMER_AGENT,
@@ -244,6 +248,7 @@ async function setup(
     const db = new Database(":memory:");
     db.exec("CREATE TABLE schema_migrations_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     const rows = new Rows();
+    const activity = new HiddenModelActivity();
     const hook = new HiddenChildHook();
     const children = new Map<
         string,
@@ -274,6 +279,7 @@ async function setup(
     let reasoningOnly = false;
 
     const host: HiddenChildHost = {
+        watchModelActivity: (sessionID, onOutput) => activity.watch(sessionID, onOutput),
         async create(input) {
             creates.push(structuredClone(input));
             const id = `child-${++nextID}`;
@@ -380,6 +386,7 @@ async function setup(
     return {
         db,
         rows,
+        activity,
         hook,
         host,
         executor,
@@ -453,6 +460,137 @@ async function close(
 }
 
 describe("OpenCode 2 hidden child completion", () => {
+    test("records the dispatched model and terminal host error when no assistant row exists", async () => {
+        const { dir: dataHome, cleanup } = createTestTempDir("v2-model-refusal-");
+        const previous = process.env.XDG_DATA_HOME;
+        process.env.XDG_DATA_HOME = dataHome;
+        const state = await setup();
+        try {
+            const db = openDatabase();
+            if (!db) throw new Error("invocation test database did not open");
+            const model = "mock/missing";
+            const suggestion = "mock/available";
+            state.setTerminalOutcome("failed");
+            state.setTerminalRowType("idle");
+            state.setEventSessionError({
+                type: "provider.error",
+                name: "ProviderModelNotFoundError",
+                data: {
+                    providerID: "mock",
+                    modelID: "missing",
+                    message: `Model not found: ${model}. Did you mean: ${suggestion}?`,
+                    suggestions: [suggestion],
+                },
+            });
+
+            await runValidatedHistorianPass({
+                client: undefined,
+                hiddenCompletionExecutor: state.executor,
+                db: state.db,
+                parentSessionId: "v2-model-refusal-parent",
+                sessionDirectory: "/project",
+                prompt: "Summarize history",
+                chunk: {
+                    startIndex: 1,
+                    endIndex: 1,
+                    lines: [{ ordinal: 1, messageId: "m1" }],
+                },
+                priorCompartments: [],
+                sequenceOffset: 0,
+                dumpLabelBase: "v2-model-refusal",
+                model: { model, sourceConfigKey: "historian.opencode.model" },
+            });
+
+            const [row] = getSubagentInvocations(db, "v2-model-refusal-parent");
+            expect(row).toMatchObject({
+                providerId: "mock",
+                modelId: "missing",
+                status: "failed",
+            });
+            expect(row?.error).toContain("No reply: OpenCode 2 refused the model");
+            expect(row?.error).toContain(suggestion);
+        } finally {
+            state.db.close();
+            closeDatabase();
+            if (previous === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = previous;
+            cleanup();
+        }
+    });
+
+    for (const streaming of [false, true]) {
+        test(`OpenCode 2 dreamer ${streaming ? "streamed primary keeps its full timeout" : "silent primary is cut and fallback completes with a timed_out attempt row"}`, async () => {
+            const f = await setup();
+            initializeDatabase(f.db);
+            runMigrations(f.db);
+            const handle = await f.executor.open({
+                ...dreamerRun,
+                title: "magic-context-dream-classify-memories",
+            });
+            const prompt = f.host.prompt;
+            const sent: string[] = [];
+            f.host.prompt = async (input) => {
+                const model = f.creates.find((_, i) => `child-${i + 1}` === input.sessionID)?.model
+                    .id;
+                sent.push(model ?? "unknown");
+                if (model !== "cheap") return prompt(input);
+                f.rows.append(input.sessionID, "", { omitFinish: true, usage: false });
+                f.activity.observe({
+                    type: "session.execution.started",
+                    data: { sessionID: input.sessionID },
+                });
+                // A different child's output cannot protect this attempt from its deadline.
+                f.activity.observe({
+                    type: "session.text.delta",
+                    data: { sessionID: "foreign", delta: "x" },
+                });
+                if (streaming)
+                    f.activity.observe({
+                        type: "session.reasoning.delta",
+                        data: { sessionID: input.sessionID, delta: "thinking" },
+                    });
+            };
+            f.host.wait = async ({ sessionID }) => {
+                if (sessionID === "child-1") await new Promise(() => {});
+            };
+            const startedAt = Date.now();
+            try {
+                const result = promptSyncWithValidatedOutputRetry(undefined, request(), {
+                    transport: (args) => f.executor.attempt(handle, args),
+                    timeoutMs: 500,
+                    firstOutputTimeoutMs: 60,
+                    fallbackModels: ["mock/fallback"],
+                    fetchOutput: () => f.executor.collect(handle),
+                    validateOutput: (completion) => completion.text,
+                });
+                if (streaming) {
+                    await expect(result).rejects.toThrow("prompt timed out after 500ms");
+                    expect(sent).toEqual(["cheap"]);
+                    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(450);
+                    expect(getSubagentInvocations(f.db, "user-session")).toHaveLength(0);
+                } else {
+                    expect((await result).validated).toBe("editor completion");
+                    expect(sent).toEqual(["cheap", "fallback"]);
+                    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(55);
+                    expect(Date.now() - startedAt).toBeLessThan(400);
+                    expect(f.interrupts).toContain("child-1");
+                    expect(getSubagentInvocations(f.db, "user-session")).toMatchObject([
+                        {
+                            modelId: "cheap",
+                            harness: "opencode2",
+                            status: "timed_out",
+                            error: expect.stringContaining(
+                                "prompt timed out after 60ms with no model output",
+                            ),
+                        },
+                    ]);
+                }
+            } finally {
+                await close(f.executor, handle, !streaming);
+                f.db.close();
+            }
+        });
+    }
     for (const stage of ["initial", "repair", "fallback", "editor"] as const) {
         test(`OpenCode 2 historian rejects unconfigured model suggestions during ${stage}`, async () => {
             const { dir: dataHome, cleanup } = createTestTempDir("v2-historian-suggestion-");

@@ -12,6 +12,7 @@
 import { afterAll } from "bun:test";
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
+import { __setLocalEmbeddingPoolingTestFallback } from "@magic-context/core/features/magic-context/memory/local-embedding-pooling";
 import {
 	createTestTempDir,
 	installTestTempDirCleanup,
@@ -28,23 +29,34 @@ process.env.MAGIC_CONTEXT_TEST_DATA_DIR = isolatedDataHome;
 process.env.XDG_DATA_HOME = isolatedDataHome;
 process.env.XDG_CONFIG_HOME = isolatedDataHome;
 
+// Provider fixtures in this package use fake model IDs and retain the legacy mean path.
+__setLocalEmbeddingPoolingTestFallback({
+	status: "ready",
+	pooling: "mean",
+	normalize: true,
+	declared: false,
+	reason: "test fixture has no sentence-transformers pooling metadata",
+});
+
 afterAll(() => {
-    const packageDir = process.cwd();
-    const violations: string[] = [];
-    const scan = (directory: string): void => {
-        for (const entry of readdirSync(directory, { withFileTypes: true })) {
-            const path = join(directory, entry.name);
-            if (entry.isDirectory()) {
-                if (entry.name === "node_modules" || entry.name === ".git") continue;
-                if (entry.name === "undefined") violations.push(path);
-                scan(path);
-            } else if (entry.isFile() && entry.name === "context.db") {
-                violations.push(path);
-            }
-        }
-    };
-    scan(packageDir);
-    if (violations.length > 0) {
-        throw new Error(`Test storage leaked into the package directory:\n${violations.join("\n")}`);
-    }
+	const packageDir = process.cwd();
+	const violations: string[] = [];
+	const scan = (directory: string): void => {
+		for (const entry of readdirSync(directory, { withFileTypes: true })) {
+			const path = join(directory, entry.name);
+			if (entry.isDirectory()) {
+				if (entry.name === "node_modules" || entry.name === ".git") continue;
+				if (entry.name === "undefined") violations.push(path);
+				scan(path);
+			} else if (entry.isFile() && entry.name === "context.db") {
+				violations.push(path);
+			}
+		}
+	};
+	scan(packageDir);
+	if (violations.length > 0) {
+		throw new Error(
+			`Test storage leaked into the package directory:\n${violations.join("\n")}`,
+		);
+	}
 });

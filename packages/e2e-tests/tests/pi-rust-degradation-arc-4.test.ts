@@ -8,11 +8,9 @@ import { registerPiFailClosedSurface } from "../../pi-plugin/src/fail-closed-pi"
 import { PiTestHarness } from "../src/pi-harness";
 import {
 	assertExternalProviderIsNotSupervised,
-	assertMutationDiscipline,
 	assertTraceBranch,
 	createFakePi,
 	messagesOnly,
-	readArtifact,
 	readRepositorySource,
 	textInMessages,
 } from "./pi-rust-degradation-support";
@@ -22,7 +20,6 @@ const trace = JSON.parse(
 		join(import.meta.dir, "..", "pi-rust-degradation-trace.json"),
 	).text(),
 ) as { branches: Array<Record<string, unknown>> };
-const artifact = readArtifact("mutations/fm-pi-4.json");
 const PROVIDER_PROVEN_LIMIT = 120_000;
 const PROVIDER_PROVEN_PERCENTAGE = 96;
 
@@ -178,20 +175,4 @@ describe("FM-PI-4: provider-proven pressure at the Pi refusal boundary", () => {
 		);
 	});
 
-	it("FM-PI-4 mutation records keep both halves and both rung mutations", () => {
-		assertMutationDiscipline(artifact, [
-			"FM-PI-4-CONTINUE-95-PROVIDER",
-			"FM-PI-4-REFUSE-95-PROVIDER",
-		]);
-		// Fence the mechanism, not a comment: Pi's message_end payload is classified
-		// by handlePiProviderFailure, which persists the overflow verdict the next
-		// context pass reads as provider-proven pressure.
-		const entry = readRepositorySource("packages/pi-plugin/src/index.ts");
-		expect(entry).toContain("handlePiProviderFailure(");
-		const recovery = readRepositorySource(
-			"packages/pi-plugin/src/provider-error-recovery-pi.ts",
-		);
-		expect(recovery).toContain("detectOverflow(message.errorMessage)");
-		expect(recovery).toContain("recordOverflowDetected(");
-	});
 });

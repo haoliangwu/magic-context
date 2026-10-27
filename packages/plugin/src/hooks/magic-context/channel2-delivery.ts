@@ -56,6 +56,7 @@ import {
     formatChannel2Evaluation,
     type ToolReclaimHint,
 } from "./ctx-reduce-nudge";
+import { logNudgeEvaluation } from "./nudge-evaluation-log";
 import { assistantAwaitingTools } from "./read-session-db";
 
 export interface Channel2DeliveryDeps {
@@ -204,8 +205,9 @@ export async function maybeDeliverChannel2(
     // An unavailable or generation-invalidated baseline holds `pending`; a known
     // false predicate cancels it to the re-armable empty state.
     const evaluation = evaluateChannel2(deps.baseline);
-    sessionLog(
+    logNudgeEvaluation(
         sessionId,
+        "delivery",
         formatChannel2Evaluation(evaluation, { leaseBefore: "pending", leaseAfter: "pending" }),
     );
     if (deps.directiveText === undefined && !evaluation.evaluable) {

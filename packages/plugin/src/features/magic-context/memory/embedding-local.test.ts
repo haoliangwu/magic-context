@@ -18,6 +18,10 @@ import {
     LocalEmbeddingProvider,
     resolveLocalEmbeddingRuntime,
 } from "./embedding-local";
+import {
+    __setLocalEmbeddingPoolingForTests,
+    preflightLocalEmbeddingPooling,
+} from "./local-embedding-pooling";
 
 const originalHfEndpoint = process.env.HF_ENDPOINT;
 
@@ -42,6 +46,8 @@ function missingNativeRuntimeError(): Error & { code: string } {
 
 function fakeTransformersModule(options?: {
     onPipeline?: (pipelineOptions: { dtype: string; device?: string }) => void;
+    onInference?: (pipelineOptions: { pooling: string; normalize: boolean }) => void;
+    inferenceVectors?: Partial<Record<"mean" | "cls" | "last_token", number[]>>;
     env?: Record<string, unknown>;
 }): Record<string, unknown> {
     return {
@@ -53,7 +59,16 @@ function fakeTransformersModule(options?: {
             pipelineOptions: { dtype: string; device?: string },
         ) => {
             options?.onPipeline?.(pipelineOptions);
-            return async () => ({ data: new Float32Array([0, 1]), dims: [1, 2] });
+            return async (
+                _input: string | string[],
+                inferenceOptions: { pooling: string; normalize: boolean },
+            ) => {
+                options?.onInference?.(inferenceOptions);
+                const data = options?.inferenceVectors?.[
+                    inferenceOptions.pooling as "mean" | "cls" | "last_token"
+                ] ?? [0, 1];
+                return { data: new Float32Array(data), dims: [1, data.length] };
+            };
         },
     };
 }
@@ -306,6 +321,113 @@ describe("isNativeRuntimeMissingError", () => {
 // the transformers.js pipeline AND fold it into the model identity so switching
 // dtype re-embeds rather than mixing vector spaces. The default (no dtype) must
 // produce the byte-identical identity as before this field existed.
+describe("LocalEmbeddingProvider declared pooling", () => {
+    test("threads CLS pooling and the declared normalization flag into the pipeline", async () => {
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-pooling-cls-pipeline-"));
+        const model = "fixture/declared-cls";
+        const calls: Array<{ pooling: string; normalize: boolean }> = [];
+        __setLocalEmbeddingPoolingForTests(model, {
+            status: "ready",
+            pooling: "cls",
+            normalize: true,
+            declared: true,
+            reason: "fixture Pooling CLS and Normalize modules",
+        });
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({ isElectron: false, isBun: false }),
+                importTransformers: async () =>
+                    fakeTransformersModule({ onInference: (options) => calls.push(options) }),
+                modelCacheDir: () => cacheDir,
+                log: () => {},
+            });
+            const provider = new LocalEmbeddingProvider(model);
+            expect(await provider.embed("fixture text")).toEqual(new Float32Array([0, 1]));
+            expect(calls).toEqual([{ pooling: "cls", normalize: true }]);
+            await provider.dispose();
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+
+    test("keeps legacy mean vectors and identity when pooling metadata fetch fails", async () => {
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-pooling-offline-"));
+        const model = "fixture/offline-pooling";
+        const config = { provider: "local" as const, model };
+        const legacyIdentity = getEmbeddingProviderIdentity(config);
+        const calls: Array<{ pooling: string; normalize: boolean }> = [];
+        const baselineMeanVector = new Float32Array([0.6, 0.8]);
+        __setLocalEmbeddingPoolingForTests(model, null);
+        try {
+            const metadata = await preflightLocalEmbeddingPooling(model, {
+                modelCacheDir: cacheDir,
+                fetcher: async () => {
+                    throw new Error("network is unavailable");
+                },
+                logger: () => {},
+            });
+            expect(metadata).toMatchObject({
+                status: "unresolved",
+                pooling: "mean",
+                normalize: true,
+            });
+            expect(getEmbeddingProviderIdentity(config)).toBe(legacyIdentity);
+
+            __setLocalEmbeddingTestHooks({
+                host: () => ({ isElectron: false, isBun: false }),
+                importTransformers: async () =>
+                    fakeTransformersModule({
+                        onInference: (options) => calls.push(options),
+                        inferenceVectors: {
+                            mean: Array.from(baselineMeanVector),
+                            cls: [0.9, 0.1],
+                        },
+                    }),
+                modelCacheDir: () => cacheDir,
+                log: () => {},
+            });
+            const provider = new LocalEmbeddingProvider(model);
+            expect(provider.modelId).toBe(legacyIdentity);
+            const actual = await provider.embed("offline legacy content");
+            expect(actual).not.toBeNull();
+            expect(new Uint8Array(actual!.buffer)).toEqual(
+                new Uint8Array(baselineMeanVector.buffer),
+            );
+            expect(calls).toEqual([{ pooling: "mean", normalize: true }]);
+            await provider.dispose();
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+
+    test("names and refuses a declared pooling mode Transformers.js cannot apply", async () => {
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-pooling-unsupported-"));
+        const model = "fixture/declared-max";
+        const logs: string[] = [];
+        __setLocalEmbeddingPoolingForTests(model, {
+            status: "unsupported",
+            normalize: false,
+            declared: true,
+            reason: "unsupported declared pooling mode pooling_mode_max_tokens",
+        });
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({ isElectron: false, isBun: false }),
+                importTransformers: async () => fakeTransformersModule(),
+                modelCacheDir: () => cacheDir,
+                log: (message, data) => logs.push(`${message} ${String(data)}`),
+            });
+            const provider = new LocalEmbeddingProvider(model);
+            expect(await provider.initialize()).toBe(false);
+            expect(logs.join("\\n")).toContain("fixture/declared-max");
+            expect(logs.join("\\n")).toContain("pooling_mode_max_tokens");
+            await provider.dispose();
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+});
+
 describe("LocalEmbeddingProvider dtype threading (#259)", () => {
     test("runtime upgrades change the local vector-space identity", () => {
         expect(LOCAL_EMBEDDING_RUNTIME_FINGERPRINT).toBe(

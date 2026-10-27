@@ -38,7 +38,9 @@ export interface MaterializationPassSignals {
  * history. Each is a cache bust the session is already paying for, so a
  * reduction riding one adds no further prefix rewrite of its own. Subagents
  * have no historian or history fold, so their execute pass is the shared ride
- * for all eligible cleanup; permission alone must not rewrite any bytes.
+ * for all eligible cleanup. Primary execute can originate the separately
+ * admitted, worthwhile executeReclaim ride when no summary is expected.
+ * Permission alone must not rewrite any bytes.
  */
 export interface ReclaimRideSignals {
     hardFold: boolean;
@@ -46,16 +48,20 @@ export interface ReclaimRideSignals {
     explicitFlush: boolean;
     publishedHistory: boolean;
     subagentExecute?: boolean;
+    executeReclaim?: boolean;
+    servedShapeRepair?: boolean;
 }
 
-/** Primary reductions never ride pressure alone; subagents share the execute ride. */
+/** Primary execute reclaim must first satisfy the bounded queue/historian admission policy. */
 export function hasReclaimRide(signals: ReclaimRideSignals): boolean {
     return (
         signals.hardFold ||
         signals.force ||
         signals.explicitFlush ||
         signals.publishedHistory ||
-        signals.subagentExecute === true
+        signals.subagentExecute === true ||
+        signals.executeReclaim === true ||
+        signals.servedShapeRepair === true
     );
 }
 
@@ -95,6 +101,8 @@ const RECLAIM_RIDE_NAMES = [
     "explicitFlush",
     "publishedHistory",
     "subagentExecute",
+    "executeReclaim",
+    "servedShapeRepair",
 ] as const;
 
 /**

@@ -1,12 +1,17 @@
 /// <reference types="bun-types" />
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
 import { BOOT_QUIET_MS, setBootQuietPeriodForTests } from "../../plugin/boot-quiet";
+import * as logger from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { getDirtyIndexFloor } from "./message-index";
+import {
+    getDirtyIndexFloor,
+    getLastIndexedOrdinal,
+    indexMessagesAfterOrdinal,
+} from "./message-index";
 import {
     __resetMessageIndexAsyncForTests,
     clearSessionTracking,
@@ -506,5 +511,113 @@ describe("message-index-async", () => {
         clearSessionTracking("ses-track");
 
         expect(isSessionReconciled("ses-track")).toBe(false);
+    });
+
+    it("backfills a stalled durable prefix from its watermark in bounded pages", async () => {
+        const messages = Array.from({ length: 305 }, (_, i) => ({
+            ...message(`m-${i + 1}`, i + 1, `backfill ${i + 1}`),
+            createdAt: i,
+        }));
+        indexMessagesAfterOrdinal(db, "stalled", messages.slice(0, 2), 0, 2);
+        const pages: number[] = [];
+        const reader = Object.assign(
+            pagedReader(messages, (after) => pages.push(after)),
+            {
+                getRevision: () => 305,
+            },
+        );
+        scheduleReconciliation(db, "stalled", reader);
+        await waitUntil(() => getLastIndexedOrdinal(db, "stalled") === 305);
+        expect(pages).toEqual([2, 102, 202, 302]);
+        expect(searchMessageIds(db, "stalled", '"backfill 305"')).toEqual(["m-305"]);
+    });
+
+    it("catches appends that arrive while a revision-aware reconciliation is queued", async () => {
+        const messages = [message("first", 1, "first bytes")];
+        let appended = false;
+        const reader = Object.assign(
+            pagedReader(messages, () => {
+                if (!appended) {
+                    appended = true;
+                    messages.push(message("second", 2, "second bytes"));
+                    scheduleReconciliation(db, "coalesced-append", reader);
+                }
+            }),
+            { getRevision: () => messages.length },
+        );
+        scheduleReconciliation(db, "coalesced-append", reader);
+        await waitUntil(() => getLastIndexedOrdinal(db, "coalesced-append") === 2);
+        expect(searchMessageIds(db, "coalesced-append", "second")).toEqual(["second"]);
+    });
+
+    it("does not spin on a gap after an earlier successful snapshot", async () => {
+        let count = 1;
+        let pages = 0;
+        const reader = {
+            getRevision: () => count,
+            getCount: () => count,
+            readPage: () => {
+                pages++;
+                return count === 1 ? [{ ...message("first", 1, "first bytes"), createdAt: 1 }] : [];
+            },
+        };
+        scheduleReconciliation(db, "cached-gap", reader);
+        await waitUntil(() => getMessageIndexQueueHeapStats().queueLength === 0);
+        expect(getLastIndexedOrdinal(db, "cached-gap")).toBe(1);
+        count = 2;
+        pages = 0;
+        scheduleReconciliation(db, "cached-gap", reader);
+        await waitUntil(() => getMessageIndexQueueHeapStats().queueLength === 0);
+        expect(getLastIndexedOrdinal(db, "cached-gap")).toBe(1);
+        expect(pages).toBe(1);
+    });
+
+    it.each([
+        "reader error",
+        "revision error",
+        "count error",
+        "gap",
+    ])("logs a reconciliation %s once per session and retries", async (failure) => {
+        const diagnostic = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        let broken = true;
+        const reader = {
+            getRevision: () => {
+                if (broken && failure === "revision error")
+                    throw new Error("host sequence unavailable");
+                return 1;
+            },
+            getCount: () => 1,
+            getCountAfterRevision: () => {
+                if (broken && failure === "count error") throw new Error("host count unavailable");
+                return 1;
+            },
+            readPage: () => {
+                if (!broken) return [message("recovered", 1, "recovered bytes")];
+                if (failure === "reader error") throw new Error("host reader unavailable");
+                return [];
+            },
+        };
+        try {
+            for (let attempt = 0; attempt < 2; attempt++) {
+                scheduleReconciliation(db, "stalled-log", reader);
+                await waitUntil(() => getMessageIndexQueueHeapStats().queueLength === 0);
+            }
+            expect(diagnostic).toHaveBeenCalledTimes(1);
+            expect(diagnostic.mock.calls[0]?.[1]).toContain(
+                {
+                    "reader error": "host reader unavailable",
+                    "revision error": "host sequence unavailable",
+                    "count error": "host count unavailable",
+                    gap: "gap after ordinal 0 (store count 1)",
+                }[failure],
+            );
+            broken = false;
+            scheduleReconciliation(db, "stalled-log", reader);
+            await waitUntil(() => getLastIndexedOrdinal(db, "stalled-log") === 1);
+            expect(diagnostic).toHaveBeenCalledTimes(1);
+            expect(searchMessageIds(db, "stalled-log", "recovered")).toEqual(["recovered"]);
+        } finally {
+            diagnostic.mockRestore();
+        }
     });
 });

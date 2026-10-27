@@ -754,6 +754,7 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
         for (const [key, value] of Object.entries(resolvedOpts.extraEnv ?? {})) {
             childEnv[key] = value;
         }
+        childEnv.MAGIC_CONTEXT_LOG_SYNC = "1";
         childEnv.TMPDIR = hostExtractCache();
         const pluginLogPath =
             childEnv.MAGIC_CONTEXT_LOG_PATH?.trim() ||

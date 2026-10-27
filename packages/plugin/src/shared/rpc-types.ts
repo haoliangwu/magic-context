@@ -380,6 +380,7 @@ export interface DebugSessionHolderCount {
     wireMessages: number;
     wireContentSnapshots: number;
     wireEstimatedBytes: number;
+    generateReplayBytes: number;
 }
 
 export interface DebugMemoryHolders {
@@ -400,6 +401,12 @@ export interface DebugMemoryHolders {
     };
     compartmentMirrors: {
         entries: number;
+    };
+    /** OpenCode 2 only: kept copies of each session's last served request, which side
+     * questions replay. Zero on other hosts. */
+    generateReplay: {
+        sessionCount: number;
+        estimatedBytes: number;
     };
     messageIndexQueue: {
         queueLength: number;

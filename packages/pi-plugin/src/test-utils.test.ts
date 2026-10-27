@@ -3,7 +3,10 @@ import { runMigrations } from "@magic-context/core/features/magic-context/migrat
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { getTagsBySession } from "@magic-context/core/features/magic-context/storage-tags";
 import { setHarness } from "@magic-context/core/shared/harness";
-import { Database } from "@magic-context/core/shared/sqlite";
+import {
+	createSqliteTurnDatabase,
+	type Database,
+} from "@magic-context/core/shared/sqlite";
 import {
 	__setPiTagSnapshotWorkerForTests,
 	loadPiTagSnapshotCandidate,
@@ -16,7 +19,7 @@ export type PiMessage = ContextEvent["messages"][number];
 
 export function createTestDb(path = ":memory:"): Database {
 	setHarness("pi");
-	const db = new Database(path);
+	const db = createSqliteTurnDatabase(path);
 	initializeDatabase(db);
 	runMigrations(db);
 	if (path === ":memory:") {

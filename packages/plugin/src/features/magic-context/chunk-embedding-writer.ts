@@ -1,6 +1,7 @@
 import { Worker } from "node:worker_threads";
 import { getHarness } from "../../shared/harness";
 import { type Database, getSqliteDatabasePath, inRootAsyncContext } from "../../shared/sqlite";
+import { createWorkerShutdown } from "../../shared/worker-shutdown";
 import type {
     CompartmentChunkBackfillCandidate,
     SaveCompartmentChunkEmbeddingInput,
@@ -51,6 +52,11 @@ export function createChunkEmbeddingWriter(db: Database) {
     const worker = inRootAsyncContext(
         () => new Worker(entry, { workerData: { path, harness: getHarness(), timeout } }),
     );
+    // The worker reads the close request between operations. One operation may
+    // first wait up to this connection's busy timeout for the writer lock and
+    // then write a batch of vectors, so allow that wait plus a margin before
+    // terminating it.
+    const shutdown = createWorkerShutdown(worker, "chunk-embedding-writer", timeout + 2_000);
     let pending: { resolve: (value: unknown) => void; reject: (error: Error) => void } | undefined;
     let failure: Error | undefined;
     let deadline: ReturnType<typeof setTimeout> | undefined;
@@ -85,7 +91,7 @@ export function createChunkEmbeddingWriter(db: Database) {
                                 "chunk embedding database operation timed out; coverage will be rechecked",
                             ),
                         );
-                        void worker.terminate();
+                        void shutdown.close();
                     }, 30_000),
                 );
                 deadline.unref();
@@ -135,7 +141,7 @@ export function createChunkEmbeddingWriter(db: Database) {
             request<void>({ kind: "release", project, holder }),
         async close(): Promise<void> {
             clearTimeout(deadline);
-            await worker.terminate();
+            await shutdown.close();
         },
     };
 }

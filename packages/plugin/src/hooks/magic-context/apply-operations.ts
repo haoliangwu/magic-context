@@ -611,12 +611,16 @@ export function applyPendingOperations(
                             }
                         } else if (target) {
                             const replacement = buildReplacementContent(pendingOp.tagId);
+                            if (target.canSetContent?.(replacement) === false) {
+                                reject("content_unchanged");
+                                continue;
+                            }
                             persistDrop();
                             mutations.push(() => {
                                 const priorContent = target.getContent?.();
                                 const changed = target.setContent(replacement);
-                                record(changed);
                                 if (changed) {
+                                    record(true);
                                     const originalCharacters =
                                         typeof priorContent === "string"
                                             ? priorContent.length

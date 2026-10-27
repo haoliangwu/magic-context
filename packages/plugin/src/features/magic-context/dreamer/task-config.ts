@@ -33,6 +33,8 @@ export function buildDreamTaskRuntimeConfigs(
             schedule: resolved.schedule ?? "",
             model: resolved.primary,
             fallbackModels: resolved.fallbacks,
+            modelConfigKey:
+                resolved.primary?.sourceConfigKey ?? resolved.fallbacks[0]?.sourceConfigKey,
             thinkingLevel:
                 harness === "pi"
                     ? (resolved.primary?.qualifier as DreamTaskRuntimeConfig["thinkingLevel"])

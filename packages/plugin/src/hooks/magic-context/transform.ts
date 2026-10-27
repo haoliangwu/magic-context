@@ -103,6 +103,7 @@ import {
 } from "./ctx-reduce-nudge";
 import { DegradedPassRefusalError, degradedPassError } from "./degraded-pass-refusal";
 import { deriveTriggerBudget } from "./derive-budgets";
+import { clearDiagnosticLogState, diagnosticStateChanged } from "./diagnostic-log-state";
 import { contextRefusalError, EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     escalationBands,
@@ -112,6 +113,7 @@ import {
     resolveModelKey,
     resolveTrustedContextLimit,
 } from "./event-resolvers";
+import { maintainExecuteFloorMark } from "./execute-reclaim";
 import { omitIncompleteFileTokenTotals } from "./file-token-coverage";
 import {
     createFinalWireUsageTracker,
@@ -153,11 +155,14 @@ import {
     lkgDirtyRevision,
     noteLkgHealthyPrefix,
     noteUncertifiedNormalLkg,
+    persistLkgUntaggedInputIds,
     readLkgRecoveryPrefix,
+    readPersistedLkgUntaggedInputIds,
 } from "./lkg-recovery-prefix";
 import { captureLkgSlot, createLkgEntryProjector, resolveLkgModelKeys } from "./lkg-replay";
 import { beginLkgPass, dropSlot, getInMemorySlot } from "./lkg-slot";
 import { onNoteTrigger } from "./note-nudger";
+import { logNudgeEvaluation } from "./nudge-evaluation-log";
 import {
     createPassOutcome,
     degradationChangesRequest,
@@ -229,6 +234,7 @@ import {
     defaultCompactionMarkerStrategy,
     evaluateEmergencyFailClosed,
     runPostTransformPhase,
+    servesThinkingBlock,
 } from "./transform-postprocess-phase";
 import { logTransformTiming, withTransformTimingSummary } from "./transform-stage-logger";
 import { isClearlyOverWindow, UnmanagedOverWindowError } from "./unmanaged-over-window";
@@ -713,7 +719,7 @@ export interface TransformDeps {
      * `TagMessagesOptions.normalizeRestoredAssistantText`). Only the OpenCode 2
      * adapter supplies it.
      */
-    normalizeRestoredAssistantText?: (text: string) => string;
+    normalizeRestoredAssistantText?: (text: string, providerID?: string) => string;
     refreshSourceContents?: (sessionId: string) => boolean;
 }
 
@@ -753,8 +759,13 @@ export function createTransform(deps: TransformDeps) {
     const loadedSessions = new Set<string>();
     const prefixHoldLogTurnIds = new Map<string, string | null>();
     const thinkingFitRetries = new Set<string>();
+    // Sessions whose compaction mode changed in this process and that have not
+    // finished a pass in the new mode yet. The flag outlives a pass that fails
+    // before its thinking strip is recorded, so the retry still strips.
+    const compactionModeTransitionPending = new Set<string>();
     const clearSessionLogState = (sessionId: string): void => {
         prefixHoldLogTurnIds.delete(sessionId);
+        clearDiagnosticLogState(sessionId);
     };
     // Sessions whose history was clearly over the model's window, with no
     // Magic Context state to send in its place, on a pass that could not bring
@@ -851,6 +862,19 @@ export function createTransform(deps: TransformDeps) {
             deps.compactionOff || deps.transformMode === "rust"
                 ? {}
                 : readLkgRecoveryPrefix(sessionId, lkgInput, messages, deps.db);
+        // Messages an earlier last-good replay served untagged that still go out
+        // untagged: the in-memory recovery prefix's set and, after a restart, the
+        // durable record of it. Ordinary tagging skips them until a pass allowed
+        // to rewrite the prefix tags them (normalizeRecoveryTail below), so a pass
+        // that must not change served bytes keeps them byte-identical.
+        const persistedUntaggedInputIds =
+            deps.compactionOff || deps.transformMode === "rust"
+                ? []
+                : readPersistedLkgUntaggedInputIds(deps.db, sessionId);
+        const untaggedReplayIds = new Set<string>([
+            ...(recovery.prefix?.untaggedInputIds ?? []),
+            ...persistedUntaggedInputIds,
+        ]);
         logTransformTiming(
             sessionId,
             "lkg.entryProjection",
@@ -945,7 +969,7 @@ export function createTransform(deps: TransformDeps) {
             }
         }
 
-        if (deps.client !== undefined) {
+        if (deps.client !== undefined || deps.hostMessageReconciliationSource !== undefined) {
             withoutSqliteTransformPass(() =>
                 scheduleReconciliation(db, sessionId, host.hostMessageReconciliationSource),
             );
@@ -1046,6 +1070,9 @@ export function createTransform(deps: TransformDeps) {
                 transition.historianCatchUpSignaled;
             if (hasTransitionEffects) {
                 if (transition.invalidatedM0Baseline) {
+                    // A mode switch: the next postprocess strips signed thinking
+                    // bound to the previous mode's message bytes.
+                    compactionModeTransitionPending.add(sessionId);
                     // The persisted baseline bytes were nulled; drop the
                     // pass-local copies too so this pass re-materializes
                     // instead of replaying the pre-flip render.
@@ -1947,6 +1974,13 @@ export function createTransform(deps: TransformDeps) {
             },
         );
         let _boundarySnapshotCache: ProtectedTailBoundarySnapshot | null | undefined;
+        if (fullFeatureMode && !compactionOff)
+            maintainExecuteFloorMark(
+                db,
+                sessionId,
+                currentTurnId,
+                boundaryUsageForProtectedTail.percentage < boundaryExecuteThreshold,
+            );
         const getRunnableBoundaryForCompartment = (
             emergencyTailScale?: 0.5 | 0.25,
         ): ProtectedTailBoundarySnapshot | null => {
@@ -2208,15 +2242,27 @@ export function createTransform(deps: TransformDeps) {
         // deriving it here keeps both tag scans scoped on every pass (those
         // anchor-miss passes were the residual ~90ms full-scan regression).
         const taggerFloor = compactionOff ? 0 : deriveTaggerLoadFloor(messages, sessionId, db);
-        // floor 0 = no leading wire message resolved to a tag → BOTH tag scans
+        // Floor 0 means no scoped lower bound above the safety margin: a tagless
+        // head or an early tag number can both cause it. BOTH tag scans
         // (tagger initFromDb + the trigger's token scans) fall back to the full
         // ~O(session) load. On a large session that's the ~70ms compartmentTrigger
         // we are trying to avoid, so surface it as a one-line health signal rather
         // than letting it hide as silent latency.
-        if (!compactionOff && taggerFloor === 0 && messages.length > 0) {
+        const tagFloorMode =
+            compactionOff || messages.length === 0
+                ? "inactive"
+                : taggerFloor === 0
+                  ? "fallback"
+                  : "scoped";
+        if (
+            diagnosticStateChanged(sessionId, "tag-floor", tagFloorMode) &&
+            tagFloorMode !== "inactive"
+        ) {
             sessionLog(
                 sessionId,
-                `tag floor: 0 (full-scan fallback) — no leading wire message resolved a tag across ${messages.length} msgs`,
+                taggerFloor === 0
+                    ? `tag floor: 0 (full-scan fallback) — no scoped floor above the safety margin across ${messages.length} msgs`
+                    : `tag floor: ${taggerFloor} (scoped load)`,
             );
         }
 
@@ -2320,6 +2366,7 @@ export function createTransform(deps: TransformDeps) {
                         },
                     },
                     pendingDropEligibility.read(sessionId, dropProjectionKey()),
+                    schedulerDecision === "execute",
                 );
                 if (triggerResult.shouldFire) {
                     sessionLog(
@@ -2436,11 +2483,17 @@ export function createTransform(deps: TransformDeps) {
         let taggingSucceeded = false;
         let recoveryBatch: { finalize: () => void } | null = null;
         let recoveryNormalized = false;
-        const normalizeRecoveryTail = recovery.prefix
+        // A recovery prefix is always normalized once a pass may rewrite it,
+        // even with nothing untagged: until then every pass re-serves its bytes.
+        const untaggedReplayTailServed =
+            !!recovery.prefix ||
+            (untaggedReplayIds.size > 0 &&
+                messages.some((message) => untaggedReplayIds.has(message.info.id ?? "")));
+        const normalizeRecoveryTail = untaggedReplayTailServed
             ? () => {
                   if (recoveryNormalized) return;
                   const tail = messages.filter((message) =>
-                      recovery.prefix?.untaggedInputIds.has(message.info.id ?? ""),
+                      untaggedReplayIds.has(message.info.id ?? ""),
                   );
                   const tagged = tagMessages(sessionId, tail, deps.tagger, db, {
                       skipPrefixInjection: !ctxReduceCallable,
@@ -2499,10 +2552,9 @@ export function createTransform(deps: TransformDeps) {
                     : createPreAdoptionToolSweepResolver(db, sessionId);
                 const result = tagMessages(
                     sessionId,
-                    recovery.prefix
+                    untaggedReplayIds.size > 0
                         ? messagesForTagging.filter(
-                              (message) =>
-                                  !recovery.prefix?.untaggedInputIds.has(message.info.id ?? ""),
+                              (message) => !untaggedReplayIds.has(message.info.id ?? ""),
                           )
                         : messagesForTagging,
                     deps.tagger,
@@ -2672,6 +2724,7 @@ export function createTransform(deps: TransformDeps) {
                 messages,
                 messageTagNumbers,
                 persistedReasoningWatermark,
+                !canUseEmptySentinels,
             );
             if (replayed > 0 || replayedInline > 0) {
                 sessionLog(
@@ -3059,6 +3112,7 @@ export function createTransform(deps: TransformDeps) {
             activeThinkingPrefixHold,
             directoryPrefixHold: unresolvedDirectoryHold,
             forceSignedRebuildForFit: thinkingFitRetries.has(sessionId) || !!recovery.rebuildReason,
+            compactionModeTransition: compactionModeTransitionPending.has(sessionId),
             readLastServedMessages: () => {
                 const slot = getInMemorySlot(sessionId) ?? loadPersistedLkgSlot(db, sessionId);
                 try {
@@ -3144,6 +3198,9 @@ export function createTransform(deps: TransformDeps) {
                 hardSignals: m0HardSignals,
             },
         });
+        // The pass recorded any strip the mode switch required; later passes
+        // replay it from the persisted ledger.
+        compactionModeTransitionPending.delete(sessionId);
         if (recovery.prefix && !recoveryNormalized) {
             const priorIds = new Set(recovery.prefix.inputs.map((input) => input.id));
             const newIds = new Set(
@@ -3166,8 +3223,13 @@ export function createTransform(deps: TransformDeps) {
         // A persisted latch is cleared by the off-transition, never consumed
         // here; overflow propagates to native compaction instead of blocking.
         const finalWireTail = describeFinalWireTail(messages);
+        // The durable refusal marker remembers, across restarts, that a held
+        // signed turn could not be made to fit. It applies only to a held pass:
+        // an unheld pass strips and drains like any model without prefix-bound
+        // thinking, so it is estimated and refused exactly as such a model is.
         const signedFitPreviouslyRefused =
             !compactionOff &&
+            activeThinkingPrefixHold &&
             getMergedReasoningStrippedIds(db, sessionId).has(SIGNED_FIT_REFUSED_MARKER);
         let finalWireEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
         if (postTransformResult.bustedThisPass) {
@@ -3509,17 +3571,38 @@ export function createTransform(deps: TransformDeps) {
             );
         }
 
+        // Keep the durable untagged-message record equal to what this pass serves
+        // untagged, before the pass is served: a restart then keeps serving them
+        // untagged. It empties once a pass tagged them (or none is left to serve).
+        // A failed write fails the pass, so the last good request is replayed.
+        if (!compactionOff) {
+            const stillUntagged =
+                untaggedReplayTailServed && !recoveryNormalized ? [...untaggedReplayIds] : [];
+            if (
+                JSON.stringify([...new Set(stillUntagged)].sort()) !==
+                    JSON.stringify([...new Set(persistedUntaggedInputIds)].sort()) &&
+                !persistLkgUntaggedInputIds(db, sessionId, stillUntagged)
+            )
+                throw new Error("Cannot persist the last-good untagged-message record");
+        }
         // The system date rides a bust, but on a prefix-bound model only one
-        // that leaves no open-turn signed thinking behind the system prompt: an
-        // unheld bust that kept the turn's thinking (it edited nothing in front
-        // of it) must not change the system prompt in front of it either.
+        // that serves no signed thinking: every such block is bound to the
+        // system prompt in front of it, whether the bust kept it (it edited
+        // nothing in front of it) or a hold did. The served array, after every
+        // strip and any recovered prefix, is what decides. The last argument
+        // carries the same fact to an idle-expired request, whose date would
+        // otherwise advance without asking for permission.
+        const signedThinkingServed =
+            isPrefixBoundThinkingModel(modelForBudget?.providerID, modelForBudget?.modelID) &&
+            servesThinkingBlock(messages, modelForBudget?.providerID, modelForBudget?.modelID);
         finishSystemDateRefresh(
             deps.historyRefreshSessions,
             dateRequest,
             (postTransformResult.bustedThisPass &&
                 !activeThinkingPrefixHold &&
-                postTransformResult.openTurnSignedThinkingKept !== true) ||
+                !signedThinkingServed) ||
                 postTransformResult.thinkingReleasedForFit === true,
+            signedThinkingServed,
         );
         if (
             activeThinkingPrefixHold &&
@@ -3812,7 +3895,11 @@ export function createTransform(deps: TransformDeps) {
                     postReduceGraceBaselineU: channel1State.postReduceGraceBaselineU,
                     postReduceGracePreLevel: channel1State.postReduceGracePreLevel,
                 });
-                sessionLog(sessionId, formatChannel1Evaluation(channel1Decision));
+                logNudgeEvaluation(
+                    sessionId,
+                    "transform",
+                    formatChannel1Evaluation(channel1Decision),
+                );
 
                 const channel2Evaluation = evaluateChannel2(channelBaseline);
                 const leaseBefore = getChannel2NudgeState(db, sessionId);
@@ -3828,8 +3915,9 @@ export function createTransform(deps: TransformDeps) {
                     }
                 }
                 const leaseAfter = getChannel2NudgeState(db, sessionId);
-                sessionLog(
+                logNudgeEvaluation(
                     sessionId,
+                    "transform",
                     formatChannel2Evaluation(channel2Evaluation, {
                         leaseBefore,
                         leaseAfter,

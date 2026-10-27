@@ -85,10 +85,15 @@ test("OpenCode 1 live cache_ttl edits affect the next idle check without changin
         await completedPrompt("The two-hour idle cache should stay warm.");
         expect(JSON.parse(readFileSync(configPath, "utf8")).cache_ttl["mock-anthropic/mock-sonnet"]).toBe("13h");
         expect(meta().cache_ttl).toBe("13h");
-        // An unchanged warm defer has no durable decision row. Read this pass's
-        // scheduler line, not the seed assistant's defer/first_render row.
-        const warmSchedulers = readFileSync(pluginLogPath, "utf8").slice(warmLogOffset).split("\n")
-            .filter(line => line.includes(`[magic-context][${session}] transform scheduler:`));
+        // An unchanged warm defer has no durable decision row, so read this pass's
+        // scheduler line. The plugin buffers log writes for up to half a second,
+        // so the previous turn's line can also land after `warmLogOffset`. Only a
+        // pass after the edit sees the 13h lifetime, so select by that, and wait
+        // for it to be flushed. A missing line still fails on the assertion below.
+        const readWarmSchedulers = () => readFileSync(pluginLogPath, "utf8").slice(warmLogOffset).split("\n")
+            .filter(line => line.includes(`[magic-context][${session}] transform scheduler:`) && line.includes("cacheTtl=13h "));
+        await h.waitFor(() => readWarmSchedulers().length > 0, { timeoutMs: 5000, label: "warm pass scheduler log line" }).catch(() => undefined);
+        const warmSchedulers = readWarmSchedulers();
         expect(warmSchedulers).toHaveLength(1);
         expect(warmSchedulers[0]).toMatch(/cacheTtl=13h .*decision=defer\b/);
         const raised = h.requests().filter(r => !bytes(r.body.system).includes("title generator")).at(-1)!;

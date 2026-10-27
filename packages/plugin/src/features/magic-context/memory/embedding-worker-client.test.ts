@@ -24,7 +24,55 @@ afterEach(() => {
 
 const entry = new URL("./embedding-worker.fixture.ts", import.meta.url);
 
+async function waitForIdle(client: EmbeddingWorkerClient): Promise<void> {
+    const deadline = Date.now() + 3000;
+    while (client.isRunning() && Date.now() < deadline) await Bun.sleep(10);
+    expect(client.isRunning()).toBe(false);
+}
+
 describe("embedding worker transport", () => {
+    for (const transport of ["thread", "child"] as const) {
+        const inProcess = async () => transport === "thread";
+        test(`${transport} idle shutdown releases the owner and restarts with identical vector bytes`, async () => {
+            const client = new EmbeddingWorkerClient({}, entry, undefined, inProcess, 80);
+            try {
+                const before = await client.request(["special-floats", "hello", "pid"]);
+                const pid = before.vectors![2]![0]!;
+                await waitForIdle(client);
+                if (transport === "child") {
+                    const deadline = Date.now() + 3000;
+                    while (existsSync(`/proc/${pid}`) && Date.now() < deadline) await Bun.sleep(10);
+                    expect(existsSync(`/proc/${pid}`)).toBe(false);
+                }
+                const after = await client.request(["special-floats", "hello", "pid"]);
+                expect(after.loaded).toBe(true);
+                for (const index of [0, 1]) {
+                    expect(Buffer.from(after.vectors![index]!.buffer)).toEqual(
+                        Buffer.from(before.vectors![index]!.buffer),
+                    );
+                }
+                if (transport === "child") expect(after.vectors![2]![0]).not.toBe(pid);
+            } finally {
+                await client.dispose();
+            }
+        });
+
+        test(`${transport} requests racing idle shutdown complete on either owner`, async () => {
+            const client = new EmbeddingWorkerClient({}, entry, undefined, inProcess, 80);
+            try {
+                await client.request();
+                await Bun.sleep(40);
+                // This batch outlasts the old idle deadline, but must not be interrupted.
+                expect((await client.request(["before deadline"])).vectors?.[0]?.[0]).toBe(15);
+                // The idle callback and a new sender become runnable at the same deadline.
+                await Bun.sleep(80);
+                expect((await client.request(["at deadline"])).vectors?.[0]?.[0]).toBe(11);
+            } finally {
+                await client.dispose();
+            }
+        });
+    }
+
     test("concurrent startup prepares telemetry once and disposal prevents a late worker", async () => {
         let ready!: (value: boolean) => void;
         let preparations = 0;

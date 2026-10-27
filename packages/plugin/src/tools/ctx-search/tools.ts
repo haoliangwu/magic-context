@@ -186,6 +186,7 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                 }
             }
 
+            let rerankSkipped = "";
             const results = await unifiedSearch(
                 deps.db,
                 toolContext.sessionID,
@@ -220,15 +221,26 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                     // (the hot path) leave this off to protect their latency.
                     explicitSearch: true,
                     rerankConnectionFile: deps.rerankConnectionFile,
+                    rerankConfig: deps.rerankConfig,
+                    onRerankSkipped: (line) => {
+                        rerankSkipped = line;
+                    },
                     // Probe match counts walk the session's FTS rows; run the
                     // message lane on a worker so the serving thread stays free.
                     searchMessageHistory: (request) =>
                         searchMessageHistoryOffThread(deps.db, request),
+                    // The history-chunk pool is still built on this thread. A
+                    // cancelled call stops building it between batches instead
+                    // of finishing it for nobody.
+                    signal: toolContext.abort,
                     ...dateRange,
                 },
             );
 
-            return formatSearchResults(query, results, toolContext.sessionID, diagnostics);
+            return (
+                formatSearchResults(query, results, toolContext.sessionID, diagnostics) +
+                (rerankSkipped ? `\n${rerankSkipped}` : "")
+            );
         },
     });
 }

@@ -219,10 +219,8 @@ test("review: an unbound pending snapshot does not adopt another local checkpoin
 });
 
 // Inapplicable: captured host messages live only in this process, not in editable files or tables.
-test.skip("review: corruption of the persisted tail cannot be blessed by a new snapshot digest", () => {});
 
 // Inapplicable: no shared file or table holds captured messages for a queued checkpoint. Each process reads its own host store after restart.
-test.skip("review: two processes cannot overwrite the sole recovery record of an admitted cut", () => {});
 
 test("review: the same session id in a different host store cannot inherit another host's bytes", async () => {
     const { storage } = await files();
@@ -271,7 +269,6 @@ test("review: capture freezes message-level metadata as well as content", async 
 // Skipped as unsupported: hidden rows (those behind the latest checkpoint, served
 // from this cache) are refreshed only when OpenCode sends an event. Editing one
 // directly in OpenCode's database sends no event, so the cache cannot detect it.
-test.skip("review: a hidden row edit is not silently replayed from obsolete bytes", () => {});
 
 test("review control: the seventeenth session recovers an evicted snapshot from files", async () => {
     const { storage } = await files();
@@ -301,11 +298,9 @@ test("review control: the seventeenth session recovers an evicted snapshot from 
 // Not applicable: captured messages are kept only in memory, never in a file, so
 // completing a checkpoint has no saved copy to publish or delete and there is no
 // crash window between those steps. After a restart, replay reads the host store.
-test.skip("review control: a crash after promotion but before tombstoning retains recovery bytes", () => {});
 
 // Not applicable: no file or table stores captured messages, so there is no saved
 // copy whose ids or bytes could be corrupted. A checkpoint whose context the
 // provider holds (a compaction row with providerContext) is never treated as a
 // local checkpoint; native-replay.test.ts covers that in "native checkpoint
 // recognition is structural and leaves literal user delimiters alone".
-test.skip("review control: draft id mismatch, provider cuts and active snapshot corruption refuse adoption", () => {});

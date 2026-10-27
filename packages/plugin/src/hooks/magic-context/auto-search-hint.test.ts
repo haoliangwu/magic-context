@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { UnifiedSearchResult } from "../../features/magic-context/search";
-import { buildAutoSearchHint } from "./auto-search-hint";
+import { buildAutoSearchHint, selectAutoSearchResults } from "./auto-search-hint";
 
 function memory(content: string, score = 0.85, id = 1): UnifiedSearchResult {
     return {
@@ -86,5 +86,35 @@ describe("buildAutoSearchHint", () => {
         expect(single).toContain("1 related fragment");
         const many = buildAutoSearchHint([memory("one"), memory("two")]);
         expect(many).toContain("2 related fragments");
+    });
+});
+
+describe("selectAutoSearchResults", () => {
+    it("keeps fragments at or above the threshold and orders them by relevance", () => {
+        const fragment = (id: string, score: number, relevanceScore: number) =>
+            ({
+                source: "message",
+                content: id,
+                score,
+                relevanceScore,
+                messageOrdinal: 1,
+                messageId: id,
+                role: "assistant",
+            }) as UnifiedSearchResult;
+        // Rank order (score) differs from relevance order.
+        const selected = selectAutoSearchResults(
+            [
+                fragment("first-ranked", 1, 0.7),
+                fragment("below", 0.95, 0.5),
+                fragment("most-relevant", 0.9, 0.95),
+                fragment("tied", 0.8, 0.7),
+            ],
+            0.6,
+        );
+        expect(selected.map((result) => result.content)).toEqual([
+            "most-relevant",
+            "first-ranked",
+            "tied",
+        ]);
     });
 });

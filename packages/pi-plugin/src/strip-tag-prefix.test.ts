@@ -10,6 +10,24 @@ import {
 } from "./strip-tag-prefix";
 
 describe("stripTagPrefixFromAssistantMessage", () => {
+	it("preserves tag-only text and blank framing on unsafe providers in Pi and Oh My Pi", () => {
+		for (const provider of ["openai", "bedrock", "ark"]) {
+			const content = [
+				{ type: "text", text: "§58§", id: "text" },
+				{ type: "text", text: " \n " },
+				{ type: "toolCall", id: "call", name: "read", arguments: {} },
+			];
+			const message = {
+				role: "assistant",
+				provider,
+				content: structuredClone(content),
+			};
+			expect(stripTagPrefixFromAssistantMessage(message)).toBe(false);
+			expect(message.content).toEqual(content);
+			expect(strippedAssistantContent(content, provider)).toBeUndefined();
+		}
+	});
+
 	describe("leading tag prefix (canonical MC tagger mimicry)", () => {
 		it("strips a single §N§ prefix from assistant text", () => {
 			const msg = {

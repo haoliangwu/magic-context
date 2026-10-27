@@ -30,17 +30,16 @@ for (const position of [0,1,2]) test(`cache review partial-commit LKG: position 
   signalPiPendingMaterialization(session);
   let result:any, error:any;
   try {result=await pass();}catch(e){error=e;}
-  console.log('PARTIAL_LKG_REVIEW',JSON.stringify({returned:!!result,error:error?.message,statuses:getTagsBySession(db,session).filter(t=>t.type==='tool').map(t=>[t.status,t.dropMode]),returnedPrior:result&&JSON.stringify(result.messages)===JSON.stringify(before.messages),returnedOldCall:result&&JSON.stringify(result.messages).includes('"id":"reduce-0"')}));
   const spy = spyOn(cleanup,'applyPiHeuristicCleanup'); tokens=1000; warm();
   let next:any, nextError:any; try { next=await pass(); } catch(e) {nextError=e;}
-  console.log('PARTIAL_LKG_NEXT',JSON.stringify({returned:!!next,error:nextError?.message,scans:spy.mock.calls.length,oldCall:next&&JSON.stringify(next.messages).includes('"id":"reduce-0"'),equalRecovery:next&&result&&JSON.stringify(next.messages)===JSON.stringify(result.messages),equalPrior:next&&JSON.stringify(next.messages)===JSON.stringify(before.messages),statuses:getTagsBySession(db,session).filter(t=>t.type==='tool').map(t=>[t.status,t.dropMode])})); spy.mockRestore();
+   spy.mockRestore();
   clearContextHandlerSession(session); db.close(); db=createTestDb(path);
   registerPiContextHandler(fake.pi as never,{db,protectedTokens:0,protectedTags:0,heuristics:{},scheduler:{executeThresholdPercentage:65}});
   handler=fake.handlers.get('context') as any; warm();
   const restartSpy=spyOn(cleanup,'applyPiHeuristicCleanup');
   let gate:any; const releaseGate=__test.setMutationGateObserverForTests(s=>{gate=s;});
   let restarted:any, restartError:any; try {restarted=await pass();}catch(e){restartError=e;}
-  console.log('PARTIAL_LKG_RESTART',JSON.stringify({gate,returned:!!restarted,error:restartError?.message,scans:restartSpy.mock.calls.length,oldCall:restarted&&JSON.stringify(restarted.messages).includes('"id":"reduce-0"'),equalPrior:restarted&&JSON.stringify(restarted.messages)===JSON.stringify(before.messages)}));restartSpy.mockRestore();releaseGate();
+   restartSpy.mockRestore();releaseGate();
   expect(result).toBeDefined();
   expect(restarted).toBeDefined();
   expect(gate).toEqual({foldDue:false,foldExecuted:false,foldBustsServedPrefix:false,shouldApplyPendingOps:false,shouldRunHeuristics:false,shouldRunReasoningCleanup:false});

@@ -2794,7 +2794,13 @@ describe("registerPiContextHandler", () => {
 
 	for (const [name, isSubagent, tokens, queued, applies] of [
 		["subagent execute drains queued drops", true, 70000, true, true],
-		["primary execute holds queued drops", false, 70000, true, false],
+		[
+			"primary execute holds briefly before bounded reclaim",
+			false,
+			70000,
+			true,
+			false,
+		],
 		["subagent defer holds queued drops", true, 20000, true, false],
 		["subagent empty execute is byte-identical", true, 70000, false, false],
 	] as const) {
@@ -2859,8 +2865,16 @@ describe("registerPiContextHandler", () => {
 					expect(bytes).not.toBe(baseline);
 					expect(bytes).not.toContain("issue-619-stale-thought");
 				} else expect(bytes).toBe(baseline);
-				for (let replay = 0; replay < 3; replay++)
+				if (!isSubagent && tokens === 70000) {
 					expect(JSON.stringify((await pass()).messages)).toBe(bytes);
+					const reclaimed = JSON.stringify((await pass()).messages);
+					expect(reclaimed).not.toBe(bytes);
+					expect(getPendingOps(db, sessionId)).toHaveLength(0);
+					expect(JSON.stringify((await pass()).messages)).toBe(reclaimed);
+				} else {
+					for (let replay = 0; replay < 3; replay++)
+						expect(JSON.stringify((await pass()).messages)).toBe(bytes);
+				}
 			} finally {
 				clearContextHandlerSession(sessionId);
 				closeQuietly(db);

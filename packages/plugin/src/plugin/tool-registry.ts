@@ -159,7 +159,11 @@ export function createToolRegistry(args: {
                       ),
                   rustToolBackends,
               })),
-        ...createCtxExpandTools({ db, expandTools: pluginConfig.historian?.expand_tools }),
+        ...createCtxExpandTools({
+            db,
+            expandTools: pluginConfig.historian?.expand_tools,
+            transformMode: pluginConfig.transform_mode,
+        }),
         ...createCtxNoteTools({
             db,
             dreamerEnabled: isDreamerRunnable(pluginConfig),
@@ -170,6 +174,7 @@ export function createToolRegistry(args: {
         ...createCtxSearchTools({
             db,
             rerankConnectionFile: pluginConfig.subc?.connection_file,
+            rerankConfig: pluginConfig.rerank,
             resolveProjectPath,
             ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
         }),

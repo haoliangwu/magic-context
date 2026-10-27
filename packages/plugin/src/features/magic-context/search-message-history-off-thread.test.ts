@@ -8,6 +8,7 @@ import {
 } from "../../hooks/magic-context/auto-search-worker-client";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDir } from "../../shared/test-temp-dir";
+import { getWorkerShutdownStats } from "../../shared/worker-shutdown";
 import { ensureMessagesIndexed } from "./message-index";
 import { createUnifiedSearchDiagnostics, type UnifiedSearchOptions, unifiedSearch } from "./search";
 import { initializeDatabase } from "./storage-db";
@@ -88,6 +89,42 @@ describe("message search off the serving thread", () => {
                 expect(offThread).toEqual(inProcess);
                 expect(workerDiagnostics).toEqual(inProcessDiagnostics);
             }
+        } finally {
+            db.close();
+            cleanup();
+        }
+    }, 60_000);
+
+    it("lets a finished worker exit by itself instead of terminating it", async () => {
+        const { dir: directory, cleanup } = createTestTempDir("mc-search-worker-");
+        const db = new Database(join(directory, "context.db"));
+        const before = getWorkerShutdownStats().get("message-search") ?? {
+            graceful: 0,
+            forced: 0,
+        };
+        try {
+            initializeDatabase(db);
+            seed(db);
+            const outcome = await searchMessageHistoryOffThread(db, {
+                sessionId: SESSION,
+                query: QUERY,
+                limit: 25,
+                probes: ["cache_timeout"],
+                collectDiagnostics: false,
+                dateRange: null,
+            });
+            expect(outcome).not.toBeNull();
+            const deadline = Date.now() + 5_000;
+            while (
+                (getWorkerShutdownStats().get("message-search")?.graceful ?? 0) ===
+                    before.graceful &&
+                Date.now() < deadline
+            )
+                await new Promise((resolve) => setTimeout(resolve, 5));
+            expect(getWorkerShutdownStats().get("message-search")).toEqual({
+                graceful: before.graceful + 1,
+                forced: before.forced,
+            });
         } finally {
             db.close();
             cleanup();

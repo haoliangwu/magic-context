@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
-import { v2NonNarrativeStoredGapRanges } from "./compartment-runner-incremental";
+import { nonNarrativeStoredGapRanges } from "./compartment-runner-incremental";
 import { validateHistorianOutput } from "./compartment-runner-validation";
 import {
     cleanUserText,
@@ -480,7 +480,7 @@ describe("readSessionChunk", () => {
                                 anchorMessageId: "m-44600",
                             }),
                         ).toBe(true);
-                        return v2NonNarrativeStoredGapRanges(db, sessionId, [
+                        return nonNarrativeStoredGapRanges(db, sessionId, [
                             { startMessage: 44_473, endMessage: 44_586 },
                             { startMessage: 44_588, endMessage: 44_606 },
                         ]);

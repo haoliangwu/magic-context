@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { createTestTempDirFromPath } from "./test-temp-dir";
 
 /**
@@ -22,6 +23,34 @@ import { createTestTempDirFromPath } from "./test-temp-dir";
 
 let tmpRoot = "";
 let originalXdg: string | undefined;
+let fixtureCounter = 0;
+let fixturePath = "";
+
+async function loadAnnouncement(version = "1.2.3", features = ["Fixture announcement"]) {
+    // Load the real gate with pinned release content, without a process-global module mock.
+    const source = fs.readFileSync(path.join(import.meta.dir, "announcement.ts"), "utf8");
+    const pinned = source
+        .replace(
+            /export const ANNOUNCEMENT_VERSION = .*?;/s,
+            `export const ANNOUNCEMENT_VERSION = ${JSON.stringify(version)};`,
+        )
+        .replace(
+            /export const ANNOUNCEMENT_FEATURES: ReadonlyArray<string> = \[[\s\S]*?\];/,
+            `export const ANNOUNCEMENT_FEATURES: ReadonlyArray<string> = ${JSON.stringify(features)};`,
+        )
+        .replace(
+            /from "(\.[^"]+)"/g,
+            (_, specifier) => `from ${JSON.stringify(path.resolve(import.meta.dir, specifier))}`,
+        );
+    const scratch = path.resolve(import.meta.dir, "../../../../target/scratch");
+    fs.mkdirSync(scratch, { recursive: true });
+    fixturePath = path.join(scratch, `announcement-${process.pid}-${fixtureCounter++}.ts`);
+    fs.writeFileSync(fixturePath, pinned);
+    const mod = (await import(pathToFileURL(fixturePath).href)) as typeof import("./announcement");
+    expect(mod.ANNOUNCEMENT_VERSION).toBe(version);
+    expect(mod.ANNOUNCEMENT_FEATURES).toEqual(features);
+    return mod;
+}
 
 beforeEach(() => {
     tmpRoot = createTestTempDirFromPath(path.join(os.tmpdir(), "mc-announcement-test-"));
@@ -30,6 +59,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+    if (fixturePath) fs.rmSync(fixturePath, { force: true });
     if (originalXdg === undefined) {
         delete process.env.XDG_DATA_HOME;
     } else {
@@ -46,7 +76,7 @@ afterEach(() => {
 describe("announcement state persistence", () => {
     test("round-trips a dismissed version through the file", async () => {
         // Fresh import after XDG override so the module captures the temp path
-        const mod = await import(`./announcement?t=${Date.now()}-rt`);
+        const mod = await loadAnnouncement();
         const { readLastAnnouncedVersion, markAnnouncementSeen } = mod;
 
         expect(readLastAnnouncedVersion()).toBe("");
@@ -59,7 +89,7 @@ describe("announcement state persistence", () => {
     });
 
     test("ignores empty / zero-length version marks", async () => {
-        const mod = await import(`./announcement?t=${Date.now()}-empty`);
+        const mod = await loadAnnouncement();
         const { readLastAnnouncedVersion, markAnnouncementSeen } = mod;
 
         markAnnouncementSeen("");
@@ -67,7 +97,7 @@ describe("announcement state persistence", () => {
     });
 
     test("creates the storage directory if it does not exist", async () => {
-        const mod = await import(`./announcement?t=${Date.now()}-mkdir`);
+        const mod = await loadAnnouncement();
         const { markAnnouncementSeen } = mod;
 
         // Storage dir lives under tmpRoot + cortexkit/magic-context — does not
@@ -84,7 +114,7 @@ describe("announcement state persistence", () => {
     });
 
     test("trims whitespace from stored version on read", async () => {
-        const mod = await import(`./announcement?t=${Date.now()}-trim`);
+        const mod = await loadAnnouncement();
         const { readLastAnnouncedVersion } = mod;
 
         const dir = path.join(tmpRoot, "cortexkit", "magic-context");
@@ -96,39 +126,28 @@ describe("announcement state persistence", () => {
 });
 
 describe("shouldShowAnnouncement gating", () => {
-    test("returns false when the live version is already marked", async () => {
-        const mod = await import(`./announcement?t=${Date.now()}-match`);
-        const {
-            ANNOUNCEMENT_VERSION,
-            ANNOUNCEMENT_FEATURES,
-            markAnnouncementSeen,
-            shouldShowAnnouncement,
-        } = mod;
-
-        // Skip the test if announcements are currently disabled (empty constants)
-        // — the gate's empty-input behavior is covered separately below.
-        if (!ANNOUNCEMENT_VERSION || ANNOUNCEMENT_FEATURES.length === 0) {
-            return;
+    test("empty release content does not announce or seed state", async () => {
+        for (const [version, features] of [
+            ["", ["Fixture"]],
+            ["1.2.3", []],
+        ] as const) {
+            const mod = await loadAnnouncement(version, [...features]);
+            expect(mod.shouldShowAnnouncement()).toBe(false);
+            expect(mod.readLastAnnouncedVersion()).toBe("");
+            fs.rmSync(fixturePath);
         }
+    });
+    test("returns false when the live version is already marked", async () => {
+        const mod = await loadAnnouncement();
+        const { ANNOUNCEMENT_VERSION, markAnnouncementSeen, shouldShowAnnouncement } = mod;
 
         markAnnouncementSeen(ANNOUNCEMENT_VERSION);
         expect(shouldShowAnnouncement()).toBe(false);
     });
 
     test("seeds state and returns false on first run / wiped sandbox (issue #99)", async () => {
-        const mod = await import(`./announcement?t=${Date.now()}-none`);
-        const {
-            ANNOUNCEMENT_VERSION,
-            ANNOUNCEMENT_FEATURES,
-            shouldShowAnnouncement,
-            readLastAnnouncedVersion,
-        } = mod;
-
-        if (!ANNOUNCEMENT_VERSION || ANNOUNCEMENT_FEATURES.length === 0) {
-            // When empty, the gate is always false regardless of state
-            expect(shouldShowAnnouncement()).toBe(false);
-            return;
-        }
+        const mod = await loadAnnouncement();
+        const { ANNOUNCEMENT_VERSION, shouldShowAnnouncement, readLastAnnouncedVersion } = mod;
 
         // No mark exists yet (fresh install or ephemeral/wiped sandbox). The
         // gate must NOT announce — it seeds the state to the current version and
@@ -142,13 +161,8 @@ describe("shouldShowAnnouncement gating", () => {
     });
 
     test("does not seed or advance state when an existing state file is unreadable/corrupt", async () => {
-        const mod = await import(`./announcement?t=${Date.now()}-corrupt`);
-        const { ANNOUNCEMENT_VERSION, ANNOUNCEMENT_FEATURES, shouldShowAnnouncement } = mod;
-
-        if (!ANNOUNCEMENT_VERSION || ANNOUNCEMENT_FEATURES.length === 0) {
-            expect(shouldShowAnnouncement()).toBe(false);
-            return;
-        }
+        const mod = await loadAnnouncement();
+        const { shouldShowAnnouncement } = mod;
 
         const dir = path.join(tmpRoot, "cortexkit", "magic-context");
         const file = path.join(dir, "last_announced_version");
@@ -160,34 +174,16 @@ describe("shouldShowAnnouncement gating", () => {
     });
 
     test("returns true when a different (older) version is marked", async () => {
-        const mod = await import(`./announcement?t=${Date.now()}-older`);
-        const {
-            ANNOUNCEMENT_VERSION,
-            ANNOUNCEMENT_FEATURES,
-            markAnnouncementSeen,
-            shouldShowAnnouncement,
-        } = mod;
-
-        if (!ANNOUNCEMENT_VERSION || ANNOUNCEMENT_FEATURES.length === 0) {
-            return;
-        }
+        const mod = await loadAnnouncement();
+        const { markAnnouncementSeen, shouldShowAnnouncement } = mod;
 
         markAnnouncementSeen("0.0.0-pre-historic");
         expect(shouldShowAnnouncement()).toBe(true);
     });
 
     test("does NOT re-announce on a downgrade (stored version is newer)", async () => {
-        const mod = await import(`./announcement?t=${Date.now()}-downgrade`);
-        const {
-            ANNOUNCEMENT_VERSION,
-            ANNOUNCEMENT_FEATURES,
-            markAnnouncementSeen,
-            shouldShowAnnouncement,
-        } = mod;
-
-        if (!ANNOUNCEMENT_VERSION || ANNOUNCEMENT_FEATURES.length === 0) {
-            return;
-        }
+        const mod = await loadAnnouncement();
+        const { markAnnouncementSeen, shouldShowAnnouncement } = mod;
 
         // Stored version is far newer than the running binary (user downgraded).
         // A bare string-inequality gate would re-show the OLD announcement; the

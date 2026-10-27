@@ -63,6 +63,7 @@ import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
 import {
     byteSize,
     prependTag,
+    stripPersistedAssistantText,
     stripTagPrefix,
     stripWellFormedLeadingTagPrefix,
 } from "../hooks/magic-context/tag-content-primitives";
@@ -75,6 +76,8 @@ import type { Transcript, TranscriptMessage, TranscriptPart } from "./transcript
 export { TEXT_TAG_IDENTITY_MARKER };
 
 export interface TagTranscriptOptions {
+    /** Keep tag-only assistant slots inert when their original text must survive stripping. */
+    preserveTagOnlyAssistantText?: boolean;
     /**
      * When true, skip injecting `§N§` prefix into visible text. Tags
      * still get assigned in the DB so historian/drops can reference
@@ -416,6 +419,7 @@ export function tagTranscript(
                     db,
                     targets,
                     skipPrefixInjection,
+                    preserveTagOnlyAssistantText: options.preserveTagOnlyAssistantText,
                     entryFingerprint: options.entryFingerprintByMessageId?.get(messageId) ?? null,
                     reuseIdentity: reuseIdentity || contentDerivedTextIds !== undefined,
                     timing,
@@ -996,6 +1000,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 interface TagTextPartArgs {
+    preserveTagOnlyAssistantText?: boolean;
     sessionId: string;
     message: { info: { id?: string; role: string } };
     messageId: string;
@@ -1022,7 +1027,10 @@ function tagTextPart(args: TagTextPartArgs): void {
     // into a tag-bearing part that later strip logic could mistake for content.
     if (
         args.message.info.role === "assistant" &&
-        stripWellFormedLeadingTagPrefix(text).trim().length === 0
+        (stripWellFormedLeadingTagPrefix(text).trim().length === 0 ||
+            (args.preserveTagOnlyAssistantText &&
+                text.includes("§") &&
+                stripPersistedAssistantText(text).length === 0))
     ) {
         if (args.timing) args.timing.identity += performance.now() - identityStart;
         return;

@@ -119,7 +119,11 @@ import {
 } from "./read-session-chunk";
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
-import { isStrictGapHealingMessage, RawOrdinalsNotReady } from "./read-session-raw";
+import {
+    areRustHistorianSyntheticParts,
+    isStrictGapHealingMessage,
+    RawOrdinalsNotReady,
+} from "./read-session-raw";
 import { sendStatusNotification } from "./send-session-notification";
 
 const inconsistentProducerWindows = new Set<string>();
@@ -140,30 +144,48 @@ function logInconsistentProducerWindowOnce(
 /** Suppress repeated historian failure notifications — at most once per 60 seconds per session */
 const HISTORIAN_ALERT_COOLDOWN_MS = 60 * 1000;
 
-export function v2NonNarrativeStoredGapRanges(
+export function nonNarrativeStoredGapRanges(
     db: HiddenCompartmentRunnerDeps["db"],
     sessionId: string,
     compartments: ReadonlyArray<{ startMessage: number; endMessage: number }>,
 ): Array<{ start: number; end: number }> {
-    if (readCoordinateRebaseNotice(db, sessionId)?.generation !== "v2") return [];
+    const rebasedToV2 = readCoordinateRebaseNotice(db, sessionId)?.generation === "v2";
     const safeRanges: Array<{ start: number; end: number }> = [];
-    for (let index = 1; index < compartments.length; index += 1) {
+    for (let index = 0; index < compartments.length; index += 1) {
         const previous = compartments[index - 1];
         const current = compartments[index];
-        if (!previous || !current) continue;
-        const start = previous.endMessage + 1;
+        if (!current) continue;
+        const start = previous ? previous.endMessage + 1 : 1;
         const end = current.startMessage - 1;
         if (end < start) continue;
         const messages = readRawSessionMessageRange(sessionId, start, end);
         const ordinals = new Set(messages.map((message) => message.ordinal));
         const complete =
             ordinals.size === end - start + 1 &&
-            messages.every((message) => isStrictGapHealingMessage(message));
+            messages.every(
+                (message) =>
+                    message.ordinal >= start &&
+                    message.ordinal <= end &&
+                    (areRustHistorianSyntheticParts(message.parts) ||
+                        (index > 0 && rebasedToV2 && isStrictGapHealingMessage(message))),
+            );
         if (complete) safeRanges.push({ start, end });
     }
     return safeRanges;
 }
 const lastHistorianAlertBySession = new Map<string, number>();
+const loggedStoredValidationFailures = new Map<string, Set<string>>();
+
+function logStoredValidationFailureOnce(sessionId: string, error: string): void {
+    // Ordinals vary as history changes; the failure class, not its coordinates,
+    // determines whether this session has already logged the problem.
+    const failureClass = error.split(" ", 2).join(" ");
+    const logged = loggedStoredValidationFailures.get(sessionId) ?? new Set<string>();
+    if (logged.has(failureClass)) return;
+    logged.add(failureClass);
+    loggedStoredValidationFailures.set(sessionId, logged);
+    sessionLog(sessionId, `historian failure: source=existing-validation reason="${error}"`);
+}
 
 /**
  * How long the historian waits before re-checking stored compartments that
@@ -233,6 +255,7 @@ export function findDanglingPublicationBoundary(
 /** Clean up module-level session state on session deletion. */
 export function clearHistorianAlertState(sessionId: string): void {
     lastHistorianAlertBySession.delete(sessionId);
+    loggedStoredValidationFailures.delete(sessionId);
 }
 
 export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Promise<void> {
@@ -384,7 +407,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
 
         let existingValidationError = validateStoredCompartments(
             priorCompartments,
-            v2NonNarrativeStoredGapRanges(db, sessionId, priorCompartments),
+            nonNarrativeStoredGapRanges(db, sessionId, priorCompartments),
         );
         // A compartment a store-projection rebase left unresolved keeps stale
         // ordinals that can overlap its neighbour. Stored rows in that state do
@@ -394,17 +417,18 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             existingValidationError !== null &&
             priorCompartments.some((compartment) => compartment.rebaseStatus === "unresolved");
         if (
-            unresolvedInvolved &&
             existingValidationError &&
             storedCompartmentFailureBackingOff(db, sessionId, existingValidationError)
         ) {
             // The same stored rows already failed this check recently. Nothing
             // but a rebuild changes them, so re-running now would only repeat
             // the failure and its notice.
-            sessionLog(
-                sessionId,
-                `historian no-op: stored compartments still invalid ("${existingValidationError}"); backing off`,
-            );
+            if (unresolvedInvolved) {
+                sessionLog(
+                    sessionId,
+                    `historian no-op: stored compartments still invalid ("${existingValidationError}"); backing off`,
+                );
+            }
             telemetry.status = "noop";
             telemetry.failureReason = `existing-validation backoff: ${existingValidationError}`;
             return;
@@ -423,23 +447,27 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 priorCompartments = getCompartments(db, sessionId);
                 existingValidationError = validateStoredCompartments(
                     priorCompartments,
-                    v2NonNarrativeStoredGapRanges(db, sessionId, priorCompartments),
+                    nonNarrativeStoredGapRanges(db, sessionId, priorCompartments),
                 );
             }
         }
         if (existingValidationError) {
-            sessionLog(
-                sessionId,
-                `historian failure: source=existing-validation reason="${existingValidationError}"`,
-            );
+            if (unresolvedInvolved) {
+                sessionLog(
+                    sessionId,
+                    `historian failure: source=existing-validation reason="${existingValidationError}"`,
+                );
+            } else {
+                logStoredValidationFailureOnce(sessionId, existingValidationError);
+            }
             // This is a real failure (stored compartments are corrupt) — record
             // it so `doctor --issue` and the >=95% abort path can see it.
             const failCount = incrementHistorianFailure(db, sessionId, existingValidationError);
             telemetry.failureReason = `existing-validation: ${existingValidationError}`;
+            retainDrainReservationForRetryThrottle = true;
             if (unresolvedInvolved) {
                 // Record the failure time like any other permanent historian
                 // failure, which is also what the backoff above measures from.
-                retainDrainReservationForRetryThrottle = true;
                 await notifyHistorianIssue(buildStoredCompartmentsInvalidNotice());
             } else {
                 await notifyHistorianIssue(

@@ -168,6 +168,39 @@ Durable project memory, semantic search, and recall features. OpenAI-compatible 
 | `embedding.local_runtime` | `"auto"` \| `"native"` \| `"wasm"` | `"auto"` | Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Inference runs in a dedicated worker after disabling POSIX telemetry in the native process environment. Compiled Bun hosts and hosts without a verified in-process opt-out use a subprocess instead. Windows native ONNX emits OS-controlled ETW diagnostics, not direct uploads. On Bun before 1.4.0, even explicit 'native' uses WASM because native worker teardown can crash the process. Set 'wasm' to avoid loading the native addon on newer hosts too. |
 | `embedding.local_dtype` | `"auto"` \| `"fp32"` \| `"fp16"` \| `"q8"` \| `"int8"` \| `"uint8"` \| `"q4"` \| `"bnb4"` \| `"q4f16"` \| `"q2"` \| `"q2f16"` \| `"q1"` \| `"q1f16"` | — | Local provider only: ONNX model dtype passed to the transformers.js feature-extraction pipeline. Accepts the @huggingface/transformers DataType strings (auto, fp32, fp16, q8, int8, uint8, q4, bnb4, q4f16, q2, q2f16, q1, q1f16). Omitted keeps today's behavior (fp32). A non-default value changes the produced vectors and folds into the embedding model identity, so switching dtype re-embeds rather than mixing vector spaces. Useful for selecting a quantized variant (e.g. q8) of a larger multilingual model to cut memory and CPU cost; see issue #259. |
 
+## Explicit search reranking
+
+Reranking reuses the existing prose-query gate, candidate preparation and stable score sorting for explicit `ctx_search` on OpenCode and Pi. Automatic per-turn search hints never call a reranker. With no block configured, local Synapse remains the default.
+
+Hosted reranking sends retrieved text to a user-chosen service. Put this block in user config beside `embedding` (it is independent of the embedding provider):
+
+```jsonc
+"rerank": {
+  "provider": "remote",
+  "endpoint": "https://api.cohere.com/v2",
+  "model": "rerank-v3.5",
+  "api_key": "{env:RERANK_API_KEY}",
+  "timeout_ms": 1500,
+  "top_n": 20
+}
+```
+
+The client posts to `<endpoint>/rerank` with `{model, query, documents, top_n}` and reads `results: [{index, relevance_score}]` (Cohere, Voyage, OpenRouter and Jina-compatible). Prefix the base URL with `tei+` for Hugging Face TEI: `{query, texts}` in and `[{index, score}]` out. API keys are sent as Bearer tokens; user-level `{env:NAME}` and `{file:path}` expansion follows the embedding configuration rules.
+
+Each document uses the existing location/title/body recipe, truncated at a UTF-8 character boundary to 1024 bytes. At most 20 documents are allowed per request; larger batches are refused, never split. `top_n` caps the fused candidate pool, and the wire request asks for all submitted scores. Scores must cover each document index exactly once and be finite; ties retain candidate order. Any failure preserves the original unreranked order, adds one short skip reason to the tool result, and never falls back to Synapse while remote is configured.
+
+Project config may only set `"rerank": {"provider": "off"}`. Project routing, credentials and limits are stripped with a warning, and project `{env:}` / `{file:}` tokens never expand. Changes require a host restart. The dashboard currently requires its raw JSONC editor for this block.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `rerank` | object | — | Explicit ctx_search reranking only. Defaults to local Synapse. Hosted settings are user-level only; projects may only select off. |
+| `rerank.provider` | `"synapse"` \| `"remote"` \| `"off"` | `"synapse"` | Explicit ctx_search reranker: local Synapse by default, remote for hosted scoring, or off. Projects may only select off. |
+| `rerank.endpoint` | string | — | User-level rerank API base URL; prefix with tei+ for Hugging Face TEI. |
+| `rerank.model` | string | — | Hosted reranker model name. |
+| `rerank.api_key` | string | — | Bearer API key; supports {env:NAME} in user config, like embedding.api_key. |
+| `rerank.timeout_ms` | integer (-9007199254740991–9007199254740991) | — | Hosted request timeout in milliseconds, clamped to 50–15000; also cancelled by ctx_search's abort signal. |
+| `rerank.top_n` | integer (1–20) | `20` | Maximum fused candidates sent to the hosted reranker (1–20). Requests ask for a score for every submitted document; partial replies are rejected. |
+
 ## Background agents
 
 Off-hours maintenance through Dreamer.

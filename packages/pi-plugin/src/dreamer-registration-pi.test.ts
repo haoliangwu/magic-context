@@ -61,7 +61,7 @@ for (const disable of [true, false]) {
 				},
 			}),
 		);
-		const db = openDatabase();
+		const db = openDatabase({ nativeTurnDeadlines: true });
 		if (!db) throw new Error("throwaway store unavailable");
 		const registrations: Parameters<
 			typeof dreamer.registerPiDreamerProject

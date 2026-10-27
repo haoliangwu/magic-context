@@ -82,14 +82,14 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
-    def prepare_pr(self, paths):
+    def prepare_pr(self, paths, message="Fixture PR"):
         self.git("checkout", "-B", "fixture-pr", self.master)
         for name in paths:
             path = self.repo / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("export const changed = true;\n")
         self.git("add", ".")
-        self.git("commit", "-m", "Fixture PR")
+        self.git("commit", "-m", message)
         self.scenario["head"] = self.git("rev-parse", "HEAD").strip()
         self.git("checkout", "master")
 
@@ -213,6 +213,27 @@ class MergeTests(unittest.TestCase):
             with self.subTest(title=title):
                 self.scenario["title"] = title
                 self.assert_refused(self.run_script(), "closing keyword")
+
+    def test_closing_keyword_in_description_refuses(self):
+        for body in ("Summary.\n\nFixes #777", "fixes: #7", "Closes cortexkit/magic-context#9"):
+            with self.subTest(body=body):
+                self.scenario["body"] = body
+                self.assert_refused(self.run_script(), "PR description contains a GitHub closing keyword")
+
+    def test_closing_keyword_in_commit_message_refuses(self):
+        self.prepare_pr(["packages/plugin/demo.ts"], message="fix(agents): keep named allows\n\nFixes #777")
+        run = self.run_script()
+        self.assert_refused(run, "commit message in PR #123 contains a GitHub closing keyword")
+        self.assertIn("Fixes #777", run.stderr)
+
+    def test_issue_mentions_without_closing_keyword_proceed(self):
+        self.scenario["body"] = "Implements the direction agreed in issue #777 (see #777)."
+        self.prepare_pr(["packages/plugin/demo.ts"], message="fix(agents): keep named allows (#777)")
+        self.assertEqual(self.run_script().returncode, 0)
+
+    def test_rechecks_description_after_gates(self):
+        self.scenario["recheck"] = {"body": "Fixes #123"}
+        self.assert_refused(self.run_script(), "PR description contains a GitHub closing keyword")
 
     def test_head_changed_between_query_and_fetch_refuses(self):
         self.scenario["fetched_head"] = self.master
@@ -402,6 +423,17 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(len(pushes), 1)
         self.assertTrue(pushes[0][-1].endswith(":refs/heads/train/check-pr-123"))
         self.assertFalse(self.commands("bun"))
+        self.assert_cleaned()
+
+    def test_ci_gate_missing_slow_modes_never_fast_forwards_master(self):
+        self.scenario["ci_jobs"] = []
+        run = self.run_script("--ci-gate")
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("required slow lane", run.stderr)
+        self.assertEqual(self.git("rev-parse", "master").strip(), self.master)
+        pushes = [item["args"] for item in self.commands("git") if item["args"][0] == "push"]
+        self.assertEqual(len(pushes), 1)
+        self.assertTrue(pushes[0][-1].endswith(":refs/heads/train/check-pr-123"))
         self.assert_cleaned()
 
     def test_ci_gate_fast_forwards_only_the_tested_sha(self):

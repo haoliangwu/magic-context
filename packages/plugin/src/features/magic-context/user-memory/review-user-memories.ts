@@ -211,6 +211,8 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
             startedAt,
             status: params.status,
             messages: params.messages,
+            attemptedModel: args.model,
+            configuredModels: args.fallbackModels,
             error: params.error,
         });
     };

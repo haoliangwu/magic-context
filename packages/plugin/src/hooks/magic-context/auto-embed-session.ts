@@ -1,3 +1,4 @@
+import { getCachedLocalEmbeddingPooling } from "../../features/magic-context/memory/local-embedding-pooling";
 import {
     embedSessionCompartmentChunks,
     getAutoEmbeddingSessionCoverage,
@@ -19,6 +20,13 @@ interface AutoEmbedSessionDeps {
     db: Database;
     projectIdentity: string;
     ensureRegistered: () => Promise<unknown>;
+}
+
+function localPoolingPreflightPending(projectIdentity: string): boolean {
+    const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
+    if (snapshot?.provider !== "local") return false;
+    const metadata = getCachedLocalEmbeddingPooling(snapshot.model);
+    return !metadata || metadata.status === "unresolved";
 }
 
 function embeddingIdentity(projectIdentity: string): string {
@@ -44,11 +52,12 @@ export function maybeAutoEmbedSessionBackfill(deps: AutoEmbedSessionDeps, sessio
         invalidateAutoEmbedSession(sessionId);
         autoEmbedIdentityBySession.set(sessionId, identity);
     }
+    const poolingPreflightPending = localPoolingPreflightPending(deps.projectIdentity);
     if (
-        autoEmbedAttemptedBySession.has(sessionId) ||
         embedPauseBySession.has(sessionId) ||
         embedRunStateBySession.has(sessionId) ||
-        Date.now() < (autoEmbedRetryAfterBySession.get(sessionId) ?? 0)
+        Date.now() < (autoEmbedRetryAfterBySession.get(sessionId) ?? 0) ||
+        (autoEmbedAttemptedBySession.has(sessionId) && !poolingPreflightPending)
     )
         return;
 
@@ -61,12 +70,14 @@ export function maybeAutoEmbedSessionBackfill(deps: AutoEmbedSessionDeps, sessio
         let started = false;
         let reason = "error";
         let registeredIdentity = identity;
+        let poolingPendingAfterRegistration = poolingPreflightPending;
         try {
             // Registration reads config synchronously; defer it off the context-transform return path.
             await new Promise<void>((resolve) => setTimeout(resolve, 0));
             if (controller.signal.aborted) return;
             await deps.ensureRegistered();
             if (controller.signal.aborted) return;
+            poolingPendingAfterRegistration = localPoolingPreflightPending(deps.projectIdentity);
             markActive();
             registeredIdentity = embeddingIdentity(deps.projectIdentity);
             autoEmbedIdentityBySession.set(sessionId, registeredIdentity);
@@ -77,7 +88,8 @@ export function maybeAutoEmbedSessionBackfill(deps: AutoEmbedSessionDeps, sessio
             );
             if (controller.signal.aborted || !coverage.enabled) return;
             if (coverage.embedded === coverage.total) {
-                complete = true;
+                complete = !poolingPendingAfterRegistration;
+                if (!complete) retryDelay = 60_000;
                 return;
             }
             const model = getProjectEmbeddingSnapshot(deps.projectIdentity)?.model;
@@ -100,8 +112,12 @@ export function maybeAutoEmbedSessionBackfill(deps: AutoEmbedSessionDeps, sessio
                 deps.projectIdentity,
                 sessionId,
             );
-            complete = after.enabled && after.embedded === after.total;
-            if (!complete && outcome.status !== "busy" && outcome.status !== "aborted") {
+            complete =
+                after.enabled && after.embedded === after.total && !poolingPendingAfterRegistration;
+            if (poolingPendingAfterRegistration) {
+                retryDelay = 60_000;
+                reason = "pooling metadata unavailable";
+            } else if (!complete && outcome.status !== "busy" && outcome.status !== "aborted") {
                 retryDelay = 60_000;
                 if (outcome.status === "nothing" || outcome.status === "done") reason = "deferred";
             }

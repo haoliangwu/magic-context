@@ -1,14 +1,14 @@
 import { expect, test } from "bun:test";
 import { readdir } from "node:fs/promises";
 import { resolve } from "node:path";
-import { failedRequiredJobs } from "./check-ci-results";
+import { failedRequiredJobs, slowUnitRequired } from "./check-ci-results";
 
 const root = resolve(import.meta.dir, "../../..");
 const text = await Bun.file(resolve(root, ".github/workflows/ci.yml")).text();
 const releaseText = await Bun.file(resolve(root, ".github/workflows/release.yml")).text();
 const waitActionText = await Bun.file(resolve(root, ".github/actions/wait-ci-artifact/action.yml")).text();
 type Step = { name?: string; run?: string; if?: string; uses?: string; with?: Record<string, string>; env?: Record<string, string> };
-type Job = { name: string; needs?: string[]; if?: string; "timeout-minutes"?: number; permissions?: Record<string, string>; steps: Step[]; strategy?: { "fail-fast": boolean; matrix: { shard: number[]; mode?: string[]; version?: string[] } } };
+type Job = { name: string; needs?: string[]; if?: string; "timeout-minutes"?: number; permissions?: Record<string, string>; steps: Step[]; strategy?: { "fail-fast": boolean; matrix: { shard?: number[]; mode?: string[]; version?: string[] } } };
 const workflow = Bun.YAML.parse(text) as { jobs: Record<string, Job> };
 const releaseWorkflow = Bun.YAML.parse(releaseText) as { jobs: Record<string, Job> };
 const allWorkflowDocuments = await Promise.all(
@@ -38,8 +38,47 @@ test("summary rejects failed, cancelled, skipped and missing legs", () => {
     expect(() => failedRequiredJobs([], {})).toThrow();
 });
 
+test("slow units are required on nightly and check branches, but may skip only on fast runs", () => {
+    const job = workflow.jobs["slow-unit"]!;
+    expect(job.if).toBe("github.event_name == 'schedule' || startsWith(github.ref, 'refs/heads/train/check-')");
+    expect(job.strategy).toEqual({ "fail-fast": false, matrix: { mode: ["normal", "assertions"] } });
+    expect(slowUnitRequired("schedule", "refs/heads/master")).toBe(true);
+    expect(slowUnitRequired("push", "refs/heads/train/check-pr-123")).toBe(true);
+    for (const [event, ref] of [["push", "refs/heads/master"], ["pull_request", "refs/pull/123/merge"], ["push", "refs/heads/train/other"]]) {
+        expect(slowUnitRequired(event, ref)).toBe(false);
+    }
+    expect(failedRequiredJobs(["slow-unit"], { "slow-unit": { result: "skipped" } }, ["slow-unit"])).toEqual([]);
+    expect(failedRequiredJobs(["slow-unit"], { "slow-unit": { result: "skipped" } })).toEqual(["slow-unit"]);
+    expect(failedRequiredJobs(["slow-unit"], {}, ["slow-unit"])).toEqual(["slow-unit"]);
+    expect(failedRequiredJobs(["slow-unit"], { "slow-unit": { result: "failure" } }, ["slow-unit"])).toEqual(["slow-unit"]);
+    for (const id of ["publish-npm", "publish-npm-pi", "publish-npm-cli", "github-release"]) {
+        expect(releaseWorkflow.jobs[id]!.needs).toContain("slow-unit");
+        expect(releaseWorkflow.jobs[id]!.if).toContain("needs.slow-unit.result == 'success'");
+    }
+    expect(releaseWorkflow.jobs["slow-unit"]!.if).toBeUndefined();
+});
+
+test("dists publish before independent checks without removing preflight gates", () => {
+    const preflight = workflow.jobs.preflight!;
+    const publish = preflight.steps.findIndex((step) => step.uses === "actions/upload-artifact@v4");
+    expect(publish).toBeGreaterThan(preflight.steps.findIndex((step) => step.name === "Check compiled contracts"));
+    for (const name of ["Layout, manifest and shard contracts", "Format check", "TypeScript typecheck", "Lint"]) {
+        const index = preflight.steps.findIndex((step) => step.name === name);
+        expect(index).toBeGreaterThan(publish);
+        expect(preflight.steps[index]!.if).toBe("${{ !cancelled() }}");
+    }
+    expect(workflow.jobs["ci-summary"]!.needs).toContain("preflight");
+});
+
+test("native producers start without waiting for unrelated preflight checks", () => {
+    for (const id of ["rust-clippy", "rust-lib-archive", "e2e-rust-hermetic-build"]) {
+        expect(workflow.jobs[id]!.needs).toBeUndefined();
+        expect(workflow.jobs["ci-summary"]!.needs).toContain(id);
+    }
+});
+
 test("artifact consumers start setup immediately and gate tests on artifacts", () => {
-    for (const id of ["unit-plugin", "unit-pi-plugin", "check-plugin-compat", "e2e-opencode", "e2e-opencode2", "e2e-pi", "e2e-omp", "e2e-host-opencode", "e2e-host-opencode2", "e2e-host-pi", "e2e-host-omp", "rust-mc-module-integration", "rust-workspace-crates", "rust-mc-module-lib", "rust-mc-module-parity", "e2e-rust-hermetic"]) {
+    for (const id of ["unit-plugin", "unit-pi-plugin", "check-plugin-compat", "e2e-opencode", "e2e-opencode2", "e2e-pi", "e2e-omp", "e2e-host-opencode", "e2e-host-opencode2", "e2e-host-pi", "e2e-host-omp", "rust-mc-module-integration", "rust-workspace-crates", "rust-mc-module-lib", "e2e-rust-hermetic"]) {
         const job = workflow.jobs[id]!;
         expect(job.needs).toBeUndefined();
         expect(job.steps[0]!.uses).toBe("actions/checkout@v5");
@@ -56,7 +95,7 @@ test("artifact consumers start setup immediately and gate tests on artifacts", (
 });
 
 test("same-run artifact downloads retry transient failures and guard consumers", () => {
-    const ciConsumers = ["rust-mc-module-lib", "rust-mc-module-parity", "e2e-rust-hermetic", "rust-raw-replay-review"];
+    const ciConsumers = ["rust-mc-module-lib", "e2e-rust-hermetic", "rust-raw-replay-review"];
     const actualCiConsumers = Object.entries(workflow.jobs)
         .filter(([, job]) => job.steps.some((step) => step.run?.includes("scripts/download-ci-artifact.py") && /--artifact-(?:id|name)/.test(step.run)))
         .map(([id]) => id)
@@ -75,7 +114,6 @@ test("same-run artifact downloads retry transient failures and guard consumers",
     expect(actualRetryConsumers).toEqual([
         "ci.yml:e2e-rust-hermetic",
         "ci.yml:rust-mc-module-lib",
-        "ci.yml:rust-mc-module-parity",
         "ci.yml:rust-raw-replay-review",
         "release.yml:e2e-rust-hermetic",
     ]);
@@ -133,14 +171,12 @@ test("cache oracle and separate OC2 regressions run exactly once even after a su
 test("Rust archive consumers preserve all lib partitions and remaining target kinds", () => {
     const lib = workflow.jobs["rust-mc-module-lib"]!;
     expect(lib.strategy).toEqual({ "fail-fast": false, matrix: { shard: [1, 2, 3, 4] } });
-    for (const id of ["rust-mc-module-lib", "rust-mc-module-parity"]) {
-        const wait = workflow.jobs[id]!.steps.find((step) => step.uses === "./.github/actions/wait-ci-artifact")!;
-        expect(wait.with!.producer).toBe(workflow.jobs["rust-lib-archive"]!.name);
-        expect(Number(wait.with!["timeout-minutes"])).toBe(workflow.jobs["rust-lib-archive"]!["timeout-minutes"]!);
-        expect(workflow.jobs[id]!["timeout-minutes"]).toBe(90);
-        expect(workflow.jobs[id]!.steps.some((step) => step.run?.includes("--archive-file ci-rust-lib/archive.tar.zst"))).toBe(true);
-        expect(workflow.jobs[id]!.steps.some((step) => step.run?.includes("--failure-output immediate-final"))).toBe(true);
-    }
+    const wait = lib.steps.find((step) => step.uses === "./.github/actions/wait-ci-artifact")!;
+    expect(wait.with!.producer).toBe(workflow.jobs["rust-lib-archive"]!.name);
+    expect(Number(wait.with!["timeout-minutes"])).toBe(workflow.jobs["rust-lib-archive"]!["timeout-minutes"]!);
+    expect(lib["timeout-minutes"]).toBe(90);
+    expect(lib.steps.some((step) => step.run?.includes("--archive-file ci-rust-lib/archive.tar.zst"))).toBe(true);
+    expect(lib.steps.some((step) => step.run?.includes("--failure-output immediate-final"))).toBe(true);
     const commands = workflow.jobs["rust-mc-module-integration"]!.steps.map((step) => step.run ?? "").join("\n");
     expect(commands).toContain("--test '*' --bins --no-fail-fast");
     expect(commands).toContain("--doc --no-fail-fast");

@@ -61,6 +61,8 @@ export interface HiddenChildHost {
     }>;
     /** Optional event-backed error lookup for hosts that do not retain the reason on session.get. */
     terminalError?(input: { sessionID: string }): Promise<unknown>;
+    /** Watch this attempt's streamed text, reasoning or tool input; return its unsubscribe. */
+    watchModelActivity?(sessionID: string, onOutput: () => void): () => void;
     switchModel(input: {
         sessionID: string;
         model: { providerID: string; id: string; variant?: string };

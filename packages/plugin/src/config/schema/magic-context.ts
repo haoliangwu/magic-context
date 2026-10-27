@@ -922,6 +922,61 @@ export const EmbeddingConfigSchema = BaseEmbeddingConfigSchema.transform((data) 
 export type EmbeddingConfig = z.infer<typeof EmbeddingConfigSchema>;
 export type EmbeddingFallbackProvider = z.infer<typeof EmbeddingFallbackProviderSchema>;
 
+export const RerankConfigSchema = z
+    .object({
+        provider: z
+            .enum(["synapse", "remote", "off"])
+            .default("synapse")
+            .describe(
+                "Explicit ctx_search reranker: local Synapse by default, remote for hosted scoring, or off. Projects may only select off.",
+            ),
+        endpoint: z
+            .string()
+            .trim()
+            .optional()
+            .describe("User-level rerank API base URL; prefix with tei+ for Hugging Face TEI."),
+        model: z.string().trim().optional().describe("Hosted reranker model name."),
+        api_key: z
+            .string()
+            .optional()
+            .describe(
+                "Bearer API key; supports {env:NAME} in user config, like embedding.api_key.",
+            ),
+        timeout_ms: z
+            .number()
+            .int()
+            .transform((n) => Math.max(50, Math.min(15000, n)))
+            .default(1500)
+            .describe(
+                "Hosted request timeout in milliseconds, clamped to 50–15000; also cancelled by ctx_search's abort signal.",
+            ),
+        top_n: z
+            .number()
+            .int()
+            .min(1)
+            .max(20)
+            .default(20)
+            .describe(
+                "Maximum fused candidates sent to the hosted reranker (1–20). Requests ask for a score for every submitted document; partial replies are rejected.",
+            ),
+    })
+    .superRefine((data, ctx) => {
+        if (data.provider !== "remote") return;
+        for (const field of ["endpoint", "model"] as const) {
+            if (!data[field])
+                ctx.addIssue({
+                    code: "custom",
+                    path: [field],
+                    message: `${field} is required when rerank.provider is remote`,
+                });
+        }
+    })
+    .describe(
+        "Explicit ctx_search reranking only. Defaults to local Synapse. Hosted settings are user-level only; projects may only select off.",
+    );
+
+export type RerankConfig = z.infer<typeof RerankConfigSchema>;
+
 export interface SubcConfig {
     connection_file: string;
 }
@@ -1087,6 +1142,7 @@ export interface MagicContextConfig {
         min_chars: number;
     };
     embedding: EmbeddingConfig;
+    rerank?: RerankConfig;
     /** User-only connection settings for the Synapse daemon. */
     subc?: SubcConfig;
     /** Developer-only Synapse shadow lane switch. */
@@ -1400,6 +1456,7 @@ export const MagicContextConfigSchema = z
             .describe(
                 "Storage permission policy. The default keeps session content and memories owner-private. Disabling enforcement is for trusted shared-group storage managed externally; TypeScript mode follows that policy, but Rust transform mode always keeps its shared data directory owner-only because ck-mc's store library enforces it.",
             ),
+        rerank: RerankConfigSchema.optional(),
         embedding: EmbeddingConfigSchema.default({
             provider: "local",
             model: DEFAULT_LOCAL_EMBEDDING_MODEL,

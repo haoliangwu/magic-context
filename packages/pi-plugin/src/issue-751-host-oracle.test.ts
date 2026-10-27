@@ -1,5 +1,17 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	cleanupTestTempDir,
+	createTestTempDirFromPath,
+} from "@magic-context/core/shared/test-temp-dir";
+import {
+	exerciseOmpLoggerFiles,
+	pinOmpLoggerFiles,
+	reportOmpLogDescriptors,
+} from "./__tests__/omp-log-files";
 import {
 	type PiDispatchHost,
 	piPreparedStructure,
@@ -50,15 +62,60 @@ async function load(
 	return { version, host, transform: module.transformMessages };
 }
 
-// The Oh My Pi releases our lanes pin. 18.12.5's transform-messages.ts is
-// byte-identical to 18.12.3's.
+const parent = join(tmpdir(), "magic-context", "issue-766");
+mkdirSync(parent, { recursive: true });
+const hostRoot = createTestTempDirFromPath(join(parent, "host-oracle-"));
+afterAll(() => cleanupTestTempDir(hostRoot));
+const ompVersions = [
+	["omp-pi-ai-1889", "18.8.9"],
+	["omp-pi-ai-1811", "18.11.3"],
+	["omp-pi-ai-1812", "18.12.3"],
+] as const;
+const ompLoggerAliases = ompVersions.map(([alias]) => alias);
+
+async function loadOmpHosts(): Promise<HostTransform[]> {
+	const environment = {
+		HOME: join(hostRoot, "home"),
+		XDG_CONFIG_HOME: join(hostRoot, "config"),
+		XDG_DATA_HOME: join(hostRoot, "data"),
+		XDG_CACHE_HOME: join(hostRoot, "cache"),
+		XDG_STATE_HOME: join(hostRoot, "state"),
+	};
+	const previous = Object.fromEntries(
+		Object.keys(environment).map((key) => [key, process.env[key]]),
+	);
+	// OMP captures log/config paths during import; later tests keep their own environment.
+	for (const [key, value] of Object.entries(environment)) {
+		mkdirSync(value, { recursive: true });
+		process.env[key] = value;
+	}
+	try {
+		await pinOmpLoggerFiles(hostRoot, ompLoggerAliases);
+		// Cover the supported OMP converters. The 18.12.5 transform is byte-identical
+		// to 18.12.3, so loading 18.12.3 also covers that release.
+		const hosts: HostTransform[] = [];
+		for (const [alias, version] of ompVersions) {
+			hosts.push(await load(alias, version, "omp"));
+		}
+		return hosts;
+	} finally {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+}
+
 const hosts = [
-	await load("omp-pi-ai-1889", "18.8.9", "omp"),
-	await load("omp-pi-ai-1811", "18.11.3", "omp"),
-	await load("omp-pi-ai-1812", "18.12.3", "omp"),
+	...(await loadOmpHosts()),
 	await load("pi-ai-087", "0.87.1", "pi"),
 	await load("pi-ai-130", "1.3.0", "pi"),
 ];
+
+// Exercise real sinks after HOME is restored so lsof observes files,
+// not just configured paths.
+await exerciseOmpLoggerFiles(ompLoggerAliases);
+reportOmpLogDescriptors();
 
 const SEQUENCES = 2000;
 const responsesModel = {
@@ -449,3 +506,158 @@ describe("issue 751 host oracle: prepared tool windows match the real host trans
 		}
 	}
 });
+
+// Only APIs whose provider sources establish a transformMessages call belong
+// here. The unverified-API tests below pin the other APIs' serialized structure.
+const transformedApis = [
+	"openai-completions",
+	"openai-responses",
+	"openrouter",
+	"openai-codex-responses",
+	"azure-openai-responses",
+	"anthropic-messages",
+	"bedrock-converse-stream",
+	"google-generative-ai",
+	"google-gemini-cli",
+	"google-vertex",
+	"ollama-chat",
+	"factory-droid-agent",
+	"devin-agent",
+	"apple-foundation-models",
+];
+
+/** User, interrupted thinking-only assistant, user (Zireael, issue 761 comment 3). */
+function thinkingHistory(stopReason: string): Message[] {
+	return [
+		{ role: "user", content: [{ type: "text", text: "go" }], timestamp: 1 },
+		{
+			role: "assistant",
+			content: [{ type: "thinking", thinking: "weighing options" }],
+			stopReason,
+			timestamp: 2,
+		},
+		{
+			role: "user",
+			content: [{ type: "text", text: "continue" }],
+			timestamp: 3,
+		},
+	];
+}
+
+/** Encode the no-tool oracle output in the target provider's conversation shape. */
+function thinkingPayload(messages: unknown[], api: string) {
+	if (api.includes("responses")) return responsesPayload(messages);
+	if (api.startsWith("google-"))
+		return {
+			contents: (messages as Message[]).map((message) => ({
+				role: message.role === "assistant" ? "model" : "user",
+				parts: [{ text: textOf(message) }],
+			})),
+		};
+	return {
+		...chatPayload(messages),
+		...(api === "anthropic-messages" ? { system: [], max_tokens: 100 } : {}),
+		...(api === "bedrock-converse-stream" ? { inferenceConfig: {} } : {}),
+	};
+}
+
+describe("truncated thinking-only host oracle", () => {
+	for (const host of hosts.filter((entry) => entry.host === "omp")) {
+		for (const api of transformedApis) {
+			const model = { ...chatModel, api, compat: {} };
+			test(`omp ${host.version}: ${api}: Zireael minimal fixture`, () => {
+				for (const stopReason of ["length", "error", "aborted"]) {
+					const messages = thinkingHistory(stopReason);
+					const bytes = JSON.stringify(messages);
+					const emitted = host.transform(structuredClone(messages), model);
+					expect(hostRows(emitted)).toEqual(["user [] []", "user [] []"]);
+					const prepared = piPreparedStructure(messages, model);
+					expect(preparedRows(prepared)).toEqual(hostRows(emitted));
+					expect(
+						piPreparedStructureMismatch(
+							thinkingPayload(emitted, api),
+							prepared,
+						),
+					).toBeUndefined();
+					expect(JSON.stringify(messages)).toBe(bytes);
+				}
+			});
+			test(`omp ${host.version}: ${api}: Qiiks 104 to 103 row fixture`, () => {
+				const messages: Message[] = Array.from({ length: 104 }, (_, index) => ({
+					role: index % 2 === 0 ? "user" : "assistant",
+					content: [{ type: "text", text: `turn ${index}` }],
+					stopReason: "stop",
+					timestamp: index + 1,
+				}));
+				messages[7] = thinkingHistory("length")[1];
+				const emitted = host.transform(structuredClone(messages), model);
+				expect(emitted).toHaveLength(103);
+				const prepared = piPreparedStructure(messages, model);
+				expect(
+					piPreparedStructureMismatch(thinkingPayload(emitted, api), prepared),
+				).toBeUndefined();
+				expect(preparedRows(prepared)).toEqual(hostRows(emitted));
+			});
+			test(`omp ${host.version}: ${api}: text and tool calls survive truncation`, () => {
+				for (const stopReason of ["length", "error", "aborted"]) {
+					for (const block of [
+						{ type: "text", text: "answer" },
+						{ type: "text", text: "" },
+						{ type: "toolCall", id: "call_A", name: "tool", arguments: {} },
+					]) {
+						const messages = thinkingHistory(stopReason);
+						(messages[1].content as unknown[]).push(block);
+						const emitted = host.transform(structuredClone(messages), model);
+						expect(
+							(emitted as Message[]).some((row) => row.role === "assistant"),
+						).toBe(true);
+						const prepared = piPreparedStructure(messages, model);
+						expect(preparedRows(prepared)).toEqual(hostRows(emitted));
+						expect(prepared?.messages[1].role).toBe("assistant");
+					}
+				}
+				const messages = thinkingHistory("stop");
+				expect(host.transform(structuredClone(messages), model)).toHaveLength(
+					3,
+				);
+				expect(piPreparedStructure(messages, model)?.messages).toHaveLength(3);
+			});
+		}
+	}
+	for (const host of hosts.filter((entry) => entry.host === "pi")) {
+		test(`pi ${host.version}: interrupted thinking keeps Pi's own transform rules`, () => {
+			for (const stopReason of ["length", "error", "aborted", "stop"]) {
+				const messages = thinkingHistory(stopReason);
+				const emitted = host.transform(structuredClone(messages), chatModel);
+				expect(emitted).toHaveLength(
+					stopReason === "error" || stopReason === "aborted" ? 2 : 3,
+				);
+				expect(
+					preparedRows(piPreparedStructure(messages, chatModel, "pi")),
+				).toEqual(hostRows(emitted));
+			}
+		});
+	}
+});
+
+for (const api of [
+	undefined,
+	"cursor-agent",
+	"gitlab-duo-agent",
+	"vertex-claude-api",
+	"opencode-free-zen",
+]) {
+	test(`unverified API ${api ?? "(no model)"}: thinking-only structure is byte-identical to base`, () => {
+		for (const stopReason of ["length", "error", "aborted", "stop"]) {
+			const model = api ? { ...chatModel, api } : undefined;
+			// Captured on c1becce52: without a verified host transform, retain the
+			// assistant row even when it contains only interrupted thinking.
+			const expected =
+				'{"messages":[{"role":"user","calls":[],"results":[],"timestamp":1},{"role":"assistant","calls":[],"results":[],"timestamp":2},{"role":"user","calls":[],"results":[],"timestamp":3}]' +
+				(api ? `,"api":"${api}"}` : "}");
+			expect(
+				JSON.stringify(piPreparedStructure(thinkingHistory(stopReason), model)),
+			).toBe(expected);
+		}
+	});
+}

@@ -36,6 +36,8 @@ export class EmbeddingWorkerClient {
         }
     >();
     private disposed = false;
+    private activeRequests = 0;
+    private idleTimer: ReturnType<typeof setTimeout> | null = null;
 
     constructor(
         private readonly data: Record<string, unknown>,
@@ -47,6 +49,7 @@ export class EmbeddingWorkerClient {
         ),
         private readonly timeoutMs = 5 * 60_000,
         private readonly prepareTelemetry = prepareNativeOnnxTelemetry,
+        private readonly idleMs = 10 * 60_000,
     ) {}
 
     private start(): Promise<ChildProcess | Worker> {
@@ -131,6 +134,7 @@ export class EmbeddingWorkerClient {
         });
         const fail = (error: Error) => {
             if (this.worker !== worker) return;
+            this.clearIdleTimer();
             this.worker = null;
             for (const request of this.pending.values()) {
                 clearTimeout(request.timer);
@@ -155,6 +159,39 @@ export class EmbeddingWorkerClient {
 
     async request(texts?: string[], signal?: AbortSignal): Promise<EmbeddingWorkerReply> {
         if (signal?.aborted) return Promise.reject(new Error("embedding request aborted"));
+        // Count the request and cancel idle shutdown before awaiting worker startup.
+        this.activeRequests++;
+        this.clearIdleTimer();
+        try {
+            return await this.requestOnWorker(texts, signal);
+        } finally {
+            this.activeRequests--;
+            this.armIdleTimer();
+        }
+    }
+
+    private clearIdleTimer(): void {
+        if (this.idleTimer) clearTimeout(this.idleTimer);
+        this.idleTimer = null;
+    }
+
+    private armIdleTimer(): void {
+        if (this.disposed || this.activeRequests !== 0 || !this.worker) return;
+        this.clearIdleTimer();
+        this.idleTimer = inRootAsyncContext(() =>
+            setTimeout(() => {
+                this.idleTimer = null;
+                // stop clears the worker before awaiting termination, so new requests can restart it.
+                void this.stop(new Error("embedding worker idle"));
+            }, this.idleMs),
+        );
+        this.idleTimer.unref();
+    }
+
+    private async requestOnWorker(
+        texts?: string[],
+        signal?: AbortSignal,
+    ): Promise<EmbeddingWorkerReply> {
         const worker = await this.start();
         if (this.disposed) throw new Error("embedding worker disposed");
         if (signal?.aborted) throw new Error("embedding request aborted");
@@ -202,6 +239,7 @@ export class EmbeddingWorkerClient {
     }
 
     private async stop(error: Error): Promise<void> {
+        this.clearIdleTimer();
         const worker = this.worker;
         this.worker = null;
         for (const request of this.pending.values()) {

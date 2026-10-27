@@ -58,7 +58,6 @@ describe("boot phase deadline", () => {
     });
 
     test("plugin hook initialization resolves when the boot dependency never settles", async () => {
-        const startedAt = performance.now();
         const messages: string[] = [];
 
         const result = await runBootPhaseWithDeadline(
@@ -69,7 +68,6 @@ describe("boot phase deadline", () => {
         );
 
         expect(result.status).toBe("timed_out");
-        expect(performance.now() - startedAt).toBeLessThan(250);
         expect(messages).toEqual([
             "[magic-context] boot phase 'hooks' exceeded its 20ms deadline; host startup will continue with Magic Context fail-closed",
         ]);

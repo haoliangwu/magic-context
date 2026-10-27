@@ -14,6 +14,7 @@ import {
 } from "../../features/magic-context/storage-meta-session";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { getWorkerShutdownStats } from "../../shared/worker-shutdown";
 import { clearAutoSearchForSession, runAutoSearchHint } from "./auto-search-runner";
 import { autoSearchTestSnapshot } from "./auto-search-snapshot.fixture";
 import { persistAutoSearchDecision, queueAutoSearchBackfill } from "./auto-search-worker-client";
@@ -223,6 +224,53 @@ test("cleanup discards an active backfill's late passage result after session re
         await new Promise((resolve) => setTimeout(resolve, 20));
         expect(loadAllEmbeddings(db, project, initial.modelId).has(memory.id)).toBe(false);
         expect(getAutoSearchHintDecisions(db, "active-cleanup")).toEqual([]);
+    } finally {
+        snapshot.mockRestore();
+        query.mockRestore();
+        batch.mockRestore();
+    }
+});
+
+test("cleanup closes an active backfill's worker before clearing the session", async () => {
+    const { db } = fixture();
+    const project = "git:active-close";
+    const initial = autoSearchTestSnapshot(project);
+    insertMemory(db, {
+        projectPath: project,
+        category: "ARCHITECTURE_DECISIONS",
+        content: "historian cache wiring details",
+    });
+    getOrCreateSessionMeta(db, "active-close");
+    const snapshot = spyOn(embedding, "getProjectEmbeddingSnapshot").mockReturnValue(initial);
+    const query = spyOn(embedding, "embedTextForProject").mockResolvedValue({
+        vector: new Float32Array([1, 0]),
+        modelId: initial.modelId,
+        chunkModelId: initial.chunkModelId,
+        generation: 1,
+    });
+    const reached = Promise.withResolvers<void>();
+    // The worker now waits for this batch with its writable connection open.
+    const batch = spyOn(embedding, "embedBatchForProject").mockImplementation(() => {
+        reached.resolve();
+        return new Promise(() => {});
+    });
+    const before = getWorkerShutdownStats().get("auto-search") ?? { graceful: 0, forced: 0 };
+    try {
+        const pending = queueAutoSearchBackfill(db, "active-close", project, "question");
+        await reached.promise;
+        expect(() => clearSession(db, "active-close")).not.toThrow();
+        await pending;
+        const deadline = Date.now() + 5_000;
+        while (
+            (getWorkerShutdownStats().get("auto-search")?.graceful ?? 0) === before.graceful &&
+            Date.now() < deadline
+        )
+            await new Promise((resolve) => setTimeout(resolve, 5));
+        // The worker closed its connection and exited by itself; it was not terminated.
+        expect(getWorkerShutdownStats().get("auto-search")).toEqual({
+            graceful: before.graceful + 1,
+            forced: before.forced,
+        });
     } finally {
         snapshot.mockRestore();
         query.mockRestore();

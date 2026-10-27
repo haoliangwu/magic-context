@@ -11,6 +11,7 @@ import {
 	applyFlushedStatuses,
 	applyPendingOperations,
 } from "@magic-context/core/hooks/magic-context/apply-operations";
+import { scaleTest } from "@magic-context/core/shared/slow-test";
 import { createTestTempDirFromPath } from "@magic-context/core/shared/test-temp-dir";
 import {
 	history,
@@ -21,43 +22,48 @@ import {
 import { createTestDb } from "./test-utils.test";
 
 for (const host of ["pi", "oc1", "oc2"] as const) {
-	test(`queued batch ${host}: 160 drops have three bounded commits and stay below 300ms`, () => {
-		const root = createTestTempDirFromPath(join(tmpdir(), "queued-count-"));
-		const db = createTestDb(join(root, "fixture.db"));
-		try {
-			seedHistory(db);
-			const raw = history(host, 160);
-			const tagged = project(host, raw, db, host === "pi");
-			db.transaction(() => {
-				for (const t of getTagsBySession(db, session).filter(
-					(t) => t.type === "tool",
-				))
-					queuePendingOp(db, session, t.tagNumber, "drop");
-			}).immediate();
-			const exec = db.exec.bind(db);
-			let commits = 0;
-			db.exec = ((sql: string) => {
-				const result = exec(sql);
-				if (sql === "COMMIT") commits++;
-				return result;
-			}) as typeof db.exec;
-			const start = performance.now();
-			expect(
-				applyPendingOperations(session, db, tagged.targets, new Set()),
-			).toBe(true);
-			tagged.commit();
-			const elapsed = performance.now() - start;
-			expect(commits).toBe(3);
-			expect(elapsed).toBeLessThan(300);
-			expect(getPendingOps(db, session)).toEqual([]);
-			expect(
-				getTagsBySession(db, session).filter((t) => t.status === "dropped"),
-			).toHaveLength(160);
-		} finally {
-			db.close();
-			rmSync(root, { recursive: true, force: true });
-		}
-	}, 30_000);
+	const boundedCommits = `queued batch ${host}: 160 drops have three bounded commits`;
+	scaleTest(
+		boundedCommits,
+		(slow) => {
+			const root = createTestTempDirFromPath(join(tmpdir(), "queued-count-"));
+			const db = createTestDb(join(root, "fixture.db"));
+			try {
+				seedHistory(db);
+				const raw = history(host, 160);
+				const tagged = project(host, raw, db, host === "pi");
+				db.transaction(() => {
+					for (const t of getTagsBySession(db, session).filter(
+						(t) => t.type === "tool",
+					))
+						queuePendingOp(db, session, t.tagNumber, "drop");
+				}).immediate();
+				const exec = db.exec.bind(db);
+				let commits = 0;
+				db.exec = ((sql: string) => {
+					const result = exec(sql);
+					if (sql === "COMMIT") commits++;
+					return result;
+				}) as typeof db.exec;
+				const start = performance.now();
+				expect(
+					applyPendingOperations(session, db, tagged.targets, new Set()),
+				).toBe(true);
+				tagged.commit();
+				const elapsed = performance.now() - start;
+				expect(commits).toBe(3);
+				if (slow) expect(elapsed).toBeLessThan(300);
+				expect(getPendingOps(db, session)).toEqual([]);
+				expect(
+					getTagsBySession(db, session).filter((t) => t.status === "dropped"),
+				).toHaveLength(160);
+			} finally {
+				db.close();
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+		30_000,
+	);
 
 	test(`queued batch ${host}: SIGKILL before first wire mutation replays committed drops exactly once`, () => {
 		const root = createTestTempDirFromPath(join(tmpdir(), "queued-crash-"));

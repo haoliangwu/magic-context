@@ -9,7 +9,7 @@ import {
     ensureContextStoreUuid,
     installAuthorityManagedMarker,
 } from "./legacy-authority-fixture.test-support";
-import { runMigrations } from "./migrations";
+import { MIGRATIONS, runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 
 const databases: DatabaseType[] = [];
@@ -204,6 +204,38 @@ describe("authority-managed context.db schema", () => {
 });
 
 describe("module changefeed mirror", () => {});
+
+it("v55 bakes the durable privilege predicate even when the runtime can register SQL functions", () => {
+    // Bun 1.4.4 added `db.function`, and node:sqlite has it too. v55 used to bake a
+    // connection-local function call into the guards on such runtimes; no connection
+    // registers that function, so every memories/notes write then failed with
+    // `no such function` until v71. Give this connection a `function` method so the
+    // test exercises that runtime shape on any Bun version.
+    const db = freshDatabase();
+    Object.defineProperty(db, "function", { configurable: true, value: () => db });
+    const v55 = MIGRATIONS.find((migration) => migration.version === 55);
+    if (!v55) throw new Error("migration v55 is missing");
+
+    db.transaction(() => v55.up(db)).immediate();
+
+    const triggerSql = (
+        db
+            .prepare(
+                "SELECT group_concat(sql, char(10)) AS sql FROM sqlite_master WHERE type = 'trigger' AND name LIKE '%authority_guard%'",
+            )
+            .get() as { sql?: string }
+    ).sql;
+    expect(triggerSql).not.toContain("mc_privileged_writer");
+    expect(triggerSql).toContain(
+        "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0",
+    );
+    db.prepare(
+        "INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, ?, ?, ?, 0, 0, 0, 0)",
+    ).run("/unmanaged", "CONSTRAINTS", "written after v55", "v55-hash");
+    db.prepare(
+        "INSERT INTO notes (type, status, content, project_path, created_at, updated_at) VALUES ('smart', 'active', 'written after v55', ?, 0, 0)",
+    ).run("/unmanaged");
+});
 
 it("reinstalls the latest authority triggers after replaying a legacy batch", () => {
     const db = freshDatabase();

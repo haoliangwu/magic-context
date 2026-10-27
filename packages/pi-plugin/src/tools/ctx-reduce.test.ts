@@ -114,7 +114,9 @@ describe("Pi ctx_reduce tool", () => {
 			const empty = await callDrop({ db, sessionId, drop: "" });
 			expect(empty.text).toBe(omitted.text);
 			expect(empty.isError).toBe(true);
-			expect(empty.text).toContain("'drop' must be provided");
+			expect(empty.text).toBe(
+				`Error: 'drop' must be provided as a string of tag numbers, for example {"drop": "3-5,8"}.`,
+			);
 			expect(getPendingOps(db, sessionId)).toHaveLength(0);
 		} finally {
 			closeQuietly(db);
@@ -386,8 +388,8 @@ describe("Pi ctx_reduce tool", () => {
 			fakeContext(sessionId) as never,
 		);
 		expect(result.isError).toBe(true);
-		expect((result.content[0] as { text: string }).text).toContain(
-			"'drop' must",
+		expect((result.content[0] as { text: string }).text).toBe(
+			`Error: 'drop' must be provided as a string of tag numbers, for example {"drop": "3-5,8"}.`,
 		);
 	});
 

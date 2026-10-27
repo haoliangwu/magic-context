@@ -450,6 +450,19 @@ export class V2StoreReaderPool {
     }
 }
 
+/**
+ * The stored-times read for `count` message ids of one session. The ids are
+ * looked up through the primary key; `+session_id` keeps SQLite from choosing
+ * the host's (session_id, time_created, id) index instead, which walks every
+ * row of the session for each batch of ids. The session is still checked on
+ * each row found.
+ */
+export function messageTimesQuery(count: number): string {
+    return `SELECT id, COALESCE(time_created, json_extract(data, '$.time.created')) AS created,
+                   json_extract(data, '$.time.completed') AS completed
+            FROM session_message WHERE +session_id = ? AND id IN (${Array.from({ length: count }, () => "?").join(",")})`;
+}
+
 /** Opens an existing store read-only; missing/corrupt stores propagate errors, never an empty history. */
 export class V2StoreReader {
     private readonly db: Database;
@@ -603,6 +616,16 @@ export class V2StoreReader {
             ).get(sessionID, ...RAW_MESSAGE_TYPES) as { count?: number } | undefined;
             return typeof row?.count === "number" ? row.count : 0;
         });
+    }
+
+    /** Count only appended conversational rows, using the host's session/sequence index. */
+    messageCountAfterSequence(sessionID: string, after: number, through: number): number {
+        const rawTypes = RAW_MESSAGE_TYPES.map(() => "?").join(", ");
+        const row = this.prepare(
+            `SELECT COUNT(*) AS count FROM session_message
+             WHERE session_id = ? AND seq > ? AND seq <= ? AND type IN (${rawTypes})`,
+        ).get(sessionID, after, through, ...RAW_MESSAGE_TYPES) as { count?: number } | undefined;
+        return typeof row?.count === "number" ? row.count : 0;
     }
 
     /**
@@ -833,11 +856,10 @@ export class V2StoreReader {
         // or the session's archived history. Bound each query's parameter count.
         for (let offset = 0; offset < ids.length; offset += 500) {
             const batch = ids.slice(offset, offset + 500);
-            const rows = this.prepare(
-                `SELECT id, COALESCE(time_created, json_extract(data, '$.time.created')) AS created,
-                        json_extract(data, '$.time.completed') AS completed
-                 FROM session_message WHERE session_id = ? AND id IN (${batch.map(() => "?").join(",")})`,
-            ).all(sessionID, ...batch) as Array<{
+            const rows = this.prepare(messageTimesQuery(batch.length)).all(
+                sessionID,
+                ...batch,
+            ) as Array<{
                 id: string;
                 created: number | null;
                 completed: number | null;

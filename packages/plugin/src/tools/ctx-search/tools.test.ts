@@ -48,6 +48,107 @@ describe("createCtxSearchTools", () => {
         closeQuietly(db);
     });
 
+    it("hosted reranking reaches OpenCode output and cancellation without exposing the key", async () => {
+        const originalSearch = searchModule.unifiedSearch;
+        // Repeated comparisons must not change retrieval counters and reorder tied hits.
+        const search = spyOn(searchModule, "unifiedSearch").mockImplementation(
+            (database, session, project, query, options) =>
+                originalSearch(database, session, project, query, {
+                    ...options,
+                    countRetrievals: false,
+                    measurementDisabled: true,
+                }),
+        );
+        const key = "FAKE_OPENCODE_RERANK_KEY_765";
+        let mode = "success";
+        let calls = 0;
+        let started: (() => void) | undefined;
+        const server = Bun.serve({
+            port: 0,
+            hostname: "127.0.0.1",
+            async fetch(req) {
+                calls++;
+                expect(req.headers.get("Authorization")).toBe(`Bearer ${key}`);
+                const { documents } = (await req.json()) as { documents: string[] };
+                if (mode === "abort") {
+                    started?.();
+                    return new Promise<Response>(() => {});
+                }
+                if (mode === "failure") return new Response(key, { status: 401 });
+                return Response.json({
+                    results: documents.map((_, index) => ({ index, relevance_score: index })),
+                });
+            },
+        });
+        const query = "why does prompt cache budget stay stable";
+        for (let i = 0; i < 3; i++)
+            insertMemory(db, {
+                projectPath: "git:rerank",
+                category: "ARCHITECTURE",
+                content: `prompt cache budget stable memory ${i}`,
+            });
+        const deps = {
+            db,
+            resolveProjectPath: () => "git:rerank",
+            embeddingEnabled: false,
+            memoryEnabled: true,
+            readMessages: () => [],
+            rerankConnectionFile: "/nonexistent/rerank-test-765",
+        };
+        const config = {
+            provider: "remote" as const,
+            endpoint: String(server.url),
+            model: "reranker",
+            api_key: key,
+            timeout_ms: 1500,
+            top_n: 20,
+        };
+        try {
+            const defaults = createCtxSearchTools(deps);
+            const off = createCtxSearchTools({
+                ...deps,
+                rerankConfig: { provider: "off", timeout_ms: 1500, top_n: 20 },
+            });
+            const baseline = await defaults.ctx_search.execute(
+                { query, sources: ["memory"] },
+                toolContext(),
+            );
+            expect(baseline).toBe(
+                await off.ctx_search.execute({ query, sources: ["memory"] }, toolContext()),
+            );
+            expect(calls).toBe(0);
+            const tools = createCtxSearchTools({ ...deps, rerankConfig: config });
+            const success = await tools.ctx_search.execute(
+                { query, sources: ["memory"] },
+                toolContext(),
+            );
+            expect(success).not.toContain("Reranking skipped");
+            expect(success).not.toBe(baseline);
+            mode = "failure";
+            expect(
+                await tools.ctx_search.execute({ query, sources: ["memory"] }, toolContext()),
+            ).toBe(`${baseline}\nReranking skipped: http_401`);
+            mode = "abort";
+            const seen = new Promise<void>((resolve) => {
+                started = resolve;
+            });
+            const controller = new AbortController();
+            const pending = tools.ctx_search.execute({ query, sources: ["memory"] }, {
+                sessionID: "ses-search",
+                abort: controller.signal,
+            } as never);
+            await seen;
+            controller.abort(new Error(key));
+            const aborted = await pending;
+            expect(aborted).toBe(`${baseline}\nReranking skipped: aborted`);
+            expect(aborted).not.toContain(key);
+            expect(calls).toBe(3);
+        } finally {
+            search.mockRestore();
+            server.stop(true);
+        }
+    });
+
     it("validates required query", async () => {
         const tools = createCtxSearchTools({
             db,

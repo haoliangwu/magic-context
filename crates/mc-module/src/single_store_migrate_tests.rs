@@ -690,21 +690,6 @@ fn a_store_upgraded_to_the_latest_schema_remains_recognized_as_migrated() {
 }
 
 #[test]
-fn a_dry_run_reports_and_leaves_both_files_unchanged() {
-    let fixture = Fixture::new(Extras::default());
-    let before = fixture.digest();
-    let mut options = fixture.options("backup");
-    options.dry_run = true;
-    let report = run(&options, &mut NoHooks).unwrap();
-    assert_eq!(report.status, "dry_run");
-    assert!(report
-        .projects
-        .iter()
-        .any(|entry| entry.project == STORE_PROJECT));
-    assert_eq!(fixture.digest(), before);
-}
-
-#[test]
 fn a_dry_run_writes_nothing_and_leaves_the_backup_directory_free_for_the_real_run() {
     let fixture = Fixture::new(Extras::default());
     let file_bytes = |path: &Path| {
@@ -720,6 +705,10 @@ fn a_dry_run_writes_nothing_and_leaves_the_backup_directory_free_for_the_real_ru
     options.dry_run = true;
     let report = run(&options, &mut NoHooks).unwrap();
     assert_eq!(report.status, "dry_run");
+    assert!(report
+        .projects
+        .iter()
+        .any(|entry| entry.project == STORE_PROJECT));
     assert_eq!(report.backup_dir, None, "a dry run backs nothing up");
     assert!(
         !fixture.root.join("backup").exists(),

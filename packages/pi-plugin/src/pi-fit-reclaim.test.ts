@@ -1,4 +1,5 @@
 import { expect, it, spyOn } from "bun:test";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import {
 	getPendingOps,
@@ -137,6 +138,47 @@ it("upper-only reservations compare-and-set before work and release only a faile
 		db.close();
 	}
 });
+
+it("failed upper-reclaim cleanup never waits for a competing writer", () => {
+	const { dir } = createTestTempDir("pi-fit-cleanup-");
+	const path = join(dir, "claims.db");
+	const db = createTestDb(path);
+	const other = createTestDb(path);
+	const sessionId = "fit-cleanup-busy";
+	const cursor = piUpperReclaimCursor({
+		sessionId,
+		modelKey: "mock/mock",
+		messageCount: 1,
+		input: [userMessage("same", 1)],
+	});
+	if (!cursor) throw new Error("fixture cursor missing");
+	try {
+		const reservation = reservePiUpperEstimateReclaim(db, cursor);
+		if (!reservation) throw new Error("reservation missing");
+		db.exec("PRAGMA busy_timeout=5000");
+		other.exec("BEGIN IMMEDIATE");
+		const start = performance.now();
+		expect(() =>
+			releasePiUpperEstimateReclaim(db, cursor, reservation),
+		).toThrow(/locked|busy/i);
+		expect(performance.now() - start).toBeLessThan(300);
+		expect(other.inTransaction).toBe(true);
+		other.exec("ROLLBACK");
+		expect(
+			readReplayEnvelope(db, sessionId).piUpperEstimateReclaim,
+		).toHaveProperty("reservation", reservation);
+		releasePiUpperEstimateReclaim(db, cursor, reservation);
+		expect(
+			readReplayEnvelope(db, sessionId).piUpperEstimateReclaim,
+		).toBeUndefined();
+	} finally {
+		if (other.inTransaction) other.exec("ROLLBACK");
+		clearPiUpperReclaimSession(sessionId);
+		other.close();
+		db.close();
+		rmSync(dir, { recursive: true, force: true });
+	}
+}, 10000);
 
 it("upper-only claim has one winner across simultaneous processes", async () => {
 	const { dir } = createTestTempDir("pi-fit-process-cas-");

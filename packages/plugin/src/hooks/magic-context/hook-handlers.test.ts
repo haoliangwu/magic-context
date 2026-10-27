@@ -1021,7 +1021,7 @@ describe("createToolExecuteAfterHook Channel-1 dampening", () => {
                         call[0] === sessionId && String(call[1]).startsWith("channel1 evaluation:"),
                 )
                 .map((call) => String(call[1]));
-            expect(evaluations).toHaveLength(4);
+            expect(evaluations).toHaveLength(3);
             for (const evaluation of evaluations) {
                 expect(evaluation).toContain(" U=");
                 expect(evaluation).toContain(" T=");

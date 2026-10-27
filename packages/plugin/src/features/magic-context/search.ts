@@ -3,7 +3,9 @@ import { cleanSearchText, keywordRelevance, matchedSearchSnippet } from "../../s
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import {
     loadCompartmentChunkEmbeddingsForSearch,
+    peekCompartmentChunkSearchPool,
     type StoredCompartmentChunkEmbedding,
+    warmCompartmentChunkSearchPool,
 } from "./compartment-chunk-embedding";
 import { type GitCommitSearchHit, searchGitCommitsSync } from "./git-commits";
 import { containsProbeVerbatim, extractLiteralProbes } from "./literal-probes";
@@ -35,6 +37,7 @@ import {
     isProseQuery,
     logRerankFallback,
     prepareReranker,
+    remoteRerankSkipped,
     rerankSearchResults,
     type SearchLanes,
 } from "./search-rerank";
@@ -142,6 +145,8 @@ export interface UnifiedSearchOptions {
     rerankConnectionFile?: string;
     /** Optional service for offline comparisons and protocol tests. Null explicitly represents an unavailable Synapse service. */
     rerankClient?: SynapseClientLike | null;
+    rerankConfig?: import("../../config/schema/magic-context").RerankConfig;
+    onRerankSkipped?: (line: string) => void;
     /** Optional offline measurement sink, populated without repeating the original retrieval passes. */
     captureRerankLanes?: (lanes: SearchLanes) => void;
     /** Earliest persisted source timestamp in epoch milliseconds (inclusive). */
@@ -216,6 +221,34 @@ export interface UnifiedSearchOptions {
     searchMessageHistory?: (
         request: MessageHistorySearchRequest,
     ) => Promise<MessageHistorySearchOutcome | null>;
+    /**
+     * Search the history-chunk vectors only when this thread's decoded pool for
+     * the session is already warm (see `peekCompartmentChunkSearchPool`). A cold
+     * pool leaves those vectors out of this search and starts a background warm
+     * on this thread. Automatic hints set it, so a turn never waits for a pool
+     * build.
+     */
+    chunkPoolWarmOnly?: boolean;
+    /** Optional sink for how long each lane took. Durations and states only. */
+    stepTimings?: UnifiedSearchStepTimings;
+}
+
+/** Durations, in milliseconds, of the parts of one {@link unifiedSearch}. */
+export interface UnifiedSearchStepTimings {
+    /** The message-history full-text lane. */
+    messageMs?: number;
+    /** Waiting for the query embedding after the message lane finished. */
+    vectorWaitMs?: number;
+    /** The history-chunk vector lane, including any pool load. */
+    chunkMs?: number;
+    /**
+     * warm: searched an already decoded pool; cold: the pool was not warm, so
+     * the lane was skipped; loaded: the pool was loaded (and refreshed) for this
+     * search; no-vector: there was no query vector; off: the lane did not run.
+     */
+    chunkPool?: "warm" | "cold" | "loaded" | "no-vector" | "off";
+    /** Memory, git-commit, primer and note lanes, which run together. */
+    otherLanesMs?: number;
 }
 
 /** Everything the message-history lane needs, in a form a worker can receive. */
@@ -1735,17 +1768,68 @@ async function searchCompartmentChunks(args: {
     maxOrdinal?: number;
     modelId?: string | null;
     dateRange: InclusiveDateRange | null;
+    warmOnly?: boolean;
+    signal?: AbortSignal;
+    timings?: UnifiedSearchStepTimings;
 }): Promise<CompartmentSearchResult[]> {
-    if (!args.queryEmbedding || args.limit <= 0 || !args.modelId || args.modelId === "off")
+    if (args.limit <= 0 || !args.modelId || args.modelId === "off") {
+        if (args.timings) args.timings.chunkPool = "off";
         return [];
+    }
+    if (!args.queryEmbedding) {
+        if (args.timings) args.timings.chunkPool = "no-vector";
+        // A late query vector is common for automatic hints. Warm the pool now
+        // anyway, so a later turn whose vector does arrive finds it ready.
+        if (args.warmOnly)
+            void warmCompartmentChunkSearchPool(
+                args.db,
+                args.sessionId,
+                args.projectPath,
+                args.modelId,
+            );
+        return [];
+    }
     const cutoff = args.maxOrdinal != null && args.maxOrdinal >= 0 ? args.maxOrdinal : null;
-    const rows = await loadCompartmentChunkEmbeddingsForSearch(
-        args.db,
-        args.sessionId,
-        args.projectPath,
-        args.modelId,
-        args.dateRange,
-    );
+    let rows: StoredCompartmentChunkEmbedding[];
+    if (args.warmOnly) {
+        const warm = peekCompartmentChunkSearchPool(
+            args.db,
+            args.sessionId,
+            args.projectPath,
+            args.modelId,
+            args.dateRange,
+        );
+        if (warm === null) {
+            if (args.timings) args.timings.chunkPool = "cold";
+            // Never throws. It runs between this thread's later work, which
+            // already yields between pages and batches.
+            void warmCompartmentChunkSearchPool(
+                args.db,
+                args.sessionId,
+                args.projectPath,
+                args.modelId,
+            );
+            return [];
+        }
+        if (args.timings) args.timings.chunkPool = "warm";
+        rows = warm;
+    } else {
+        try {
+            rows = await loadCompartmentChunkEmbeddingsForSearch(
+                args.db,
+                args.sessionId,
+                args.projectPath,
+                args.modelId,
+                args.dateRange,
+                args.signal,
+            );
+        } catch (error) {
+            // The caller gave up; the caller's own abort check discards the search.
+            if (args.signal?.aborted) return [];
+            throw error;
+        }
+        if (args.timings) args.timings.chunkPool = "loaded";
+    }
     if (rows.length === 0) return [];
 
     const byCompartment = new Map<
@@ -2222,6 +2306,7 @@ export async function unifiedSearch(
                   sessionId,
                   options.rerankConnectionFile,
                   options.rerankClient,
+                  options.rerankConfig,
               )
             : null;
     const lanes = reranker || options.captureRerankLanes ? emptySearchLanes() : undefined;
@@ -2303,6 +2388,8 @@ export async function unifiedSearch(
     // Multi-probe recall is opt-in for explicit searches only. NL queries
     // yield no probes, so this is a no-op for them regardless of the flag.
     const messageProbes = options.explicitSearch ? extractLiteralProbes(trimmedQuery) : [];
+    const timings = options.stepTimings;
+    let stepStartedAt = performance.now();
     let messageResults: MessageSearchResult[] = [];
     if (runMessages) {
         const messageRequest: MessageHistorySearchRequest = {
@@ -2335,11 +2422,14 @@ export async function unifiedSearch(
             (result) => result.messageId !== options.excludeMessageId,
         );
         if (lanes) lanes.message_fts = (outcome.laneResults ?? outcome.results).slice(0, 25);
+        if (timings) timings.messageMs = performance.now() - stepStartedAt;
     }
 
     // Wait for the single embed call (if any) and then run the two
     // embedding-dependent searches in parallel using the same vector.
+    stepStartedAt = performance.now();
     const capturedQuery = await queryEmbeddingPromise;
+    if (timings && needsEmbedding) timings.vectorWaitMs = performance.now() - stepStartedAt;
     // A provider may ignore cancellation and resolve after the hint deadline.
     // Do not turn that late vector into another synchronous database scan.
     if (options.signal?.aborted) return [];
@@ -2359,6 +2449,8 @@ export async function unifiedSearch(
         queryContract?.chunkModelId ??
         options.chunkModelIdOverride ??
         embeddingSnapshot?.chunkModelId;
+    stepStartedAt = performance.now();
+    if (timings) timings.chunkPool = "off";
     const compartmentResults = runCompartmentChunks
         ? await searchCompartmentChunks({
               db,
@@ -2369,8 +2461,13 @@ export async function unifiedSearch(
               maxOrdinal: options.maxMessageOrdinal,
               modelId: chunkModelId && chunkModelId !== "off" ? chunkModelId : null,
               dateRange,
+              warmOnly: options.chunkPoolWarmOnly,
+              signal: options.signal,
+              timings,
           })
         : [];
+    if (timings && runCompartmentChunks) timings.chunkMs = performance.now() - stepStartedAt;
+    stepStartedAt = performance.now();
     if (lanes) lanes.chunk_vector = compartmentResults.slice(0, 25);
     const messageLikeResults = mergeMessageAndCompartmentResults({
         messages: messageResults,
@@ -2444,6 +2541,7 @@ export async function unifiedSearch(
             : Promise.resolve([] as NoteSearchResult[]),
     ]);
 
+    if (timings) timings.otherLanesMs = performance.now() - stepStartedAt;
     if (options.diagnostics) {
         options.diagnostics.suppressedVisibleMemoryIds = memoryOutcome.suppressedVisibleIds;
     }
@@ -2464,7 +2562,10 @@ export async function unifiedSearch(
         options.captureRerankLanes?.(lanes);
     }
     if (reranker && lanes) {
-        const pool = fuseSearchLanes(lanes);
+        const pool = fuseSearchLanes(lanes).slice(
+            0,
+            "remote" in reranker ? reranker.remote.top_n : 20,
+        );
         try {
             results = await rerankSearchResults(
                 reranker,
@@ -2473,9 +2574,13 @@ export async function unifiedSearch(
                 pool,
                 candidateTexts(db, sessionId, projectPath, pool),
                 limit,
+                options.signal,
+                options.onRerankSkipped,
             );
         } catch {
-            logRerankFallback("candidate_validation");
+            if ("remote" in reranker)
+                remoteRerankSkipped("candidate_validation", options.onRerankSkipped);
+            else logRerankFallback("candidate_validation");
         }
     }
 

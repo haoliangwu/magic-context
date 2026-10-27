@@ -1,366 +1,20 @@
 import { expect, spyOn, test } from "bun:test";
-import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import * as configLoader from "../../config";
-import { MagicContextConfigSchema } from "../../config/schema/magic-context";
-import { appendCompartments } from "../../features/magic-context/compartment-storage";
-import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
 import * as retention from "../../features/magic-context/storage-host-instruction-retention";
 import { setHostInstructionRetentionEnabledForTests } from "../../features/magic-context/storage-host-instruction-retention";
 import * as incremental from "../../hooks/magic-context/compartment-runner-incremental";
-import { resetCtxReduceRegisteredGloballyForTest } from "../../hooks/magic-context/ctx-reduce-availability";
-import { resetLkgSlotsForTest } from "../../hooks/magic-context/lkg-slot";
-import * as transformModule from "../../hooks/magic-context/transform";
-import { _resetDreamTimerForTests } from "../../plugin/dream-timer";
-import { setHarness } from "../../shared/harness";
-import * as logger from "../../shared/logger";
+import { getSlot } from "../../hooks/magic-context/lkg-slot";
 import * as models from "../../shared/models-dev-cache";
-import { resetOpenCodeDbPathStateForTesting } from "../../shared/opencode-db-path";
-import * as sqlite from "../../shared/sqlite";
-import { Database } from "../../shared/sqlite";
-import { cleanupTestTempDir, createTestTempDirFromPath } from "../../shared/test-temp-dir";
-import { resetHostMediaForTests } from "../fold/host-media";
-import { registerContext } from "./context";
-import * as storageGate from "./storage-gate";
-import type { SessionContext, V2Context, V2Message } from "./types";
-
-const prose =
-    "Please review the implementation and verify the results carefully before we continue with the next deployment cache invalidation step. ";
-
-type Row = {
-    id: string;
-    type: "user" | "assistant" | "system";
-    text: string;
-    created: number;
-    seq: number;
-    /** Provider input tokens recorded on an assistant row (drives context usage). */
-    inputTokens?: number;
-};
-
-/**
- * A real OpenCode 2 context hook over an isolated store. Rows carry 10-minute
- * gaps (so temporal markers render) and OpenCode 2 instruction-update `system`
- * rows, which the host renders as id-less system messages.
- */
-async function fixture(
-    seed: number,
-    {
-        provider = "openai",
-        model = "gpt-4.1",
-        cacheTtl = "5m",
-        historian = false,
-        instructions = true,
-        temporal = true,
-    } = {},
-) {
-    setHarness("opencode2");
-    const base = join(tmpdir(), "magic-context/issue-750");
-    mkdirSync(base, { recursive: true });
-    const root = createTestTempDirFromPath(join(base, `seed-${seed}-`));
-    const keys = [
-        "HOME",
-        "XDG_DATA_HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_CACHE_HOME",
-        "XDG_STATE_HOME",
-        "MAGIC_CONTEXT_STORAGE_DIR",
-        "MAGIC_CONTEXT_LOG_PATH",
-        "OPENCODE_DB",
-        "MC_OC2_INVISIBLE_FOLD",
-    ];
-    const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
-    for (const key of keys.filter((key) => key !== "MC_OC2_INVISIBLE_FOLD"))
-        process.env[key] = join(root, key);
-    delete process.env.MC_OC2_INVISIBLE_FOLD;
-    const start = 1770000000000 + seed * 100000000;
-    let nowClock = start;
-    const clock = spyOn(Date, "now").mockImplementation(() => nowClock);
-    for (const key of keys.filter(
-        (key) => !["MAGIC_CONTEXT_LOG_PATH", "OPENCODE_DB", "MC_OC2_INVISIBLE_FOLD"].includes(key),
-    ))
-        mkdirSync(process.env[key]!, { recursive: true });
-    resetOpenCodeDbPathStateForTesting();
-    const raw = new Database(process.env.OPENCODE_DB!);
-    raw.exec(
-        "CREATE TABLE IF NOT EXISTS session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT); CREATE TABLE IF NOT EXISTS session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL, parent_id TEXT, fork_session_id TEXT, fork_boundary TEXT);",
-    );
-    const db = openDatabase();
-    if (!db) throw new Error("isolated database unavailable");
-    const realRoot = realpathSync(root);
-    for (const row of db.prepare("PRAGMA database_list").all() as Array<{ file: string }>)
-        if (row.file && !row.file.startsWith(`${root}/`) && !row.file.startsWith(`${realRoot}/`))
-            throw new Error("database escaped isolated root");
-    const config = MagicContextConfigSchema.parse({
-        auto_update: false,
-        embedding: { provider: "off" },
-        historian: { disable: !historian },
-        dreamer: { disable: true },
-        memory: { enabled: false, git_commit_indexing: { enabled: false } },
-        temporal_awareness: temporal,
-        mural: { enabled: false },
-        protected_tokens: 4000,
-        commit_cluster_trigger: { enabled: false },
-        cache_ttl: cacheTtl,
-    });
-    const configPath = join(process.env.XDG_CONFIG_HOME!, "cortexkit");
-    mkdirSync(configPath, { recursive: true });
-    writeFileSync(join(configPath, "magic-context.jsonc"), JSON.stringify(config));
-    const load = spyOn(configLoader, "loadPluginConfigDetailed").mockReturnValue({
-        config,
-    } as ReturnType<typeof configLoader.loadPluginConfigDetailed>);
-    const probe = spyOn(storageGate, "probeV2StorageAtBoot").mockResolvedValue(db);
-    const logs = spyOn(logger, "sessionLog");
-    const storage = new Map<string, unknown>();
-    let hooks = new Map<string, (draft: SessionContext) => Promise<void>>();
-    let duties: Awaited<ReturnType<typeof registerContext>> | undefined;
-    const host = {
-        location: { directory: root },
-        agent: { transform: async () => {}, reload: async () => {} },
-        model: {
-            list: () => [{ id: model, providerID: provider, limit: { context: 1000000 } }],
-        },
-        storage: {
-            get: async (key: string) => storage.get(key),
-            set: async (key: string, value: unknown) => {
-                storage.set(key, structuredClone(value));
-            },
-        },
-        event: { subscribe: async function* () {} },
-        tool: { hook: async () => {} },
-        session: {
-            remove: async () => {},
-            compact: async () => {},
-            interrupt: async () => ({ interrupted: true }),
-            hook: async (name: string, callback: (draft: SessionContext) => Promise<void>) => {
-                hooks.set(name, callback);
-            },
-            get: async () => ({ location: { directory: root } }),
-        },
-    } as unknown as V2Context;
-    const session = `ses750-${seed}`;
-    raw.prepare("INSERT OR IGNORE INTO session_v2(id,directory) VALUES (?,?)").run(session, root);
-    const rows: Row[] = [];
-    // Store order: every row and host compaction takes the next seq, so rows
-    // written after a checkpoint sort after it, as on the real host.
-    let nextSeq = 0;
-    let turn = 0;
-    const addRow = (type: Row["type"], text: string, advanceMs = 600000) => {
-        rows.push({ id: `r${seed}-${rows.length}`, type, text, created: nowClock, seq: nextSeq++ });
-        nowClock += advanceMs;
-    };
-    const addTurn = () => {
-        addRow("assistant", `${seed}/${turn}: ${prose.repeat(2 + ((seed + turn) % 5))}`);
-        addRow("user", `${seed}/${turn}: ${prose.repeat(1 + ((seed + turn) % 3))}`);
-        turn++;
-    };
-    const persist = () => {
-        raw.prepare(
-            "DELETE FROM session_message WHERE session_id = ? AND type != 'compaction'",
-        ).run(session);
-        for (const row of rows) {
-            const data =
-                row.type === "assistant"
-                    ? {
-                          content: [{ type: "text", text: row.text }],
-                          model: { providerID: provider, id: model },
-                          time: { created: row.created, completed: row.created + 1000 },
-                          tokens: {
-                              input: row.inputTokens ?? 10000,
-                              output: 50,
-                              reasoning: 0,
-                              cache: { read: 0, write: 0 },
-                          },
-                      }
-                    : { text: row.text, time: { created: row.created } };
-            raw.prepare(
-                "INSERT INTO session_message(id,session_id,type,seq,time_created,data) VALUES (?,?,?,?,?,?)",
-            ).run(row.id, session, row.type, row.seq, row.created, JSON.stringify(data));
-        }
-    };
-    const render = (row: Row): V2Message =>
-        row.type === "system"
-            ? { role: "system", content: [{ type: "text", text: row.text }] }
-            : { id: row.id, role: row.type, content: [{ type: "text", text: row.text }] };
-    let checkpoint: V2Message | undefined;
-    let hostWindowStart = 0;
-    let lastDraft: SessionContext | undefined;
-    const inputDraft = (): SessionContext => ({
-        sessionID: session,
-        model: { providerID: provider, id: model, limit: { context: 1000000 } },
-        agent: "build",
-        system: [{ type: "text", text: "Review the isolated project." }],
-        tools: { read: { description: "Read a file", input: { type: "object" } } },
-        options: {},
-        messages: structuredClone([
-            ...(checkpoint ? [checkpoint] : []),
-            ...rows.slice(hostWindowStart).map(render),
-        ]),
-    });
-    addRow("user", `${seed}: start ${prose.repeat(2)}`);
-    for (let n = 0; n < 12; n++) {
-        addTurn();
-        if (instructions && (n === 2 || n === 6 || n === 8))
-            addRow("system", `Today's date is now: day ${n}.`);
-    }
-    persist();
-    const startHook = async () => {
-        await duties?.dispose();
-        resetCtxReduceRegisteredGloballyForTest();
-        resetLkgSlotsForTest();
-        hooks = new Map();
-        duties = await registerContext(host);
-        if (!hooks.has("context")) throw new Error("real context hook missing");
-    };
-    await startHook();
-    const ordinalOf = (id: string) => rows.findIndex((row) => row.id === id) + 1;
-    let compartments = 0;
-    let coveredThrough = -1;
-    return {
-        db,
-        raw,
-        rows,
-        session,
-        /** A new plugin process over the same stores (an upgrade restart). */
-        restart: startHook,
-        get coveredThrough() {
-            return coveredThrough;
-        },
-        async pass() {
-            const draft = inputDraft();
-            const before = logs.mock.calls.length;
-            await hooks.get("context")!(draft);
-            lastDraft = structuredClone(draft);
-            return {
-                draft,
-                bytes: JSON.stringify({ system: draft.system, messages: draft.messages }),
-                logs: logs.mock.calls.slice(before).map((args) => args.map(String).join(" ")),
-            };
-        },
-        /** A pass whose refusal is returned rather than thrown. */
-        async attempt() {
-            const draft = inputDraft();
-            const before = logs.mock.calls.length;
-            let error: unknown;
-            try {
-                await hooks.get("context")!(draft);
-            } catch (caught) {
-                error = caught;
-            }
-            return {
-                draft,
-                error,
-                logs: logs.mock.calls.slice(before).map((args) => args.map(String).join(" ")),
-            };
-        },
-        /** Publish the next compartment, covering rows through `endIndex` (a served row). */
-        compartment(endIndex: number) {
-            if (rows[endIndex]!.type === "system") throw new Error("boundary must be served");
-            const sequence = compartments++;
-            const startIndex = coveredThrough + 1;
-            coveredThrough = endIndex;
-            appendCompartments(db, session, [
-                {
-                    sequence,
-                    startMessage: startIndex + 1,
-                    endMessage: endIndex + 1,
-                    startMessageId: rows[startIndex]!.id,
-                    endMessageId: rows[endIndex]!.id,
-                    title: `Review history ${sequence}`,
-                    content: prose.repeat(3),
-                    p1: prose.repeat(3),
-                    p2: prose.repeat(2),
-                    p3: "Reviewed the cache policy.",
-                    p4: "Cache policy reviewed.",
-                    legacy: 0,
-                },
-            ]);
-            return ordinalOf(rows[endIndex]!.id);
-        },
-        /** The host folds: a compaction row after every row, then a short host window. */
-        async fold(windowRows = 3) {
-            const draft = structuredClone(lastDraft!);
-            await hooks.get("compaction")!(draft);
-            if (!draft.result) throw new Error("compaction hook supplied no summary");
-            const id = `fold-${seed}-${rows.length}`;
-            raw.prepare(
-                "INSERT INTO session_message(id,session_id,type,seq,time_created,data) VALUES (?,?,?,?,?,?)",
-            ).run(
-                id,
-                session,
-                "compaction",
-                nextSeq++,
-                Date.now(),
-                JSON.stringify({
-                    status: "completed",
-                    summary: draft.result.summary,
-                    time: { completed: Date.now() },
-                }),
-            );
-            checkpoint = {
-                id,
-                role: "user",
-                content: [{ type: "text", text: `<summary>\n${draft.result.summary}\n</summary>` }],
-            };
-            hostWindowStart = rows.length - windowRows;
-        },
-        /** Let the provider cache expire, so the next pass may rebuild the prefix. */
-        idle(hours = 3) {
-            nowClock += hours * 3600000;
-        },
-        /** The provider answers the last request: a new assistant row completes now. */
-        respond(repeat = 1, inputTokens?: number) {
-            addRow("assistant", `${seed}/reply ${rows.length}: ${prose.repeat(repeat)}`, 5000);
-            if (inputTokens !== undefined) rows[rows.length - 1]!.inputTokens = inputTokens;
-            persist();
-        },
-        /** A user turn after `gapMs` of quiet, optionally carrying an injected reminder. */
-        user(text: string, gapMs: number) {
-            nowClock += gapMs;
-            addRow("user", text, 1000);
-            persist();
-        },
-        /** An OpenCode 2 instruction update (for example the daily date line). */
-        instruction(text: string) {
-            addRow("system", text, 1000);
-            persist();
-        },
-        async cleanup() {
-            await duties?.dispose();
-            logs.mockRestore();
-            probe.mockRestore();
-            load.mockRestore();
-            clock.mockRestore();
-            _resetDreamTimerForTests();
-            closeDatabase();
-            raw.close();
-            resetLkgSlotsForTest();
-            resetCtxReduceRegisteredGloballyForTest();
-            for (const key of keys) {
-                if (saved[key] === undefined) delete process.env[key];
-                else process.env[key] = saved[key];
-            }
-            resetOpenCodeDbPathStateForTesting();
-            resetHostMediaForTests();
-            cleanupTestTempDir(root);
-        },
-    };
-}
-
-function firstDivergence(a: V2Message[], b: V2Message[]): string | null {
-    for (let index = 0; index < Math.max(a.length, b.length); index++) {
-        const left = JSON.stringify(a[index] ?? null);
-        const right = JSON.stringify(b[index] ?? null);
-        if (left !== right)
-            return `message ${index}: ${left.slice(0, 160)} !== ${right.slice(0, 160)}`;
-    }
-    return null;
-}
-
-const instructionTexts = (messages: V2Message[]) =>
-    messages
-        .filter((message) => !message.id && message.role === "system")
-        .map((message) => String(message.content[0]?.text ?? ""));
+import { scaleTest } from "../../shared/slow-test";
+import {
+    firstDivergence,
+    oc2ContextFixture as fixture,
+    installBusyAdmission,
+    installTransientFailure,
+    instructionTexts,
+    lkgEvents,
+    prose,
+    replayDifference,
+} from "./__tests__/oc2-context.fixture";
 
 // OpenCode 2 sends instruction-update rows as id-less system messages. The
 // executing pass moves the history boundary past one of them, and the defer
@@ -563,15 +217,24 @@ for (const [provider, model] of [
     ["openai", "gpt-4.1"],
     ["anthropic", "claude-opus-4-1"],
 ] as const) {
-    test(`issue 750 differential: ${provider} defer passes replay their predecessor over 200+ passes`, async () => {
-        const result = await runDifferential(provider, model, [7501, 7502, 7503, 7504], 30);
-        console.log(`ISSUE750 ${provider} ${JSON.stringify(result)}`);
-        expect(result.passes).toBeGreaterThanOrEqual(200);
-        expect(result.executes).toBeGreaterThan(0);
-        expect(result.instructionsCovered).toBeGreaterThan(0);
-        expect(result.checkpointPasses).toBeGreaterThan(0);
-        expect(result.failures).toEqual([]);
-    }, 600000);
+    scaleTest(
+        `issue 750 differential: ${provider} defer passes replay their predecessor`,
+        async (slow) => {
+            const result = await runDifferential(
+                provider,
+                model,
+                slow ? [7501, 7502, 7503, 7504] : [7501, 7502],
+                30,
+            );
+            console.log(`ISSUE750 ${provider} ${JSON.stringify(result)}`);
+            expect(result.passes).toBeGreaterThanOrEqual(slow ? 200 : 100);
+            expect(result.executes).toBeGreaterThan(0);
+            expect(result.instructionsCovered).toBeGreaterThan(0);
+            expect(result.checkpointPasses).toBeGreaterThan(0);
+            expect(result.failures).toEqual([]);
+        },
+        600000,
+    );
 }
 
 for (const checkpoint of [true, false]) {
@@ -693,63 +356,15 @@ test("issue 750: a historian join at 97% and the defer pass after it serve the s
     }
 }, 60000);
 
-/**
- * Make the next request's first writer admission report a busy database once,
- * as another process holding the writer does, before the admission succeeds.
- */
-function installBusyAdmission() {
-    const realAdmit = sqlite.withAsyncPrivilegedWriter;
-    const state = { busyNext: false };
-    const spy = spyOn(sqlite, "withAsyncPrivilegedWriter").mockImplementation((async (
-        ...args: Parameters<typeof realAdmit>
-    ) => {
-        if (state.busyNext) {
-            state.busyNext = false;
-            args[2]?.beforeRetry?.(new sqlite.SqliteAcquisitionBusyError("database is locked"));
-        }
-        return realAdmit(...args);
-    }) as typeof realAdmit);
-    return { state, restore: () => spy.mockRestore() };
-}
-
-const lkgEvents = (logs: string[]) =>
-    logs
-        .filter((line) => /\blkg_[a-z_]+$/.test(line))
-        .map((line) => line.replace(/^.*\b(lkg_[a-z_]+)$/, "$1"))
-        .join(",");
-
-/** Make the next transform pass fail with a transient SQLite error, as a busy writer does. */
-function installTransientFailure() {
-    const realCreate = transformModule.createTransform;
-    const state = { failNext: false };
-    const spy = spyOn(transformModule, "createTransform").mockImplementation(((
-        deps: Parameters<typeof realCreate>[0],
-    ) => {
-        const real = realCreate(deps);
-        const wrapped = async (...args: Parameters<typeof real>) => {
-            if (state.failNext) {
-                state.failNext = false;
-                throw Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
-            }
-            return real(...args);
-        };
-        return Object.assign(wrapped, real) as typeof real;
-    }) as typeof realCreate);
-    return { state, restore: () => spy.mockRestore() };
-}
-
 // Without a host checkpoint and without any instruction row there are no
-// covered rows, so a busy database must end as it did before covered rows were
-// served. On OpenCode 2 in TypeScript mode that earlier code does not replay
-// here either:
-// - at admission the draft is adapted without the stored message times the
-//   transform input carries, so the saved copy's content digests differ:
-//   lkg_content_mismatch, then the pass runs;
-// - inside the transform the host's fit check compares the saved system prompt
-//   with one that already carries Magic Context's guidance and declines:
-//   lkg_replay_does_not_fit, then a refusal.
+// covered rows. A busy database replays the saved copy of the last good
+// request, at admission and inside the transform alike, and the replay serves
+// that request's bytes. (Before replay rebuilt the transform input at
+// admission, the admission entry lacked the stored message times, and the fit
+// check inside the transform compared the saved system prompt with one that
+// already carried Magic Context's guidance, so neither path replayed.)
 for (const where of ["admission", "transform"] as const)
-    test(`issue 750: a busy database before any checkpoint ends as before covered rows were served (${where})`, async () => {
+    test(`issue 750: a busy database before any checkpoint replays the saved request (${where})`, async () => {
         const failure = installTransientFailure();
         const busy = installBusyAdmission();
         const limit = spyOn(models, "getSdkContextLimit").mockReturnValue(1_000_000);
@@ -760,25 +375,27 @@ for (const where of ["admission", "transform"] as const)
             f.respond();
             const before = await f.pass();
             f.respond();
+            const anchor = getSlot(f.session)?.lastInputMessageId;
             if (where === "admission") busy.state.busyNext = true;
             else failure.state.failNext = true;
             const failed = await f.attempt();
             console.log(
                 `ISSUE750_LKG pre-checkpoint ${where} error=${failed.error ? String(failed.error).slice(0, 80) : "none"} lkg=${lkgEvents(failed.logs)}`,
             );
-            if (where === "admission") {
-                expect(lkgEvents(failed.logs)).toBe("lkg_content_mismatch");
-                expect(failed.error).toBeUndefined();
-                expect(
-                    firstDivergence(
-                        before.draft.messages,
-                        failed.draft.messages.slice(0, before.draft.messages.length),
-                    ),
-                ).toBeNull();
-            } else {
-                expect(lkgEvents(failed.logs)).toBe("lkg_replay_does_not_fit,lkg_replay_declined");
-                expect(String(failed.error)).toContain("database is busy");
-            }
+            expect(lkgEvents(failed.logs)).toBe("lkg_replay_served");
+            expect(failed.error).toBeUndefined();
+            expect(failed.draft.system).toEqual(before.draft.system);
+            expect(
+                firstDivergence(
+                    before.draft.messages,
+                    failed.draft.messages.slice(0, before.draft.messages.length),
+                ),
+            ).toBeNull();
+            // The whole served request, byte for byte: the saved request through
+            // its anchor, then every host message after the anchor (the tail),
+            // with the saved system and tool list.
+            expect(anchor).toBeDefined();
+            expect(replayDifference(failed, before, anchor!)).toBeNull();
         } finally {
             busy.restore();
             failure.restore();
@@ -790,15 +407,11 @@ for (const where of ["admission", "transform"] as const)
 // After a host checkpoint the restored covered instruction rows reach the
 // transform handler without ids, and the request serves them. The saved copy
 // must still be captured and the entry check must skip those rows, so a busy
-// database ends as it did before covered rows were served, when the history
-// trim cut every covered row and the request had no id-less row:
-// - at admission the entry is the host draft without the restored rows, which
-//   never matches the saved input: lkg_invalidated_reshape, then the pass runs;
-// - inside the transform the candidate is built and reaches the host's fit
-//   check, which declines it: lkg_replay_does_not_fit, then a refusal.
-// Neither may end as lkg_miss (no saved copy at all).
+// database replays the saved request, covered rows included: at admission the
+// entry is built from the same restored input the transform saved its copy
+// from. It may never end as lkg_miss (no saved copy at all).
 for (const where of ["admission", "transform"] as const)
-    test(`issue 750: a busy database after a checkpoint ends as before covered rows were served (${where})`, async () => {
+    test(`issue 750: a busy database after a checkpoint replays the saved request (${where})`, async () => {
         const failure = installTransientFailure();
         const busy = installBusyAdmission();
         const limit = spyOn(models, "getSdkContextLimit").mockReturnValue(1_000_000);
@@ -820,25 +433,27 @@ for (const where of ["admission", "transform"] as const)
             f.respond();
             const before = await f.pass();
             f.respond();
+            const anchor = getSlot(f.session)?.lastInputMessageId;
             if (where === "admission") busy.state.busyNext = true;
             else failure.state.failNext = true;
             const failed = await f.attempt();
             console.log(
                 `ISSUE750_LKG after-checkpoint ${where} error=${failed.error ? String(failed.error).slice(0, 80) : "none"} lkg=${lkgEvents(failed.logs)} instructions=${instructionTexts(before.draft.messages).length}`,
             );
-            if (where === "admission") {
-                expect(lkgEvents(failed.logs)).toBe("lkg_invalidated_reshape");
-                expect(failed.error).toBeUndefined();
-                expect(
-                    firstDivergence(
-                        before.draft.messages,
-                        failed.draft.messages.slice(0, before.draft.messages.length),
-                    ),
-                ).toBeNull();
-            } else {
-                expect(lkgEvents(failed.logs)).toBe("lkg_replay_does_not_fit,lkg_replay_declined");
-                expect(String(failed.error)).toContain("database is busy");
-            }
+            expect(lkgEvents(failed.logs)).toBe("lkg_replay_served");
+            expect(failed.error).toBeUndefined();
+            expect(failed.draft.system).toEqual(before.draft.system);
+            expect(
+                firstDivergence(
+                    before.draft.messages,
+                    failed.draft.messages.slice(0, before.draft.messages.length),
+                ),
+            ).toBeNull();
+            // The whole served request, byte for byte: the saved request through
+            // its anchor, then every host message after the anchor (the tail),
+            // with the saved system and tool list.
+            expect(anchor).toBeDefined();
+            expect(replayDifference(failed, before, anchor!)).toBeNull();
         } finally {
             busy.restore();
             failure.restore();

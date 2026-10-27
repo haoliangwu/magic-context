@@ -45,6 +45,28 @@ env:
 # (workflow_dispatch only) for re-announcements and external releases.
 
 jobs:
+  slow-unit:
+    name: Slow unit (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [normal, assertions]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - name: Require full corpora and isolated timing checks on the release candidate
+        env:
+          UNIT_MODE: ${{ matrix.mode }}
+        run: |
+          if [[ "$UNIT_MODE" == assertions ]]; then export MAGIC_CONTEXT_DEBUG_ASSERTIONS=1; fi
+          bun packages/e2e-tests/scripts/run-slow-unit-tests.ts
+
   test:
     name: Test (plugin)
     runs-on: ubuntu-latest
@@ -464,13 +486,14 @@ jobs:
     # Publishes are gated on the full e2e suite (OpenCode + Pi) so a tag
     # push can never produce a published npm package whose runtime fails
     # the install + first-turn smoke test.
-    needs: [test, test-pi, test-cli, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, e2e-rust-hermetic-build, e2e-rust-hermetic]
+    needs: [test, test-pi, test-cli, slow-unit, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, e2e-rust-hermetic-build, e2e-rust-hermetic]
     # Every Rust shard must pass before publishing.
     if: >-
       always() &&
       needs.test.result == 'success' &&
       needs.test-pi.result == 'success' &&
       needs.test-cli.result == 'success' &&
+      needs.slow-unit.result == 'success' &&
       needs.e2e-opencode.result == 'success' &&
       needs.e2e-pi.result == 'success' &&
       needs.e2e-host-opencode.result == 'success' &&
@@ -515,13 +538,14 @@ jobs:
   publish-npm-pi:
     name: Publish pi-plugin to npm
     runs-on: ubuntu-latest
-    needs: [test, test-pi, test-cli, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, e2e-rust-hermetic-build, e2e-rust-hermetic]
+    needs: [test, test-pi, test-cli, slow-unit, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, e2e-rust-hermetic-build, e2e-rust-hermetic]
     # Every Rust shard must pass before publishing.
     if: >-
       always() &&
       needs.test.result == 'success' &&
       needs.test-pi.result == 'success' &&
       needs.test-cli.result == 'success' &&
+      needs.slow-unit.result == 'success' &&
       needs.e2e-opencode.result == 'success' &&
       needs.e2e-pi.result == 'success' &&
       needs.e2e-host-opencode.result == 'success' &&
@@ -561,13 +585,14 @@ jobs:
   publish-npm-cli:
     name: Publish unified CLI to npm
     runs-on: ubuntu-latest
-    needs: [test, test-pi, test-cli, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, e2e-rust-hermetic-build, e2e-rust-hermetic]
+    needs: [test, test-pi, test-cli, slow-unit, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, e2e-rust-hermetic-build, e2e-rust-hermetic]
     # Every Rust shard must pass before publishing.
     if: >-
       always() &&
       needs.test.result == 'success' &&
       needs.test-pi.result == 'success' &&
       needs.test-cli.result == 'success' &&
+      needs.slow-unit.result == 'success' &&
       needs.e2e-opencode.result == 'success' &&
       needs.e2e-pi.result == 'success' &&
       needs.e2e-host-opencode.result == 'success' &&
@@ -612,7 +637,7 @@ jobs:
     # publish timeout or registry failure could leave a published release
     # page on GitHub while one of the @cortexkit/* packages was missing
     # from npm.
-    needs: [test, test-pi, test-cli, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, publish-npm, publish-npm-pi, publish-npm-cli]
+    needs: [test, test-pi, test-cli, slow-unit, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, publish-npm, publish-npm-pi, publish-npm-cli]
     # Explicit per-need conditions instead of the default success(): the default
     # evaluates the TRANSITIVE needs chain. This keeps the release job governed by
     # the results of its direct needs, including the publish jobs' explicit
@@ -622,6 +647,7 @@ jobs:
       needs.test.result == 'success' &&
       needs.test-pi.result == 'success' &&
       needs.test-cli.result == 'success' &&
+      needs.slow-unit.result == 'success' &&
       needs.e2e-opencode.result == 'success' &&
       needs.e2e-pi.result == 'success' &&
       needs.e2e-host-opencode.result == 'success' &&

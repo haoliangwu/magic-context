@@ -1,15 +1,26 @@
 import { expect, mock, spyOn, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import * as timers from "node:timers/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import * as configLoader from "../../config";
 import { MagicContextConfigSchema } from "../../config/schema/magic-context";
+import * as embedding from "../../features/magic-context/memory/embedding";
+import { insertMemory } from "../../features/magic-context/memory/storage-memory";
 import {
     MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS,
     sweepOrphanedOpenCodeMessageIndexesCooperatively,
 } from "../../features/magic-context/message-index";
 import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
+import * as sessionStorage from "../../features/magic-context/storage-meta-session";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta-session";
+import {
+    tagIdentityRevisionKey,
+    tagRevisionKey,
+    tagTombstoneOwnerRange,
+} from "../../features/magic-context/storage-tag-identity-revision";
+import { autoSearchTestSnapshot } from "../../hooks/magic-context/auto-search-snapshot.fixture";
+import { queueAutoSearchBackfill } from "../../hooks/magic-context/auto-search-worker-client";
 import { resetCtxReduceRegisteredGloballyForTest } from "../../hooks/magic-context/ctx-reduce-availability";
 import * as transformModule from "../../hooks/magic-context/transform";
 import { _resetDreamTimerForTests } from "../../plugin/dream-timer";
@@ -18,6 +29,7 @@ import * as logger from "../../shared/logger";
 import { resetOpenCodeDbPathStateForTesting } from "../../shared/opencode-db-path";
 import { Database } from "../../shared/sqlite";
 import { cleanupTestTempDir, createTestTempDir } from "../../shared/test-temp-dir";
+import { getWorkerShutdownStats } from "../../shared/worker-shutdown";
 import { registerContext } from "./context";
 import * as storageGate from "./storage-gate";
 import type { SessionContext, V2Context } from "./types";
@@ -38,6 +50,45 @@ async function until(predicate: () => boolean) {
     const deadline = Date.now() + 2000;
     while (!predicate() && Date.now() < deadline) await delay(5);
     expect(predicate()).toBe(true);
+}
+
+function controlledBackoff(realRetries = 0) {
+    const original = timers.setTimeout;
+    const pending = new Set<() => void>();
+    const clock = spyOn(timers, "setTimeout").mockImplementation(
+        <T>(
+            ms?: number,
+            value?: T,
+            options?: { signal?: AbortSignal; ref?: boolean },
+        ): Promise<T> => {
+            if (!options?.signal || realRetries-- > 0)
+                return original(ms, value, options) as Promise<T>;
+            const signal = options.signal;
+            return new Promise<T>((resolve, reject) => {
+                const finish = () => {
+                    pending.delete(finish);
+                    signal.removeEventListener("abort", abort);
+                    resolve(value as T);
+                };
+                const abort = () => {
+                    pending.delete(finish);
+                    reject(new Error("backoff aborted"));
+                };
+                pending.add(finish);
+                signal.addEventListener("abort", abort, { once: true });
+                if (signal.aborted) abort();
+            });
+        },
+    );
+    return {
+        pending: () => pending.size,
+        async advance() {
+            // Fire any armed retry, including one left behind by incorrect disposal.
+            for (const finish of [...pending]) finish();
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        },
+        restore: () => clock.mockRestore(),
+    };
 }
 
 async function fixture(
@@ -84,6 +135,7 @@ async function fixture(
     const transform = spyOn(transformModule, "createTransform").mockImplementation(
         () => fake as unknown as ReturnType<typeof transformModule.createTransform>,
     );
+    const storageSet = mock(async (_key: string, _value: unknown) => {});
     const log = spyOn(logger, "log").mockImplementation(() => {});
     const sessionLog = spyOn(logger, "sessionLog");
     let hook: ((draft: SessionContext) => Promise<void>) | undefined;
@@ -103,7 +155,7 @@ async function fixture(
                     },
                 ],
             },
-            storage: { get: async () => undefined, set: async () => {} },
+            storage: { get: async () => undefined, set: storageSet },
             event: {
                 subscribe: ({ signal }: { signal: AbortSignal }) => {
                     starts.push(Date.now());
@@ -157,6 +209,7 @@ async function fixture(
         log,
         sessionLog,
         clearSessionLogState,
+        storageSet,
         dispose: async () => {
             await duties?.dispose();
             duties = undefined;
@@ -181,6 +234,36 @@ async function fixture(
         },
     };
 }
+
+test("v2 permanent session deletion retires tag revisions and owner keys", async () => {
+    const ready = Promise.withResolvers<void>();
+    let consumed = false;
+    const f = await fixture(async function* () {
+        await ready.promise;
+        yield deleted;
+        consumed = true;
+    });
+    const id = deleted.data.sessionID;
+    const epochs = () =>
+        f.db
+            .prepare(
+                "SELECT key FROM schema_migrations_meta WHERE key IN (?, ?) OR (key >= ? AND key < ?)",
+            )
+            .all(tagIdentityRevisionKey(id), tagRevisionKey(id), ...tagTombstoneOwnerRange(id));
+    try {
+        await f.start();
+        f.db
+            .prepare("INSERT INTO tags(session_id,tag_number,harness) VALUES (?,1,'opencode2')")
+            .run(id);
+        expect(epochs().length).toBeGreaterThan(0);
+        ready.resolve();
+        await until(() => consumed);
+        expect(epochs()).toEqual([]);
+    } finally {
+        ready.resolve();
+        await f.cleanup();
+    }
+});
 
 for (const failDeletion of [false, true]) {
     test(`v2 records usage after ${failDeletion ? "a throwing" : "a normal"} deletion handler`, async () => {
@@ -227,6 +310,7 @@ for (const failDeletion of [false, true]) {
 
 for (const failure of ["end", "throw"] as const) {
     test(`v2 resubscribes with backoff after stream ${failure} and records usage`, async () => {
+        const backoff = controlledBackoff(1);
         const ready = Promise.withResolvers<void>();
         let consumed = false;
         const f = await fixture(async function* (signal, subscription) {
@@ -251,16 +335,18 @@ for (const failure of ["end", "throw"] as const) {
             ).toBe(12345);
             await f.dispose();
             expect(f.signals.every((signal) => signal.aborted)).toBe(true);
-            await delay(300);
+            await backoff.advance();
             expect(f.starts).toHaveLength(2);
         } finally {
             ready.resolve();
             await f.cleanup();
+            backoff.restore();
         }
     });
 }
 
 test("v2 dispose cancels reconnect backoff before a replacement subscribes", async () => {
+    const backoff = controlledBackoff();
     let ended = false;
     const f = await fixture(async function* () {
         ended = true;
@@ -269,16 +355,19 @@ test("v2 dispose cancels reconnect backoff before a replacement subscribes", asy
     try {
         await f.start();
         await until(() => ended);
+        await until(() => backoff.pending() > 0);
         await f.dispose();
         const previousStarts = f.starts.length;
         await f.start();
         expect(f.starts).toHaveLength(previousStarts + 1);
         expect(f.signals.slice(0, previousStarts).every((signal) => signal.aborted)).toBe(true);
+        await until(() => backoff.pending() > 0);
         await f.dispose();
-        await delay(300);
+        await backoff.advance();
         expect(f.starts).toHaveLength(previousStarts + 1);
     } finally {
         await f.cleanup();
+        backoff.restore();
     }
 });
 
@@ -336,5 +425,117 @@ test("v2 sweep cleans a deletion missed during the resubscribe gap", async () =>
         await f.cleanup();
         _resetHarnessForTesting();
         setHarness(previous);
+    }
+});
+
+/** The deleted session's native-fold admission key; the in-memory cleanup removes it after the store clear. */
+const deletedAdmissionKey = `native-fold/v2/${encodeURIComponent(deleted.data.sessionID)}`;
+
+test("v2 deletion still runs its in-memory cleanup when the store clear is busy, and logs the error", async () => {
+    const ready = Promise.withResolvers<void>();
+    let consumed = false;
+    const busy = Object.assign(new Error("database is locked"), { code: "SQLITE_BUSY" });
+    const clear = spyOn(sessionStorage, "clearSession").mockImplementation(() => {
+        throw busy;
+    });
+    const f = await fixture(async function* () {
+        await ready.promise;
+        try {
+            yield deleted;
+            yield succeeded;
+        } finally {
+            consumed = true;
+        }
+    });
+    try {
+        await f.start();
+        ready.resolve();
+        await until(() => consumed);
+        expect(clear).toHaveBeenCalledWith(f.db, deleted.data.sessionID, false, true);
+        // The cleanup after the store clear ran: it removes the fold admission key.
+        expect(f.storageSet).toHaveBeenCalledWith(deletedAdmissionKey, null);
+        // The store error was not swallowed: the event loop logged it.
+        const errors = f.log.mock.calls.filter(([message]) =>
+            String(message).includes("event handler failed"),
+        );
+        expect(errors).toHaveLength(1);
+        expect(errors[0]?.[0]).toContain("type=session.deleted, session=ses-deleted");
+        expect(errors[0]?.[1]).toBe(busy);
+        // The usage event after the failed deletion was still handled.
+        expect(getOrCreateSessionMeta(f.db, sessionID).lastInputTokens).toBe(12345);
+    } finally {
+        ready.resolve();
+        clear.mockRestore();
+        await f.cleanup();
+    }
+});
+
+test("v2 deletion completes while the session's auto-search backfill is running", async () => {
+    const ready = Promise.withResolvers<void>();
+    let consumed = false;
+    const f = await fixture(async function* () {
+        await ready.promise;
+        try {
+            yield deleted;
+            yield succeeded;
+        } finally {
+            consumed = true;
+        }
+    });
+    const project = "git:v2-deleted-backfill";
+    const initial = autoSearchTestSnapshot(project);
+    const snapshot = spyOn(embedding, "getProjectEmbeddingSnapshot").mockReturnValue(initial);
+    const query = spyOn(embedding, "embedTextForProject").mockResolvedValue({
+        vector: new Float32Array([1, 0]),
+        modelId: initial.modelId,
+        chunkModelId: initial.chunkModelId,
+        generation: 1,
+    });
+    const reached = Promise.withResolvers<void>();
+    // The backfill worker waits for this batch with its writable connection open.
+    const batch = spyOn(embedding, "embedBatchForProject").mockImplementation(() => {
+        reached.resolve();
+        return new Promise(() => {});
+    });
+    const before = getWorkerShutdownStats().get("auto-search") ?? { graceful: 0, forced: 0 };
+    try {
+        await f.start();
+        insertMemory(f.db, {
+            projectPath: project,
+            category: "ARCHITECTURE_DECISIONS",
+            content: "historian cache wiring details",
+        });
+        const backfill = queueAutoSearchBackfill(
+            f.db,
+            deleted.data.sessionID,
+            project,
+            "historian cache wiring",
+        );
+        await reached.promise;
+        ready.resolve();
+        await until(() => consumed);
+        await backfill;
+        const errors = f.log.mock.calls.filter(([message]) =>
+            String(message).includes("event handler failed"),
+        );
+        expect(errors).toEqual([]);
+        expect(
+            f.db
+                .prepare("SELECT 1 FROM session_meta WHERE session_id = ?")
+                .get(deleted.data.sessionID),
+        ).toBeNull();
+        expect(f.storageSet).toHaveBeenCalledWith(deletedAdmissionKey, null);
+        // Deleting the session closed the backfill worker's connection before the
+        // store clear; the worker exited by itself rather than being terminated.
+        await until(
+            () => (getWorkerShutdownStats().get("auto-search")?.graceful ?? 0) > before.graceful,
+        );
+        expect(getWorkerShutdownStats().get("auto-search")?.forced ?? 0).toBe(before.forced);
+    } finally {
+        ready.resolve();
+        snapshot.mockRestore();
+        query.mockRestore();
+        batch.mockRestore();
+        await f.cleanup();
     }
 });

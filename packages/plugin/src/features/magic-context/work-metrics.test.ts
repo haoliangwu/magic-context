@@ -1,7 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import {
     computeOpenCodeWorkMetrics,
@@ -236,25 +233,5 @@ describe("work metrics", () => {
         insertWithId(db, "m4", "ses", 5, "build", 120, 4);
         const second = computeOpenCodeWorkMetricsIncremental(db, "ses", first.carry);
         expect(second.metrics).toEqual(computeOpenCodeWorkMetrics(db, "ses"));
-    });
-
-    test("live OpenCode smoke targets stay within 1%", () => {
-        if (process.env.MAGIC_CONTEXT_RUN_LIVE_OPENCODE_SMOKE !== "1") return;
-        const dbPath = join(homedir(), ".local", "share", "opencode", "opencode.db");
-        if (!existsSync(dbPath)) return;
-        const db = new Database(dbPath, { readonly: true });
-        const cases = [
-            ["ses_331acff95fferWZOYF1pG0cjOn", 122_527_859, 345_669_836],
-            ["ses_227ce5788ffeRPA9THoPLOQreO", 11_847_315, 71_309_730],
-        ] as const;
-        for (const [sessionId, expectedNewWork, expectedTotalInput] of cases) {
-            const actual = computeOpenCodeWorkMetrics(db, sessionId);
-            expect(Math.abs(actual.newWorkTokens - expectedNewWork) / expectedNewWork).toBeLessThan(
-                0.01,
-            );
-            expect(
-                Math.abs(actual.totalInputTokens - expectedTotalInput) / expectedTotalInput,
-            ).toBeLessThan(0.01);
-        }
     });
 });

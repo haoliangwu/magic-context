@@ -47,6 +47,7 @@ import {
 } from "./auto-search-deadline";
 import { buildAutoSearchHint, selectAutoSearchResults } from "./auto-search-hint";
 import {
+    AutoSearchBusyError,
     coalesceAutoSearchTurn,
     disposeIdleAutoSearchWorkers,
     persistAutoSearchDecision,
@@ -366,6 +367,9 @@ export async function runAutoSearchHint(args: {
                         // Leave primers out of automatic hints so primer updates cannot rewrite
                         // cached request prefixes. Explicit ctx_search and the dashboard expose them.
                         sources: ["memory", "message", "git_commit"],
+                        // Never wait for the history-chunk pool to be built: a
+                        // cold pool is warmed in the background for later turns.
+                        chunkPoolWarmOnly: true,
                     };
                     return searchAutoHint(db, sessionId, options.projectPath, rawPrompt, {
                         ...searchOptions,
@@ -375,6 +379,16 @@ export async function runAutoSearchHint(args: {
                 }, startedAt);
             } catch (error) {
                 if (lifecycleSignal.aborted) return AUTO_SEARCH_OK;
+                if (error instanceof AutoSearchBusyError) {
+                    // An earlier search of this session is still running. Serve this
+                    // turn without a hint and freeze that decision, as a timeout does.
+                    sessionLog(
+                        sessionId,
+                        "auto-search: an earlier search of this session is still running, skipping hint for this turn",
+                    );
+                    void persistAutoSearchSkip(db, sessionId, userMsgId);
+                    return { ok: false, kind: "timeout" };
+                }
                 // This pass serves the user message without a hint. Freeze that decision
                 // before returning so a recovered search cannot rewrite cached bytes.
                 log(
@@ -451,7 +465,7 @@ export async function runAutoSearchHint(args: {
                 }
                 sessionLog(
                     sessionId,
-                    `auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,
+                    `auto-search: attached hint to ${userMsgId} (${results.length} fragments, top relevance ${(results[0].relevanceScore ?? results[0].score).toFixed(3)})`,
                 );
                 return AUTO_SEARCH_OK;
             } finally {

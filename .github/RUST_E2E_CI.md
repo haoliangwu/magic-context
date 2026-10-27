@@ -31,8 +31,7 @@ publication requires all of them to pass. No App credentials are used to fetch
 the public siblings.
 
 `scripts/release.sh <version> --ci-gate=<sha>` avoids repeating local gates only
-when the SHA resolves to HEAD and the latest [CI](workflows/ci.yml),
-[Mutations](workflows/mutations.yml) (mutation tests), and
+when the SHA resolves to HEAD and the latest [CI](workflows/ci.yml) and
 [Smoke](workflows/smoke-opencode-linux.yml) (OpenCode bring-up) runs for that
 exact commit all completed successfully. CI certifies the Rust E2E gate,
 so the release script skips its local Rust E2E run as well.

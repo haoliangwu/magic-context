@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1032,6 +1032,40 @@ describe("agent.deliver contract", () => {
 });
 
 describe("cache-bust sentinel runs", () => {
+    test("saves its state once per run, and keeps a failed run's progress", async () => {
+        // The state file covers every session ever seen and a run walks thousands
+        // of them, so saving after each session rewrote gigabytes an hour.
+        const directory = temporaryDirectory("cache-bust-sentinel-save-once-");
+        const stateFile = join(directory, "state.json");
+        const sessions = ["ses_a", "ses_b", "ses_c"].map((sessionId) => ({ ...activeSession, sessionId }));
+        const seenDuringRun: string[][] = [];
+        let failOn: string | undefined;
+        const deps = {
+            now: () => 1_000,
+            listActiveSessions: () => sessions,
+            loadDecisions: () => [],
+            analyzeSession: async (session: ActiveCacheBustSession) => {
+                seenDuringRun.push(
+                    existsSync(stateFile) ? Object.keys(loadSentinelState(stateFile).sessions).sort() : [],
+                );
+                if (session.sessionId === failOn) throw new Error("analysis failed");
+                return { requests: [], highWaterMarkMs: 900 };
+            },
+            stdout: () => {},
+            stderr: () => {},
+        };
+
+        await runSentinelOnce(options(stateFile), deps);
+        expect(seenDuringRun).toEqual([[], [], []]);
+        expect(Object.keys(loadSentinelState(stateFile).sessions).sort()).toEqual(["ses_a", "ses_b", "ses_c"]);
+
+        rmSync(stateFile);
+        seenDuringRun.length = 0;
+        failOn = "ses_c";
+        await expect(runSentinelOnce(options(stateFile), deps)).rejects.toThrow("analysis failed");
+        expect(seenDuringRun).toEqual([[], [], []]);
+        expect(Object.keys(loadSentinelState(stateFile).sessions).sort()).toEqual(["ses_a", "ses_b"]);
+    });
     test("resumes a timed-out pass and emits every window", async () => {
         const directory = temporaryDirectory("cache-bust-sentinel-resume-");
         const stateFile = join(directory, "state.json");

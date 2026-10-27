@@ -102,8 +102,9 @@ test("mock rejects edited, missing and reordered latest-turn thinking across too
 // 5.4%), so the bounded signed-thinking hold ends at about 15.4%. At 76% and 85%
 // a signed turn is never held: the task's subagent execute and the primary's
 // force band bust mid-turn, apply the queued ctx_reduce and strip the turn's
-// signed thinking. Earlier revisions held both until the next real user
-// message. The held behaviour is still covered at 10% (execute, below the cap)
+// signed thinking. At 76% a primary's queued drop becomes eligible on the next
+// real user and the execute-reclaim ride applies it without an explicit flush.
+// The held behaviour is still covered at 10% (execute, below the cap)
 // with a heavy step: thinking text long enough to estimate above 1,500 tokens.
 const heavyThinking = (n: number) => ({
 	...thinking(n),
@@ -112,7 +113,7 @@ const heavyThinking = (n: number) => ({
 for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "drops" }, { band: 10, mode: "drops" }, { band: 76, mode: "primary" }, { band: 85, mode: "primary" }, { band: 76, mode: "legacy-accepted" }, { band: 76, mode: "legacy-rejected" }]) {
 	const heldBand = band === 10;
 	const busts = !heldBand && (mode === "drops" || (mode === "primary" && band === 85));
-	test(mode === "primary" ? band === 76 ? "Anthropic primary long tool loop holds queued drops on a plain real-user pass until ctx-flush at 76%" : `Anthropic primary long tool loop applies a thinking-changing queued drop mid-turn above the hold cap at ${band}%` : mode === "drops" ? heldBand ? `Anthropic task held for heavy reasoning preserves latest-turn thinking and queues ctx_reduce at ${band}%` : `Anthropic task applies ctx_reduce mid-turn above the hold cap and strips the turn's thinking at ${band}%` : `Anthropic task ${mode} thinking replay`, async () => {
+	test(mode === "primary" ? band === 76 ? "Anthropic primary unheld execute reclaim strips thinking once and replays the rebuilt prefix at 76%" : `Anthropic primary long tool loop applies a thinking-changing queued drop mid-turn above the hold cap at ${band}%` : mode === "drops" ? heldBand ? `Anthropic task held for heavy reasoning preserves latest-turn thinking and queues ctx_reduce at ${band}%` : `Anthropic task applies ctx_reduce mid-turn above the hold cap and strips the turn's thinking at ${band}%` : `Anthropic task ${mode} thinking replay`, async () => {
         let enforceLegacy = mode !== "legacy-accepted";
         const modelID = mode.startsWith("legacy-") ? "mock-sonnet" : "claude-sonnet-5-5";
 		const oldTmp = process.env.TMPDIR;
@@ -204,8 +205,12 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 				const usage = {
 					input_tokens: 0,
 					output_tokens: 20,
+					// The reply after primary reclaim reports low usage so the next
+					// request proves scheduler-defer replay, not another empty execute.
 					cache_read_input_tokens:
-						pass >= 4 ? Math.ceil((band * (100_000 - 8192)) / 100) : 100,
+						mode === "primary" && band === 76 && pass >= lastPass
+							? 100
+							: pass >= 4 ? Math.ceil((band * (100_000 - 8192)) / 100) : 100,
 					cache_creation_input_tokens: 0,
 				};
 				const tool = (name: string, input: unknown) => ({
@@ -396,36 +401,45 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 			const previousBody = workerRequest();
 			const logPath = join(h.dataDir, "cortexkit", "magic-context-e2e.log");
 			const beforeUserLog = readFileSync(logPath, "utf8").length;
-			// Ending a signed tool loop is not itself permission to rewrite its prefix.
+			// A new real user is not a ride by itself; an unheld primary may now
+			// admit its queued work through the separately priced execute-reclaim ride.
 			await h.sendPrompt(childId, "Next real user turn; finish.", {
 				timeoutMs: 30_000,
 				agent: "thinking-worker",
 			});
 			if (mode === "primary" && band === 76) {
-				const held = wire.at(-1)!;
-				expect(bytes(held.slice(0, previousRequest.length))).toBe(bytes(previousRequest));
+				const rebuilt = wire.at(-1)!;
+				expect(bytes(rebuilt.slice(0, previousRequest.length))).not.toBe(bytes(previousRequest));
 				expect(bytes(workerRequest().system)).toBe(bytes(previousBody.system));
 				expect(bytes(workerRequest().tools)).toBe(bytes(previousBody.tools));
-				expect(bytes(held)).toContain("SPENT-b");
-				const signedBlocks = held.flatMap(message =>
+				expect(bytes(rebuilt)).not.toContain("SPENT-b");
+				const signedBlocks = rebuilt.flatMap(message =>
 					(message as { content: Array<{ type: string }> }).content,
 				).filter(part => part.type === "thinking");
-				expect(signedBlocks).toEqual(Array.from({ length: lastPass - 1 }, (_, index) => thinking(index + 1)));
-				expect(h.contextDb().query("SELECT tag_id FROM pending_ops WHERE session_id = ?").all(childId)).toContainEqual({ tag_id: tag });
-				expect(readFileSync(logPath, "utf8").slice(beforeUserLog)).toContain(
-					"pending ops held — reason=no originating cache-bust opportunity; scheduler=execute, historianRunning=false",
-				);
-				// An explicit flush supplies the shared rebuild permission and releases the queue.
-				const response = await fetch(`${h.serverUrl}/session/${childId}/command?directory=${encodeURIComponent(h.workdir)}`, {
-					method: "POST",
-					headers: { "content-type": "application/json" },
-					body: JSON.stringify({ command: "ctx-flush", arguments: "" }),
-				});
-				expect(response.ok).toBe(true);
-				await h.sendPrompt(childId, "Apply the explicitly requested rebuild; finish.", {
+				expect(signedBlocks).toEqual([]);
+				expect(h.contextDb().query("SELECT tag_id FROM pending_ops WHERE session_id = ?").all(childId)).toHaveLength(0);
+				// The plugin buffers log writes for up to half a second; wait for the line.
+				// Pin the sole ride, not just the drop: no fold, publication or force
+				// signal may be credited as execute reclaim by this scenario.
+				const reclaimLine = "pending ops WILL APPLY — reason=ride=executeReclaim (scheduler=execute)";
+				await h.waitFor(() => readFileSync(logPath, "utf8").slice(beforeUserLog).includes(reclaimLine), { timeoutMs: 5000, label: "execute reclaim log line" }).catch(() => undefined);
+				expect(readFileSync(logPath, "utf8").slice(beforeUserLog)).toContain(reclaimLine);
+				const frozenThinking = () => h.contextDb().query("SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?").get(childId);
+				const frozen = frozenThinking();
+				expect(bytes(frozen)).not.toMatch(/null|\[\]/);
+				const rebuiltBody = workerRequest();
+				const beforeDeferLog = readFileSync(logPath, "utf8").length;
+				await h.sendPrompt(childId, "No newly queued work; replay the rebuilt prefix and finish.", {
 					timeoutMs: 30_000,
 					agent: "thinking-worker",
 				});
+				expect(bytes(wire.at(-1)!.slice(0, rebuilt.length))).toBe(bytes(rebuilt));
+				expect(bytes(workerRequest().system)).toBe(bytes(rebuiltBody.system));
+				expect(bytes(workerRequest().tools)).toBe(bytes(rebuiltBody.tools));
+				expect(frozenThinking()).toEqual(frozen);
+				const deferLine = "pending ops WILL NOT APPLY — reason=scheduler_defer";
+				await h.waitFor(() => readFileSync(logPath, "utf8").slice(beforeDeferLog).includes(deferLine), { timeoutMs: 5000, label: "scheduler defer log line" }).catch(() => undefined);
+				expect(readFileSync(logPath, "utf8").slice(beforeDeferLog)).toContain(deferLine);
 			}
 			if (mode === "primary" && band === 85) {
 				// The force band's one reclaim already removed the output; the drop the

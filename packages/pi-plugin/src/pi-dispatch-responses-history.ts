@@ -1,4 +1,7 @@
+import { stripPersistedAssistantText } from "@magic-context/core/hooks/magic-context/tag-content-primitives";
+import { piOmitsTruncatedAssistant } from "./pi-dispatch-assistant-history";
 import type { PiChatHistoryModel } from "./pi-dispatch-chat-history";
+import type { PiDispatchHost } from "./pi-dispatch-structure";
 
 const MAX_TEXT_UNITS = 32 * 1024 * 1024;
 
@@ -50,24 +53,44 @@ function demotedThinking(
 	return undefined;
 }
 
+export interface PiResponsesUnsignedAlternatives {
+	fallback?: readonly string[];
+	cold?: readonly string[];
+}
+
+/** Cold replay is safe only for plaintext reasoning with no surviving server state. */
+function coldReplayable(items: unknown[]): boolean {
+	let reasoning = false;
+	for (const value of items) {
+		const item = object(value);
+		if (typeof item?.encrypted_content === "string") return false;
+		if (item?.type !== "reasoning") continue;
+		if (
+			!Array.isArray(item.content) ||
+			!item.content.some((part) => object(part)?.type === "reasoning_text")
+		)
+			return false;
+		reasoning = true;
+	}
+	// The supported native items below lose their top-level IDs in OMP's
+	// sanitizer; computer items, whose IDs can survive, are not admitted here.
+	return reasoning;
+}
+
 /**
  * Capture ordered [text, phase] pairs as JSON strings for OpenAI Responses replay.
- * Cached provider items may omit our leading ordinal only when they represent
- * the same signed text blocks; otherwise require the prepared text verbatim.
+ * Cached provider items must bind to signed prepared blocks, except for OMP's
+ * narrowly recognized unsigned hook rewrite. Other edits require prepared text.
  */
 export function piResponsesAssistantTexts(
 	value: unknown,
 	model: PiChatHistoryModel | undefined,
+	host?: PiDispatchHost,
+	alternatives?: PiResponsesUnsignedAlternatives,
 ): readonly string[] | undefined {
 	const message = object(value);
 	if (!message || !Array.isArray(message.content)) return undefined;
-	if (
-		["length", "error", "aborted"].includes(String(message.stopReason)) &&
-		!message.content.some((value) =>
-			["text", "toolCall"].includes(String(object(value)?.type)),
-		)
-	)
-		return [];
+	if (piOmitsTruncatedAssistant(message)) return [];
 	const texts: string[] = [];
 	const blocks: Record<string, unknown>[] = [];
 	const sameModel =
@@ -137,7 +160,8 @@ export function piResponsesAssistantTexts(
 	// the prepared blocks. The cache's dt flag marks items to append; without it,
 	// replay replaces all preceding input. Allow only append-only text whose v1
 	// signature binds the cached item ID and phase to the prepared block, and whose
-	// text differs at most by our leading ordinal label. Never excuse other edits.
+	// text differs at most by our leading ordinal label. OMP's unsigned rewrite
+	// exception below requires the hook's exact cleanup relation instead.
 	// openai-shared.ts:2204-2260; utils.ts:653-663 (18.10.4).
 	//
 	// A real Codex turn stores every native output item it produced, so the cache
@@ -151,6 +175,16 @@ export function piResponsesAssistantTexts(
 	const replay: string[] = [];
 	let bound = 0;
 	let output = false;
+	const allowUnsigned =
+		host === "omp" &&
+		message.role === "assistant" &&
+		[
+			"openai-responses",
+			"azure-openai-responses",
+			"openai-codex-responses",
+		].includes(model?.api ?? "");
+	let unsigned = false;
+	let rewrittenText = false;
 	for (const value of payload.items) {
 		const item = object(value);
 		if (item?.type === "reasoning") continue;
@@ -181,14 +215,28 @@ export function piResponsesAssistantTexts(
 			} catch {
 				return texts;
 			}
-			if (
-				signature?.v !== 1 ||
-				typeof signature.id !== "string" ||
-				item.id !== signature.id ||
-				item.phase !== signature.phase ||
-				part.text !== (block.text as string).replace(/^§\d+§ /u, "")
-			)
-				return texts;
+			const signed =
+				signature?.v === 1 &&
+				typeof signature.id === "string" &&
+				item.id === signature.id &&
+				item.phase === signature.phase &&
+				part.text === (block.text as string).replace(/^§\d+§ /u, "");
+			if (!signed) {
+				// OMP removes the signature when its assistant-message hook rewrites
+				// text, but its native encoder still replays the original payload.
+				// Use the hook's own cleanup, including mid-text notation and trimming.
+				// Remove only our current prepared ordinal from the visible side;
+				// unrelated visible edits must not inherit the native text or phase.
+				const stripped = stripPersistedAssistantText(part.text);
+				if (
+					!allowUnsigned ||
+					"textSignature" in block ||
+					stripped !== (block.text as string).replace(/^§\d+§ /u, "")
+				)
+					return texts;
+				unsigned = true;
+				rewrittenText ||= part.text !== stripped && part.text !== block.text;
+			}
 			bound++;
 			itemTexts.push(part.text);
 		}
@@ -199,7 +247,13 @@ export function piResponsesAssistantTexts(
 	}
 	// Every prepared text block must own exactly one cached text, in order. With
 	// no replayable output OMP converts the blocks instead, so keep their texts.
-	return output && bound === blocks.length ? replay : texts;
+	if (!output || bound !== blocks.length || (unsigned && !rewrittenText))
+		return texts;
+	if (unsigned && alternatives) {
+		alternatives.fallback = texts;
+		alternatives.cold = coldReplayable(payload.items) ? replay : texts;
+	}
+	return replay;
 }
 
 /** Keep every wire text item when adjacent assistant items share one role row. */

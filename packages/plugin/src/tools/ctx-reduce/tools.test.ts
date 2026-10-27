@@ -122,7 +122,9 @@ describe("createCtxReduceTools", () => {
             const result = await tools.ctx_reduce.execute({}, toolContext());
 
             expect(result).toContain("Error");
-            expect(result).toContain("'drop' must be provided");
+            expect(result).toBe(
+                `Error: 'drop' must be provided as a string of tag numbers, for example {"drop": "3-5,8"}.`,
+            );
         });
 
         it("refuses empty drop filler without queuing a phantom command", async () => {
@@ -130,7 +132,9 @@ describe("createCtxReduceTools", () => {
             const omitted = await tools.ctx_reduce.execute({}, toolContext());
             const empty = await tools.ctx_reduce.execute({ drop: "" }, toolContext());
             expect(empty).toBe(omitted);
-            expect(empty).toContain("'drop' must be provided");
+            expect(empty).toBe(
+                `Error: 'drop' must be provided as a string of tag numbers, for example {"drop": "3-5,8"}.`,
+            );
             expect(getPendingOps(db, "ses-1")).toHaveLength(0);
         });
 

@@ -42,9 +42,9 @@
  *
  * Discovery remains enabled. The full Magic Context entry no-ops under the env
  * guard and this explicit lean entry supplies scoped Magic Context tools. Pi
- * applies the per-agent `--tools` list to the complete registry. OMP applies it
- * to built-ins only and appends discovered extension tools afterward, so its
- * list is an intended budget rather than an enforced extension-tool sandbox.
+ * applies the per-agent `--tools` list to the complete registry. OMP's CLI only
+ * gates built-ins; the child startup extension selects its complete active list
+ * through setActiveTools after extension tools have registered.
  *
  * Tool/action allowlists via Pi flags:
  *   --magic-context-dreamer-actions  Register ctx_memory with the dreamer
@@ -119,6 +119,7 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 
 			registerMagicContextTools(pi, {
 				rerankConnectionFile: cfg.subc?.connection_file,
+				rerankConfig: cfg.rerank,
 				db,
 				ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
 				resolveProjectIdentity: (ctx) =>

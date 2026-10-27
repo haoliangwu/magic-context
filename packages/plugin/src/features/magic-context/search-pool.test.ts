@@ -1,10 +1,13 @@
 import { expect, spyOn, test } from "bun:test";
+import { scaleTest, slowOnlyTest } from "../../shared/slow-test";
 import { Database } from "../../shared/sqlite";
 import {
     _getCompartmentChunkSearchCacheStatsForTests,
     _resetCompartmentChunkSearchCacheForTests,
     loadCompartmentChunkEmbeddingsForSearch,
+    peekCompartmentChunkSearchPool,
     type StoredCompartmentChunkEmbedding,
+    warmCompartmentChunkSearchPool,
 } from "./compartment-chunk-embedding";
 import { cosineSimilarity } from "./memory/embedding";
 import { baseSearchPool, measureSearchBlock, searchPoolFixture } from "./search-pool-fixture";
@@ -91,7 +94,7 @@ test("pure append retains decoded prefix vectors and original compartment/window
     }
 });
 
-test("in-scope delete plus insert keeping count rebuilds decoded vectors", async () => {
+test("in-scope delete plus insert keeping count re-decodes the replaced row", async () => {
     const fixture = searchPoolFixture();
     try {
         const first = await load(fixture.db);
@@ -101,10 +104,16 @@ test("in-scope delete plus insert keeping count rebuilds decoded vectors", async
             SELECT NULL, 1, session_id, project_path, 0, 2, 3, 'replacement', model_id, dims, vector, created_at, harness
             FROM compartment_chunk_embeddings WHERE id = 2`)
             .run();
+        const decodedBefore = _getCompartmentChunkSearchCacheStatsForTests().rowsDecoded;
         const replaced = await load(fixture.db);
         expect(replaced).toHaveLength(first.length);
         expect(replaced).toEqual(baseSearchPool(fixture.db));
-        expect(replaced[1].vector).not.toBe(first[1].vector);
+        // The replacement row (compartment 1) carries compartment 2's vector and
+        // is decoded afresh; the untouched rows keep their decoded vectors.
+        expect(replaced[0].vector).not.toBe(first[0].vector);
+        expect([...replaced[0].vector]).toEqual([...first[1].vector]);
+        expect(replaced[1].vector).toBe(first[1].vector);
+        expect(_getCompartmentChunkSearchCacheStatsForTests().rowsDecoded - decodedBefore).toBe(1);
     } finally {
         fixture.close();
         _resetCompartmentChunkSearchCacheForTests();
@@ -191,20 +200,23 @@ test("a pool evicted during its probe is rebuilt with accounted LRU bytes", asyn
     const fixture = searchPoolFixture(0, 4096);
     const cleanups: (() => void)[] = [];
     const overlap: { promise?: Promise<StoredCompartmentChunkEmbedding[]> } = {};
-    let eofCount = 0;
+    let largeLoading = false;
+    let revisionReads = 0;
     const prepare = fixture.db.prepare.bind(fixture.db);
     const observePrepare = (sql: string) => {
         const statement = prepare(sql);
-        if (sql.includes("length(e.vector) AS vectorBytes")) {
-            const all = statement.all.bind(statement);
-            const spy = spyOn(statement, "all").mockImplementation((...args: unknown[]) => {
-                const rows = all(...args);
-                if (args[0] === "other-session" && rows.length === 0 && ++eofCount === 2) {
-                    // Begin the small probe at the large probe's validation EOF,
-                    // immediately before the large pool evicts cached entries.
+        if (sql.includes("total_changes()")) {
+            const get = statement.get.bind(statement);
+            const spy = spyOn(statement, "get").mockImplementation((...args: unknown[]) => {
+                // A refresh reads the write counters before its probe and again
+                // after its last read, immediately before it caches (and here
+                // evicts). Begin the small probe at the large refresh's second
+                // read, so it overlaps the eviction.
+                if (largeLoading && !overlap.promise && ++revisionReads === 2) {
+                    largeLoading = false;
                     overlap.promise = load(fixture.db);
                 }
-                return rows;
+                return get(...(args as []));
             });
             cleanups.push(() => spy.mockRestore());
         }
@@ -225,6 +237,7 @@ test("a pool evicted during its probe is rebuilt with accounted LRU bytes", asyn
             .immediate();
         await load(fixture.db);
         const initialBytes = _getCompartmentChunkSearchCacheStatsForTests().bytes;
+        largeLoading = true;
         const large = await loadCompartmentChunkEmbeddingsForSearch(
             fixture.db,
             "other-session",
@@ -261,7 +274,11 @@ test("in-place metadata changes rebuild even when rowid and window-index sums st
         fixture.db
             .prepare("UPDATE compartment_chunk_embeddings SET harness = 'opencode2' WHERE id = 3")
             .run();
-        expect((await load(fixture.db))[0].vector).not.toBe(changed[0].vector);
+        // Only the edited row is read again; the others keep their decoded vectors.
+        const third = await load(fixture.db);
+        expect(third).toEqual(baseSearchPool(fixture.db));
+        expect(third[2].vector).not.toBe(changed[2].vector);
+        expect(third[0].vector).toBe(changed[0].vector);
     } finally {
         fixture.close();
         _resetCompartmentChunkSearchCacheForTests();
@@ -311,6 +328,95 @@ test("rolled-back transaction-local vectors never escape through a cached pool",
         expect((await load(fixture.db))[0].chunkHash).toBe("temporary");
         fixture.db.exec("ROLLBACK");
         expect((await load(fixture.db))[0].chunkHash).toBe(original[0].chunkHash);
+    } finally {
+        fixture.close();
+        _resetCompartmentChunkSearchCacheForTests();
+    }
+});
+
+test("a warm pool is served without a probe and a changed session reads as cold", async () => {
+    const fixture = searchPoolFixture();
+    try {
+        const peek = () =>
+            peekCompartmentChunkSearchPool(fixture.db, "session", "/project", "model");
+        expect(peek()).toBeNull();
+        expect(
+            (await warmCompartmentChunkSearchPool(fixture.db, "session", "/project", "model"))
+                .outcome,
+        ).toBe("refreshed");
+        const stats = _getCompartmentChunkSearchCacheStatsForTests();
+        expect(peek()).toEqual(baseSearchPool(fixture.db));
+        expect(_getCompartmentChunkSearchCacheStatsForTests().probePages).toBe(stats.probePages);
+        // Rows of another project or model in the same session also change the
+        // session's signature; the warm then finds the scope itself unchanged.
+        fixture.add(81, "session", "/other-project");
+        expect(peek()).toBeNull();
+        await warmCompartmentChunkSearchPool(fixture.db, "session", "/project", "model");
+        expect(peek()).toEqual(baseSearchPool(fixture.db));
+    } finally {
+        fixture.close();
+        _resetCompartmentChunkSearchCacheForTests();
+    }
+});
+
+test("a background warm after an append probes and decodes only the new rows", async () => {
+    const fixture = searchPoolFixture();
+    try {
+        await warmCompartmentChunkSearchPool(fixture.db, "session", "/project", "model");
+        const first = peekCompartmentChunkSearchPool(fixture.db, "session", "/project", "model");
+        const stats = _getCompartmentChunkSearchCacheStatsForTests();
+        fixture.add(81);
+        fixture.add(82);
+        const report = await warmCompartmentChunkSearchPool(
+            fixture.db,
+            "session",
+            "/project",
+            "model",
+        );
+        const after = _getCompartmentChunkSearchCacheStatsForTests();
+        expect({
+            outcome: report.outcome,
+            decodedRows: report.decodedRows,
+            fullProbes: after.probes - stats.probes,
+            tailProbes: after.tailProbes - stats.tailProbes,
+            endProbes: after.endProbes - stats.endProbes,
+        }).toEqual({
+            outcome: "refreshed",
+            decodedRows: 2,
+            fullProbes: 0,
+            tailProbes: 1,
+            endProbes: 0,
+        });
+        const warm = peekCompartmentChunkSearchPool(fixture.db, "session", "/project", "model");
+        expect(warm).toEqual(baseSearchPool(fixture.db));
+        expect(warm?.[0].vector).toBe(first?.[0].vector);
+    } finally {
+        fixture.close();
+        _resetCompartmentChunkSearchCacheForTests();
+    }
+});
+
+test("an aborted load stops between batches and caches nothing", async () => {
+    const fixture = searchPoolFixture(200);
+    try {
+        const decodedBefore = _getCompartmentChunkSearchCacheStatsForTests().rowsDecoded;
+        const controller = new AbortController();
+        const pending = loadCompartmentChunkEmbeddingsForSearch(
+            fixture.db,
+            "session",
+            "/project",
+            "model",
+            null,
+            controller.signal,
+        );
+        controller.abort();
+        await expect(pending).rejects.toThrow();
+        expect(_getCompartmentChunkSearchCacheStatsForTests().rowsDecoded).toBe(decodedBefore);
+        expect(
+            peekCompartmentChunkSearchPool(fixture.db, "session", "/project", "model"),
+        ).toBeNull();
+        // A later caller without a signal is not affected by the aborted one.
+        expect(await load(fixture.db)).toEqual(baseSearchPool(fixture.db));
     } finally {
         fixture.close();
         _resetCompartmentChunkSearchCacheForTests();
@@ -405,22 +511,27 @@ test("250 seeded searches equal base SQL rows, ids, ordering and exact scores af
     }
 });
 
-test("cold full rebuild keeps every main-thread slice below 50ms", async () => {
-    const fixture = searchPoolFixture(15000, 4096);
-    try {
-        const result = await measureSearchBlock(() => load(fixture.db));
-        expect(result.value).toHaveLength(15000);
-        console.log(
-            `search-pool cold: max=${result.maximum.toFixed(2)}ms cpu-at-max=${result.cpuMsAtMaximum.toFixed(2)}ms (${result.cpuSource}) total=${result.elapsed.toFixed(2)}ms`,
-        );
-        expect(result.maximum).toBeLessThan(50);
-    } finally {
-        fixture.close();
-        _resetCompartmentChunkSearchCacheForTests();
-    }
-}, 30000);
+scaleTest(
+    "cold full rebuild returns every row across cooperative slices",
+    async (slow) => {
+        const count = slow ? 15000 : 128;
+        const fixture = searchPoolFixture(count, slow ? 4096 : 64);
+        try {
+            const result = await measureSearchBlock(() => load(fixture.db));
+            expect(result.value).toHaveLength(count);
+            console.log(
+                `search-pool cold: max=${result.maximum.toFixed(2)}ms cpu-at-max=${result.cpuMsAtMaximum.toFixed(2)}ms (${result.cpuSource}) total=${result.elapsed.toFixed(2)}ms`,
+            );
+            if (slow) expect(result.maximum).toBeLessThan(50);
+        } finally {
+            fixture.close();
+            _resetCompartmentChunkSearchCacheForTests();
+        }
+    },
+    30000,
+);
 
-test("heartbeat CPU samples observe synchronous busy work", async () => {
+slowOnlyTest("heartbeat CPU samples observe synchronous busy work", async () => {
     const measured = await measureSearchBlock(() => {
         let value = 1;
         for (let i = 0; i < 20_000_000; i++) value = (Math.imul(value, 1664525) + 1013904223) | 0;
@@ -434,7 +545,7 @@ test("heartbeat CPU samples observe synchronous busy work", async () => {
     );
 });
 
-test("heartbeat stops sampling when the measured operation ends", async () => {
+slowOnlyTest("heartbeat stops sampling when the measured operation ends", async () => {
     const measured = await measureSearchBlock(() => 4, "short measurement");
     const before = measured.outliers.slice();
     const started = performance.now();

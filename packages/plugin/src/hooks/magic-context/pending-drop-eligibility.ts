@@ -30,11 +30,15 @@ export function capturePendingDropEligibility(
     for (const [number, target] of targets) {
         if (pendingDropVeto(number, target, protectedTagIds)) continue;
         if (target.drop) {
-            // canDrop is a read-only probe; prepareDrop can mutate the batch.
             if (target.canDrop?.() === true) eligible.add(number);
         } else {
             const content = target.getContent?.();
-            if (typeof content === "string" && content.length > `[dropped §${number}§]`.length)
+            const replacement = `[dropped §${number}§]`;
+            if (
+                typeof content === "string" &&
+                content.length > replacement.length &&
+                target.canSetContent?.(replacement) !== false
+            )
                 eligible.add(number);
         }
     }

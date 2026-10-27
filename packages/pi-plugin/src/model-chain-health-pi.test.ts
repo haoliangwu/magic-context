@@ -263,7 +263,7 @@ describe("Pi extension reports an empty historian chain at session start", () =>
 		});
 		dreamerTest.setStartDreamScheduleTimerFactory(async () => () => {});
 		const sessionId = "ses-chain-status";
-		const db = openDatabase();
+		const db = openDatabase({ nativeTurnDeadlines: true });
 		// Set 2026-09-26T21:21:47.897Z by a spike into the force band; the
 		// historian that would read and clear it has not run since.
 		updateSessionMeta(db, sessionId, {

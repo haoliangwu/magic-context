@@ -92,7 +92,9 @@ export function createCtxReduceTool(
 			const sessionId = ctx.sessionManager.getSessionId();
 
 			if (!params.drop) {
-				return err("Error: 'drop' must be provided.");
+				return err(
+					`Error: 'drop' must be provided as a string of tag numbers, for example {"drop": "3-5,8"}.`,
+				);
 			}
 
 			let dropIds: number[] = [];

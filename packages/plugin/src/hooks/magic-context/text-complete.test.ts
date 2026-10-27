@@ -5,6 +5,26 @@ import { createTextCompleteHandler } from "./text-complete";
 const SECTION = "\u00a7"; // U+00A7, the section sign character used in MC tag prefixes.
 
 describe("text-complete handler", () => {
+    it("preserves model-authored whitespace at the non-Anthropic save boundary", async () => {
+        const output = { text: " \n\t " };
+        await createTextCompleteHandler(() => "openai")(
+            { sessionID: "s1", messageID: "m1", partID: "p1" },
+            output,
+        );
+        expect(output.text).toBe(" \n\t ");
+    });
+
+    it("keeps a whole copied tag at save time on non-Anthropic providers", async () => {
+        for (const provider of ["openai", "bedrock", "ark", undefined]) {
+            const output = { text: "§58§" };
+            await createTextCompleteHandler(() => provider)(
+                { sessionID: "s1", messageID: "m1", partID: "p1" },
+                output,
+            );
+            expect(output.text).toBe("§58§");
+        }
+    });
+
     describe("leading tag prefix (canonical MC tagger output)", () => {
         it("#given text with leading §N§ prefix #when handler runs #then strips the full tag pair", async () => {
             const handler = createTextCompleteHandler();

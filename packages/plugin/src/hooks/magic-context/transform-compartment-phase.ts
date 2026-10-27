@@ -379,10 +379,15 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
         return "completed";
     }
 
-    if (!historianRunnable && args.sessionMeta.compartmentInProgress) {
+    // A saved flag cannot publish a summary without an executor or a live run.
+    if (
+        (!historianRunnable ||
+            (!args.canRunCompartments && !getActiveCompartmentRun(args.sessionId))) &&
+        args.sessionMeta.compartmentInProgress
+    ) {
         sessionLog(
             args.sessionId,
-            "transform: historian disabled; clearing stale compartmentInProgress flag",
+            "transform: historian unavailable; clearing stale compartmentInProgress flag",
         );
         updateSessionMeta(args.db, args.sessionId, { compartmentInProgress: false });
         compartmentInProgress = false;

@@ -2,6 +2,7 @@ import type { EmbeddingConfig } from "../../../config/schema/magic-context";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../../../config/schema/magic-context";
 import { resolveEmbeddingTextPrefixes } from "./embedding-model-match";
 import { getSynapseLaneIdentity } from "./embedding-synapse";
+import { getCachedLocalEmbeddingPooling } from "./local-embedding-pooling";
 import { computeNormalizedHash } from "./normalize-hash";
 
 function normalizeEndpoint(endpoint?: string): string {
@@ -60,6 +61,18 @@ export function getEmbeddingProviderIdentity(config: EmbeddingConfig): string {
         config.provider === "local" && config.local_dtype && config.local_dtype !== "fp32"
             ? config.local_dtype
             : undefined;
+    const localPooling =
+        config.provider === "local"
+            ? getCachedLocalEmbeddingPooling(config.model?.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL)
+            : null;
+    // The original local default was mean pooling with normalization. Preserve
+    // its identity for declared mean models with a Normalize module and for
+    // models that do not declare a sentence-transformers Pooling module.
+    const localPoolingFingerprint =
+        localPooling?.status === "ready" &&
+        (localPooling.pooling !== "mean" || !localPooling.normalize)
+            ? `${localPooling.pooling};normalize=${localPooling.normalize}`
+            : undefined;
     const identityInput =
         config.provider === "openai-compatible"
             ? {
@@ -83,6 +96,7 @@ export function getEmbeddingProviderIdentity(config: EmbeddingConfig): string {
                   apiKeyPresent: false,
                   runtimeFingerprint: LOCAL_EMBEDDING_RUNTIME_FINGERPRINT,
                   ...(localDtype ? { localDtype } : {}),
+                  ...(localPoolingFingerprint ? { localPooling: localPoolingFingerprint } : {}),
               };
 
     return `embedding-provider:${computeNormalizedHash(JSON.stringify(identityInput))}`;

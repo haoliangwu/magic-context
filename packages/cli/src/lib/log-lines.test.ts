@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
@@ -368,10 +368,6 @@ describe("log path discovery", () => {
         // filename. magic-context still writes one `magic-context.log` rotated
         // to `.1` (packages/plugin/src/shared/logger.ts) and the doctor reads no
         // daemon log, so no reader here resolves or prunes a dated segment.
-        // Read the two sections anyway: when the writer does move, this is the
-        // assertion that fails and asks for a dated-segment resolver.
-        expect(golden.segment_name.cases.length).toBeGreaterThan(0);
-        expect(golden.retention_prune.cases.length).toBeGreaterThan(0);
         const dated = /\.\d{4}-\d{2}-\d{2}\.log$/;
         for (const path of getMagicContextLogPaths("opencode", {
             tempDir: root,
@@ -380,17 +376,5 @@ describe("log path discovery", () => {
         })) {
             expect(path, path).not.toMatch(dated);
         }
-    });
-});
-
-describe("vendored fleet log fixture", () => {
-    it("matches the authority fixture when the sibling checkout exists", () => {
-        const vendored = resolve(import.meta.dir, "__fixtures__/log_format_golden.json");
-        const authority = resolve(
-            import.meta.dir,
-            "../../../../../subconscious/crates/subc-core/tests/fixtures/log_format_golden.json",
-        );
-        if (!existsSync(authority)) return;
-        expect(readFileSync(vendored, "utf8")).toBe(readFileSync(authority, "utf8"));
     });
 });

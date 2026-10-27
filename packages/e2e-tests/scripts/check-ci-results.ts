@@ -2,9 +2,13 @@
 
 import { resolve } from "node:path";
 
-export function failedRequiredJobs(required: string[], needs: Record<string, { result?: string }>): string[] {
+export function failedRequiredJobs(required: string[], needs: Record<string, { result?: string }>, allowedSkipped: string[] = []): string[] {
     if (required.length === 0 || new Set(required).size !== required.length) throw new Error("invalid required job list");
-    return required.filter((job) => needs[job]?.result !== "success");
+    return required.filter((job) => needs[job]?.result !== "success" && !(allowedSkipped.includes(job) && needs[job]?.result === "skipped"));
+}
+
+export function slowUnitRequired(event: string | undefined, ref: string | undefined): boolean {
+    return event === "schedule" || ref?.startsWith("refs/heads/train/check-") === true;
 }
 
 if (import.meta.main) {
@@ -18,7 +22,8 @@ if (import.meta.main) {
         const needs = JSON.parse(process.env.CI_NEEDS ?? "null") as Record<string, { result?: string }> | null;
         if (!needs || typeof needs !== "object" || Array.isArray(needs)) throw new Error("CI_NEEDS must be a needs result object");
         for (const name of required) console.log(`${name}: ${needs[name]?.result ?? "MISSING"}`);
-        const failed = failedRequiredJobs(required, needs);
+        const allowedSkipped = slowUnitRequired(process.env.GITHUB_EVENT_NAME, process.env.GITHUB_REF) ? [] : ["slow-unit"];
+        const failed = failedRequiredJobs(required, needs, allowedSkipped);
         if (failed.length > 0) throw new Error(`required CI jobs did not succeed: ${failed.join(", ")}`);
         console.log(`${job}: all ${required.length} required jobs succeeded`);
     } catch (error) {

@@ -23,6 +23,7 @@ import {
     reclaimRideLabel,
     reclaimRidePermitted,
 } from "./cache-busting-signals";
+import { readExecuteReclaimState, writeExecuteReclaimState } from "./execute-reclaim";
 import { isHistorianDrainBudgetSpent } from "./historian-drain-gate";
 import {
     createDefaultBoundarySnapshotForTests,
@@ -353,6 +354,7 @@ function getUnsummarizedTailInfo(
     contextLimit?: number,
     inMemoryTail?: InMemoryTailSource,
     taggerFloor = 0,
+    liftLivePromptFloor = false,
 ): TailInfo {
     return withRawSessionMessageCache(() => {
         try {
@@ -409,6 +411,7 @@ function getUnsummarizedTailInfo(
                           usage,
                           usageSource: "live",
                           taggerFloor,
+                          liftLivePromptFloor,
                       });
             const hasProtectedEligibleHead =
                 boundary.offset <
@@ -482,7 +485,11 @@ export function checkCompartmentTrigger(
     reasoningProjection?: ReasoningProjectionCapability,
     reclaimRide?: ReclaimRideSignals & { permission?: ReclaimRidePermissionGate },
     eligiblePendingDropTagIds?: ReadonlySet<number>,
+    primaryExecute = false,
 ): CompartmentTriggerResult {
+    if (usage.percentage < executeThresholdPercentage) {
+        writeExecuteReclaimState(db, sessionId, { floorOrdinal: null, floorPromptId: null });
+    }
     if (sessionMeta.compartmentInProgress) {
         sessionLog(
             sessionId,
@@ -634,7 +641,7 @@ export function checkCompartmentTrigger(
         }
     }
 
-    const tailInfo = getUnsummarizedTailInfo(
+    let tailInfo = getUnsummarizedTailInfo(
         db,
         sessionId,
         triggerBudget,
@@ -644,6 +651,43 @@ export function checkCompartmentTrigger(
         resolvedInMemoryTail,
         taggerFloor,
     );
+    const markState = readExecuteReclaimState(db, sessionId);
+    const mark = markState.floorOrdinal;
+    const livePromptOrdinal = tailInfo.boundarySnapshot?.diagnostics?.livePromptFloor.ordinal;
+    let consumedFloorMark = false;
+    if (mark !== null) {
+        // A newer meaningful prompt releases the old head normally, rather than
+        // spending the escape on the new prompt. Reminder-only user messages do
+        // not advance the meaningful-user prompt's identity or ordinal.
+        const consumed = writeExecuteReclaimState(db, sessionId, {
+            floorOrdinal: null,
+            floorPromptId: null,
+        });
+        if (
+            consumed &&
+            mark === livePromptOrdinal &&
+            markState.floorPromptId ===
+                tailInfo.boundarySnapshot?.diagnostics?.livePromptFloor.messageId &&
+            usage.percentage >= executeThresholdPercentage
+        ) {
+            consumedFloorMark = true;
+            sessionLog(
+                sessionId,
+                `compartment trigger: live-prompt floor mark consumed at ${mark}`,
+            );
+            tailInfo = getUnsummarizedTailInfo(
+                db,
+                sessionId,
+                triggerBudget,
+                usage,
+                executeThresholdPercentage,
+                contextLimit,
+                resolvedInMemoryTail,
+                taggerFloor,
+                true,
+            );
+        }
+    }
     if (!tailInfo.hasNewRawHistory) {
         // Diagnostic data collection is best-effort. The helpers can throw if
         // the OpenCode session DB is unavailable (e.g. in unit-test env or
@@ -836,9 +880,45 @@ export function checkCompartmentTrigger(
     }
 
     if (!tailInfo.hasProtectedEligibleHead || !tailInfo.isMeaningful) {
+        let floorOnly = false;
+        const boundary = tailInfo.boundarySnapshot;
+        const floor = boundary?.diagnostics?.livePromptFloor;
+        if (!consumedFloorMark && floor?.ordinal && floor.from > floor.to) {
+            const withoutFloor = getUnsummarizedTailInfo(
+                db,
+                sessionId,
+                triggerBudget,
+                usage,
+                executeThresholdPercentage,
+                contextLimit,
+                resolvedInMemoryTail,
+                taggerFloor,
+                true,
+            );
+            floorOnly = withoutFloor.hasProtectedEligibleHead && withoutFloor.isMeaningful;
+            if (
+                floorOnly &&
+                primaryExecute &&
+                usage.percentage >= executeThresholdPercentage &&
+                writeExecuteReclaimState(db, sessionId, {
+                    floorOrdinal: floor.ordinal,
+                    floorPromptId: floor.messageId ?? null,
+                })
+            ) {
+                sessionLog(
+                    sessionId,
+                    `compartment trigger: live-prompt floor mark set at ${floor.ordinal}`,
+                );
+            }
+        }
+        const refusal = floorOnly
+            ? `no eligible head (live-prompt floor at ${floor?.ordinal})`
+            : tailInfo.hasProtectedEligibleHead
+              ? "below meaningfulness"
+              : "no eligible head";
         sessionLog(
             sessionId,
-            `compartment trigger: not firing at ${usage.percentage.toFixed(1)}% because unsummarized tail from ${tailInfo.nextStartOrdinal} is too small`,
+            `compartment trigger: not firing at ${usage.percentage.toFixed(1)}% — ${refusal}; offset=${tailInfo.nextStartOrdinal} protectedStart=${boundary?.protectedTailStart ?? "none"} eligibleEnd=${boundary?.eligibleEndOrdinal ?? "none"} rawTokens=${tailInfo.trueRawEligibleTokens} chunkTokens=${tailInfo.tokenEstimate}`,
         );
         return { shouldFire: false };
     }

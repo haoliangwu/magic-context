@@ -10,8 +10,10 @@ import {
 	setPendingPiCompactionMarkerState,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
+import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import {
 	__test,
+	awaitInFlightHistorians,
 	clearContextHandlerSession,
 	consumeDeferredHistoryRefresh,
 	consumeDeferredMaterialization,
@@ -46,24 +48,57 @@ const model = {
 
 // Each arm uses the same identities and serializer, but independent durable state.
 // Small tool results keep automatic age reclaim from masking the queued drop.
-export function rideHarness(inject = true) {
+export function rideHarness(inject = true, scenario?: "floor" | "small") {
 	const db = createTestDb();
 	const id = "ses-deferred-ride-evidence";
 	const fake = createFakePi();
-	registerPiContextHandler(fake.pi as never, {
-		db,
-		protectedTags: 0,
-		scheduler: { executeThresholdPercentage: 65 },
-		injection: inject
-			? {
-					injectionBudgetTokens: 40_000,
-					historyBudgetTokens: 30_000,
-					memoryEnabled: false,
-					injectDocs: false,
-					temporalAwareness: false,
-				}
-			: undefined,
+	let releaseHistorian: (() => void) | undefined;
+	let historianRuns = 0;
+	const historianWait = new Promise<void>((resolve) => {
+		releaseHistorian = resolve;
 	});
+	const runner = {
+		harness: "pi",
+		run: async (options: { userMessage: string }) => {
+			historianRuns++;
+			await historianWait;
+			const range = /Messages (\d+)-(\d+):/.exec(options.userMessage);
+			if (!range)
+				throw new Error("Historian prompt did not specify its message range");
+			return {
+				ok: true,
+				assistantText: `<compartment start="${range[1]}" end="${range[2]}" title="Autonomous work"><p1>Completed the earlier work and verified the files.</p1></compartment>`,
+				durationMs: 1,
+			};
+		},
+	} as unknown as SubagentRunner;
+	const register = () =>
+		registerPiContextHandler(fake.pi as never, {
+			db,
+			protectedTags: 0,
+			scheduler: { executeThresholdPercentage: scenario ? 75 : 65 },
+			historian:
+				scenario === "floor"
+					? {
+							runner,
+							model: "test/historian",
+							historianChunkTokens: 10_000,
+							executeThresholdPercentage: 75,
+							memoryEnabled: false,
+							twoPass: false,
+						}
+					: undefined,
+			injection: inject
+				? {
+						injectionBudgetTokens: 40_000,
+						historyBudgetTokens: 30_000,
+						memoryEnabled: false,
+						injectDocs: false,
+						temporalAwareness: false,
+					}
+				: undefined,
+		});
+	register();
 	let systemPrompt = "Fixed system prompt.";
 	updateSessionMeta(db, id, {
 		systemPromptHash: createHash("sha256").update(systemPrompt).digest("hex"),
@@ -97,6 +132,35 @@ export function rideHarness(inject = true) {
 				model: model.id,
 			});
 	}
+	if (scenario === "floor") {
+		for (let i = 2; i < raw.length; i++) {
+			const message = raw[i];
+			if (!message) continue;
+			if (message.role === "user")
+				Object.assign(message, {
+					content:
+						i === 2
+							? "Implement the long autonomous task"
+							: "<system-reminder>Continue working</system-reminder>",
+				});
+			if (
+				message.role === "assistant" &&
+				!(message as { content: { type: string }[] }).content.some(
+					(p) => p.type === "toolCall",
+				)
+			)
+				Object.assign(message, {
+					content: [
+						{
+							type: "text",
+							text: `Work phase ${i}: inspected and verified code. `.repeat(
+								400,
+							),
+						},
+					],
+				});
+		}
+	}
 	appendCompartments(db, id, [
 		{
 			sequence: 0,
@@ -112,6 +176,32 @@ export function rideHarness(inject = true) {
 	return {
 		db,
 		id,
+		get historianRuns() {
+			return historianRuns;
+		},
+		async finishHistorian() {
+			releaseHistorian?.();
+			await awaitInFlightHistorians(id);
+		},
+		restart() {
+			clearContextHandlerSession(id);
+			register();
+		},
+		appendTurn(meaningful: boolean) {
+			const timestamp = raw.length + 1000;
+			raw.push(
+				userMessage(
+					meaningful
+						? `New human instruction ${timestamp}`
+						: "<system-reminder>Continue working</system-reminder>",
+					timestamp,
+				),
+				Object.assign(
+					assistantMessage(`Work continuation ${timestamp}`, timestamp + 1),
+					{ api: model.api, provider: model.provider, model: model.id },
+				),
+			);
+		},
 		setSystemPrompt(prompt: string) {
 			systemPrompt = prompt;
 			const hash = createHash("sha256").update(prompt).digest("hex");

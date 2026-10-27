@@ -321,6 +321,7 @@ describe("Rust-mode compaction target recording under cross-process write conten
                 ),
             ).toBe(true);
             expect(RUST_MARKER_LOCK_SKIP_LOG).toContain("next cache-busting pass retries");
+            expect(RUST_MARKER_LOCK_SKIP_LOG).not.toContain("next pass retries");
         } finally {
             await locker.exited;
             sessionLog.mockRestore();

@@ -10,6 +10,7 @@ import {
 	unregisterProjectEmbedding,
 	unregisterProjectShadowEmbedding,
 } from "@magic-context/core/features/magic-context/memory/embedding";
+import { preflightLocalEmbeddingPooling } from "@magic-context/core/features/magic-context/memory/local-embedding-pooling";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { drainProjectEmbeddingIdentityMaintenance } from "@magic-context/core/features/magic-context/project-embedding-registry";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
@@ -19,6 +20,7 @@ import {
 } from "@magic-context/core/plugin/embedding-bootstrap-helpers";
 import { resolveEmbeddingRouting } from "@magic-context/core/plugin/embedding-routing";
 import { log } from "@magic-context/core/shared/logger";
+
 import { loadPiConfigDetailed } from "./config";
 
 interface RegistrationFingerprint {
@@ -70,6 +72,7 @@ export function unregisterPiProjectEmbeddings(db: ContextDatabase): void {
 export async function ensureProjectRegisteredFromPiDirectory(
 	directory: string,
 	db: ContextDatabase,
+	options: { preflightLocalPooling?: boolean } = {},
 ): Promise<void> {
 	const detailed = loadPiConfigDetailed({ cwd: directory });
 	const projectIdentity = resolveProjectIdentityForSession(
@@ -107,6 +110,11 @@ export async function ensureProjectRegisteredFromPiDirectory(
 		memoryEnabled: detailed.config.memory.enabled,
 		gitCommitEnabled: detailed.config.memory.git_commit_indexing.enabled,
 	};
+	if (options.preflightLocalPooling && routing.primary.provider === "local") {
+		await preflightLocalEmbeddingPooling(
+			routing.primary.model ?? "Xenova/all-MiniLM-L6-v2",
+		);
+	}
 	let registered = registeredIdentitiesByDatabase.get(db);
 	if (!registered) {
 		registered = new Set();

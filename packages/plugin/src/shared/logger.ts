@@ -5,6 +5,7 @@ import { sanitizeConfigValue, sanitizeDiagnosticText } from "./redaction";
 import { stalePluginBuildDiagnostic } from "./stale-plugin-build";
 
 const isTestEnv = process.env.NODE_ENV === "test";
+const syncLogWrites = process.env.MAGIC_CONTEXT_LOG_SYNC === "1";
 
 let buffer: string[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -198,6 +199,14 @@ function scheduleFlush(): void {
     }, FLUSH_INTERVAL_MS);
 }
 
+function appendLine(line: string): void {
+    buffer.push(line);
+    bufferedBytes += Buffer.byteLength(line);
+    boundBuffer();
+    if (syncLogWrites || buffer.length >= BUFFER_SIZE_LIMIT) flush();
+    else scheduleFlush();
+}
+
 // Set inside a worker thread so its lines reach the main thread's log file. The
 // log path depends on which host (OpenCode or Pi) the main thread registered,
 // and only the main thread's buffer and flush timer write that file.
@@ -215,11 +224,7 @@ export function setLogLineForwarder(forward: ((line: string) => void) | null): v
 export function writeForwardedLogLine(line: string): void {
     if (isTestEnv) return;
     try {
-        buffer.push(line);
-        bufferedBytes += Buffer.byteLength(line);
-        boundBuffer();
-        if (buffer.length >= BUFFER_SIZE_LIMIT) flush();
-        else scheduleFlush();
+        appendLine(line);
     } catch {
         // Intentional: logging must never throw
     }
@@ -249,14 +254,7 @@ export function log(message: string, data?: unknown): void {
             lineForwarder(line);
             return;
         }
-        buffer.push(line);
-        bufferedBytes += Buffer.byteLength(line);
-        boundBuffer();
-        if (buffer.length >= BUFFER_SIZE_LIMIT) {
-            flush();
-        } else {
-            scheduleFlush();
-        }
+        appendLine(line);
     } catch {
         // Intentional: logging must never throw
     }

@@ -17,6 +17,6 @@ import { stripPersistedAssistantText } from "../../hooks/magic-context/tag-conte
  * trims surrounding whitespace, and trimming text that holds no tag notation
  * would change the bytes of sessions that never had copies.
  */
-export function stripCopiedTagNotation(text: string): string {
-    return text.includes("\u00a7") ? stripPersistedAssistantText(text) : text;
+export function stripCopiedTagNotation(text: string, acceptsEmpty = true): string {
+    return text.includes("\u00a7") ? stripPersistedAssistantText(text, acceptsEmpty) : text;
 }

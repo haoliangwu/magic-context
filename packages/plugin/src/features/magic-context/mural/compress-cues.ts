@@ -460,6 +460,8 @@ async function compressOneChunk(
                 tokens: run.output.usage,
                 providerId: run.output.providerId,
                 modelId: run.output.modelId,
+                attemptedModel: args.model,
+                configuredModels: args.fallbackModels,
             });
         }
 
