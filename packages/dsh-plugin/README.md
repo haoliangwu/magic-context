@@ -38,7 +38,7 @@ dsh-magic-context doctor --profile <name>
 **Production — GitHub subpath (no npm publish, verified with pnpm 11):**
 
 Pin to a commit SHA for reproducibility, or track the branch (the plugin
-version follows the monorepo version — `0.49.23` in lockstep with
+version follows the monorepo version — `0.49.25` in lockstep with
 `@cortexkit/opencode-magic-context`; fork release tags use that scheme
 once cut):
 
