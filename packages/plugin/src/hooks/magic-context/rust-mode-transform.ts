@@ -2946,6 +2946,7 @@ export function createRustModeTransform(
                             providerID: model?.providerID,
                             modelID: model?.modelID,
                             agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                            sessionId,
                         }),
                 });
                 if (measure.fit !== "under") {
@@ -3880,6 +3881,7 @@ export function createRustModeTransform(
                           providerID: model?.providerID,
                           modelID: model?.modelID,
                           agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                          sessionId,
                       })
                     : undefined;
             // The module folds these fields into the session's render identity and
@@ -4815,6 +4817,7 @@ export function createRustModeTransform(
                             providerID: model?.providerID,
                             modelID: model?.modelID,
                             agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                            sessionId,
                             systemPromptHash: sessionMeta.systemPromptHash,
                         },
                         resolvedWindowGeometry?.usableHard ?? resolvedContextLimit,
@@ -5201,6 +5204,7 @@ export function createRustModeTransform(
                 providerID: model?.providerID,
                 modelID: model?.modelID,
                 agentName: deps.getNotificationParams?.(sessionId)?.agent,
+                sessionId,
                 systemPromptHash: sessionMeta.systemPromptHash,
             });
             captureOpencodeReasoningBudgetStatus(

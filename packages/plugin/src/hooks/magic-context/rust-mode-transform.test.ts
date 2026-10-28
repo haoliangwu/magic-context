@@ -10049,7 +10049,7 @@ it("refuses LKG plus suffix when no tool-definition envelope exists", async () =
     expect(output.messages).toEqual(input);
 });
 
-it("serves a fitting LKG with an envelope from another measured model", async () => {
+it("serves a fitting LKG with an envelope from the model this session last flew", async () => {
     const sessionId = "fit-envelope-replay";
     sessions.push(sessionId);
     const db = makeDb();
@@ -10068,7 +10068,17 @@ it("serves a fitting LKG with an envelope from another measured model", async ()
     await transform.run(sessionId, input, { messages: [...input] }, meta);
     expect(getSlot(sessionId)).toBeDefined();
     __resetToolDefinitionMeasurements();
-    recordToolDefinition("test-provider", "previous-model", "default", "read", "Read a file", {});
+    // The session's previous request flew another model; the current one has
+    // no tool measurement yet.
+    recordToolDefinition(
+        "test-provider",
+        "previous-model",
+        "default",
+        "read",
+        "Read a file",
+        {},
+        sessionId,
+    );
     failing = true;
     const output = { messages: [...input] as unknown[] };
     await transform.run(sessionId, input, output, meta);
@@ -10179,6 +10189,17 @@ describe("proactive thinking strip on a released frozen replay", () => {
         const transform = createRustModeTransform(deps, { moduleClient });
         const run = async (input: MessageLike[]) => {
             lastInput = input;
+            // OpenCode 1 measures the session's own route's tools before every
+            // transform pass.
+            recordToolDefinition(
+                PREFIX_BOUND_MODEL.providerID,
+                PREFIX_BOUND_MODEL.modelID,
+                undefined,
+                "read",
+                "read fixture",
+                { type: "object" },
+                sessionId,
+            );
             const output = { messages: [...input] as unknown[] };
             await transform.run(sessionId, input, output, makeMeta(db, sessionId));
             return output.messages;

@@ -169,9 +169,9 @@ export function createPiTagSnapshotReader(db: Database) {
 	const managed = new Set<string>();
 	const epoch = ++connectionEpoch;
 	const sessionEpochs = new Map<string, number>();
+	let closed = false;
 	let jobId = 0;
 	let current: OwnerJob | undefined;
-	let desiredSession: string | undefined;
 	let failedUntil = 0;
 	let lastFailure: unknown;
 	let failedSession: string | undefined;
@@ -227,31 +227,46 @@ export function createPiTagSnapshotReader(db: Database) {
 	};
 	const cancel = (sessionId: string) => {
 		sessionEpochs.set(sessionId, (sessionEpochs.get(sessionId) ?? 0) + 1);
-		if (desiredSession === sessionId) desiredSession = undefined;
 		if (current?.sessionId === sessionId) current.cancel();
 	};
 	// A shared prewarm outlives individual context waiters. Its TEMP bookkeeping
 	// must not inherit a cancelled waiter's transform-write or ownership guard.
-	const load = (sessionId: string): Promise<void> =>
+	const load = (
+		sessionId: string,
+		kind: PiTagSnapshotLoadKind,
+	): Promise<void> =>
 		inSnapshotRoot(async () => {
+			if (closed) throw new PiTagHydrationError("connection closed");
 			managed.add(sessionId);
 			if (ready(sessionId)) return;
-			desiredSession = sessionId;
 			if (current) {
-				// A running or non-retryable job is shared by every waiter. A job that
-				// already failed as stale is not: returning its rejected result would
-				// make the readiness retry fail with the same stale error without ever
-				// reading again. Wait for its worker to exit, then start a new one.
-				if (current.sessionId === sessionId && !current.stale)
+				// A turn joining its prewarm owns that read from now on. Only an
+				// unclaimed background read may yield to another session's turn.
+				if (
+					current.sessionId === sessionId &&
+					!current.retryable &&
+					!current.preempted
+				) {
+					if (kind === "turn") current.kind = "turn";
 					return current.result;
-				current.cancel();
-				await current.released;
-				if (desiredSession !== sessionId)
+				}
+				if (
+					kind === "turn" &&
+					current.kind === "prewarm" &&
+					current.sessionId !== sessionId &&
+					!current.preempted
+				) {
+					current.preempted = true;
+					current.cancel();
+				}
+				const epoch = sessionEpochs.get(sessionId) ?? 0;
+				await Promise.allSettled([current.result, current.released]);
+				if (epoch !== (sessionEpochs.get(sessionId) ?? 0))
 					throw new PiTagHydrationError(
-						"session hydration superseded",
-						"stale",
+						"session hydration cancelled while queued",
+						"cancelled",
 					);
-				return load(sessionId);
+				return load(sessionId, kind);
 			}
 			if (failedSession === sessionId && performance.now() < failedUntil)
 				throw lastFailure;
@@ -286,6 +301,7 @@ export function createPiTagSnapshotReader(db: Database) {
 			);
 			const destination: OwnerJob = {
 				sessionId,
+				kind,
 				result: Promise.resolve(),
 				released: worker.released,
 				cancel: worker.cancel,
@@ -306,11 +322,16 @@ export function createPiTagSnapshotReader(db: Database) {
 			jobs.add(lifetime);
 			destination.result = worker.result
 				.then(({ candidate, generation }) => {
+					if (destination.preempted)
+						throw new PiTagHydrationError(
+							"prewarm yielded to a turn",
+							"cancelled",
+						);
 					// No await is allowed from this owner validation through publication.
 					const live = stamps(sessionId, token.jobId);
 					if (
+						closed ||
 						current !== destination ||
-						desiredSession !== sessionId ||
 						!samePiTagSnapshotToken(token, live) ||
 						token.totalRevision !== live.totalRevision ||
 						generation.revision !== token.totalRevision ||
@@ -362,23 +383,21 @@ export function createPiTagSnapshotReader(db: Database) {
 					cache.set(sessionId, snapshot);
 				})
 				.catch((error) => {
-					if (error instanceof PiTagHydrationError && error.code === "stale")
-						destination.stale = true;
+					const retryable =
+						error instanceof PiTagHydrationError &&
+						(error.code === "stale" || error.code === "cancelled");
+					if (retryable) destination.retryable = true;
 					// Cancelling an old session is not a connection failure. Do not
 					// replay its cancellation as the next session's startup error.
 					if (
+						!destination.preempted &&
 						current === destination &&
-						desiredSession === sessionId &&
 						token.sessionEpoch === (sessionEpochs.get(sessionId) ?? 0)
 					) {
 						// Back off only the failed session; another session needs its own read.
 						failedSession = sessionId;
 						lastFailure = error;
-						failedUntil =
-							performance.now() +
-							(error instanceof PiTagHydrationError && error.code === "stale"
-								? 0
-								: 500);
+						failedUntil = performance.now() + (retryable ? 0 : 500);
 					}
 					throw error;
 				});
@@ -575,7 +594,7 @@ export function createPiTagSnapshotReader(db: Database) {
 			// Weak-key readers are collected only when the engine examines their
 			// connection keys. Release large snapshots immediately on explicit close
 			// rather than retaining closed sessions until a major collection.
-			desiredSession = undefined;
+			closed = true;
 			nativeWaiters.clear();
 			current?.cancel();
 			cache.clear();
@@ -957,15 +976,18 @@ export function readPiFallbackTagRows(
 	return fallbackReaders.get(db)?.(sessionId) ?? null;
 }
 
+type PiTagSnapshotLoadKind = "prewarm" | "turn";
+
 interface OwnerJob {
 	sessionId: string;
+	kind: PiTagSnapshotLoadKind;
+	/** A turn preempted this background read; its cancellation is not a failure. */
+	preempted?: boolean;
 	result: Promise<void>;
 	released: Promise<void>;
 	cancel: () => void;
-	/** Set when this job's result rejected because the database changed while it
-	 * read. Such a result must not be shared with a later load of the same
-	 * session: that load is a retry and needs a fresh read. */
-	stale?: boolean;
+	/** Stale or cancelled results need a fresh worker, not the rejected promise. */
+	retryable?: boolean;
 }
 
 type PiSnapshotWorkerFactory = (
@@ -985,7 +1007,7 @@ const owners = new WeakMap<
 	Database,
 	{
 		ready: (sessionId: string) => boolean;
-		load: (sessionId: string) => Promise<void>;
+		load: (sessionId: string, kind: PiTagSnapshotLoadKind) => Promise<void>;
 		addNativeWaiter: (remaining: () => number) => () => void;
 		manage: (sessionId: string) => void;
 		cancel: (sessionId: string) => void;
@@ -1010,12 +1032,12 @@ export function __setPiTagSnapshotWorkerForTests(
 	workerFactories.set(db, factory);
 }
 
-/** Start only the current destination; clone callers invoke this after inheritance. */
+/** Best-effort background hydration; a turn may claim it or preempt it for another session. */
 export function prewarmPiTagSnapshot(db: Database, sessionId: string): void {
 	createPiTagSnapshotReader(db);
 	void owners
 		.get(db)
-		?.load(sessionId)
+		?.load(sessionId, "prewarm")
 		.catch(() => {});
 }
 
@@ -1077,8 +1099,9 @@ export function ensurePiTagSnapshotReady(
 	}
 	const end = deadline;
 	return (async () => {
-		// A stale worker's partial candidate is discarded. Start at the first page
-		// again until one complete generation fits in the original pass allowance.
+		// Discard stale or externally cancelled reads and retry within the original
+		// allowance. The budget's signal and owner guard distinguish a cancelled
+		// pass from a shared prewarm that was cancelled independently of the pass.
 		for (;;) {
 			budget.assert();
 			const allowance = Math.min(
@@ -1099,7 +1122,7 @@ export function ensurePiTagSnapshotReady(
 			try {
 				await budget.wait(
 					Promise.race([
-						owner.load(sessionId),
+						owner.load(sessionId, "turn"),
 						new Promise<never>((_, reject) => {
 							timer = setTimeout(
 								() =>
@@ -1119,7 +1142,12 @@ export function ensurePiTagSnapshotReady(
 				return;
 			} catch (error) {
 				budget.assert();
-				if (!(error instanceof PiTagHydrationError && error.code === "stale"))
+				if (
+					!(
+						error instanceof PiTagHydrationError &&
+						(error.code === "stale" || error.code === "cancelled")
+					)
+				)
 					throw error;
 			} finally {
 				clearTimeout(timer);

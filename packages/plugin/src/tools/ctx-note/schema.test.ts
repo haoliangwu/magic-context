@@ -5,6 +5,11 @@ import { CTX_NOTE_LIGHT_DESCRIPTION } from "../light-descriptions";
 import { CTX_NOTE_DESCRIPTION } from "./constants";
 
 const NOTE_IDS_DESCRIPTION =
+    "Note ids: one for update, 1–50 for dismiss, or 1–50 to read those notes in full. Write and a plain read take an empty list.";
+// ck-mc keeps the previous contract until the Claude Code gateway owner picks
+// this up on the release train: at least one id required, and the
+// write-ignores wording.
+const RUST_NOTE_IDS_DESCRIPTION =
     "Note ids: one for update, 1–50 for dismiss or read (read returns full bodies). Ignored by write.";
 
 const pluginSchemaSource = readFileSync(resolve(import.meta.dir, "tools.ts"), "utf8");
@@ -18,8 +23,8 @@ const rustSchemaSource = readFileSync(
 );
 
 describe("ctx_note note_ids schema parity", () => {
-    it("keeps the single id field byte-identical across TS, Pi, and Rust", () => {
-        for (const source of [pluginSchemaSource, piSchemaSource, rustSchemaSource]) {
+    it("keeps the single id field byte-identical across TS and Pi, with Rust following on the release train", () => {
+        for (const source of [pluginSchemaSource, piSchemaSource]) {
             expect(source).toContain(NOTE_IDS_DESCRIPTION);
         }
         expect(pluginSchemaSource).toContain(".array(tool.schema.number().int().min(1))");
@@ -28,6 +33,7 @@ describe("ctx_note note_ids schema parity", () => {
             "Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })",
         );
         expect(piSchemaSource).toContain("maxItems: 50");
+        expect(rustSchemaSource).toContain(RUST_NOTE_IDS_DESCRIPTION);
         expect(rustSchemaSource).toContain(
             '"minItems": 1, "maxItems": 50, "items": { "type": "integer", "minimum": 1, "maximum": 9007199254740991_i64 }',
         );

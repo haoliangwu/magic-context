@@ -2,7 +2,13 @@ import {
 	piAgentHistory,
 	piIsDeveloperHistory,
 } from "./pi-dispatch-agent-history";
-import { piOmitsTruncatedAssistant } from "./pi-dispatch-assistant-history";
+import {
+	type PiAnthropicOptionalThinking,
+	piAnthropicAssistantReplay,
+	piAnthropicOptionalThinking,
+	piExplainsOptionalAssistant,
+	piOmitsTruncatedAssistant,
+} from "./pi-dispatch-assistant-history";
 import {
 	type PiChatHistoryModel,
 	piChatHistoryPlan,
@@ -46,6 +52,25 @@ interface MessageStructure {
 	/** JSON [text, phase] pairs for every assistant text block, retained in wire order. */
 	responseTexts?: string[];
 	images?: readonly PiInputImage[];
+	/**
+	 * Set on an assistant the Anthropic converter may or may not send; see
+	 * piAnthropicAssistantReplay. When the row is sent, each wire block must
+	 * come from this evidence (see piExplainsOptionalAssistant), or be the
+	 * converter's thinking placeholder.
+	 */
+	optionalThinking?: PiAnthropicOptionalThinking;
+}
+
+/**
+ * Rows before developer promotion and Continue pads, for a request whose
+ * prepared history has optional assistants. The comparator rebuilds the
+ * expected rows for each choice of sent optional assistants.
+ */
+interface PiAnthropicOptionalPlan {
+	rows: readonly MessageStructure[];
+	/** Developer rows that become system rows when placed after a user turn
+	 * and before an assistant or the end, with their system texts. */
+	promotable: ReadonlyMap<MessageStructure, readonly string[]>;
 }
 
 /** Transport-independent roles and ordered tool IDs, captured before text transforms. */
@@ -60,6 +85,8 @@ export interface PiPreparedStructure {
 	imageBudget?: PiImageBudgetPlan<MessageStructure>;
 	/** Set when the Anthropic Continue-pad rule was modeled for this route. */
 	anthropicContinuePad?: boolean;
+	/** Set when some prepared assistants may be absent from the wire. */
+	anthropicOptional?: PiAnthropicOptionalPlan;
 }
 
 const MAX_MESSAGES = 100_000;
@@ -784,6 +811,16 @@ function buildPiPreparedStructure(
 					}))
 		)
 			continue;
+		if (source?.role === "assistant") {
+			// The Anthropic converter sends no row for an assistant whose blocks
+			// it skips, and may or may not send one whose only blocks are
+			// thinking. Earlier passes still count the assistant, since the
+			// host's replay pass keeps it.
+			const replay = piAnthropicAssistantReplay(source, model, host);
+			if (replay === "dropped") continue;
+			if (replay === "optional")
+				row.optionalThinking = piAnthropicOptionalThinking(source);
+		}
 		row.calls.forEach((id, index) => {
 			toolNames.set(id, row.callNames?.[index] ?? "");
 			if (model?.api) {
@@ -815,6 +852,10 @@ function buildPiPreparedStructure(
 		piRecordImages(imageBudget, row, source);
 	}
 	if (!valid) return undefined;
+	// The rows before developer promotion and Continue pads, which the
+	// comparator rebuilds when an optional assistant is left out.
+	const baseRows = [...rows];
+	const promotable = new Map<MessageStructure, readonly string[]>();
 	// OMP renders non-user-attributed developer messages as system only after a
 	// user turn (including tool results packed into user) and before assistant or end.
 	// Iterate backwards, as the serializer does, so a promoted notice prevents
@@ -835,14 +876,28 @@ function buildPiPreparedStructure(
 					object(part)?.type === "text" &&
 					typeof object(part)?.text === "string",
 			);
+		const systemTexts = () => {
+			// Called only when textOnly holds, so every part is a text block.
+			const texts = (parts as { text: string }[]).map((part) => part.text);
+			return model?.api === "anthropic-messages"
+				? texts
+						.filter((text) => text.trim())
+						.map((text) =>
+							new TextDecoder().decode(new TextEncoder().encode(text)),
+						)
+				: texts;
+		};
 		if (piIsDeveloperHistory(source) && source.attribution !== "user") {
 			const previous = rows[position - 1];
 			const next = rows[position + 1];
+			const anthropicPromotable =
+				model?.api === "anthropic-messages" &&
+				object(model.compat)?.supportsMidConversationSystem === true &&
+				textOnly;
+			if (anthropicPromotable) promotable.set(row, systemTexts());
 			if (
 				model?.api === "ollama-chat" ||
-				(model?.api === "anthropic-messages" &&
-					object(model.compat)?.supportsMidConversationSystem === true &&
-					textOnly &&
+				(anthropicPromotable &&
 					(previous?.role === "user" || previous?.role === "toolResult") &&
 					(!next || next.role === "assistant"))
 			)
@@ -850,15 +905,7 @@ function buildPiPreparedStructure(
 		}
 		if (row.role === "system") {
 			if (!textOnly) return undefined;
-			const texts: string[] = parts.map((part) => part.text);
-			row.systemText =
-				model?.api === "anthropic-messages"
-					? texts
-							.filter((text) => text.trim())
-							.map((text) =>
-								new TextDecoder().decode(new TextEncoder().encode(text)),
-							)
-					: texts;
+			row.systemText = systemTexts();
 		}
 	}
 	// Model OMP's adjacent-assistant repair on the Anthropic route: an assistant
@@ -984,6 +1031,9 @@ function buildPiPreparedStructure(
 			: {}),
 		...(model?.api ? { api: model.api } : {}),
 		...(modelsContinuePad ? { anthropicContinuePad: true as const } : {}),
+		...(modelsContinuePad && baseRows.some((row) => row.optionalThinking)
+			? { anthropicOptional: { rows: baseRows, promotable } }
+			: {}),
 		...(model?.api?.startsWith("google-")
 			? {
 					googleFunctionIds:
@@ -1330,6 +1380,7 @@ type StructureComparison =
 	| "count"
 	| "timestamp"
 	| "content"
+	| "alignment"
 	| "exception";
 
 function safeRole(
@@ -1404,6 +1455,127 @@ function trimPreparedImageRows(
 	return projected;
 }
 
+/**
+ * Count the ways the wire rows read as the prepared rows with some optional
+ * assistants left out, stopping at two. Leaving an assistant out changes its
+ * neighbours as the converter does: OMP puts a Continue pad between two
+ * assistants that end up adjacent, and promotes a developer row to system
+ * only between a user turn and an assistant or the end (see
+ * buildPiPreparedStructure). Each wire row maps to exactly one prepared row
+ * or pad; a trailing Continue pad after a final assistant is also accepted.
+ *
+ * The walk is forward over prepared rows. A state is the last chosen row,
+ * whose final form waits for the next chosen row, the role of the row chosen
+ * before it, and the wire row it must match. Required rows cannot be skipped,
+ * so a state reaches only the run of optional rows that follows it.
+ */
+function countAnthropicOptionalAlignments(
+	plan: PiAnthropicOptionalPlan,
+	base: readonly MessageStructure[],
+	wire: readonly MessageStructure[],
+	compare: (
+		expected: MessageStructure,
+		actual: MessageStructure,
+	) => StructureComparison | undefined,
+): number {
+	const pad: MessageStructure = {
+		role: "user",
+		calls: [],
+		results: [],
+		exactText: ANTHROPIC_CONTINUE_PAD_TEXT,
+	};
+	// Promoted rows were rewritten in place for the all-present rows; their
+	// role before promotion is always user.
+	const role = (index: number) =>
+		plan.promotable.has(base[index]) ? "user" : base[index].role;
+	const final = (
+		index: number,
+		previous: string | undefined,
+		next: string | undefined,
+	): MessageStructure => {
+		const row = base[index];
+		const systemText = plan.promotable.get(row);
+		if (!systemText) return row;
+		const promoted =
+			(previous === "user" || previous === "toolResult") &&
+			(next === undefined || next === "assistant");
+		return promoted
+			? { ...row, role: "system", systemText }
+			: { ...row, role: "user", systemText: undefined };
+	};
+	const matches = (expected: MessageStructure, at: number) =>
+		at < wire.length && compare(expected, wire[at]) === undefined;
+	// states[index] maps "previous role|wire position" to a path count.
+	const states = new Map<number, Map<string, number>>();
+	const add = (
+		index: number,
+		previous: string | undefined,
+		at: number,
+		count: number,
+	) => {
+		let bucket = states.get(index);
+		if (!bucket) {
+			bucket = new Map();
+			states.set(index, bucket);
+		}
+		const key = `${previous ?? ""}|${at}`;
+		bucket.set(key, Math.min(2, (bucket.get(key) ?? 0) + count));
+	};
+	let complete = 0;
+	const advance = (
+		current: number,
+		previous: string | undefined,
+		at: number,
+		count: number,
+	) => {
+		// Place the current row once its successor is known, then a pad when
+		// both are assistants.
+		const place = (next: number | undefined): number | undefined => {
+			if (current < 0) return at;
+			const nextRole = next === undefined ? undefined : role(next);
+			if (!matches(final(current, previous, nextRole), at)) return undefined;
+			let after = at + 1;
+			if (role(current) === "assistant" && nextRole === "assistant") {
+				if (!matches(pad, after)) return undefined;
+				after++;
+			}
+			return after;
+		};
+		for (let next = current + 1; next < base.length; next++) {
+			const after = place(next);
+			if (after !== undefined)
+				add(next, current < 0 ? undefined : role(current), after, count);
+			if (!base[next].optionalThinking) return;
+		}
+		// Every remaining row is optional and left out: the current row ends
+		// the request.
+		if (current < 0) {
+			if (wire.length === 0) complete = Math.min(2, complete + count);
+			return;
+		}
+		const after = place(undefined);
+		if (
+			after === wire.length ||
+			(after === wire.length - 1 &&
+				role(current) === "assistant" &&
+				isAnthropicContinuePadRow(wire[after]))
+		)
+			complete = Math.min(2, complete + count);
+	};
+	advance(-1, undefined, 0, 1);
+	for (let index = 0; index < base.length && complete < 2; index++) {
+		const bucket = states.get(index);
+		if (!bucket) continue;
+		states.delete(index);
+		for (const [key, count] of bucket) {
+			const split = key.lastIndexOf("|");
+			const previous = key.slice(0, split) || undefined;
+			advance(index, previous, Number(key.slice(split + 1)), count);
+		}
+	}
+	return complete;
+}
+
 /** Return metadata for the first differing zero-based normalized row, or no mismatch. */
 export function piPreparedStructureMismatch(
 	payload: unknown,
@@ -1473,6 +1645,10 @@ export function piPreparedStructureMismatch(
 						),
 				) ?? expectedRows;
 		}
+		const optionalPlan =
+			expectedRows === prepared?.messages
+				? prepared?.anthropicOptional
+				: undefined;
 		if (expectedRows && imageProjection && imageBudget)
 			expectedRows = trimPreparedImageRows(expectedRows, imageBudget, trimmed);
 		if (!rows || !expectedRows)
@@ -1487,12 +1663,13 @@ export function piPreparedStructureMismatch(
 			(!prepared?.api &&
 				body.max_tokens !== undefined &&
 				Array.isArray(body.system));
-		for (let i = 0; i < Math.min(rows.length, expectedRows.length); i++) {
-			row = i;
-			const expected = expectedRows[i];
-			const actual = rows[i];
-			if (actual.role !== expected.role)
-				return structureDetail(i, expectedRows, rows, "role");
+		// One prepared row against one wire row: the comparison that failed, or
+		// none when the wire row is the one prepared.
+		const compareRow = (
+			expected: MessageStructure,
+			actual: MessageStructure,
+		): StructureComparison | undefined => {
+			if (actual.role !== expected.role) return "role";
 			if (expected.systemText !== undefined) {
 				const texts = expected.systemText;
 				const content = actual.wireContent;
@@ -1513,13 +1690,13 @@ export function piPreparedStructureMismatch(
 						? content !== texts.join("\n")
 						: JSON.stringify(actualTexts) !== JSON.stringify(texts))
 				)
-					return structureDetail(i, expectedRows, rows, "content");
+					return "content";
 			}
 			if (
 				imageProjection &&
 				!piMatchesImages(actual.images ?? [], expected.images ?? [])
 			)
-				return structureDetail(i, expectedRows, rows, "content");
+				return "content";
 			if (
 				expected.responseTexts !== undefined &&
 				(expected.responseTexts.length !== actual.responseTexts?.length ||
@@ -1527,13 +1704,12 @@ export function piPreparedStructureMismatch(
 						(text, index) => text !== actual.responseTexts?.[index],
 					))
 			)
-				return structureDetail(i, expectedRows, rows, "content");
+				return "content";
 			if (
 				expected.exactText !== undefined ||
 				expected.exactImages !== undefined
 			) {
-				if (actual.wireRole !== "user")
-					return structureDetail(i, expectedRows, rows, "role");
+				if (actual.wireRole !== "user") return "role";
 				if (
 					(expected.exactText !== undefined &&
 						!matchesUserText(
@@ -1546,18 +1722,18 @@ export function piPreparedStructureMismatch(
 					(expected.exactImages !== undefined &&
 						!piMatchesChatImages(actual.wireContent, expected.exactImages))
 				)
-					return structureDetail(i, expectedRows, rows, "content");
+					return "content";
 			}
 			if (
 				actual.calls.length !== expected.calls.length ||
 				actual.results.length !== expected.results.length
 			)
-				return structureDetail(i, expectedRows, rows, "count");
+				return "count";
 			if (
 				actual.timestamp !== undefined &&
 				actual.timestamp !== expected.timestamp
 			)
-				return structureDetail(i, expectedRows, rows, "timestamp");
+				return "timestamp";
 			for (let j = 0; j < actual.calls.length; j++)
 				if (
 					(google &&
@@ -1572,15 +1748,10 @@ export function piPreparedStructureMismatch(
 									? expected.wireCalls[j]
 									: wireId(expected.calls[j], anthropic, responses))
 				)
-					return structureDetail(
-						i,
-						expectedRows,
-						rows,
-						(google && actual.calls[j] === "") ||
-							(ollama && actual.idlessCalls?.[j] === true)
-							? "name"
-							: "call id",
-					);
+					return (google && actual.calls[j] === "") ||
+						(ollama && actual.idlessCalls?.[j] === true)
+						? "name"
+						: "call id";
 			for (let j = 0; j < actual.results.length; j++)
 				if (
 					(google &&
@@ -1595,15 +1766,52 @@ export function piPreparedStructureMismatch(
 									? expected.wireResults[j]
 									: wireId(expected.results[j], anthropic, responses))
 				)
-					return structureDetail(
-						i,
-						expectedRows,
-						rows,
-						(google && actual.results[j] === "") ||
-							(ollama && actual.idlessResults?.[j] === true)
-							? "name"
-							: "result id",
-					);
+					return (google && actual.results[j] === "") ||
+						(ollama && actual.idlessResults?.[j] === true)
+						? "name"
+						: "result id";
+			if (
+				expected.optionalThinking &&
+				!piExplainsOptionalAssistant(
+					expected.optionalThinking,
+					actual.wireContent,
+				)
+			)
+				return "content";
+			return undefined;
+		};
+		// Some prepared assistants may be absent from the wire. Count the ways
+		// the wire can be read as the prepared rows with some of them left out;
+		// exactly one must fit, and more than one refuses. With none, the
+		// comparison below against the rows with every assistant present names
+		// the first difference.
+		if (optionalPlan) {
+			stage = "optional assistants";
+			const alignments = countAnthropicOptionalAlignments(
+				optionalPlan,
+				imageProjection && imageBudget
+					? trimPreparedImageRows(optionalPlan.rows, imageBudget, trimmed)
+					: optionalPlan.rows,
+				rows,
+				compareRow,
+			);
+			if (alignments > 1)
+				return structureDetail(0, expectedRows, rows, "alignment");
+			if (alignments === 1) {
+				if (imageProjection && imageBudget)
+					onImageTrim?.({
+						planned: imageBudget.count,
+						actual: actualImages,
+						trimmed,
+					});
+				return undefined;
+			}
+			stage = "row comparison";
+		}
+		for (let i = 0; i < Math.min(rows.length, expectedRows.length); i++) {
+			row = i;
+			const comparison = compareRow(expectedRows[i], rows[i]);
+			if (comparison) return structureDetail(i, expectedRows, rows, comparison);
 		}
 		if (rows.length !== expectedRows.length) {
 			// OMP appends the same neutral Continue pad after a trailing assistant
@@ -1627,6 +1835,10 @@ export function piPreparedStructureMismatch(
 					"count",
 				);
 		}
+		// No reading of the wire fit the optional assistants, so the wire is not
+		// the prepared turn even where the all-present rows above raised nothing.
+		if (optionalPlan)
+			return structureDetail(0, expectedRows, rows, "alignment");
 		if (imageProjection && imageBudget)
 			onImageTrim?.({
 				planned: imageBudget.count,
