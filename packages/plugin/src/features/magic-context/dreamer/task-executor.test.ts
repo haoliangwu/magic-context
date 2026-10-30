@@ -1925,7 +1925,7 @@ describe("createDreamTaskExecutor — map-memories disposition", () => {
             { db, projectIdentity: project, holderId: "holder-map-timeout", leaseKey },
         );
 
-        expect(promptCalls).toBe(2);
+        expect(promptCalls).toBe(4);
         expect(result).toMatchObject({ status: "failed", transient: true });
         expect(result.error).toContain("map-memories starvation");
         const run = getDreamRuns(db, project)[0];

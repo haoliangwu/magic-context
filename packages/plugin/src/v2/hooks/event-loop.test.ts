@@ -8,9 +8,9 @@ import { MagicContextConfigSchema } from "../../config/schema/magic-context";
 import * as embedding from "../../features/magic-context/memory/embedding";
 import { insertMemory } from "../../features/magic-context/memory/storage-memory";
 import {
-    MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS,
-    sweepOrphanedOpenCodeMessageIndexesCooperatively,
-} from "../../features/magic-context/message-index";
+    seedRetainedSession,
+    snapshotSessionRows,
+} from "../../features/magic-context/session-retention.fixture";
 import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
 import * as sessionStorage from "../../features/magic-context/storage-meta-session";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta-session";
@@ -24,17 +24,17 @@ import { queueAutoSearchBackfill } from "../../hooks/magic-context/auto-search-w
 import { resetCtxReduceRegisteredGloballyForTest } from "../../hooks/magic-context/ctx-reduce-availability";
 import * as transformModule from "../../hooks/magic-context/transform";
 import { _resetDreamTimerForTests } from "../../plugin/dream-timer";
-import { _resetHarnessForTesting, getHarness, setHarness } from "../../shared/harness";
 import * as logger from "../../shared/logger";
 import { resetOpenCodeDbPathStateForTesting } from "../../shared/opencode-db-path";
 import { Database } from "../../shared/sqlite";
 import { cleanupTestTempDir, createTestTempDir } from "../../shared/test-temp-dir";
 import { getWorkerShutdownStats } from "../../shared/worker-shutdown";
+import { V2MessageTimesCache } from "../message-times";
 import { registerContext } from "./context";
 import * as storageGate from "./storage-gate";
 import type { SessionContext, V2Context } from "./types";
 
-type Event = { type: string; data: { sessionID: string } };
+type Event = { type: string; data: { sessionID: string; assistantMessageID?: string } };
 const sessionID = "ses-event-usage";
 const succeeded: Event = { type: "session.execution.succeeded", data: { sessionID } };
 const deleted: Event = { type: "session.deleted", data: { sessionID: "ses-deleted" } };
@@ -106,7 +106,7 @@ async function fixture(
     mkdirSync(join(dir, "opencode"));
     const hostDb = new Database(process.env.OPENCODE_DB);
     hostDb.exec(`
-        CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT);
+        CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, data TEXT, time_updated INTEGER);
         CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT);
         INSERT INTO session_v2 VALUES ('${sessionID}', NULL, '${dir}');
     `);
@@ -186,7 +186,7 @@ async function fixture(
         // The completion appears after the pre-generation pass, just as on the host.
         hostDb
             .prepare(
-                "INSERT OR REPLACE INTO session_message VALUES (?, ?, 'assistant', 1, 1000, ?)",
+                "INSERT OR REPLACE INTO session_message(id, session_id, type, seq, time_created, data) VALUES (?, ?, 'assistant', 1, 1000, ?)",
             )
             .run(
                 "a1",
@@ -202,7 +202,6 @@ async function fixture(
     return {
         db,
         hostDb,
-        hostPath: process.env.OPENCODE_DB,
         starts,
         signals,
         start,
@@ -235,7 +234,33 @@ async function fixture(
     };
 }
 
-test("v2 permanent session deletion retires tag revisions and owner keys", async () => {
+test("v2 step lifecycle events invalidate the affected message's times", async () => {
+    const cleared = spyOn(V2MessageTimesCache.prototype, "deleteMessage");
+    const f = await fixture(async function* (signal) {
+        for (const [type, assistantMessageID] of [
+            ["session.step.started", "start"],
+            ["session.step.ended", "end"],
+            ["session.step.failed", "failed"],
+        ] as const)
+            yield { type, data: { sessionID, assistantMessageID } };
+        yield { type: "session.step.ended", data: { sessionID } };
+        await aborted(signal);
+    });
+    try {
+        await f.start();
+        await until(() => cleared.mock.calls.length === 3);
+        expect(cleared.mock.calls).toEqual([
+            [sessionID, "start"],
+            [sessionID, "end"],
+            [sessionID, "failed"],
+        ]);
+    } finally {
+        cleared.mockRestore();
+        await f.cleanup();
+    }
+});
+
+test("v2 session.deleted removes summaries, raw history, tag revisions and every seeded row", async () => {
     const ready = Promise.withResolvers<void>();
     let consumed = false;
     const f = await fixture(async function* () {
@@ -252,13 +277,15 @@ test("v2 permanent session deletion retires tag revisions and owner keys", async
             .all(tagIdentityRevisionKey(id), tagRevisionKey(id), ...tagTombstoneOwnerRange(id));
     try {
         await f.start();
-        f.db
-            .prepare("INSERT INTO tags(session_id,tag_number,harness) VALUES (?,1,'opencode2')")
-            .run(id);
+        seedRetainedSession(f.db, id, Date.now() - 25 * 60 * 60 * 1000);
+        expect(snapshotSessionRows(f.db, id).compartments).toHaveLength(40);
         expect(epochs().length).toBeGreaterThan(0);
         ready.resolve();
         await until(() => consumed);
         expect(epochs()).toEqual([]);
+        for (const [table, rows] of Object.entries(snapshotSessionRows(f.db, id))) {
+            expect(rows, `${table} retained deleted session data`).toEqual([]);
+        }
     } finally {
         ready.resolve();
         await f.cleanup();
@@ -368,63 +395,6 @@ test("v2 dispose cancels reconnect backoff before a replacement subscribes", asy
     } finally {
         await f.cleanup();
         backoff.restore();
-    }
-});
-
-test("v2 sweep cleans a deletion missed during the resubscribe gap", async () => {
-    const previous = getHarness();
-    _resetHarnessForTesting();
-    setHarness("opencode2");
-    const ready = Promise.withResolvers<void>();
-    let ended = false;
-    const f = await fixture(async function* (signal, subscription) {
-        await ready.promise;
-        if (subscription === 1) {
-            ended = true;
-            return;
-        }
-        await aborted(signal);
-        yield* [];
-    });
-    try {
-        await f.start();
-        f.hostDb
-            .prepare("INSERT INTO session_v2 VALUES (?, NULL, '/tmp')")
-            .run(deleted.data.sessionID);
-        f.db
-            .prepare(
-                "INSERT INTO message_history_index(session_id,last_indexed_ordinal,updated_at,harness) VALUES (?,1,?,'opencode2')",
-            )
-            .run(deleted.data.sessionID, Date.now() - MESSAGE_HISTORY_ORPHAN_SAFETY_AGE_MS - 1);
-        ready.resolve();
-        await until(() => ended);
-        // No subscriber sees this deletion, so no pending-cleanup marker exists.
-        f.hostDb.prepare("DELETE FROM session_v2 WHERE id = ?").run(deleted.data.sessionID);
-        expect(f.clearSessionLogState).not.toHaveBeenCalled();
-        expect(
-            f.db
-                .prepare("SELECT 1 FROM pending_session_cleanup WHERE session_id = ?")
-                .get(deleted.data.sessionID),
-        ).toBeNull();
-        await until(() => f.starts.length === 2);
-        const swept = await sweepOrphanedOpenCodeMessageIndexesCooperatively(
-            f.db,
-            () => new Database(f.hostPath, { readonly: true }),
-        );
-        expect(swept).toMatchObject({ status: "swept", deleted: 1 });
-        expect(
-            f.db
-                .prepare("SELECT 1 FROM session_meta WHERE session_id = ?")
-                .get(deleted.data.sessionID),
-        ).toBeNull();
-        expect(
-            f.db.prepare("SELECT 1 FROM session_meta WHERE session_id = ?").get(sessionID),
-        ).not.toBeNull();
-    } finally {
-        ready.resolve();
-        await f.cleanup();
-        _resetHarnessForTesting();
-        setHarness(previous);
     }
 });
 

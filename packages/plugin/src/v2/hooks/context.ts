@@ -171,6 +171,7 @@ import {
     type V2HiddenCompletionExecutor,
 } from "../hidden-completion";
 import { HiddenModelActivity } from "../hidden-model-activity";
+import { V2MessageTimesCache } from "../message-times";
 import { gaDatabasePath, type V2StoreReader, V2StoreReaderPool } from "../store-reader";
 import {
     clearSyntheticCandidates,
@@ -690,6 +691,7 @@ function coveredInstructionRows(
 export async function registerContext(context: V2Context) {
     const directory = context.location.directory;
     const config = loadPluginConfigDetailed(directory).config;
+    log(`[magic-context] OpenCode 2 keep_subagents=${config.keep_subagents === true}`);
     setHomeProjectPermission(config.allow_home_project);
     if (!config.enabled) return;
     const nativeRemove = nativeSessionRemove(context.session);
@@ -919,6 +921,7 @@ export async function registerContext(context: V2Context) {
     });
     let hiddenAgentsReady: Promise<void> | undefined;
     const readerPool = new V2StoreReaderPool();
+    const messageTimesCache = new V2MessageTimesCache();
     const openStoreReader = () =>
         readerPool.open(gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"));
     const createHiddenExecutor = async (database: NonNullable<typeof db>) => {
@@ -1393,7 +1396,7 @@ export async function registerContext(context: V2Context) {
                     if (usageController.signal.aborted) break;
                     const event = value as {
                         type?: string;
-                        data?: { sessionID?: string; error?: unknown };
+                        data?: { sessionID?: string; assistantMessageID?: string; error?: unknown };
                     };
                     try {
                         hiddenModelActivity.observe(event);
@@ -1420,6 +1423,16 @@ export async function registerContext(context: V2Context) {
                         ) {
                             nativeFoldReplay?.onEvent(event);
                             restoredRows.forget(sessionID);
+                            messageTimesCache.delete(sessionID);
+                        }
+                        if (
+                            event.type === "session.step.started" ||
+                            event.type === "session.step.ended" ||
+                            event.type === "session.step.failed"
+                        ) {
+                            const messageID = event.data.assistantMessageID;
+                            if (typeof messageID === "string")
+                                messageTimesCache.deleteMessage(sessionID, messageID);
                         }
                         if (
                             event.type === "session.error" ||
@@ -1467,6 +1480,7 @@ export async function registerContext(context: V2Context) {
                                 rawProviders.get(sessionID)?.();
                                 rawProviders.delete(sessionID);
                                 usage.delete(sessionID);
+                                messageTimesCache.delete(sessionID);
                                 hiddenSessionErrors.delete(sessionID);
                                 storageNoticeBySession.delete(sessionID);
                                 liveModels.delete(sessionID);
@@ -1823,6 +1837,138 @@ export async function registerContext(context: V2Context) {
             ...args.messages.filter((message) => message !== args.incoming),
         ];
     };
+    // Construct retained callbacks outside the request scope. Even callbacks that
+    // only read instance state can keep a shared closure environment alive, along
+    // with replay helpers that hold the request's messages and attachments.
+    const initializeTransform = (database: NonNullable<typeof db>) =>
+        (transform ??= createTransform({
+            ...createV2TransformFeatureDeps(
+                config,
+                compactionOff,
+                directory,
+                embeddings.ensureRegistered,
+            ),
+            cacheTtlConfig: config.cache_ttl,
+            cacheTtlConfigured: config.cacheTtlConfigured,
+            sampleCacheTtlConfig: () => liveConfigReader.poll().effective,
+            db: database,
+            tagger,
+            ...createV2ThresholdDeps(config),
+            contextUsageMap: usage,
+            compactionOff,
+            // OpenCode 2 reads `session_message`, which numbers the same
+            // conversation differently from the v1 tables a converted store
+            // still carries.
+            storeGeneration: "v2",
+            // The host stores copied `§N§` notation unchanged (no hook runs before
+            // it writes a finished reply), so assistant text restored from a saved
+            // source copy gets the same strip `adaptPayload` gives the live text.
+            normalizeRestoredAssistantText: (text, providerID) =>
+                stripCopiedTagNotation(text, providerID === "anthropic"),
+            refreshSourceContents: (sessionID) =>
+                nativeFoldReplay?.needsHeadRebuild(sessionID) ?? false,
+            // OpenCode 2 owns its native checkpoints; this adapter never writes the
+            // OpenCode 1 synthetic marker rows that the shared off-transition deletes.
+            hostCleanupCompactionMarkers: () => ({
+                verified: true,
+                removedLineages: 0,
+                removedRows: 0,
+                retainedLineages: 0,
+            }),
+            protectedTokens: config.protected_tokens,
+            protectedTokenTierOverrides: getProtectedTokensTierOverrides(config),
+            liveModelBySession: liveModels,
+            getToolSetHash: (sessionId) => {
+                const model = liveModels.get(sessionId);
+                if (!model) return "";
+                return getCurrentToolSetHash(
+                    model.providerID,
+                    model.modelID,
+                    agents.get(sessionId),
+                    sessionId,
+                );
+            },
+            channel1StateBySession: channel1,
+            historyRefreshSessions,
+            pendingMaterializationSessions,
+            lastHeuristicsTurnId,
+            commitSeenLastPass,
+            variantBySession: variants,
+            keepReasoningTokens: config.keep_reasoning_tokens,
+            directory,
+            sessionDirectoryBySession: sessionDirectories,
+            projectPath: resolveProjectIdentityForSession(directory, config.allow_home_project),
+            getHistorianChunkTokens: () => sampleHistorian().chunkTokens,
+            getFallbackModelId: (sessionID) => {
+                const model = liveModels.get(sessionID);
+                return model ? `${model.providerID}/${model.modelID}` : undefined;
+            },
+            maybeAutoEmbedSession: createV2AutoEmbedSession(
+                {
+                    db: database,
+                    resolveDirectory: (sessionID) => sessionDirectories.get(sessionID) ?? directory,
+                    allowHomeProject: config.allow_home_project,
+                    recompProgressBySession: new Map(),
+                },
+                embeddings.ensureRegistered,
+            ),
+            hiddenCompletionExecutor,
+            historianRunnable:
+                !compactionOff &&
+                hiddenCompletionExecutor !== undefined &&
+                config.historian?.disable !== true,
+            historianModel: historianModels.primary,
+            historianContextLimit: sampleHistorian().contextLimit,
+            fallbackModels: historianModels.fallbacks,
+            resolveHistorianRun: sampleHistorian,
+            historianTimeoutMs: config.historian_timeout_ms,
+            // Raw config on purpose: absent means the user configured no
+            // output cap, and the hidden carrier only puts a cap on the wire
+            // when one was configured. The producer-window arithmetic applies
+            // its own default, so no fallback belongs here.
+            historianMaxOutputTokens: config.historian?.maxTokens,
+            historianTwoPass: config.historian?.two_pass,
+            historianExpandTools: config.historian?.expand_tools,
+            historianRunner: config.historian?.runner,
+            historianHostRunnerEnabled: config.historian?.host_runner?.enabled,
+            // TypeScript mode folds on the host's own compaction rows, so its marker
+            // carrier stays inert. Rust mode has no such row to write: the module's
+            // materialized boundary is recorded in the marker columns instead, and
+            // the compaction hook above answers the host from it.
+            compactionMarkerStrategy: rustModeModuleClient
+                ? createV2RustCompactionMarkerStrategy((sessionID, endMessageID) => {
+                      const reader = openStoreReader();
+                      try {
+                          return resolveV2BoundaryUserMessage(reader, sessionID, endMessageID);
+                      } finally {
+                          reader.close();
+                      }
+                  })
+                : v2CompactionMarkerStrategy,
+            transformMode: config.transform_mode,
+            rustModeModuleClient,
+            rustModeProjectRoot: directory,
+            rustMemorySyncRequestedSessions,
+            // OpenCode 1 puts this on the host's toast surface through its SDK
+            // client. This host exposes no such client to a plugin, so it goes
+            // out on the notification socket the TUI already reads — the same
+            // carrier a finished dream reports on. Without it a parked module
+            // is invisible: the session keeps answering from the last good
+            // output and nothing says why it stopped moving.
+            onRustModeParked: (sessionId, message) =>
+                pushNotification(
+                    "toast",
+                    {
+                        message: `Rust Magic Context paused: ${message}`,
+                        variant: "warning",
+                    },
+                    sessionId,
+                ),
+            promptSurface: config.prompt_surface,
+            promptSurfaceRuntime,
+            onRustEngineReconnectRefusal: (refusal) => rustRefusalRecovery?.arm(refusal),
+            ...createHostSeams(context, readAllForConversion, pagedRead, liveModels),
+        }));
     const runManagedContext = async (draft: SessionContext): Promise<void> => {
         // Learn the host's message and attachment classes, so attachments on rows restored
         // after a host checkpoint can be rebuilt in the host's own shape.
@@ -1880,23 +2026,11 @@ export async function registerContext(context: V2Context) {
         // The host's messages as this pass received them. A replay rebuilds the
         // transform input from these, never from a draft a failed pass reshaped.
         const hostMessagesAtEntry = [...draft.messages];
-        // Stored message times read during this pass, by id. They do not change
-        // while a pass runs, so the writer retries and the managed pass after
-        // them read each id from the store once.
-        const passTimes = new Map<string, { created?: number; completed?: number } | null>();
+        // Retries share one timing snapshot. Across passes, settled rows reuse
+        // their times only after a current membership and revision check.
+        const cachedTimes = messageTimesCache.pass(draft.sessionID);
         const readTimes = (reader: V2StoreReader, messages: readonly V2Message[]) => {
-            const ids = timeIds(messages);
-            const missing = ids.filter((id) => !passTimes.has(id));
-            if (missing.length > 0) {
-                const read = reader.messageTimes(draft.sessionID, missing);
-                for (const id of missing) passTimes.set(id, read.get(id) ?? null);
-            }
-            const times = new Map<string, { created?: number; completed?: number }>();
-            for (const id of ids) {
-                const time = passTimes.get(id);
-                if (time) times.set(id, time);
-            }
-            return times;
+            return cachedTimes(reader, timeIds(messages));
         };
         liveModels.set(draft.sessionID, {
             providerID: draft.model.providerID,
@@ -2205,135 +2339,7 @@ export async function registerContext(context: V2Context) {
             // Background historian reads outlive the context callback. Keep its source
             // registered until plugin disposal, rather than falling back to the v1 store.
             prepareHistorySession(draft.sessionID);
-            transform ??= createTransform({
-                ...createV2TransformFeatureDeps(
-                    config,
-                    compactionOff,
-                    directory,
-                    embeddings.ensureRegistered,
-                ),
-                cacheTtlConfig: config.cache_ttl,
-                cacheTtlConfigured: config.cacheTtlConfigured,
-                sampleCacheTtlConfig: () => liveConfigReader.poll().effective,
-                db,
-                tagger,
-                ...createV2ThresholdDeps(config),
-                contextUsageMap: usage,
-                compactionOff,
-                // OpenCode 2 reads `session_message`, which numbers the same
-                // conversation differently from the v1 tables a converted store
-                // still carries.
-                storeGeneration: "v2",
-                // The host stores copied `§N§` notation unchanged (no hook runs before
-                // it writes a finished reply), so assistant text restored from a saved
-                // source copy gets the same strip `adaptPayload` gives the live text.
-                normalizeRestoredAssistantText: (text, providerID) =>
-                    stripCopiedTagNotation(text, providerID === "anthropic"),
-                refreshSourceContents: (sessionID) =>
-                    nativeFoldReplay?.needsHeadRebuild(sessionID) ?? false,
-                // GA owns its native checkpoints; this adapter never writes the v1
-                // synthetic marker rows that the shared off-transition deletes.
-                hostCleanupCompactionMarkers: () => ({
-                    verified: true,
-                    removedLineages: 0,
-                    removedRows: 0,
-                    retainedLineages: 0,
-                }),
-                protectedTokens: config.protected_tokens,
-                protectedTokenTierOverrides: getProtectedTokensTierOverrides(config),
-                liveModelBySession: liveModels,
-                getToolSetHash: (sessionId) => {
-                    const model = liveModels.get(sessionId);
-                    if (!model) return "";
-                    return getCurrentToolSetHash(
-                        model.providerID,
-                        model.modelID,
-                        agents.get(sessionId),
-                        sessionId,
-                    );
-                },
-                channel1StateBySession: channel1,
-                historyRefreshSessions,
-                pendingMaterializationSessions,
-                lastHeuristicsTurnId,
-                commitSeenLastPass,
-                variantBySession: variants,
-                keepReasoningTokens: config.keep_reasoning_tokens,
-                directory,
-                sessionDirectoryBySession: sessionDirectories,
-                projectPath: resolveProjectIdentityForSession(directory, config.allow_home_project),
-                getHistorianChunkTokens: () => sampleHistorian().chunkTokens,
-                getFallbackModelId: (sessionID) => {
-                    const model = liveModels.get(sessionID);
-                    return model ? `${model.providerID}/${model.modelID}` : undefined;
-                },
-                maybeAutoEmbedSession: createV2AutoEmbedSession(
-                    {
-                        db,
-                        resolveDirectory: (sessionID) =>
-                            sessionDirectories.get(sessionID) ?? directory,
-                        allowHomeProject: config.allow_home_project,
-                        recompProgressBySession: new Map(),
-                    },
-                    embeddings.ensureRegistered,
-                ),
-                hiddenCompletionExecutor,
-                historianRunnable:
-                    !compactionOff &&
-                    hiddenCompletionExecutor !== undefined &&
-                    config.historian?.disable !== true,
-                historianModel: historianModels.primary,
-                historianContextLimit: sampleHistorian().contextLimit,
-                fallbackModels: historianModels.fallbacks,
-                resolveHistorianRun: sampleHistorian,
-                historianTimeoutMs: config.historian_timeout_ms,
-                // Raw config on purpose: absent means the user configured no
-                // output cap, and the hidden carrier only puts a cap on the wire
-                // when one was configured. The producer-window arithmetic applies
-                // its own default, so no fallback belongs here.
-                historianMaxOutputTokens: config.historian?.maxTokens,
-                historianTwoPass: config.historian?.two_pass,
-                historianExpandTools: config.historian?.expand_tools,
-                historianRunner: config.historian?.runner,
-                historianHostRunnerEnabled: config.historian?.host_runner?.enabled,
-                // TypeScript mode folds on the host's own compaction rows, so its marker
-                // carrier stays inert. Rust mode has no such row to write: the module's
-                // materialized boundary is recorded in the marker columns instead, and
-                // the compaction hook above answers the host from it.
-                compactionMarkerStrategy: rustModeModuleClient
-                    ? createV2RustCompactionMarkerStrategy((sessionID, endMessageID) => {
-                          const reader = openStoreReader();
-                          try {
-                              return resolveV2BoundaryUserMessage(reader, sessionID, endMessageID);
-                          } finally {
-                              reader.close();
-                          }
-                      })
-                    : v2CompactionMarkerStrategy,
-                transformMode: config.transform_mode,
-                rustModeModuleClient,
-                rustModeProjectRoot: directory,
-                rustMemorySyncRequestedSessions,
-                // OpenCode 1 puts this on the host's toast surface through its SDK
-                // client. This host exposes no such client to a plugin, so it goes
-                // out on the notification socket the TUI already reads — the same
-                // carrier a finished dream reports on. Without it a parked module
-                // is invisible: the session keeps answering from the last good
-                // output and nothing says why it stopped moving.
-                onRustModeParked: (sessionId, message) =>
-                    pushNotification(
-                        "toast",
-                        {
-                            message: `Rust Magic Context paused: ${message}`,
-                            variant: "warning",
-                        },
-                        sessionId,
-                    ),
-                promptSurface: config.prompt_surface,
-                promptSurfaceRuntime,
-                onRustEngineReconnectRefusal: (refusal) => rustRefusalRecovery?.arm(refusal),
-                ...createHostSeams(context, readAllForConversion, pagedRead, liveModels),
-            });
+            transform = initializeTransform(db);
             const admitted = new Set<string>();
             let messageTimes: ReturnType<V2StoreReader["messageTimes"]> | undefined;
             const reader = openStoreReader();
@@ -2879,6 +2885,7 @@ export async function registerContext(context: V2Context) {
     );
     return {
         async dispose() {
+            messageTimesCache.clear();
             usageController.abort();
             // OpenCode 2 runs this disposer before it removes this instance's hooks
             // (scope finalizers run in reverse registration order, and the disposer

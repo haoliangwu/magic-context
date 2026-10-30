@@ -10,6 +10,7 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { getInertWhitespaceAssistantTagsByNumbers } from "../../features/magic-context/storage-tags";
+import { isLegacyForeignTextTag } from "../../hooks/magic-context/foreign-text-parts";
 import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
@@ -201,13 +202,26 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
                     (tag) => tag.tagNumber,
                 ),
             );
-            const inertDropIds = [
-                ...new Set(dropIds.filter((id) => inertWhitespaceTagNumbers.has(id))),
-            ];
+            // A tag an older release put on another plugin's text part (OpenCode 1)
+            // can't reclaim anything: that text belongs to the other plugin, and a
+            // new drop on it is never applied. Skip it per id like provider
+            // framing; never fail the call.
+            const foreignTextTagNumbers = new Set(
+                dropIds.filter((id) => isLegacyForeignTextTag(sessionId, id)),
+            );
+            const skippedTagNumbers = new Set([
+                ...inertWhitespaceTagNumbers,
+                ...foreignTextTagNumbers,
+            ]);
+            const skippedDropIds = [...new Set(dropIds.filter((id) => skippedTagNumbers.has(id)))];
             const inertNote =
-                inertDropIds.length > 0
-                    ? `Skipped: ${inertDropIds
-                          .map((id) => `§${id}§ is provider framing, nothing to reclaim`)
+                skippedDropIds.length > 0
+                    ? `Skipped: ${skippedDropIds
+                          .map((id) =>
+                              inertWhitespaceTagNumbers.has(id)
+                                  ? `§${id}§ is provider framing, nothing to reclaim`
+                                  : `§${id}§ is another plugin's text, nothing to reclaim`,
+                          )
                           .join("; ")}.`
                     : "";
 
@@ -216,7 +230,7 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
 
             const conflicts: string[] = [];
             for (const id of dropIds) {
-                if (tagStatusMap.get(id) === "compacted" && !inertWhitespaceTagNumbers.has(id)) {
+                if (tagStatusMap.get(id) === "compacted" && !skippedTagNumbers.has(id)) {
                     conflicts.push(`§${id}§ is from before compaction`);
                 }
             }
@@ -224,11 +238,10 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
                 return `Error: Conflicting operations — ${conflicts.join("; ")}.`;
             }
 
-            const stampedCount = new Set(dropIds.filter((id) => !inertWhitespaceTagNumbers.has(id)))
-                .size;
+            const stampedCount = new Set(dropIds.filter((id) => !skippedTagNumbers.has(id))).size;
             dropIds = dropIds.filter(
                 (id) =>
-                    !inertWhitespaceTagNumbers.has(id) &&
+                    !skippedTagNumbers.has(id) &&
                     tagStatusMap.get(id) !== "dropped" &&
                     pendingMap.get(id) !== "drop",
             );

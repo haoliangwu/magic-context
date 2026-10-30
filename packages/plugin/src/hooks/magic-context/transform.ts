@@ -120,6 +120,7 @@ import {
     estimateFinalWireInputTokens,
     estimateMessageTokens,
 } from "./final-wire-token-estimate";
+import type { ForeignTextParts } from "./foreign-text-parts";
 import { isHistorianDrainBudgetSpent } from "./historian-drain-gate";
 import type { LiveModelBySession } from "./hook-handlers";
 import { takeCoveredInstructionRows } from "./host-served-rows";
@@ -156,7 +157,7 @@ import {
     readPersistedLkgUntaggedInputIds,
 } from "./lkg-recovery-prefix";
 import { captureLkgSlot, createLkgEntryProjector, resolveLkgModelKeys } from "./lkg-replay";
-import { beginLkgPass, dropSlot, getInMemorySlot } from "./lkg-slot";
+import { beginLkgPass, dropSlot, getInMemorySlot, lkgInputIdentity } from "./lkg-slot";
 import { onNoteTrigger } from "./note-nudger";
 import { logNudgeEvaluation } from "./nudge-evaluation-log";
 import {
@@ -476,6 +477,12 @@ export interface TransformDeps {
     hostRefusalNotice?: HostRefusalNotice;
     hostRefuse?: typeof abortSessionFailClosed;
     tagger: Tagger;
+    /**
+     * OpenCode 1 only: find the text parts another plugin appended to stored
+     * messages, on the array the host handed to the hook. Unset on hosts whose
+     * parts carry no ids (OpenCode 2), where an id-less part may be stored text.
+     */
+    collectForeignTextParts?: (messages: MessageLike[]) => ForeignTextParts | undefined;
     scheduler: Scheduler;
     contextUsageMap: Map<
         string,
@@ -815,6 +822,11 @@ export function createTransform(deps: TransformDeps) {
         const startTime = performance.now();
         const historianRun = deps.resolveHistorianRun?.();
         const messages = output.messages as MessageLike[];
+        // Captured before Magic Context edits anything, so only parts the host
+        // delivered can count as another plugin's. In Rust mode the module does
+        // the tagging, so this collector isn't used there.
+        const foreignTextParts =
+            deps.transformMode === "rust" ? undefined : deps.collectForeignTextParts?.(messages);
         // The entry order, for the signed-thinking fit snapshot taken once the
         // hold is decided (see takeSignedThinkingFitSnapshot). No message or
         // part is edited before that point; only covered instruction rows are
@@ -850,11 +862,31 @@ export function createTransform(deps: TransformDeps) {
         const tLkgEntry = performance.now();
         // The Rust adapter captures its own last-known-good input snapshot and returns
         // before the TypeScript capture, so it does not need this entry projection.
-        const lkgInput = deps.transformMode === "rust" ? [] : projectEntry(sessionId, messages);
+        // Covered instructions still belong to the proof, even while working
+        // stages set them aside: replay can serve their saved bytes too.
+        const lkgInput =
+            deps.transformMode === "rust" ? [] : projectEntry(sessionId, entryOrderForThinkingFit);
         const recovery =
             deps.compactionOff || deps.transformMode === "rust"
                 ? {}
                 : readLkgRecoveryPrefix(sessionId, lkgInput, messages, deps.db);
+        const recoveryTailSources: { identity: string; pristineSystem?: MessageLike }[] = [];
+        if (recovery.prefix) {
+            const priorIdentities = new Set(recovery.prefix.inputs.map((input) => input.id));
+            lkgInput.forEach((input, index) => {
+                const identity = lkgInputIdentity(input.id, input.role, index);
+                if (!identity || priorIdentities.has(identity)) return;
+                recoveryTailSources.push({
+                    identity,
+                    // Anonymous instructions have no taggable host id. Freeze
+                    // their pristine bytes before stages edit the working tail.
+                    pristineSystem:
+                        input.id === null && input.role === "system"
+                            ? structuredClone(entryOrderForThinkingFit[index])
+                            : undefined,
+                });
+            });
+        }
         // Messages an earlier last-good replay served untagged that still go out
         // untagged: the in-memory recovery prefix's set and, after a restart, the
         // durable record of it. Ordinary tagging skips them until a pass allowed
@@ -2481,6 +2513,10 @@ export function createTransform(deps: TransformDeps) {
             logTransformTiming(sessionId, "injectTemporalMarkers", tTemporal);
         }
 
+        // One gate for persisted caveman replay, shared with the tagger so a legacy
+        // foreign tag is served compressed exactly when the replay below runs.
+        const replaysCaveman =
+            !reducedMode && !compactionOff && deps.cavemanTextCompression?.enabled === true;
         let taggingSucceeded = false;
         let recoveryBatch: { finalize: () => void } | null = null;
         let recoveryNormalized = false;
@@ -2501,6 +2537,8 @@ export function createTransform(deps: TransformDeps) {
                       servedMessages: messages,
                       normalizeRestoredAssistantText: deps.normalizeRestoredAssistantText,
                       refreshSourceContents: deps.refreshSourceContents?.(sessionId),
+                      foreignTextParts,
+                      replaysCaveman,
                   });
                   for (const [number, target] of tagged.targets) targets.set(number, target);
                   for (const [message, parts] of tagged.reasoningByMessage)
@@ -2566,6 +2604,8 @@ export function createTransform(deps: TransformDeps) {
                         servedMessages: messages,
                         normalizeRestoredAssistantText: deps.normalizeRestoredAssistantText,
                         refreshSourceContents: deps.refreshSourceContents?.(sessionId),
+                        foreignTextParts,
+                        replaysCaveman,
                     },
                 );
                 targets = result.targets;
@@ -2691,7 +2731,7 @@ export function createTransform(deps: TransformDeps) {
         // caveman compression even when no new cleanup is allowed. Replay it before
         // inline-reasoning removal: compression would otherwise bring back thinking
         // that an earlier request removed. Fresh cleanup uses the same ordering.
-        if (!reducedMode && !compactionOff && deps.cavemanTextCompression?.enabled) {
+        if (replaysCaveman) {
             const tCavemanReplay = performance.now();
             const replayedCaveman = replayCavemanCompression(sessionId, db, targets, activeTags);
             if (replayedCaveman > 0) {
@@ -3204,14 +3244,15 @@ export function createTransform(deps: TransformDeps) {
         // replay it from the persisted ledger.
         compactionModeTransitionPending.delete(sessionId);
         if (recovery.prefix && !recoveryNormalized) {
-            const priorIds = new Set(recovery.prefix.inputs.map((input) => input.id));
-            const newIds = new Set(
-                lkgInput.flatMap((input) =>
-                    input.id && !priorIds.has(input.id) ? [input.id] : [],
-                ),
-            );
-            const suffix = messages.filter(
-                (message) => message.info.id && newIds.has(message.info.id),
+            const renderedById = new Map<string, MessageLike[]>();
+            for (const message of messages) {
+                if (!message.info.id) continue;
+                const group = renderedById.get(message.info.id) ?? [];
+                group.push(message);
+                renderedById.set(message.info.id, group);
+            }
+            const suffix = recoveryTailSources.flatMap(({ identity, pristineSystem }) =>
+                pristineSystem ? [pristineSystem] : (renderedById.get(identity) ?? []),
             );
             messages.splice(0, messages.length, ...JSON.parse(recovery.prefix.json), ...suffix);
         }
